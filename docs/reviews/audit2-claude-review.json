@@ -1,0 +1,73 @@
+{
+  "schema": "orch.result/reviewer/v1",
+  "run_id": "audit2-20260619T213511-7674a6",
+  "verdict": "approve",
+  "reviews_run_id": "main@c0fd007",
+  "blocking_findings": [],
+  "non_blocking_findings": [
+    {
+      "id": "NB1-forge-ghe",
+      "severity": "minor",
+      "file": "src/forge.ts:35-40",
+      "body": "detectForge 只用 host.includes(\"github.com\") 判 GitHub，其余一律 gitlab。自托管 GitHub Enterprise(如 github.mycorp.com)被误判为 gitlab。实测 detectForge('git@github.mycorp.com:a/b')=>gitlab。带 --execute 时会对 GHE 仓库发 glab 命令必失败。spec 第13b/P3 仅声明 github.com/自托管 gitlab/无 remote 三类，GHE 属界外，故非阻塞。修法：host 用 endsWith 精确匹配 + 提供 --forge 覆盖或 ~/.config/orch profile 显式指定。"
+    },
+    {
+      "id": "NB2-forge-substring",
+      "severity": "minor",
+      "file": "src/forge.ts:38",
+      "body": "host.includes(\"github.com\") 是子串匹配，github.com.attacker.net / notgithub.com 之类也会判为 github。建议改 host===\"github.com\"||host.endsWith(\".github.com\")。低危(dry-run 默认)。"
+    },
+    {
+      "id": "NB3-a2-burns-idempotency",
+      "severity": "minor",
+      "file": "src/orch.ts:404 + src/supervisor.ts:153-162",
+      "body": "write-role 抢 worktree 锁失败时，run 已经创建(spec/idempotency 记录已落)并以 failed exit=75 收场;实测 impl-b=>failed(75)。之后用同 task 再 dispatch 会因幂等命中短路返回那个 failed run，必须 --retry 才能重派。即锁竞争失败会“烧掉”幂等 key。修法:LockHeldError(75)路径不写/回滚幂等指针,或对锁竞争失败自动放行重建。运维上意外但不影响正确性。"
+    },
+    {
+      "id": "NB4-idempotency-failed-state",
+      "severity": "minor",
+      "file": "src/orch.ts:403-414",
+      "body": "spec §2.2 要求 running→返 run_id、done→返 result、failed→需 --retry 才新建;实现对 existing 一律短路(不区分 state),failed 也直接返回 idempotent:true 而非提示/要求 --retry。行为可用但与 spec 的状态分支语义有偏差。修法:对 statusState===failed 时不短路(或明确提示需 --retry)。"
+    },
+    {
+      "id": "NB5-help-runid-Z",
+      "severity": "trivial",
+      "file": "src/help.ts:26-28,122-123,145,170,195,335",
+      "body": "help 示例 run_id 形如 impl-a-20260619T120000Z-abc123 带 Z 后缀;但 runId() 经 utcCompact() 去掉了尾部 Z(实测真实 run_id=rev-a-20260619T213915-01dcba 无 Z)。纯文档不一致,易让人复制出不存在的 run_id。修法:去掉示例中的 Z。"
+    },
+    {
+      "id": "NB6-githead-no-guard",
+      "severity": "minor",
+      "file": "src/orch.ts:130-132",
+      "body": "createRun 里 gitHead 无 try/catch(不同于 gitDirty)。worktree 非 git 仓库或空仓库(git init 无 commit)时 git rev-parse HEAD 抛错→run create 直接抛原始 stack 而非干净 CliError。spec §6 step4 要求“检查 worktree 存在/git head”但实现缺友好校验。修法:gitHead 失败给明确报错。"
+    },
+    {
+      "id": "NB7-outbox-poison",
+      "severity": "minor",
+      "file": "src/orch.ts:673-683",
+      "body": "mirror sync 遇到非法 outbox/pending/*.json(readOutboxComment 返 null)计入 failed 但永不移除/隔离,导致 mirror sync 永远 exit 1、永远到不了 all-clear。修法:把无效 payload 移到 outbox/sent 或 outbox/invalid 隔离。A5 主路径(发送失败留 pending、不影响本地)已实测正确,此为边角。"
+    },
+    {
+      "id": "NB8-a3-native-missing-on-early-fail",
+      "severity": "trivial",
+      "file": "src/supervisor.ts:156-162",
+      "body": "worktree 锁竞争失败 / driver spawn 失败等早夭路径下,supervisor 写了 fallback result.json 但 native.jsonl 不存在(driver 还没起)。spec A3 称“worker 原生输出必存 native.jsonl”。仅 worker 未启动的失败态如此,MVP 可接受,记录以备 A3 完整性。"
+    },
+    {
+      "id": "NB9-reviewer-live-worktree",
+      "severity": "minor",
+      "file": "drivers/driver-common.ts:20-23 + src/supervisor.ts:153",
+      "body": "D8 设计是 review/verify 评 immutable artifact(commit sha/patch bundle)故不拿 worktree 锁;但实现里 reviewer/verifier driver 直接以 codex/claude --cd <live worktree> 在活动 worktree 跑,既不 checkout base_sha 也无只读隔离。若同时有 implementer(持锁)在写,reviewer 读到的是移动靶;且无任何机制阻止 reviewer 自己改 worktree。MVP 靠 task_text 纪律+主控串行调度兜底,非阻塞但与 D8 前提有真实落差。修法(后续):reviewer 用 base_sha 建临时 worktree/patch bundle 评 artifact。"
+    }
+  ],
+  "suggested_tests": [
+    "forge 检测表驱动单测:github.com(https/ssh)→github、gitlab.com→gitlab、自托管 gitlab(git.n.xiaomi.com)→gitlab、GitHub Enterprise(github.mycorp.com)→当前=gitlab(锁定现状并标注 NB1 缺口)、空/不可解析 remote→none。",
+    "A2 并发集成测(ORCH_DRIVER_FAKE_SLEEP_MS):同一 worktree 两个 write-role 并发=>恰好一个 done、一个 failed(exit_code=75);两个 reviewer 并发=>双 done(不拿锁)。已手工实测,补成自动用例。",
+    "A1 幂等并发:同 idempotency-key 同时 fire N 个 run create=>只生成一个 run dir、只 spawn 一个 supervisor;并覆盖 L3(spawn 后写幂等仍在 mr.lock 临界区内,无竞态)。",
+    "N4 回归:create 后断言 sha256(磁盘 spec.json 原始字节)===spec.sha256.sha256(已手工验证,固化为单测防回归)。",
+    "A5 dry-run:mirror / mirror sync 无 --execute 时断言 exit_code=null 且不 spawn 任何 gh/glab 进程(可用 PATH 注入假 gh/glab 探针验证零调用)。",
+    "A5 outbox 失败语义:注入返回非零退出码的假 forge=>pending payload 留存、decision.json/status.json 不变、命令 exit 1;成功路径=>pending→sent 迁移。",
+    "result 提取(护 c0fd007 修复):喂入 claude {type:result,result:<json>} 与 codex {item:{type:agent_message,text:<json>}} 两种 native.jsonl=>extractResultFromRunDir 均返回过 schema 的 result;喂入仅 prose 无 JSON=>回退 synthesizeResult(仍合 schema)。",
+    "A7 只读保证:status / run list / result / events tail 执行前后对状态目录做 mtime+inode 快照,断言零文件改动(确保未触发 ensureStateLayout 等副作用)。"
+  ]
+}
