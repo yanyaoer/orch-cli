@@ -26,7 +26,9 @@ claude / codex / pi / 人  ──▶  orch CLI  ──▶  本地状态目录 + 
 - **D5 无常驻 daemon**：薄 `orch` CLI + per-run supervisor（生命周期=run）。
 - **D6 driver 抽象延后**：先把 codex+claude 两个 headless driver 跑稳；但**从第一天起用统一进程合同**（§8），不让 `orch` 变 provider if-else 泥潭。agy disabled，pi 待验证。
 - **D7（实现）语言 = bun + TypeScript**（`Bun.spawn` / `Bun.file` / 内置 test；`bun build --compile` 出单 binary 去运行时依赖）。选 bun 而非 Python 的原因贴核心需求：worker 本质是**消费 streaming JSON**（`for await` 流处理是 JS 主场）、CLI **高频短调用**（bun 冷启动 ~ms）、status/result/events 用 **TS 类型**原生表达 schema、SDK-first 未来对接 `@openai/codex-sdk`/Claude SDK（均 TS 优先）平滑。
-  - **两个 posix 命脉点必须 Phase 0 钉死**（Python 内置、bun 需自理）：①**进程组 kill**——spawn 走 `setsid`、kill 用 `process.kill(-pgid, sig)`；`Bun.spawn` 支持不全则 `Bun.spawn(["setsid", driver, ...])` 包一层，**实测 bun 1.3**。②**文件锁**——bun/node 无 `flock` 且 **macOS 无 `flock(1)` 命令**，故锁用 `O_EXCL` 创建 pidfile（`fs.open(..., "wx")`）+ stale 检测（pid 死则夺锁），不依赖 flock。
+  - **两个 posix 命脉点（sub-claude spike 实测，bun 1.3.14 / macOS）**：
+    ①**进程组 kill**——⚠ macOS **无 `setsid(1)` 命令**（别用 `Bun.spawn(["setsid",...])`，会 ENOENT）；⚠ 默认 `Bun.spawn` 子进程**与父同进程组**，直接 `kill(-pgid)` 会连 supervisor 一起杀。**正解**：`Bun.spawn(cmd, {detached:true})` → 新进程组、子进程为组长（`pgid == proc.pid`），kill 用 `process.kill(-proc.pid, sig)`（catch ESRCH），worker 退出 **`await proc.exited` 收尸防僵尸**。
+    ②**文件锁**——bun/node 无 `flock` 且 macOS 无 `flock(1)`，故用 `O_EXCL` pidfile（`fs.open(...,"wx")`，原子互斥已实测）+ stale 检测；**`pidAlive` 必须区分 `ESRCH`(死→夺锁) vs `EPERM`(存活属他人→不夺)**；锁内写 `{pid, run_id, ts}`，TOCTOU 用 2-attempt 重试收敛、极端抛 `ELOCKRACE` 由调用方退避。
 - **D8（并发）review/verify 评 immutable artifact**（commit sha / patch bundle），不评 live worktree ⟹ 只有 write-role 需要 worktree 锁。
 
 ## 2. 硬约束（MVP 必须；实现要克制，别上框架）
@@ -188,6 +190,17 @@ created → starting → running → done
 | 本地状态不跨机 | **MVP 接受同机**；跨机冷恢复依赖 MR 镜像，不保证 native logs 完整。需多机再上 daemon/DB |
 | worktree 并发写污染 | write-role worktree 锁（§2.3）+ review/verify 评 artifact 不评 worktree（D8） |
 | 6 约束把 MVP 养成平台 | 每条用 flock/jq/文件，禁框架（§2 注） |
+
+## 13b. P1 已知待办（sub-claude Round2 排期项；B1/N1/N6 本轮已让 codex 修）
+
+- **N3（进 D7 前必修）**：`bun build --compile` 单 binary 当前会断——supervisor/driver 以 `execPath` + 外部 `drivers/*.ts` 方式 spawn，编译后旁边没有 .ts。需改成**同一 binary 的 argv-dispatch 子命令**（`orch __supervisor` / `orch __driver-<agent>`），或把 drivers 打进 bundle。P1 从源码 `bun run` 无碍。
+- **N2**：`schemas/*.json` 当前是死代码、与手写 TS 校验已漂移 → 接入 JSON schema 作单一权威，或删 JSON 并注明 TS 为 canonical。
+- **N4**：`spec.sha256` 应对**落盘字节**求（现对紧凑 JSON 求，与 pretty 落盘不符）。
+- **N5**：`spec.yml` 实为 JSON 内容 → 改名 `spec.json` 或真序列化 YAML。
+- **N7**：`§6.4` dirty 仅上报不拦 write-role → 至少 dirty 时 warn / `--allow-dirty` 守门。
+- **L2**：锁 pid 复用误判 → 锁内带 `ts`/`run_id` sentinel + 超龄阈值兜底。
+- **L3**：幂等记录在 spawn 前写 → spawn 失败会使 key 永久指向未启动 run（改 spawn 成功后写）。
+- **L4**：`--retry` 覆盖幂等记录致旧 run 指针丢失。
 
 ## 14. 一句话
 
