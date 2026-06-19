@@ -12,11 +12,17 @@ export function topLevelHelp(): string {
     "",
     "Commands:",
     "  orch run create    Start one headless worker run for an MR task",
+    "  orch run list      List local runs for an MR",
+    "  orch events tail   Print a run's local events.jsonl",
+    "  orch result        Print a run's local result.json",
     "  orch status        Read local run status for an MR",
     "  orch mirror        Mirror a local run result summary to a PR/MR comment",
     "",
     "Quickstart:",
     "  orch run create --mr 123 --role implementer --agent codex --tag impl-a --worktree . --task task.md",
+    "  orch run list --mr 123 --worktree .",
+    "  orch events tail --run impl-a-20260619T120000Z-abc123 --mr 123 -n 20",
+    "  orch result --run impl-a-20260619T120000Z-abc123 --mr 123",
     "  orch status --mr 123 --json",
     "  cat ${XDG_STATE_HOME:-$HOME/.local/state}/orch/<repo_key>/mrs/123/runs/<run_id>/result.json",
     "",
@@ -53,6 +59,28 @@ export function runCreateHelp(): string {
   ]);
 }
 
+export function runListHelp(): string {
+  return lines([
+    "orch run list: list local runs for an MR",
+    "",
+    "Usage:",
+    "  orch run list --mr <id> [--worktree <path>] [--json]",
+    "",
+    "Flags:",
+    "  --mr <id>             MR or task id whose local runs should be listed (required)",
+    "  --worktree <path>     Git worktree used to derive repo_key; defaults to the current directory",
+    "  --json                Print a machine-readable array instead of an aligned table",
+    "  --help                Show this help",
+    "",
+    "Output fields:",
+    "  run_id, role, agent, tag, state, started_at, exit_code",
+    "",
+    "Examples:",
+    "  orch run list --mr 123 --worktree .",
+    "  orch run list --mr 123 --json",
+  ]);
+}
+
 export function statusHelp(): string {
   return lines([
     "orch status: read local status for all runs in an MR",
@@ -68,6 +96,49 @@ export function statusHelp(): string {
     "",
     "Example:",
     "  orch status --mr 123 --json --worktree .",
+  ]);
+}
+
+export function eventsTailHelp(): string {
+  return lines([
+    "orch events tail: print a run's local events.jsonl",
+    "",
+    "Usage:",
+    "  orch events tail --run <run_id> [--mr <id>] [--worktree <path>] [-n <lines>]",
+    "",
+    "Flags:",
+    "  --run <run_id>        Local orch run id to read (required)",
+    "  --mr <id>             MR or task id containing the run; omitted scans this repo's local MR state",
+    "  --worktree <path>     Git worktree used to derive repo_key; defaults to the current directory",
+    "  -n <lines>            Print only the last N lines; omitted prints the whole file",
+    "  --help                Show this help",
+    "",
+    "Examples:",
+    "  orch events tail --run impl-a-20260619T120000Z-abc123 --mr 123",
+    "  orch events tail --run impl-a-20260619T120000Z-abc123 --worktree . -n 20",
+  ]);
+}
+
+export function resultCommandHelp(): string {
+  return lines([
+    "orch result: print a run's local result.json",
+    "",
+    "Usage:",
+    "  orch result --run <run_id> [--mr <id>] [--worktree <path>] [--json]",
+    "",
+    "Flags:",
+    "  --run <run_id>        Local orch run id to read (required)",
+    "  --mr <id>             MR or task id containing the run; omitted scans this repo's local MR state",
+    "  --worktree <path>     Git worktree used to derive repo_key; defaults to the current directory",
+    "  --json                Print result.json exactly as stored",
+    "  --help                Show this help",
+    "",
+    "Human output:",
+    "  Prints schema, verdict, and summary. Implementer results also include changed_files and tests.",
+    "",
+    "Examples:",
+    "  orch result --run impl-a-20260619T120000Z-abc123 --mr 123",
+    "  orch result --run impl-a-20260619T120000Z-abc123 --worktree . --json",
   ]);
 }
 
@@ -215,8 +286,10 @@ export function runHelp(): string {
   return lines([
     "orch run commands:",
     "  orch run create    Start one headless worker run for an MR task",
+    "  orch run list      List local runs for an MR",
     "",
     "Use:",
     "  orch run create --help",
+    "  orch run list --help",
   ]);
 }

@@ -2,19 +2,22 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
 import { resolve } from "node:path";
 import { $ } from "bun";
-import type { AgentName, RoleResult, RunRole, RunSpec, RunState, RunStatus } from "./types.ts";
+import type { AgentName, ImplementerResult, RoleResult, RunRole, RunSpec, RunState, RunStatus } from "./types.ts";
 import { isResultRole } from "./types.ts";
 import { acquirePidfileLock } from "./locks.ts";
 import { randomHex, sha256 } from "./hash.ts";
-import { ensureStateLayout, getRepoIdentity, lockPathForWorktree, mrStateDir } from "./paths.ts";
+import { ensureStateLayout, getRepoIdentity, lockPathForWorktree, mrStateDir, orchStateRoot } from "./paths.ts";
 import { readJsonFile, writeJsonAtomic } from "./json.ts";
 import { argvForDisplay, createForgeAdapter, detectForge } from "./forge.ts";
 import { runSupervisor, writeInitialRunFiles } from "./supervisor.ts";
 import {
   HELP_TOPICS,
+  eventsTailHelp,
   mirrorHelp,
+  resultCommandHelp,
   runCreateHelp,
   runHelp,
+  runListHelp,
   statusHelp,
   topicHelp,
   topLevelHelp,
@@ -37,11 +40,31 @@ type IdempotencyRecord = {
   created_at: string;
 };
 
+type RunListRow = Pick<RunStatus, "run_id" | "role" | "agent" | "tag" | "state" | "started_at" | "exit_code">;
+
+type LocatedRun = {
+  mr: string;
+  run_id: string;
+  run_dir: string;
+};
+
+class CliError extends Error {}
+
 function parseArgs(argv: string[]): ParsedArgs {
   const positionals: string[] = [];
   const flags = new Map<string, string | boolean>();
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i]!;
+    if (arg === "-n") {
+      const next = argv[i + 1];
+      if (!next || next.startsWith("-")) {
+        flags.set("n", true);
+      } else {
+        flags.set("n", next);
+        i += 1;
+      }
+      continue;
+    }
     if (!arg.startsWith("--")) {
       positionals.push(arg);
       continue;
@@ -99,6 +122,123 @@ async function gitDirty(worktree: string): Promise<string> {
 
 function printJson(value: unknown): void {
   process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
+}
+
+function readTextFile(path: string): string | null {
+  try {
+    return readFileSync(path, "utf8");
+  } catch {
+    return null;
+  }
+}
+
+function runListRows(runsRoot: string): RunListRow[] {
+  if (!existsSync(runsRoot)) return [];
+  return readdirSync(runsRoot, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => readJsonFile<RunStatus | null>(`${runsRoot}/${entry.name}/status.json`, null))
+    .filter((status): status is RunStatus => status !== null)
+    .sort((a, b) => (a.started_at ?? "").localeCompare(b.started_at ?? "") || a.run_id.localeCompare(b.run_id))
+    .map((status) => ({
+      run_id: status.run_id,
+      role: status.role,
+      agent: status.agent,
+      tag: status.tag,
+      state: status.state,
+      started_at: status.started_at,
+      exit_code: status.exit_code,
+    }));
+}
+
+function formatTable(rows: RunListRow[]): string {
+  const headers = ["run_id", "role", "agent", "tag", "state", "started_at", "exit_code"];
+  const body = rows.map((row) => [
+    row.run_id,
+    row.role,
+    row.agent,
+    row.tag,
+    row.state,
+    row.started_at ?? "-",
+    row.exit_code === null ? "-" : String(row.exit_code),
+  ]);
+  const widths = headers.map((header, index) =>
+    Math.max(header.length, ...body.map((row) => row[index]!.length)),
+  );
+  const render = (columns: string[]) => columns.map((value, index) => value.padEnd(widths[index]!)).join("  ").trimEnd();
+  return `${render(headers)}\n${body.map(render).join("\n")}${body.length ? "\n" : ""}`;
+}
+
+function repoMrsRoot(repoKey: string): string {
+  return `${orchStateRoot()}/${repoKey}/mrs`;
+}
+
+function locateRun(repoKey: string, runId: string, mr?: string): LocatedRun {
+  if (mr) {
+    const runDir = `${mrStateDir(repoKey, mr)}/runs/${runId}`;
+    if (!existsSync(runDir)) throw new CliError(`run not found: ${runId} under MR ${mr}`);
+    return { mr, run_id: runId, run_dir: runDir };
+  }
+
+  const mrsRoot = repoMrsRoot(repoKey);
+  if (!existsSync(mrsRoot)) throw new CliError(`no local MR state found for repo_key: ${repoKey}`);
+  const matches = readdirSync(mrsRoot, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => ({
+      mr: entry.name,
+      run_id: runId,
+      run_dir: `${mrsRoot}/${entry.name}/runs/${runId}`,
+    }))
+    .filter((candidate) => existsSync(candidate.run_dir));
+
+  if (matches.length === 0) throw new CliError(`run not found: ${runId} under repo_key ${repoKey}`);
+  if (matches.length > 1) {
+    const mrs = matches.map((match) => match.mr).join(", ");
+    throw new CliError(`run id ${runId} exists under multiple MRs (${mrs}); pass --mr to disambiguate`);
+  }
+  return matches[0]!;
+}
+
+function parseTailLines(args: ParsedArgs): number | null {
+  if (!args.flags.has("n")) return null;
+  const rawValue = args.flags.get("n");
+  if (typeof rawValue !== "string") throw new CliError("-n <lines> must be a non-negative integer");
+  const raw = rawValue;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 0) throw new CliError("-n <lines> must be a non-negative integer");
+  return value;
+}
+
+function tailText(text: string, lines: number | null): string {
+  if (lines === null) return text;
+  if (lines === 0) return "";
+  const parts = text.split(/\r?\n/);
+  if (parts[parts.length - 1] === "") parts.pop();
+  const selected = parts.slice(-lines);
+  return selected.length ? `${selected.join("\n")}\n` : "";
+}
+
+function printResultSummary(result: RoleResult): void {
+  process.stdout.write(`schema: ${result.schema}\n`);
+  process.stdout.write(`verdict: ${resultVerdict(result)}\n`);
+  process.stdout.write(`summary: ${resultSummary(result)}\n`);
+
+  if (result.schema !== "orch.result/implementer/v1") return;
+  const implementer = result as ImplementerResult;
+  process.stdout.write("\nchanged_files:\n");
+  if (implementer.changed_files.length === 0) {
+    process.stdout.write("  - none\n");
+  } else {
+    for (const file of implementer.changed_files) process.stdout.write(`  - ${file}\n`);
+  }
+
+  process.stdout.write("\ntests:\n");
+  if (implementer.tests.length === 0) {
+    process.stdout.write("  - none\n");
+  } else {
+    for (const test of implementer.tests) {
+      process.stdout.write(`  - ${test.cmd} (exit ${test.exit_code}): ${test.summary}\n`);
+    }
+  }
 }
 
 function orchCommand(): string[] {
@@ -293,6 +433,57 @@ async function status(args: ParsedArgs): Promise<number> {
   return 0;
 }
 
+async function runList(args: ParsedArgs): Promise<number> {
+  const mr = flagString(args, "mr");
+  const worktree = resolve(flagString(args, "worktree", process.cwd()));
+  const repo = await getRepoIdentity(worktree);
+  const root = mrStateDir(repo.repo_key, mr);
+  const rows = runListRows(`${root}/runs`);
+  if (flagBool(args, "json")) {
+    printJson(rows);
+  } else {
+    process.stdout.write(formatTable(rows));
+  }
+  return 0;
+}
+
+async function eventsTail(args: ParsedArgs): Promise<number> {
+  const runId = flagString(args, "run");
+  const mr = args.flags.has("mr") ? flagString(args, "mr") : undefined;
+  const worktree = resolve(flagString(args, "worktree", process.cwd()));
+  const lines = parseTailLines(args);
+  const repo = await getRepoIdentity(worktree);
+  const located = locateRun(repo.repo_key, runId, mr);
+  const eventsPath = `${located.run_dir}/events.jsonl`;
+  const text = readTextFile(eventsPath);
+  if (text === null) throw new CliError(`events.jsonl not found for run: ${runId}`);
+  process.stdout.write(tailText(text, lines));
+  return 0;
+}
+
+async function result(args: ParsedArgs): Promise<number> {
+  const runId = flagString(args, "run");
+  const mr = args.flags.has("mr") ? flagString(args, "mr") : undefined;
+  const worktree = resolve(flagString(args, "worktree", process.cwd()));
+  const repo = await getRepoIdentity(worktree);
+  const located = locateRun(repo.repo_key, runId, mr);
+  const resultPath = `${located.run_dir}/result.json`;
+  const raw = readTextFile(resultPath);
+  if (raw === null) throw new CliError(`result.json not found for run: ${runId}`);
+  if (flagBool(args, "json")) {
+    process.stdout.write(raw.endsWith("\n") ? raw : `${raw}\n`);
+    return 0;
+  }
+  let parsed: RoleResult;
+  try {
+    parsed = JSON.parse(raw) as RoleResult;
+  } catch {
+    throw new CliError(`result.json is not valid JSON for run: ${runId}`);
+  }
+  printResultSummary(parsed);
+  return 0;
+}
+
 async function mirror(args: ParsedArgs): Promise<number> {
   const mr = flagString(args, "mr");
   const worktree = resolve(flagString(args, "worktree", process.cwd()));
@@ -346,8 +537,20 @@ async function main(): Promise<number> {
       process.stdout.write(runCreateHelp());
       return 0;
     }
+    if (first === "run" && second === "list") {
+      process.stdout.write(runListHelp());
+      return 0;
+    }
     if (first === "run") {
       process.stdout.write(runHelp());
+      return 0;
+    }
+    if (first === "events" && second === "tail") {
+      process.stdout.write(eventsTailHelp());
+      return 0;
+    }
+    if (first === "result") {
+      process.stdout.write(resultCommandHelp());
       return 0;
     }
     if (first === "status") {
@@ -380,6 +583,9 @@ async function main(): Promise<number> {
   }
 
   if (first === "run" && second === "create") return createRun(args);
+  if (first === "run" && second === "list") return runList(args);
+  if (first === "events" && second === "tail") return eventsTail(args);
+  if (first === "result") return result(args);
   if (first === "status") return status(args);
   if (first === "mirror") return mirror(args);
   process.stderr.write(topLevelHelp());
@@ -389,6 +595,10 @@ async function main(): Promise<number> {
 main()
   .then((code) => process.exit(code))
   .catch((error) => {
+    if (error instanceof CliError) {
+      process.stderr.write(`${error.message}\n`);
+      process.exit(1);
+    }
     process.stderr.write(`${error instanceof Error ? error.stack : String(error)}\n`);
     process.exit(1);
   });

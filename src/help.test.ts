@@ -1,11 +1,25 @@
 import { expect, test } from "bun:test";
-import { mirrorHelp, runCreateHelp, statusHelp, topicHelp, topLevelHelp, unknownTopicHelp } from "./help.ts";
+import {
+  eventsTailHelp,
+  mirrorHelp,
+  resultCommandHelp,
+  runCreateHelp,
+  runHelp,
+  runListHelp,
+  statusHelp,
+  topicHelp,
+  topLevelHelp,
+  unknownTopicHelp,
+} from "./help.ts";
 
 test("top-level help exposes positioning, commands, quickstart, and topics", () => {
   const text = topLevelHelp();
 
   expect(text).toContain("daemonless multi-agent orchestrator");
   expect(text).toContain("orch run create");
+  expect(text).toContain("orch run list");
+  expect(text).toContain("orch events tail");
+  expect(text).toContain("orch result");
   expect(text).toContain("orch status");
   expect(text).toContain("orch mirror");
   expect(text).toContain("Quickstart:");
@@ -22,6 +36,30 @@ test("command help exposes flags and runnable examples", () => {
   }
   expect(runCreate).toContain("Example:");
   expect(runCreate).toContain("orch run create --mr 123");
+
+  const runList = runListHelp();
+  for (const flag of ["--mr", "--worktree", "--json"]) {
+    expect(runList).toContain(flag);
+  }
+  expect(runList).toContain("run_id, role, agent, tag, state, started_at, exit_code");
+  expect(runList).toContain("orch run list --mr 123");
+
+  const run = runHelp();
+  expect(run).toContain("orch run create");
+  expect(run).toContain("orch run list");
+
+  const eventsTail = eventsTailHelp();
+  for (const flag of ["--run", "--mr", "--worktree", "-n"]) {
+    expect(eventsTail).toContain(flag);
+  }
+  expect(eventsTail).toContain("orch events tail --run");
+
+  const result = resultCommandHelp();
+  for (const flag of ["--run", "--mr", "--worktree", "--json"]) {
+    expect(result).toContain(flag);
+  }
+  expect(result).toContain("schema, verdict, and summary");
+  expect(result).toContain("changed_files");
 
   for (const flag of ["--mr", "--json", "--worktree"]) {
     expect(status).toContain(flag);
