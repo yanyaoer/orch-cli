@@ -24,17 +24,14 @@ async function main(): Promise<number> {
       cwd: args.worktree,
       stdin: "pipe",
       stdout: "pipe",
-      stderr: "pipe",
+      stderr: "inherit",
       env: process.env,
     },
   );
   proc.stdin.write(prompt);
   proc.stdin.end();
 
-  await Promise.all([
-    pipeToFile(proc.stdout, `${args.runDir}/native.jsonl`),
-    pipeToFile(proc.stderr, `${args.runDir}/stderr.log`),
-  ]);
+  await pipeToFile(proc.stdout, `${args.runDir}/native.jsonl`);
   const code = await proc.exited;
   writeExitCode(args.runDir, code);
 

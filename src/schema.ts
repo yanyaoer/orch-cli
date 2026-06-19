@@ -56,8 +56,9 @@ export function validateRoleResult(role: RunRole, value: unknown): ValidationRes
       if (!array(obj[field])) errors.push(`${field} must be an array`);
     }
   } else if (role === "reviewer") {
-    const missing = requireFields(obj, ["verdict", "reviews_run_id"]);
+    const missing = requireFields(obj, ["verdict"]);
     errors.push(...missing.map((field) => `${field} is required`));
+    if (typeof obj.reviews_run_id !== "string") errors.push("reviews_run_id must be a string");
     if (obj.verdict !== "approve" && obj.verdict !== "request_changes") {
       errors.push("verdict must be approve|request_changes");
     }
@@ -65,8 +66,9 @@ export function validateRoleResult(role: RunRole, value: unknown): ValidationRes
       if (!array(obj[field])) errors.push(`${field} must be an array`);
     }
   } else {
-    const missing = requireFields(obj, ["verdict", "verifies_run_id"]);
+    const missing = requireFields(obj, ["verdict"]);
     errors.push(...missing.map((field) => `${field} is required`));
+    if (typeof obj.verifies_run_id !== "string") errors.push("verifies_run_id must be a string");
     if (obj.verdict !== "pass" && obj.verdict !== "fail") errors.push("verdict must be pass|fail");
     for (const field of ["commands", "acceptance"]) {
       if (!array(obj[field])) errors.push(`${field} must be an array`);
@@ -120,4 +122,3 @@ export function fallbackResult(args: {
     rollback: "No changes were accepted by orch.",
   } satisfies ImplementerResult;
 }
-

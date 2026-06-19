@@ -18,20 +18,19 @@ async function main(): Promise<number> {
 
   const prompt = buildPrompt(spec, "claude");
   const proc = Bun.spawn(
-    ["claude", "-p", "--output-format", "stream-json", prompt],
+    ["claude", "-p", "--verbose", "--output-format", "stream-json", "--input-format", "text"],
     {
       cwd: args.worktree,
-      stdin: "ignore",
+      stdin: "pipe",
       stdout: "pipe",
-      stderr: "pipe",
+      stderr: "inherit",
       env: process.env,
     },
   );
+  proc.stdin.write(prompt);
+  proc.stdin.end();
 
-  await Promise.all([
-    pipeToFile(proc.stdout, `${args.runDir}/native.jsonl`),
-    pipeToFile(proc.stderr, `${args.runDir}/stderr.log`),
-  ]);
+  await pipeToFile(proc.stdout, `${args.runDir}/native.jsonl`);
   const code = await proc.exited;
   writeExitCode(args.runDir, code);
   writeResult(

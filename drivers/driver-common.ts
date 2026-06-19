@@ -148,8 +148,6 @@ export async function maybeWriteFakeResult(runDir: string, spec: RunSpec, provid
     `${JSON.stringify({ type: "fake", provider, run_id: spec.run_id, ts: new Date().toISOString() })}\n`,
     "utf8",
   );
-  writeFileSync(`${runDir}/stdout.log`, `fake ${provider} result\n`, "utf8");
-  writeFileSync(`${runDir}/stderr.log`, "", "utf8");
   writeResult(
     runDir,
     spec,
