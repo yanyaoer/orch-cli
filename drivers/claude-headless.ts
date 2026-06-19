@@ -11,8 +11,8 @@ import {
   writeResult,
 } from "./driver-common.ts";
 
-async function main(): Promise<number> {
-  const args = parseDriverArgs(process.argv.slice(2));
+export async function runClaudeDriver(argv: string[]): Promise<number> {
+  const args = parseDriverArgs(argv);
   const spec = readSpec(args.specPath);
   if (await maybeWriteFakeResult(args.runDir, spec, "claude")) return 0;
 
@@ -42,9 +42,11 @@ async function main(): Promise<number> {
   return code;
 }
 
-main()
-  .then((code) => process.exit(code))
-  .catch((error) => {
-    process.stderr.write(`${error instanceof Error ? error.stack : String(error)}\n`);
-    process.exit(1);
-  });
+if (import.meta.main) {
+  runClaudeDriver(process.argv.slice(2))
+    .then((code) => process.exit(code))
+    .catch((error) => {
+      process.stderr.write(`${error instanceof Error ? error.stack : String(error)}\n`);
+      process.exit(1);
+    });
+}

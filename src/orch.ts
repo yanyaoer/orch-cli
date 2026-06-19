@@ -9,6 +9,8 @@ import { randomHex, sha256 } from "./hash.ts";
 import { ensureStateLayout, getRepoIdentity, lockPathForWorktree, mrStateDir } from "./paths.ts";
 import { readJsonFile, writeJsonAtomic } from "./json.ts";
 import { runSupervisor, writeInitialRunFiles } from "./supervisor.ts";
+import { runCodexDriver } from "../drivers/codex-headless.ts";
+import { runClaudeDriver } from "../drivers/claude-headless.ts";
 
 interface ParsedArgs {
   positionals: string[];
@@ -77,6 +79,12 @@ async function gitDirty(worktree: string): Promise<string> {
 
 function printJson(value: unknown): void {
   process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
+}
+
+function orchCommand(): string[] {
+  const scriptPath = process.argv[1];
+  if (scriptPath?.endsWith(".ts")) return [process.execPath, scriptPath];
+  return [process.execPath];
 }
 
 function readIdempotency(path: string): Record<string, IdempotencyRecord> {
@@ -163,7 +171,7 @@ async function createRun(args: ParsedArgs): Promise<number> {
     writeJsonAtomic(idempotencyPath, idempotency);
 
     const proc = Bun.spawn(
-      [process.execPath, import.meta.path, "__supervisor", "--run-dir", runDir],
+      [...orchCommand(), "__supervisor", "--run-dir", runDir],
       {
         cwd: worktree,
         detached: true,
@@ -217,7 +225,9 @@ async function status(args: ParsedArgs): Promise<number> {
 async function main(): Promise<number> {
   const args = parseArgs(process.argv.slice(2));
   const [first, second] = args.positionals;
-  if (first === "__supervisor") return runSupervisor(flagString(args, "run-dir"));
+  if (first === "__supervisor") return runSupervisor(flagString(args, "run-dir"), orchCommand());
+  if (first === "__driver-codex") return runCodexDriver(process.argv.slice(3));
+  if (first === "__driver-claude") return runClaudeDriver(process.argv.slice(3));
   if (first === "run" && second === "create") return createRun(args);
   if (first === "status") return status(args);
   process.stderr.write(

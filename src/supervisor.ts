@@ -1,5 +1,5 @@
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync, writeSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { dirname } from "node:path";
 import type { OrchEvent, RunSpec, RunState, RunStatus } from "./types.ts";
 import { writeRoles } from "./types.ts";
 import { acquirePidfileLock, LockHeldError, type PidfileLock } from "./locks.ts";
@@ -66,10 +66,6 @@ function appendEvent(runDir: string, event: OrchEvent): void {
 
 function nextSeq(runDir: string): number {
   return countLines(runDirFile(runDir, "events.jsonl"));
-}
-
-function driverPath(agent: RunSpec["agent"]): string {
-  return resolve(import.meta.dir, "..", "drivers", `${agent}-headless.ts`);
 }
 
 function appendStream(stream: ReadableStream<Uint8Array> | null, path: string): Promise<void> {
@@ -148,7 +144,7 @@ function killProcessGroup(pgid: number, signal: NodeJS.Signals): void {
   }
 }
 
-export async function runSupervisor(runDir: string): Promise<number> {
+export async function runSupervisor(runDir: string, orchCommand: string[]): Promise<number> {
   const specPath = runDirFile(runDir, "spec.yml");
   const spec = JSON.parse(readFileSync(specPath, "utf8")) as RunSpec;
   const mrDir = mrStateDir(spec.repo_key, spec.mr);
@@ -172,8 +168,8 @@ export async function runSupervisor(runDir: string): Promise<number> {
 
   const proc = Bun.spawn(
     [
-      process.execPath,
-      driverPath(spec.agent),
+      ...orchCommand,
+      `__driver-${spec.agent}`,
       "--spec",
       specPath,
       "--run-dir",
