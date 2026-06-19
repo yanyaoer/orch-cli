@@ -1,0 +1,13 @@
+{
+  "name": "orch-cli",
+  "version": "0.0.0",
+  "type": "module",
+  "private": true,
+  "bin": { "orch": "./src/orch.ts" },
+  "scripts": {
+    "orch": "bun run src/orch.ts",
+    "test": "bun test",
+    "build": "bun build src/orch.ts --compile --outfile dist/orch"
+  },
+  "devDependencies": { "@types/bun": "latest" }
+}
