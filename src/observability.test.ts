@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { sha256 } from "./hash.ts";
 import { repoKeyFromRemote } from "./paths.ts";
 import type { ImplementerResult, RunStatus } from "./types.ts";
 
@@ -30,6 +31,37 @@ async function runCmd(args: string[], cwd: string): Promise<void> {
   if (exitCode !== 0) {
     throw new Error(`${args.join(" ")} failed (${exitCode})\n${stdout}${stderr}`);
   }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForRunDone(statusPath: string): Promise<RunStatus> {
+  const deadline = Date.now() + 4_000;
+  while (Date.now() < deadline) {
+    try {
+      const status = JSON.parse(readFileSync(statusPath, "utf8")) as RunStatus;
+      if (status.state === "done") return status;
+      if (status.state === "failed" || status.state === "timeout") {
+        throw new Error(`run ended unexpectedly: ${JSON.stringify(status)}`);
+      }
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith("run ended unexpectedly")) throw error;
+    }
+    await sleep(25);
+  }
+  throw new Error(`timed out waiting for ${statusPath}`);
+}
+
+async function initGitWorktree(worktree: string): Promise<void> {
+  await runCmd(["git", "init"], worktree);
+  writeFileSync(join(worktree, "README.md"), "initial\n", "utf8");
+  await runCmd(["git", "add", "README.md"], worktree);
+  await runCmd(
+    ["git", "-c", "user.email=test@example.com", "-c", "user.name=Test User", "commit", "-m", "initial"],
+    worktree,
+  );
 }
 
 test("observability commands read local run state", async () => {
@@ -113,6 +145,90 @@ test("observability commands read local run state", async () => {
   expect(humanResult.stdout).toContain("schema: orch.result/implementer/v1");
   expect(humanResult.stdout).toContain("changed_files:");
   expect(humanResult.stdout).toContain("bun test (exit 0): passed");
+});
+
+test("run create writes spec.json, hashes landed bytes, warns on dirty write-role, and preserves retry history", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orch-create-test-"));
+  const stateHome = join(root, "state");
+  const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
+  await initGitWorktree(worktree);
+  writeFileSync(join(worktree, "dirty.txt"), "dirty\n", "utf8");
+  const taskPath = join(root, "task.md");
+  writeFileSync(taskPath, "do fake work\n", "utf8");
+
+  const env = { XDG_STATE_HOME: stateHome, ORCH_DRIVER_FAKE_RESULT: "1" };
+  const first = await runOrch(
+    [
+      "run",
+      "create",
+      "--mr",
+      "456",
+      "--role",
+      "implementer",
+      "--agent",
+      "codex",
+      "--tag",
+      "impl-test",
+      "--worktree",
+      worktree,
+      "--task",
+      taskPath,
+      "--idempotency-key",
+      "idem-create-test",
+      "--timeout-sec",
+      "10",
+    ],
+    env,
+  );
+  expect(first.exitCode).toBe(0);
+  expect(first.stderr).toContain("warn: worktree has uncommitted changes");
+  const firstPayload = JSON.parse(first.stdout) as { run_id: string; run_dir: string; status_path: string };
+  const firstStatus = await waitForRunDone(firstPayload.status_path);
+  expect(firstStatus.run_id).toBe(firstPayload.run_id);
+  expect(existsSync(join(firstPayload.run_dir, "spec.json"))).toBe(true);
+  expect(existsSync(join(firstPayload.run_dir, "spec.yml"))).toBe(false);
+  const specBytes = readFileSync(join(firstPayload.run_dir, "spec.json"), "utf8");
+  const specSha = JSON.parse(readFileSync(join(firstPayload.run_dir, "spec.sha256"), "utf8")) as { sha256: string };
+  expect(specSha.sha256).toBe(sha256(specBytes));
+
+  const second = await runOrch(
+    [
+      "run",
+      "create",
+      "--mr",
+      "456",
+      "--role",
+      "implementer",
+      "--agent",
+      "codex",
+      "--tag",
+      "impl-test",
+      "--worktree",
+      worktree,
+      "--task",
+      taskPath,
+      "--idempotency-key",
+      "idem-create-test",
+      "--retry",
+      "--allow-dirty",
+      "--timeout-sec",
+      "10",
+    ],
+    env,
+  );
+  expect(second.exitCode).toBe(0);
+  expect(second.stderr).toBe("");
+  const secondPayload = JSON.parse(second.stdout) as { run_id: string; run_dir: string; status_path: string };
+  await waitForRunDone(secondPayload.status_path);
+  expect(secondPayload.run_id).not.toBe(firstPayload.run_id);
+
+  const idempotencyPath = join(stateHome, "orch", repoKeyFromRemote(worktree, worktree), "mrs", "456", "idempotency.json");
+  const idempotency = JSON.parse(readFileSync(idempotencyPath, "utf8")) as Record<
+    string,
+    { run_id: string; previous?: Array<{ run_id: string }> }
+  >;
+  expect(idempotency["idem-create-test"]?.run_id).toBe(secondPayload.run_id);
+  expect(idempotency["idem-create-test"]?.previous?.map((item) => item.run_id)).toEqual([firstPayload.run_id]);
 });
 
 test("decision records local verdict and queues mirror outbox payload", async () => {

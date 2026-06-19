@@ -3,11 +3,11 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync } from "no
 import { resolve } from "node:path";
 import { $ } from "bun";
 import type { AgentName, ImplementerResult, RoleResult, RunRole, RunSpec, RunState, RunStatus } from "./types.ts";
-import { isResultRole } from "./types.ts";
+import { isResultRole, writeRoles } from "./types.ts";
 import { acquirePidfileLock } from "./locks.ts";
 import { randomHex, sha256 } from "./hash.ts";
 import { ensureStateLayout, getRepoIdentity, lockPathForWorktree, mrStateDir, orchStateRoot } from "./paths.ts";
-import { readJsonFile, writeJsonAtomic } from "./json.ts";
+import { jsonBytes, readJsonFile, writeJsonAtomic, writeTextAtomic } from "./json.ts";
 import { argvForDisplay, createForgeAdapter, detectForge } from "./forge.ts";
 import { runSupervisor, writeInitialRunFiles } from "./supervisor.ts";
 import {
@@ -40,6 +40,7 @@ type IdempotencyRecord = {
   status_path: string;
   result_path: string;
   created_at: string;
+  previous?: IdempotencyRecord[];
 };
 
 type RunListRow = Pick<RunStatus, "run_id" | "role" | "agent" | "tag" | "state" | "started_at" | "exit_code">;
@@ -293,6 +294,11 @@ function readIdempotency(path: string): Record<string, IdempotencyRecord> {
   return readJsonFile<Record<string, IdempotencyRecord>>(path, {});
 }
 
+function archivedIdempotency(record: IdempotencyRecord): IdempotencyRecord {
+  const { previous: _previous, ...archived } = record;
+  return archived;
+}
+
 function statusState(record: IdempotencyRecord): RunState | null {
   const status = readJsonFile<RunStatus | null>(record.status_path, null);
   return status?.state ?? null;
@@ -408,6 +414,11 @@ async function createRun(args: ParsedArgs): Promise<number> {
     }
 
     const dirty = await gitDirty(worktree);
+    if (dirty.length > 0 && writeRoles.has(role) && !flagBool(args, "allow-dirty")) {
+      process.stderr.write(
+        `warn: worktree has uncommitted changes; write-role run will proceed. Pass --allow-dirty to acknowledge.\n`,
+      );
+    }
     const baseSha = await gitHead(worktree);
     const id = runId(tag);
     const runDir = `${mrDir}/runs/${id}`;
@@ -430,18 +441,10 @@ async function createRun(args: ParsedArgs): Promise<number> {
       timeout_sec: timeoutSec,
       created_at: createdAt,
     };
-    writeJsonAtomic(`${runDir}/spec.yml`, spec);
-    writeJsonAtomic(`${runDir}/spec.sha256`, { sha256: sha256(JSON.stringify(spec)) });
+    const specBytes = jsonBytes(spec);
+    writeTextAtomic(`${runDir}/spec.json`, specBytes);
+    writeJsonAtomic(`${runDir}/spec.sha256`, { sha256: sha256(specBytes) });
     writeInitialRunFiles(runDir, spec);
-
-    idempotency[idempotencyKey] = {
-      run_id: id,
-      run_dir: runDir,
-      status_path: `${runDir}/status.json`,
-      result_path: `${runDir}/result.json`,
-      created_at: createdAt,
-    };
-    writeJsonAtomic(idempotencyPath, idempotency);
 
     const proc = Bun.spawn(
       [...orchCommand(), "__supervisor", "--run-dir", runDir],
@@ -454,6 +457,16 @@ async function createRun(args: ParsedArgs): Promise<number> {
         env: process.env,
       },
     );
+
+    idempotency[idempotencyKey] = {
+      run_id: id,
+      run_dir: runDir,
+      status_path: `${runDir}/status.json`,
+      result_path: `${runDir}/result.json`,
+      created_at: createdAt,
+      previous: existing ? [...(existing.previous ?? []), archivedIdempotency(existing)] : undefined,
+    };
+    writeJsonAtomic(idempotencyPath, idempotency);
 
     printJson({
       run_id: id,

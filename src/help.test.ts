@@ -35,7 +35,18 @@ test("command help exposes flags and runnable examples", () => {
   const runCreate = runCreateHelp();
   const status = statusHelp();
 
-  for (const flag of ["--mr", "--role", "--agent", "--tag", "--worktree", "--task", "--idempotency-key", "--retry", "--timeout-sec"]) {
+  for (const flag of [
+    "--mr",
+    "--role",
+    "--agent",
+    "--tag",
+    "--worktree",
+    "--task",
+    "--idempotency-key",
+    "--retry",
+    "--allow-dirty",
+    "--timeout-sec",
+  ]) {
     expect(runCreate).toContain(flag);
   }
   expect(runCreate).toContain("Example:");

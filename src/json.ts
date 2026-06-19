@@ -1,6 +1,10 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
+export function jsonBytes(value: unknown): string {
+  return `${JSON.stringify(value, null, 2)}\n`;
+}
+
 export function readJsonFile<T>(path: string, fallback: T): T {
   try {
     return JSON.parse(readFileSync(path, "utf8")) as T;
@@ -10,9 +14,13 @@ export function readJsonFile<T>(path: string, fallback: T): T {
 }
 
 export function writeJsonAtomic(path: string, value: unknown): void {
+  writeTextAtomic(path, jsonBytes(value));
+}
+
+export function writeTextAtomic(path: string, value: string): void {
   mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.${process.pid}.${Date.now()}.tmp`;
-  writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  writeFileSync(tmp, value, "utf8");
   renameSync(tmp, path);
 }
 
@@ -30,4 +38,3 @@ export function countLines(path: string): number {
     return 0;
   }
 }
-

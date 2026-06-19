@@ -274,7 +274,7 @@ agent-watch.sh <session> <mr-id> <tag> <worktree>     # run_id 从 @id 读
 $HOME/.config/orch/<repo>/<mr>/
   ├── task.yml                # task-spec（派发输入，机读）
   └── runs/<run_id>/
-        ├── spec.yml          # 本次 run 的 task-spec 快照
+        ├── spec.json         # 本次 run 的 task-spec 快照
         ├── events.jsonl      # orch-evt 事件流（worker 追加，实时状态源）
         ├── result.json       # 终态 + artifact 指针
         └── status            # pid / heartbeat / exit / last_seq / lease
@@ -291,7 +291,7 @@ orch decision   accept|rework --mr <id> --run <run_id>
 ```
 
 ### MVP 落地顺序
-1. `orch run create` → spawn `codex exec --json` / `claude -p stream-json`，stdin 喂 `spec.yml`，stdout→`events.jsonl`，退出写 `result.json` + `status`。**no daemon / webhook / DB。** → 一步消灭 send-keys / watcher / resume 三大脆性。
+1. `orch run create` → spawn `codex exec --json` / `claude -p stream-json`，stdin 喂 `spec.json`，stdout→`events.jsonl`，退出写 `result.json` + `status`。**no daemon / webhook / DB。** → 一步消灭 send-keys / watcher / resume 三大脆性。
 2. per-run **轻量 supervisor**（`orch run` 启动时 fork，盯 pid/超时/heartbeat 写 `status`，run 结束即退）——取代现在的全局 watcher，非常驻。
 3. 主控（claude/codex/pi）轮询 `orch status` / 读 `result.json`，裁决后 `orch decision` 写 MR 摘要镜像。
 4. 现有 `agent-dispatch.sh` / `agent-watch.sh` 包成 `tmux_driver` 作 fallback，渐进不推翻。

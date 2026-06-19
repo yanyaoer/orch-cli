@@ -59,7 +59,7 @@ ${XDG_STATE_HOME:-$HOME/.local/state}/orch/<repo_key>/mrs/<mr_iid>/
   ├── locks/{mr.lock, worktree.<hash>.lock}
   ├── outbox/{pending/, sent/}
   └── runs/<run_id>/
-        ├── spec.yml          # 本 run 输入快照
+        ├── spec.json         # 本 run 输入快照
         ├── spec.sha256
         ├── status.json       # supervisor 写
         ├── events.jsonl      # orch 标准事件
@@ -112,9 +112,9 @@ implementer 示例：
 1 解析 repo_key / mr_iid / task_sha / role / agent / tag
 2 flock mr.lock
 3 幂等检查（idempotency_key）→ 命中按 §2.2 短路返回
-4 检查 git head / dirty / worktree 存在
+4 检查 git head / dirty / worktree 存在；write-role dirty 时 warn，`--allow-dirty` 显式确认
 5 write-role → flock worktree.<hash>.lock（supervisor 持有）
-6 创建 run dir，原子写 spec.yml + spec.sha256
+6 创建 run dir，原子写 spec.json + spec.sha256（sha256 对实际落盘 JSON 字节求）
 7 status.json = created
 8 spawn supervisor（os.setsid 新进程组）
 9   supervisor spawn worker = drivers/<agent>-headless（§8）
@@ -136,17 +136,17 @@ implementer 示例：
 ## 8. driver 进程合同（统一，但不过度抽象）
 
 ```
-drivers/<agent>-headless --spec <run_dir>/spec.yml --run-dir <run_dir> --worktree <wt>
+drivers/<agent>-headless --spec <run_dir>/spec.json --run-dir <run_dir> --worktree <wt>
 # 必须产出：native.jsonl, stdout.log, stderr.log, result.json, exit_code
 ```
-- `codex-headless`：`codex exec --json --cd "$wt" < spec.yml > native.jsonl 2> stderr.log`，从 final message 提 result.json。
+- `codex-headless`：`codex exec --json --cd "$wt" < spec.json > native.jsonl 2> stderr.log`，从 final message 提 result.json。
 - `claude-headless`：`claude -p --output-format stream-json --input-format ... --cd "$wt"`，同上。
 - 新增 provider = 新增一个遵守此合同的 driver，`orch` 核心不改。
 
 ## 9. orch CLI（agent-agnostic）
 
 ```
-orch run create --mr <id> --role <r> --agent <a> --tag <t> --worktree <w> --task <f> [--idempotency-key K] [--retry]
+orch run create --mr <id> --role <r> --agent <a> --tag <t> --worktree <w> --task <f> [--idempotency-key K] [--retry] [--allow-dirty]
 orch run list   --mr <id>
 orch status     --mr <id> [--json]        # 只读（A7）
 orch events tail --run <run_id>
@@ -169,14 +169,14 @@ created → starting → running → done
 ## 11. attach / resume 语义
 
 - **attach**：headless worker 无交互 stdin；`attach` = `tail -f native.jsonl events.jsonl stderr.log` + 打印 worktree/spec/result 路径。要人接管用 `debug shell`。
-- **resume 是优化，不是正确性基础**：run 正确性以 `spec.yml / worktree diff / result.json / events.jsonl` 为准。每个 run 记 `provider_resume_id / base_sha / spec_sha`；provider 没吐稳定 id 就**新建 run / rework run**，不硬续。
+- **resume 是优化，不是正确性基础**：run 正确性以 `spec.json / worktree diff / result.json / events.jsonl` 为准。每个 run 记 `provider_resume_id / base_sha / spec_sha`；provider 没吐稳定 id 就**新建 run / rework run**，不硬续。
 
 ## 12. 实施顺序（每步独立产出价值）
 
-- **Phase 0**：bun+ts 工程骨架 + 状态目录 + repo_key/run_id + status/result/events 的 TS 类型 + 3 个 role result schema。**并验证两个 posix 命脉点**：`Bun.spawn` 进程组 kill（`setsid`+`kill -pgid`）、`O_EXCL` pidfile 锁 + stale 检测（各 ~10 行 spike，通过才进 Phase 1）。
-- **Phase 1**：codex/claude headless runner —— `orch run create` + supervisor + 落盘 + status/result，**不写 MR**。（含 A1/A2/A3/A4/A6）
-- **Phase 2**：`orch status/run list/events tail/result`（只读，A7）。
-- **Phase 3**：MR 镜像 —— `orch decision` + outbox + `mirror sync` + MR 摘要/snapshot（A5）。
+- **Phase 0（done）**：bun+ts 工程骨架 + 状态目录 + repo_key/run_id + status/result/events 的 TS 类型 + TS canonical result schema。**并验证两个 posix 命脉点**：`Bun.spawn` 进程组 kill（`setsid`+`kill -pgid`）、`O_EXCL` pidfile 锁 + stale 检测（各 ~10 行 spike，通过才进 Phase 1）。
+- **Phase 1（done）**：codex/claude headless runner —— `orch run create` + supervisor + 落盘 + status/result，**不写 MR**。（含 A1/A2/A3/A4/A6）
+- **Phase 2（done）**：`orch status/run list/events tail/result`（只读，A7）。
+- **Phase 3（done）**：MR 镜像 —— `orch decision` + outbox + `mirror sync` + MR 摘要/snapshot（A5）；含 forge 适配 + `orch mirror`。
 - **Phase 4**：tmux fallback —— 现有 `agent-dispatch/watch` 包成 `tmux_driver`；`attach`/`debug shell`。
 - **Phase 5**：resume/retry —— `provider_resume_id`、`run retry`、stale/timeout policy。
 
@@ -191,16 +191,18 @@ created → starting → running → done
 | worktree 并发写污染 | write-role worktree 锁（§2.3）+ review/verify 评 artifact 不评 worktree（D8） |
 | 6 约束把 MVP 养成平台 | 每条用 flock/jq/文件，禁框架（§2 注） |
 
-## 13b. P1 已知待办（sub-claude Round2 排期项；B1/N1/N6 本轮已让 codex 修）
+## 13b. P1 已知待办 / 技术债清账
 
-- **N3（进 D7 前必修）**：`bun build --compile` 单 binary 当前会断——supervisor/driver 以 `execPath` + 外部 `drivers/*.ts` 方式 spawn，编译后旁边没有 .ts。需改成**同一 binary 的 argv-dispatch 子命令**（`orch __supervisor` / `orch __driver-<agent>`），或把 drivers 打进 bundle。P1 从源码 `bun run` 无碍。
-- **N2**：`schemas/*.json` 当前是死代码、与手写 TS 校验已漂移 → 接入 JSON schema 作单一权威，或删 JSON 并注明 TS 为 canonical。
-- **N4**：`spec.sha256` 应对**落盘字节**求（现对紧凑 JSON 求，与 pretty 落盘不符）。
-- **N5**：`spec.yml` 实为 JSON 内容 → 改名 `spec.json` 或真序列化 YAML。
-- **N7**：`§6.4` dirty 仅上报不拦 write-role → 至少 dirty 时 warn / `--allow-dirty` 守门。
-- **L2**：锁 pid 复用误判 → 锁内带 `ts`/`run_id` sentinel + 超龄阈值兜底。
-- **L3**：幂等记录在 spawn 前写 → spawn 失败会使 key 永久指向未启动 run（改 spawn 成功后写）。
-- **L4**：`--retry` 覆盖幂等记录致旧 run 指针丢失。
+- **N3（done）**：单 binary 通过同一入口 argv-dispatch 子命令实现（`orch __supervisor` / `orch __driver-<agent>`），`bun build --compile` 不再依赖外部 TS 脚本路径。
+- **N2（done）**：删除死代码 `schemas/*.json`；`src/schema.ts` 手写 TS 校验为 canonical result schema。
+- **N4（done）**：`spec.sha256` 对 `spec.json` 实际落盘字节求哈希。
+- **N5（done）**：run 输入快照改名为 `spec.json`。
+- **N7（done）**：write-role 遇 dirty worktree 默认仍放行但向 stderr warn；`--allow-dirty` 显式确认并抑制 warn。
+- **L2（partial）**：锁文件已写 `{pid, run_id, ts}` sentinel；仍需补超龄阈值 / 更强进程身份校验来完全缓解 pid 复用误判。
+- **L3（done）**：幂等记录改为 supervisor spawn 成功后再写。
+- **L4（done）**：`--retry` 更新当前幂等指针时保留旧 run 指针到 `previous[]`。
+
+已完成的横向能力：forge 适配 + `orch mirror`，P2 可观测（`run list` / `events tail` / `result`），P3 `decision` / outbox / `mirror sync`，N3 单 binary，渐进式 help。
 
 ## 14. 一句话
 

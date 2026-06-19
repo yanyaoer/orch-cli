@@ -8,6 +8,7 @@ import type {
 } from "./types.ts";
 import { isResultRole } from "./types.ts";
 
+// TS validation in this file is the canonical result schema.
 export interface ValidationResult {
   ok: boolean;
   errors: string[];

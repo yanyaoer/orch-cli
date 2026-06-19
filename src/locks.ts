@@ -6,8 +6,11 @@ export class LockHeldError extends Error {
   constructor(
     public readonly lockPath: string,
     public readonly holderPid: number | null,
+    public readonly holderRunId: string | null = null,
   ) {
-    super(`lock held: ${lockPath}${holderPid ? ` by pid ${holderPid}` : ""}`);
+    super(
+      `lock held: ${lockPath}${holderPid ? ` by pid ${holderPid}` : ""}${holderRunId ? ` run_id ${holderRunId}` : ""}`,
+    );
   }
 }
 
@@ -15,6 +18,12 @@ export interface PidfileLock {
   path: string;
   pid: number;
   release(): void;
+}
+
+interface PidfileRecord {
+  pid: number | null;
+  run_id: string | null;
+  ts: string | null;
 }
 
 function processExists(pid: number): boolean {
@@ -28,21 +37,29 @@ function processExists(pid: number): boolean {
   }
 }
 
-function readPid(path: string): number | null {
+function readPidfile(path: string): PidfileRecord {
   try {
     const raw = readFileSync(path, "utf8");
-    const parsed = JSON.parse(raw) as { pid?: unknown };
-    return typeof parsed.pid === "number" ? parsed.pid : null;
+    const parsed = JSON.parse(raw) as { pid?: unknown; run_id?: unknown; ts?: unknown };
+    return {
+      pid: typeof parsed.pid === "number" ? parsed.pid : null,
+      run_id: typeof parsed.run_id === "string" ? parsed.run_id : null,
+      ts: typeof parsed.ts === "string" ? parsed.ts : null,
+    };
   } catch {
-    return null;
+    return { pid: null, run_id: null, ts: null };
   }
+}
+
+function readPid(path: string): number | null {
+  return readPidfile(path).pid;
 }
 
 export function isPidAlive(pid: number): boolean {
   return processExists(pid);
 }
 
-export function acquirePidfileLock(path: string, pid = process.pid): PidfileLock {
+export function acquirePidfileLock(path: string, pid = process.pid, runId?: string): PidfileLock {
   mkdirSync(dirname(path), { recursive: true });
 
   for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -50,7 +67,7 @@ export function acquirePidfileLock(path: string, pid = process.pid): PidfileLock
       const fd = openSync(path, "wx", 0o600);
       writeFileSync(
         fd,
-        `${JSON.stringify({ pid, ts: new Date().toISOString() })}\n`,
+        `${JSON.stringify({ pid, run_id: runId ?? null, ts: new Date().toISOString() })}\n`,
         "utf8",
       );
       closeSync(fd);
@@ -72,16 +89,19 @@ export function acquirePidfileLock(path: string, pid = process.pid): PidfileLock
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       if (code !== "EEXIST") throw error;
-      const holderPid = readPid(path);
+      const holder = readPidfile(path);
+      const holderPid = holder.pid;
       if (holderPid === null || !processExists(holderPid)) {
         rmSync(path, { force: true });
         continue;
       }
-      throw new LockHeldError(path, holderPid);
+      throw new LockHeldError(path, holderPid, holder.run_id);
     }
   }
 
-  if (existsSync(path)) throw new LockHeldError(path, readPid(path));
+  if (existsSync(path)) {
+    const holder = readPidfile(path);
+    throw new LockHeldError(path, holder.pid, holder.run_id);
+  }
   throw new Error(`failed to acquire lock: ${path}`);
 }
-
