@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { runCreateHelp, statusHelp, topicHelp, topLevelHelp, unknownTopicHelp } from "./help.ts";
+import { mirrorHelp, runCreateHelp, statusHelp, topicHelp, topLevelHelp, unknownTopicHelp } from "./help.ts";
 
 test("top-level help exposes positioning, commands, quickstart, and topics", () => {
   const text = topLevelHelp();
@@ -7,9 +7,10 @@ test("top-level help exposes positioning, commands, quickstart, and topics", () 
   expect(text).toContain("daemonless multi-agent orchestrator");
   expect(text).toContain("orch run create");
   expect(text).toContain("orch status");
+  expect(text).toContain("orch mirror");
   expect(text).toContain("Quickstart:");
   expect(text).toContain("orch <command> --help");
-  expect(text).toContain("task-spec | result | events | concepts");
+  expect(text).toContain("task-spec | result | events | concepts | forge");
 });
 
 test("command help exposes flags and runnable examples", () => {
@@ -26,6 +27,12 @@ test("command help exposes flags and runnable examples", () => {
     expect(status).toContain(flag);
   }
   expect(status).toContain("orch status --mr 123");
+
+  const mirror = mirrorHelp();
+  for (const flag of ["--mr", "--run", "--worktree", "--execute"]) {
+    expect(mirror).toContain(flag);
+  }
+  expect(mirror).toContain("orch mirror --mr 123");
 });
 
 test("topic help covers task specs, results, events, and concepts", () => {
@@ -48,11 +55,17 @@ test("topic help covers task specs, results, events, and concepts", () => {
   expect(concepts).toContain("${XDG_STATE_HOME:-$HOME/.local/state}/orch/<repo_key>/mrs/<mr>/runs/<run_id>/");
   expect(concepts).toContain("A1:");
   expect(concepts).toContain("A2:");
+  expect(concepts).toContain("Forge adapter:");
+
+  const forge = topicHelp("forge");
+  expect(forge).toContain("github.com remotes use gh");
+  expect(forge).toContain("dry-run by default");
+  expect(forge).toContain("forge=none");
 });
 
 test("unknown topic help is friendly and lists topics", () => {
   const text = unknownTopicHelp("bogus");
 
   expect(text).toContain("unknown help topic: bogus");
-  expect(text).toContain("task-spec | result | events | concepts");
+  expect(text).toContain("task-spec | result | events | concepts | forge");
 });

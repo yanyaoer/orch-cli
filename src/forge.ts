@@ -1,0 +1,122 @@
+export type ForgeKind = "github" | "gitlab" | "none";
+
+export interface ForgeCommandResult {
+  forge: Exclude<ForgeKind, "none">;
+  argv: string[];
+  execute: boolean;
+  exit_code: number | null;
+  stdout: string;
+  stderr: string;
+}
+
+export interface ForgeAdapter {
+  forge: Exclude<ForgeKind, "none">;
+  execute: boolean;
+  postComment(ref: string, body: string): Promise<ForgeCommandResult>;
+  getState(ref: string): Promise<ForgeCommandResult>;
+  updateDescription(ref: string, body: string): Promise<ForgeCommandResult>;
+}
+
+function hostFromRemote(remoteUrl: string): string | null {
+  const cleaned = remoteUrl.trim().replace(/\.git$/, "");
+  if (!cleaned) return null;
+
+  const ssh = cleaned.match(/^git@([^:]+):(.+)$/);
+  if (ssh?.[1] && ssh[2]) return ssh[1].toLowerCase();
+
+  try {
+    const url = new URL(cleaned);
+    return url.host ? url.host.toLowerCase() : null;
+  } catch {
+    return null;
+  }
+}
+
+export function detectForge(remoteUrl: string): ForgeKind {
+  const host = hostFromRemote(remoteUrl);
+  if (!host) return "none";
+  if (host.includes("github.com")) return "github";
+  return "gitlab";
+}
+
+async function runArgv(
+  forge: Exclude<ForgeKind, "none">,
+  argv: string[],
+  execute: boolean,
+): Promise<ForgeCommandResult> {
+  if (!execute) return { forge, argv, execute, exit_code: null, stdout: "", stderr: "" };
+
+  const proc = Bun.spawn(argv, {
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [exitCode, stdout, stderr] = await Promise.all([
+    proc.exited,
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+  ]);
+  return { forge, argv, execute, exit_code: exitCode, stdout, stderr };
+}
+
+class GitHubAdapter implements ForgeAdapter {
+  readonly forge = "github" as const;
+
+  constructor(readonly execute: boolean) {}
+
+  postComment(ref: string, body: string): Promise<ForgeCommandResult> {
+    return runArgv(this.forge, ["gh", "pr", "comment", ref, "--body", body], this.execute);
+  }
+
+  getState(ref: string): Promise<ForgeCommandResult> {
+    return runArgv(this.forge, ["gh", "pr", "view", ref, "--json", "state,url,title"], this.execute);
+  }
+
+  updateDescription(ref: string, body: string): Promise<ForgeCommandResult> {
+    return runArgv(this.forge, ["gh", "pr", "edit", ref, "--body", body], this.execute);
+  }
+}
+
+class GitLabAdapter implements ForgeAdapter {
+  readonly forge = "gitlab" as const;
+
+  constructor(readonly execute: boolean) {}
+
+  postComment(ref: string, body: string): Promise<ForgeCommandResult> {
+    return runArgv(
+      this.forge,
+      ["glab", "mr", "note", "create", ref, "-m", body, "--resolvable=false"],
+      this.execute,
+    );
+  }
+
+  getState(ref: string): Promise<ForgeCommandResult> {
+    return runArgv(this.forge, ["glab", "mr", "view", ref, "-F", "json"], this.execute);
+  }
+
+  updateDescription(ref: string, body: string): Promise<ForgeCommandResult> {
+    return runArgv(this.forge, ["glab", "mr", "update", ref, "--description", body], this.execute);
+  }
+}
+
+export function createForgeAdapter(
+  forge: ForgeKind,
+  execute: boolean,
+): ForgeAdapter | null {
+  switch (forge) {
+    case "github":
+      return new GitHubAdapter(execute);
+    case "gitlab":
+      return new GitLabAdapter(execute);
+    case "none":
+      return null;
+  }
+}
+
+function shellQuote(arg: string): string {
+  if (/^[A-Za-z0-9_./:=@+-]+$/.test(arg)) return arg;
+  return `'${arg.replace(/'/g, "'\\''")}'`;
+}
+
+export function argvForDisplay(argv: string[]): string {
+  return argv.map(shellQuote).join(" ");
+}

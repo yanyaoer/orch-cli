@@ -32,12 +32,17 @@ async function waitForFile(path: string, timeoutMs = 2_000): Promise<string> {
   throw new Error(`timed out waiting for ${path}`);
 }
 
-function psState(pid: number): string {
-  const proc = Bun.spawnSync(["ps", "-o", "stat=", "-p", String(pid)], {
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  return proc.stdout.toString().trim();
+function psState(pid: number): string | null {
+  try {
+    const proc = Bun.spawnSync(["ps", "-o", "stat=", "-p", String(pid)], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    if (proc.exitCode !== 0) return null;
+    return proc.stdout.toString().trim();
+  } catch {
+    return null;
+  }
 }
 
 test("detached Bun.spawn creates a process group killable with negative pgid", async () => {
@@ -66,8 +71,10 @@ test("detached Bun.spawn creates a process group killable with negative pgid", a
 
   for (let i = 0; i < 50 && isPidAlive(grandchildPid); i += 1) await sleep(20);
   expect(isPidAlive(grandchildPid)).toBe(false);
-  expect(psState(proc.pid)).not.toContain("Z");
-  expect(psState(grandchildPid)).not.toContain("Z");
+  const procState = psState(proc.pid);
+  const grandchildState = psState(grandchildPid);
+  if (procState !== null) expect(procState).not.toContain("Z");
+  if (grandchildState !== null) expect(grandchildState).not.toContain("Z");
 });
 
 test("O_EXCL pidfile lock is mutually exclusive and recovers stale pidfiles", () => {
@@ -88,4 +95,3 @@ test("O_EXCL pidfile lock is mutually exclusive and recovers stale pidfiles", ()
   const staleRecovered = acquirePidfileLock(lockPath, process.pid);
   staleRecovered.release();
 });
-

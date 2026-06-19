@@ -1,6 +1,6 @@
-export type HelpTopic = "task-spec" | "result" | "events" | "concepts";
+export type HelpTopic = "task-spec" | "result" | "events" | "concepts" | "forge";
 
-export const HELP_TOPICS: HelpTopic[] = ["task-spec", "result", "events", "concepts"];
+export const HELP_TOPICS: HelpTopic[] = ["task-spec", "result", "events", "concepts", "forge"];
 
 function lines(items: string[]): string {
   return `${items.join("\n")}\n`;
@@ -13,6 +13,7 @@ export function topLevelHelp(): string {
     "Commands:",
     "  orch run create    Start one headless worker run for an MR task",
     "  orch status        Read local run status for an MR",
+    "  orch mirror        Mirror a local run result summary to a PR/MR comment",
     "",
     "Quickstart:",
     "  orch run create --mr 123 --role implementer --agent codex --tag impl-a --worktree . --task task.md",
@@ -24,7 +25,7 @@ export function topLevelHelp(): string {
     "  orch help <topic>",
     "",
     "Topics:",
-    "  task-spec | result | events | concepts",
+    "  task-spec | result | events | concepts | forge",
   ]);
 }
 
@@ -67,6 +68,27 @@ export function statusHelp(): string {
     "",
     "Example:",
     "  orch status --mr 123 --json --worktree .",
+  ]);
+}
+
+export function mirrorHelp(): string {
+  return lines([
+    "orch mirror: mirror a local run result to a PR/MR",
+    "",
+    "Usage:",
+    "  orch mirror --mr <id> [--run <run_id>] [--worktree <path>] [--execute]",
+    "",
+    "Flags:",
+    "  --mr <id>             Pull request or merge request id to comment on (required)",
+    "  --run <run_id>        Local orch run id to mirror; defaults to the newest run for the MR",
+    "  --worktree <path>     Git worktree used to derive repo_key and remote; defaults to the current directory",
+    "  --execute             Execute the gh/glab command. Omitted means dry-run only",
+    "  --help                Show this help",
+    "",
+    "Examples:",
+    "  orch mirror --mr 123 --run impl-a-20260619T120000Z-abc123",
+    "  orch mirror --mr 123 --run impl-a-20260619T120000Z-abc123 --execute",
+    "  orch mirror --mr 123 --worktree /path/to/repo",
   ]);
 }
 
@@ -153,6 +175,26 @@ export function topicHelp(topic: HelpTopic): string {
         "  A1: repeating run create with the same idempotency key returns the existing run instead of dispatching another worker.",
         "  A2: only one write-role run may hold a given worktree lock at a time.",
         "  The default idempotency key is mr<id>:<tag>:<task_sha>; override it with --idempotency-key and force a new attempt with --retry.",
+        "",
+        "Forge adapter:",
+        "  orch can derive GitHub or GitLab from the repository remote and mirror local result summaries with gh or glab.",
+      ]);
+    case "forge":
+      return lines([
+        "orch help forge",
+        "",
+        "The forge adapter chooses the PR/MR CLI from the current repository remote:",
+        "  github.com remotes use gh and GitHub pull requests.",
+        "  gitlab.com and self-hosted non-GitHub git hosts use glab and GitLab merge requests.",
+        "  missing, local, or unparsable remotes are forge=none and mirror is skipped.",
+        "",
+        "Safety:",
+        "  orch mirror is dry-run by default. It prints the gh/glab argv that would be executed and does not touch the network.",
+        "  Pass --execute to run the planned forge command for real.",
+        "",
+        "Examples:",
+        "  orch mirror --mr 123 --run impl-a-20260619T120000Z-abc123",
+        "  orch mirror --mr 123 --run impl-a-20260619T120000Z-abc123 --execute",
       ]);
   }
 }

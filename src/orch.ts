@@ -2,15 +2,17 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
 import { resolve } from "node:path";
 import { $ } from "bun";
-import type { AgentName, RunRole, RunSpec, RunState, RunStatus } from "./types.ts";
+import type { AgentName, RoleResult, RunRole, RunSpec, RunState, RunStatus } from "./types.ts";
 import { isResultRole } from "./types.ts";
 import { acquirePidfileLock } from "./locks.ts";
 import { randomHex, sha256 } from "./hash.ts";
 import { ensureStateLayout, getRepoIdentity, lockPathForWorktree, mrStateDir } from "./paths.ts";
 import { readJsonFile, writeJsonAtomic } from "./json.ts";
+import { argvForDisplay, createForgeAdapter, detectForge } from "./forge.ts";
 import { runSupervisor, writeInitialRunFiles } from "./supervisor.ts";
 import {
   HELP_TOPICS,
+  mirrorHelp,
   runCreateHelp,
   runHelp,
   statusHelp,
@@ -112,6 +114,57 @@ function readIdempotency(path: string): Record<string, IdempotencyRecord> {
 function statusState(record: IdempotencyRecord): RunState | null {
   const status = readJsonFile<RunStatus | null>(record.status_path, null);
   return status?.state ?? null;
+}
+
+function resultSummary(result: RoleResult): string {
+  if ("summary" in result && typeof result.summary === "string") return result.summary;
+  if (result.schema === "orch.result/reviewer/v1") {
+    return `${result.blocking_findings.length} blocking finding(s), ${result.non_blocking_findings.length} non-blocking finding(s).`;
+  }
+  if (result.schema === "orch.result/verifier/v1") {
+    return `${result.commands.length} command(s), ${result.acceptance.length} acceptance item(s).`;
+  }
+  return "No summary in result.json.";
+}
+
+function resultVerdict(result: RoleResult): string {
+  return "verdict" in result && typeof result.verdict === "string" ? result.verdict : "unknown";
+}
+
+function latestRunId(runsRoot: string): string | null {
+  if (!existsSync(runsRoot)) return null;
+  const candidates = readdirSync(runsRoot, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => {
+      const status = readJsonFile<RunStatus | null>(`${runsRoot}/${entry.name}/status.json`, null);
+      return { id: entry.name, updated_at: status?.updated_at ?? "" };
+    });
+  candidates.sort((a, b) => b.updated_at.localeCompare(a.updated_at) || b.id.localeCompare(a.id));
+  return candidates[0]?.id ?? null;
+}
+
+function readMirrorResult(runsRoot: string, runId: string): { result: RoleResult; status: RunStatus | null } {
+  const runDir = `${runsRoot}/${runId}`;
+  if (!existsSync(runDir)) throw new Error(`run not found: ${runId}`);
+  const result = readJsonFile<RoleResult | null>(`${runDir}/result.json`, null);
+  if (!result) throw new Error(`result.json not found for run: ${runId}`);
+  const status = readJsonFile<RunStatus | null>(`${runDir}/status.json`, null);
+  return { result, status };
+}
+
+function mirrorBody(mr: string, runId: string, result: RoleResult, status: RunStatus | null): string {
+  return [
+    "### orch run result",
+    "",
+    `- MR/PR: ${mr}`,
+    `- Run: ${runId}`,
+    `- State: ${status?.state ?? "unknown"}`,
+    `- Verdict: ${resultVerdict(result)}`,
+    "",
+    "Summary:",
+    "",
+    resultSummary(result),
+  ].join("\n");
 }
 
 async function createRun(args: ParsedArgs): Promise<number> {
@@ -240,6 +293,43 @@ async function status(args: ParsedArgs): Promise<number> {
   return 0;
 }
 
+async function mirror(args: ParsedArgs): Promise<number> {
+  const mr = flagString(args, "mr");
+  const worktree = resolve(flagString(args, "worktree", process.cwd()));
+  const execute = flagBool(args, "execute");
+  const repo = await getRepoIdentity(worktree);
+  const forge = detectForge(repo.remote_url);
+  if (forge === "none") {
+    process.stdout.write("本仓库无 github/gitlab remote，跳过 mirror\n");
+    return 0;
+  }
+
+  const adapter = createForgeAdapter(forge, execute);
+  if (!adapter) throw new Error(`unsupported forge: ${forge}`);
+
+  const root = mrStateDir(repo.repo_key, mr);
+  const runsRoot = `${root}/runs`;
+  const runId = args.flags.has("run") ? flagString(args, "run") : latestRunId(runsRoot);
+  if (!runId) throw new Error(`no local runs found for MR ${mr}`);
+
+  const { result, status } = readMirrorResult(runsRoot, runId);
+  const body = mirrorBody(mr, runId, result, status);
+  const command = await adapter.postComment(mr, body);
+
+  printJson({
+    mirror: execute ? "executed" : "dry-run",
+    forge,
+    mr,
+    run_id: runId,
+    argv: command.argv,
+    command: argvForDisplay(command.argv),
+    exit_code: command.exit_code,
+  });
+  if (command.stdout) process.stdout.write(command.stdout);
+  if (command.stderr) process.stderr.write(command.stderr);
+  return command.exit_code && command.exit_code !== 0 ? command.exit_code : 0;
+}
+
 async function main(): Promise<number> {
   const args = parseArgs(process.argv.slice(2));
   const [first, second] = args.positionals;
@@ -262,6 +352,10 @@ async function main(): Promise<number> {
     }
     if (first === "status") {
       process.stdout.write(statusHelp());
+      return 0;
+    }
+    if (first === "mirror") {
+      process.stdout.write(mirrorHelp());
       return 0;
     }
     if (first === "help") {
@@ -287,6 +381,7 @@ async function main(): Promise<number> {
 
   if (first === "run" && second === "create") return createRun(args);
   if (first === "status") return status(args);
+  if (first === "mirror") return mirror(args);
   process.stderr.write(topLevelHelp());
   return 2;
 }
