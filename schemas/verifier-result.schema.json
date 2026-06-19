@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "orch.result/verifier/v1",
+  "type": "object",
+  "required": ["schema", "run_id", "verdict", "verifies_run_id", "commands", "acceptance"],
+  "properties": {
+    "schema": { "const": "orch.result/verifier/v1" },
+    "run_id": { "type": "string", "minLength": 1 },
+    "verdict": { "enum": ["pass", "fail"] },
+    "verifies_run_id": { "type": "string" },
+    "commands": { "type": "array" },
+    "acceptance": { "type": "array" }
+  },
+  "additionalProperties": true
+}
+

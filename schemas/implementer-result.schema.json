@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "orch.result/implementer/v1",
+  "type": "object",
+  "required": ["schema", "run_id", "verdict", "summary", "base_sha", "head_sha", "changed_files", "tests", "acceptance", "risks", "rollback"],
+  "properties": {
+    "schema": { "const": "orch.result/implementer/v1" },
+    "run_id": { "type": "string", "minLength": 1 },
+    "verdict": { "enum": ["completed", "failed"] },
+    "summary": { "type": "string", "minLength": 1 },
+    "base_sha": { "type": "string", "minLength": 1 },
+    "head_sha": { "type": "string", "minLength": 1 },
+    "changed_files": { "type": "array", "items": { "type": "string" } },
+    "tests": { "type": "array" },
+    "acceptance": { "type": "array" },
+    "risks": { "type": "array", "items": { "type": "string" } },
+    "rollback": { "type": "string", "minLength": 1 }
+  },
+  "additionalProperties": true
+}
+

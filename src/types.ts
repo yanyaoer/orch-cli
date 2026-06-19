@@ -1,0 +1,134 @@
+export type RunRole =
+  | "implementer"
+  | "reviewer"
+  | "verifier"
+  | "challenger"
+  | "rework"
+  | "debugger";
+
+export type ResultRole = "implementer" | "reviewer" | "verifier";
+
+export type AgentName = "codex" | "claude";
+
+export type RunState =
+  | "created"
+  | "starting"
+  | "running"
+  | "done"
+  | "failed"
+  | "timeout"
+  | "cancelled"
+  | "stale";
+
+export type ResultVerdict =
+  | "completed"
+  | "failed"
+  | "approve"
+  | "request_changes"
+  | "pass"
+  | "fail";
+
+export interface RunSpec {
+  version: 1;
+  run_id: string;
+  mr: string;
+  role: RunRole;
+  agent: AgentName;
+  tag: string;
+  idempotency_key: string;
+  repo_key: string;
+  worktree: string;
+  task_path: string | null;
+  task_text: string;
+  task_sha: string;
+  base_sha: string;
+  timeout_sec: number;
+  created_at: string;
+}
+
+export interface RunStatus {
+  run_id: string;
+  mr: string;
+  role: RunRole;
+  agent: AgentName;
+  tag: string;
+  state: RunState;
+  pid: number | null;
+  pgid: number | null;
+  started_at: string | null;
+  updated_at: string;
+  exit_code: number | null;
+  timeout_sec: number;
+  last_event_seq: number;
+  native_event_count: number;
+  provider_resume_id: string | null;
+  worktree: string;
+  base_sha: string;
+  head_sha: string | null;
+}
+
+export interface OrchEvent {
+  type: "created" | "starting" | "running" | "heartbeat" | "done" | "failed" | "timeout";
+  seq: number;
+  ts: string;
+  message?: string;
+}
+
+export interface CommandResult {
+  cmd: string;
+  exit_code: number;
+  summary: string;
+}
+
+export interface AcceptanceResult {
+  id: string;
+  status: string;
+  evidence?: string;
+}
+
+export interface ImplementerResult {
+  schema: "orch.result/implementer/v1";
+  run_id: string;
+  verdict: "completed" | "failed";
+  summary: string;
+  base_sha: string;
+  head_sha: string;
+  changed_files: string[];
+  tests: CommandResult[];
+  acceptance: AcceptanceResult[];
+  risks: string[];
+  rollback: string;
+}
+
+export interface ReviewerResult {
+  schema: "orch.result/reviewer/v1";
+  run_id: string;
+  verdict: "approve" | "request_changes";
+  reviews_run_id: string;
+  blocking_findings: Array<{ id: string; severity: string; file: string; body: string }>;
+  non_blocking_findings: Array<{ id: string; severity?: string; file?: string; body: string }>;
+  suggested_tests: string[];
+}
+
+export interface VerifierResult {
+  schema: "orch.result/verifier/v1";
+  run_id: string;
+  verdict: "pass" | "fail";
+  verifies_run_id: string;
+  commands: CommandResult[];
+  acceptance: Array<{ id: string; status: string }>;
+}
+
+export type RoleResult = ImplementerResult | ReviewerResult | VerifierResult;
+
+export const writeRoles = new Set<RunRole>([
+  "implementer",
+  "challenger",
+  "rework",
+  "debugger",
+]);
+
+export function isResultRole(role: RunRole): role is ResultRole {
+  return role === "implementer" || role === "reviewer" || role === "verifier";
+}
+
