@@ -1,10 +1,19 @@
 import { expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { sha256 } from "./hash.ts";
 import { repoKeyFromRemote } from "./paths.ts";
-import type { ImplementerResult, RunStatus } from "./types.ts";
+import type { ImplementerResult, RoleResult, RunStatus } from "./types.ts";
 
 async function runOrch(args: string[], env: Record<string, string>): Promise<{ stdout: string; stderr: string; exitCode: number }> {
   const proc = Bun.spawn([process.execPath, "src/orch.ts", ...args], {
@@ -37,13 +46,13 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function waitForRunDone(statusPath: string): Promise<RunStatus> {
+async function waitForRunState(statusPath: string, states: RunStatus["state"][]): Promise<RunStatus> {
   const deadline = Date.now() + 4_000;
   while (Date.now() < deadline) {
     try {
       const status = JSON.parse(readFileSync(statusPath, "utf8")) as RunStatus;
-      if (status.state === "done") return status;
-      if (status.state === "failed" || status.state === "timeout") {
+      if (states.includes(status.state)) return status;
+      if (!states.includes(status.state) && (status.state === "failed" || status.state === "timeout")) {
         throw new Error(`run ended unexpectedly: ${JSON.stringify(status)}`);
       }
     } catch (error) {
@@ -54,6 +63,14 @@ async function waitForRunDone(statusPath: string): Promise<RunStatus> {
   throw new Error(`timed out waiting for ${statusPath}`);
 }
 
+async function waitForRunDone(statusPath: string): Promise<RunStatus> {
+  return waitForRunState(statusPath, ["done"]);
+}
+
+async function waitForRunFinal(statusPath: string): Promise<RunStatus> {
+  return waitForRunState(statusPath, ["done", "failed", "timeout"]);
+}
+
 async function initGitWorktree(worktree: string): Promise<void> {
   await runCmd(["git", "init"], worktree);
   writeFileSync(join(worktree, "README.md"), "initial\n", "utf8");
@@ -62,6 +79,159 @@ async function initGitWorktree(worktree: string): Promise<void> {
     ["git", "-c", "user.email=test@example.com", "-c", "user.name=Test User", "commit", "-m", "initial"],
     worktree,
   );
+}
+
+function readResult(path: string): RoleResult {
+  return JSON.parse(readFileSync(path, "utf8")) as RoleResult;
+}
+
+async function createWriteRun(args: {
+  mr: string;
+  key: string;
+  stateHome: string;
+  worktree: string;
+  taskPath: string;
+  extraEnv?: Record<string, string>;
+}): Promise<{ run_id: string; run_dir: string; status_path: string; result_path: string; worktree_lock: string }> {
+  const result = await runOrch(
+    [
+      "run",
+      "create",
+      "--mr",
+      args.mr,
+      "--role",
+      "implementer",
+      "--agent",
+      "codex",
+      "--tag",
+      "impl-lock",
+      "--worktree",
+      args.worktree,
+      "--task",
+      args.taskPath,
+      "--idempotency-key",
+      args.key,
+      "--timeout-sec",
+      "10",
+    ],
+    { XDG_STATE_HOME: args.stateHome, ...(args.extraEnv ?? {}) },
+  );
+  expect(result).toMatchObject({ exitCode: 0 });
+  const payload = JSON.parse(result.stdout) as {
+    run_id: string;
+    run_dir: string;
+    status_path: string;
+    worktree_lock: string;
+  };
+  return { ...payload, result_path: join(payload.run_dir, "result.json") };
+}
+
+async function expectOneDoneOneLockHeld(args: { firstMr: string; secondMr: string }): Promise<void> {
+  const root = mkdtempSync(join(tmpdir(), "orch-lock-test-"));
+  const stateHome = join(root, "state");
+  const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
+  await initGitWorktree(worktree);
+  const taskPath = join(root, "task.md");
+  writeFileSync(taskPath, "hold the write lock briefly\n", "utf8");
+  const extraEnv = { ORCH_DRIVER_FAKE_RESULT: "1", ORCH_DRIVER_FAKE_SLEEP_MS: "1000" };
+
+  const first = await createWriteRun({
+    mr: args.firstMr,
+    key: `${args.firstMr}-first`,
+    stateHome,
+    worktree,
+    taskPath,
+    extraEnv,
+  });
+  expect(first.worktree_lock.startsWith(join(stateHome, "orch", "worktree-locks"))).toBe(true);
+  expect(first.worktree_lock).not.toContain(`${join("mrs", args.firstMr)}`);
+  await waitForRunState(first.status_path, ["running"]);
+
+  const second = await createWriteRun({
+    mr: args.secondMr,
+    key: `${args.secondMr}-second`,
+    stateHome,
+    worktree,
+    taskPath,
+    extraEnv,
+  });
+  expect(second.worktree_lock).toBe(first.worktree_lock);
+
+  const finals = await Promise.all([waitForRunFinal(first.status_path), waitForRunFinal(second.status_path)]);
+  expect(finals.map((status) => status.state).sort()).toEqual(["done", "failed"]);
+
+  const failedIndex = finals.findIndex((status) => status.state === "failed");
+  expect(failedIndex).toBeGreaterThanOrEqual(0);
+  const failedRun = failedIndex === 0 ? first : second;
+  const failedStatus = finals[failedIndex]!;
+  const failedResult = readResult(failedRun.result_path);
+  expect(failedStatus.exit_code).toBe(75);
+  expect(JSON.stringify(failedResult)).toContain("lock held:");
+}
+
+function providerResult(runId: string, provider: string): ImplementerResult {
+  return {
+    schema: "orch.result/implementer/v1",
+    run_id: runId,
+    verdict: "completed",
+    summary: `${provider} native completed`,
+    base_sha: "base",
+    head_sha: "head",
+    changed_files: [`${provider}.txt`],
+    tests: [{ cmd: `${provider} native`, exit_code: 0, summary: "emitted native result" }],
+    acceptance: [{ id: `${provider}-native`, status: "pass" }],
+    risks: [],
+    rollback: `revert ${provider} native output`,
+  };
+}
+
+function writeProviderShims(binDir: string): void {
+  mkdirSync(binDir, { recursive: true });
+  const common = String.raw`
+function runIdFromPrompt(prompt) {
+  return prompt.match(/^Run id: (.+)$/m)?.[1]?.trim() ?? "unknown-run";
+}
+function result(runId, provider) {
+  return {
+    schema: "orch.result/implementer/v1",
+    run_id: runId,
+    verdict: "completed",
+    summary: provider + " native completed",
+    base_sha: "base",
+    head_sha: "head",
+    changed_files: [provider + ".txt"],
+    tests: [{ cmd: provider + " native", exit_code: 0, summary: "emitted native result" }],
+    acceptance: [{ id: provider + "-native", status: "pass" }],
+    risks: [],
+    rollback: "revert " + provider + " native output",
+  };
+}
+`;
+  const codex = `#!/usr/bin/env bun
+${common}
+const prompt = await Bun.stdin.text();
+const runId = runIdFromPrompt(prompt);
+let lastMessagePath = null;
+for (let i = 0; i < Bun.argv.length; i += 1) {
+  if (Bun.argv[i] === "--output-last-message") lastMessagePath = Bun.argv[i + 1] ?? null;
+}
+const text = JSON.stringify(result(runId, "codex"));
+if (lastMessagePath) await Bun.write(lastMessagePath, text);
+console.log(JSON.stringify({ item: { type: "agent_message", text } }));
+`;
+  const claude = `#!/usr/bin/env bun
+${common}
+const prompt = await Bun.stdin.text();
+const runId = runIdFromPrompt(prompt);
+console.log(JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "working" }] } }));
+console.log(JSON.stringify({ type: "result", result: JSON.stringify(result(runId, "claude")) }));
+`;
+  const codexPath = join(binDir, "codex");
+  const claudePath = join(binDir, "claude");
+  writeFileSync(codexPath, codex, "utf8");
+  writeFileSync(claudePath, claude, "utf8");
+  chmodSync(codexPath, 0o755);
+  chmodSync(claudePath, 0o755);
 }
 
 test("observability commands read local run state", async () => {
@@ -307,4 +477,56 @@ test("decision records local verdict and queues mirror outbox payload", async ()
   expect(sync.stdout).toContain("gh pr comment 123 --body");
   expect(readdirSync(pendingDir).filter((file) => file.endsWith(".json"))).toHaveLength(1);
   expect(readdirSync(sentDir).filter((file) => file.endsWith(".json"))).toHaveLength(0);
+});
+
+test("write-role worktree lock is shared within an MR and across MRs", async () => {
+  await expectOneDoneOneLockHeld({ firstMr: "same-mr", secondMr: "same-mr" });
+  await expectOneDoneOneLockHeld({ firstMr: "mr-a", secondMr: "mr-b" });
+});
+
+test("codex and claude drivers can complete from provider-native output without fallback", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orch-provider-e2e-"));
+  const stateHome = join(root, "state");
+  const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
+  await initGitWorktree(worktree);
+  const taskPath = join(root, "task.md");
+  writeFileSync(taskPath, "return a valid orch implementer result\n", "utf8");
+  const binDir = join(root, "bin");
+  writeProviderShims(binDir);
+  const env = { XDG_STATE_HOME: stateHome, PATH: `${binDir}:${process.env.PATH ?? ""}` };
+
+  for (const provider of ["codex", "claude"] as const) {
+    const created = await runOrch(
+      [
+        "run",
+        "create",
+        "--mr",
+        `provider-${provider}`,
+        "--role",
+        "implementer",
+        "--agent",
+        provider,
+        "--tag",
+        provider,
+        "--worktree",
+        worktree,
+        "--task",
+        taskPath,
+        "--idempotency-key",
+        `provider-${provider}`,
+        "--timeout-sec",
+        "10",
+      ],
+      env,
+    );
+    expect(created).toMatchObject({ exitCode: 0, stderr: "" });
+    const payload = JSON.parse(created.stdout) as { run_dir: string; status_path: string };
+    await waitForRunDone(payload.status_path);
+
+    const result = readResult(join(payload.run_dir, "result.json"));
+    expect(result).toEqual(providerResult(result.run_id, provider));
+    expect(JSON.stringify(result)).not.toContain(`${provider} did not return a valid orch result JSON`);
+    expect(result.schema).toBe("orch.result/implementer/v1");
+    expect("verdict" in result ? result.verdict : "").toBe("completed");
+  }
 });

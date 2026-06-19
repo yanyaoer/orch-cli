@@ -477,7 +477,7 @@ async function createRun(args: ParsedArgs): Promise<number> {
       run_dir: runDir,
       status_path: `${runDir}/status.json`,
       events_path: `${runDir}/events.jsonl`,
-      worktree_lock: lockPathForWorktree(mrDir, worktree),
+      worktree_lock: lockPathForWorktree(worktree),
       dirty: dirty.length > 0,
     });
     return 0;

@@ -5,7 +5,7 @@ import { writeRoles } from "./types.ts";
 import { acquirePidfileLock, LockHeldError, type PidfileLock } from "./locks.ts";
 import { countLines, appendJsonLine, readJsonFile, writeJsonAtomic } from "./json.ts";
 import { fallbackResult, validateRoleResult } from "./schema.ts";
-import { lockPathForWorktree, mrStateDir } from "./paths.ts";
+import { lockPathForWorktree } from "./paths.ts";
 
 function now(): string {
   return new Date().toISOString();
@@ -147,12 +147,11 @@ function killProcessGroup(pgid: number, signal: NodeJS.Signals): void {
 export async function runSupervisor(runDir: string, orchCommand: string[]): Promise<number> {
   const specPath = runDirFile(runDir, "spec.json");
   const spec = JSON.parse(readFileSync(specPath, "utf8")) as RunSpec;
-  const mrDir = mrStateDir(spec.repo_key, spec.mr);
   let worktreeLock: PidfileLock | null = null;
 
   try {
     if (writeRoles.has(spec.role)) {
-      worktreeLock = acquirePidfileLock(lockPathForWorktree(mrDir, spec.worktree), process.pid, spec.run_id);
+      worktreeLock = acquirePidfileLock(lockPathForWorktree(spec.worktree), process.pid, spec.run_id);
     }
   } catch (error) {
     const message = error instanceof LockHeldError ? error.message : String(error);

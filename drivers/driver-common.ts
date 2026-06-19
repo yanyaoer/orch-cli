@@ -85,6 +85,19 @@ export function extractResultFromText(text: string, spec: RunSpec): RoleResult |
   return validation.ok ? (parsed as RoleResult) : null;
 }
 
+function textFromClaudeAssistantContent(content: unknown): string | null {
+  if (!Array.isArray(content)) return null;
+  const text = content
+    .flatMap((block) => {
+      if (!block || typeof block !== "object") return [];
+      const item = block as { type?: unknown; text?: unknown };
+      return item.type === "text" && typeof item.text === "string" ? [item.text] : [];
+    })
+    .join("\n")
+    .trim();
+  return text.length > 0 ? text : null;
+}
+
 export function extractResultFromRunDir(runDir: string, spec: RunSpec): RoleResult | null {
   const candidates: string[] = [];
   for (const path of [`${runDir}/last_message.txt`, `${runDir}/stdout.log`]) {
@@ -93,17 +106,34 @@ export function extractResultFromRunDir(runDir: string, spec: RunSpec): RoleResu
 
   const nativePath = `${runDir}/native.jsonl`;
   if (existsSync(nativePath)) {
+    const claudeResultCandidates: string[] = [];
+    const claudeAssistantCandidates: string[] = [];
+    const codexCandidates: string[] = [];
+    const rawLineCandidates: string[] = [];
     for (const line of readFileSync(nativePath, "utf8").split("\n")) {
       if (!line.trim()) continue;
       try {
-        const event = JSON.parse(line) as { item?: { type?: string; text?: string } };
+        const event = JSON.parse(line) as {
+          type?: unknown;
+          result?: unknown;
+          message?: { content?: unknown };
+          item?: { type?: string; text?: string };
+        };
+        if (event.type === "result" && typeof event.result === "string") {
+          claudeResultCandidates.push(event.result);
+        }
+        if (event.type === "assistant") {
+          const text = textFromClaudeAssistantContent(event.message?.content);
+          if (text) claudeAssistantCandidates.push(text);
+        }
         if (event.item?.type === "agent_message" && typeof event.item.text === "string") {
-          candidates.push(event.item.text);
+          codexCandidates.push(event.item.text);
         }
       } catch {
-        candidates.push(line);
+        rawLineCandidates.push(line);
       }
     }
+    candidates.push(...claudeResultCandidates, ...claudeAssistantCandidates, ...codexCandidates, ...rawLineCandidates);
   }
 
   for (const candidate of candidates) {

@@ -1,7 +1,7 @@
 import { basename, resolve } from "node:path";
 import { mkdirSync, realpathSync } from "node:fs";
 import { $ } from "bun";
-import { shortHash } from "./hash.ts";
+import { sha256, shortHash } from "./hash.ts";
 
 export interface RepoIdentity {
   repo_root: string;
@@ -63,7 +63,6 @@ export async function getRepoIdentity(worktree: string): Promise<RepoIdentity> {
   };
 }
 
-export function lockPathForWorktree(mrDir: string, worktree: string): string {
-  return `${mrDir}/locks/worktree.${shortHash(resolve(worktree), 64)}.lock`;
+export function lockPathForWorktree(worktree: string): string {
+  return `${orchStateRoot()}/worktree-locks/${sha256(realpathSync(resolve(worktree)))}.lock`;
 }
-
