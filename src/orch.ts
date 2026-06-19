@@ -9,6 +9,16 @@ import { randomHex, sha256 } from "./hash.ts";
 import { ensureStateLayout, getRepoIdentity, lockPathForWorktree, mrStateDir } from "./paths.ts";
 import { readJsonFile, writeJsonAtomic } from "./json.ts";
 import { runSupervisor, writeInitialRunFiles } from "./supervisor.ts";
+import {
+  HELP_TOPICS,
+  runCreateHelp,
+  runHelp,
+  statusHelp,
+  topicHelp,
+  topLevelHelp,
+  unknownTopicHelp,
+  type HelpTopic,
+} from "./help.ts";
 import { runCodexDriver } from "../drivers/codex-headless.ts";
 import { runClaudeDriver } from "../drivers/claude-headless.ts";
 
@@ -55,6 +65,14 @@ function flagString(args: ParsedArgs, name: string, fallback?: string): string {
 
 function flagBool(args: ParsedArgs, name: string): boolean {
   return args.flags.get(name) === true;
+}
+
+function hasHelp(args: ParsedArgs): boolean {
+  return args.flags.has("help");
+}
+
+function isHelpTopic(value: string): value is HelpTopic {
+  return (HELP_TOPICS as readonly string[]).includes(value);
 }
 
 function utcCompact(date = new Date()): string {
@@ -228,15 +246,48 @@ async function main(): Promise<number> {
   if (first === "__supervisor") return runSupervisor(flagString(args, "run-dir"), orchCommand());
   if (first === "__driver-codex") return runCodexDriver(process.argv.slice(3));
   if (first === "__driver-claude") return runClaudeDriver(process.argv.slice(3));
+
+  if (!first || hasHelp(args)) {
+    if (!first) {
+      process.stdout.write(topLevelHelp());
+      return 0;
+    }
+    if (first === "run" && second === "create") {
+      process.stdout.write(runCreateHelp());
+      return 0;
+    }
+    if (first === "run") {
+      process.stdout.write(runHelp());
+      return 0;
+    }
+    if (first === "status") {
+      process.stdout.write(statusHelp());
+      return 0;
+    }
+    if (first === "help") {
+      process.stdout.write(second && isHelpTopic(second) ? topicHelp(second) : topLevelHelp());
+      return 0;
+    }
+    process.stdout.write(topLevelHelp());
+    return 0;
+  }
+
+  if (first === "help") {
+    if (!second) {
+      process.stdout.write(topLevelHelp());
+      return 0;
+    }
+    if (isHelpTopic(second)) {
+      process.stdout.write(topicHelp(second));
+      return 0;
+    }
+    process.stderr.write(unknownTopicHelp(second));
+    return 2;
+  }
+
   if (first === "run" && second === "create") return createRun(args);
   if (first === "status") return status(args);
-  process.stderr.write(
-    [
-      "usage:",
-      "  orch run create --mr <id> --role <implementer|reviewer|verifier> --agent <codex|claude> --tag <t> --worktree <path> --task <file> [--idempotency-key K] [--retry]",
-      "  orch status --mr <id> [--json] [--worktree <path>]",
-    ].join("\n") + "\n",
-  );
+  process.stderr.write(topLevelHelp());
   return 2;
 }
 
