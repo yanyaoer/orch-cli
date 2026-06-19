@@ -16,13 +16,17 @@ export function topLevelHelp(): string {
     "  orch events tail   Print a run's local events.jsonl",
     "  orch result        Print a run's local result.json",
     "  orch status        Read local run status for an MR",
+    "  orch decision      Record accept/rework and queue a PR/MR mirror comment",
     "  orch mirror        Mirror a local run result summary to a PR/MR comment",
+    "  orch mirror sync   Send queued outbox comments to a PR/MR",
     "",
     "Quickstart:",
     "  orch run create --mr 123 --role implementer --agent codex --tag impl-a --worktree . --task task.md",
     "  orch run list --mr 123 --worktree .",
     "  orch events tail --run impl-a-20260619T120000Z-abc123 --mr 123 -n 20",
     "  orch result --run impl-a-20260619T120000Z-abc123 --mr 123",
+    "  orch decision accept --mr 123 --run impl-a-20260619T120000Z-abc123 --reason \"reviewed\"",
+    "  orch mirror sync --mr 123",
     "  orch status --mr 123 --json",
     "  cat ${XDG_STATE_HOME:-$HOME/.local/state}/orch/<repo_key>/mrs/123/runs/<run_id>/result.json",
     "",
@@ -142,12 +146,38 @@ export function resultCommandHelp(): string {
   ]);
 }
 
+export function decisionHelp(): string {
+  return lines([
+    "orch decision: record a controller decision for one run",
+    "",
+    "Usage:",
+    "  orch decision accept|rework --mr <id> --run <run_id> [--reason <text>] [--worktree <path>]",
+    "",
+    "Flags:",
+    "  --mr <id>             Pull request or merge request id for the local state directory (required)",
+    "  --run <run_id>        Local orch run id being accepted or sent back for rework (required)",
+    "  --reason <text>       Optional human decision reason included in decision.json and the queued comment",
+    "  --worktree <path>     Git worktree used to derive repo_key; defaults to the current directory",
+    "  --help                Show this help",
+    "",
+    "Behavior:",
+    "  Writes runs/<run_id>/decision.json locally.",
+    "  Queues a comment payload in outbox/pending/; it does not touch the network.",
+    "  Use orch mirror sync to dry-run or send queued outbox comments.",
+    "",
+    "Examples:",
+    "  orch decision accept --mr 123 --run impl-a-20260619T120000Z-abc123 --reason \"reviewed\"",
+    "  orch decision rework --mr 123 --run impl-a-20260619T120000Z-abc123",
+  ]);
+}
+
 export function mirrorHelp(): string {
   return lines([
-    "orch mirror: mirror a local run result to a PR/MR",
+    "orch mirror: mirror a local run result or sync queued outbox comments to a PR/MR",
     "",
     "Usage:",
     "  orch mirror --mr <id> [--run <run_id>] [--worktree <path>] [--execute]",
+    "  orch mirror sync --mr <id> [--worktree <path>] [--execute]",
     "",
     "Flags:",
     "  --mr <id>             Pull request or merge request id to comment on (required)",
@@ -156,10 +186,41 @@ export function mirrorHelp(): string {
     "  --execute             Execute the gh/glab command. Omitted means dry-run only",
     "  --help                Show this help",
     "",
+    "Modes:",
+    "  Without sync, mirrors one local run result directly and preserves the old dry-run output contract.",
+    "  With sync, reads outbox/pending/*.json and sends queued comment payloads; successful sends move to outbox/sent/.",
+    "",
     "Examples:",
     "  orch mirror --mr 123 --run impl-a-20260619T120000Z-abc123",
     "  orch mirror --mr 123 --run impl-a-20260619T120000Z-abc123 --execute",
+    "  orch mirror sync --mr 123",
+    "  orch mirror sync --mr 123 --execute",
     "  orch mirror --mr 123 --worktree /path/to/repo",
+  ]);
+}
+
+export function mirrorSyncHelp(): string {
+  return lines([
+    "orch mirror sync: send queued outbox comments to a PR/MR",
+    "",
+    "Usage:",
+    "  orch mirror sync --mr <id> [--worktree <path>] [--execute]",
+    "",
+    "Flags:",
+    "  --mr <id>             Pull request or merge request id whose outbox should be synced (required)",
+    "  --worktree <path>     Git worktree used to derive repo_key and remote; defaults to the current directory",
+    "  --execute             Execute the gh/glab commands. Omitted means dry-run only",
+    "  --help                Show this help",
+    "",
+    "Behavior:",
+    "  Dry-run prints each gh/glab argv and does not touch the network.",
+    "  --execute sends pending comments one by one.",
+    "  Successful sends move from outbox/pending/ to outbox/sent/.",
+    "  Failed sends stay in outbox/pending/ and local run or decision state is unchanged.",
+    "",
+    "Examples:",
+    "  orch mirror sync --mr 123",
+    "  orch mirror sync --mr 123 --execute",
   ]);
 }
 
@@ -241,6 +302,12 @@ export function topicHelp(topic: HelpTopic): string {
         "  ${XDG_STATE_HOME:-$HOME/.local/state}/orch/<repo_key>/mrs/<mr>/runs/<run_id>/",
         "  Shorthand: ${XDG_STATE_HOME:-~/.local/state}/orch/<repo_key>/mrs/<mr>/runs/<run_id>/",
         "  Important files: spec.yml, spec.sha256, status.json, events.jsonl, native.jsonl, stdout.log, stderr.log, result.json, artifacts/",
+        "  MR outbox: ${XDG_STATE_HOME:-~/.local/state}/orch/<repo_key>/mrs/<mr>/outbox/{pending,sent}/",
+        "",
+        "Outbox:",
+        "  Decision and queued mirror payloads are written locally first under outbox/pending/.",
+        "  orch mirror sync is dry-run by default; --execute sends via gh/glab and moves successful payloads to outbox/sent/.",
+        "  Failed sends remain pending and do not change local run or decision state.",
         "",
         "Idempotency and locks:",
         "  A1: repeating run create with the same idempotency key returns the existing run instead of dispatching another worker.",
@@ -260,12 +327,14 @@ export function topicHelp(topic: HelpTopic): string {
         "  missing, local, or unparsable remotes are forge=none and mirror is skipped.",
         "",
         "Safety:",
-        "  orch mirror is dry-run by default. It prints the gh/glab argv that would be executed and does not touch the network.",
+        "  orch mirror and orch mirror sync are dry-run by default. They print the gh/glab argv that would be executed and do not touch the network.",
         "  Pass --execute to run the planned forge command for real.",
         "",
         "Examples:",
         "  orch mirror --mr 123 --run impl-a-20260619T120000Z-abc123",
         "  orch mirror --mr 123 --run impl-a-20260619T120000Z-abc123 --execute",
+        "  orch mirror sync --mr 123",
+        "  orch mirror sync --mr 123 --execute",
       ]);
   }
 }

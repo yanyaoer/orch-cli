@@ -43,10 +43,12 @@ async function runArgv(
   forge: Exclude<ForgeKind, "none">,
   argv: string[],
   execute: boolean,
+  cwd?: string,
 ): Promise<ForgeCommandResult> {
   if (!execute) return { forge, argv, execute, exit_code: null, stdout: "", stderr: "" };
 
   const proc = Bun.spawn(argv, {
+    cwd,
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -61,52 +63,54 @@ async function runArgv(
 class GitHubAdapter implements ForgeAdapter {
   readonly forge = "github" as const;
 
-  constructor(readonly execute: boolean) {}
+  constructor(readonly execute: boolean, readonly cwd?: string) {}
 
   postComment(ref: string, body: string): Promise<ForgeCommandResult> {
-    return runArgv(this.forge, ["gh", "pr", "comment", ref, "--body", body], this.execute);
+    return runArgv(this.forge, ["gh", "pr", "comment", ref, "--body", body], this.execute, this.cwd);
   }
 
   getState(ref: string): Promise<ForgeCommandResult> {
-    return runArgv(this.forge, ["gh", "pr", "view", ref, "--json", "state,url,title"], this.execute);
+    return runArgv(this.forge, ["gh", "pr", "view", ref, "--json", "state,url,title"], this.execute, this.cwd);
   }
 
   updateDescription(ref: string, body: string): Promise<ForgeCommandResult> {
-    return runArgv(this.forge, ["gh", "pr", "edit", ref, "--body", body], this.execute);
+    return runArgv(this.forge, ["gh", "pr", "edit", ref, "--body", body], this.execute, this.cwd);
   }
 }
 
 class GitLabAdapter implements ForgeAdapter {
   readonly forge = "gitlab" as const;
 
-  constructor(readonly execute: boolean) {}
+  constructor(readonly execute: boolean, readonly cwd?: string) {}
 
   postComment(ref: string, body: string): Promise<ForgeCommandResult> {
     return runArgv(
       this.forge,
       ["glab", "mr", "note", "create", ref, "-m", body, "--resolvable=false"],
       this.execute,
+      this.cwd,
     );
   }
 
   getState(ref: string): Promise<ForgeCommandResult> {
-    return runArgv(this.forge, ["glab", "mr", "view", ref, "-F", "json"], this.execute);
+    return runArgv(this.forge, ["glab", "mr", "view", ref, "-F", "json"], this.execute, this.cwd);
   }
 
   updateDescription(ref: string, body: string): Promise<ForgeCommandResult> {
-    return runArgv(this.forge, ["glab", "mr", "update", ref, "--description", body], this.execute);
+    return runArgv(this.forge, ["glab", "mr", "update", ref, "--description", body], this.execute, this.cwd);
   }
 }
 
 export function createForgeAdapter(
   forge: ForgeKind,
   execute: boolean,
+  cwd?: string,
 ): ForgeAdapter | null {
   switch (forge) {
     case "github":
-      return new GitHubAdapter(execute);
+      return new GitHubAdapter(execute, cwd);
     case "gitlab":
-      return new GitLabAdapter(execute);
+      return new GitLabAdapter(execute, cwd);
     case "none":
       return null;
   }

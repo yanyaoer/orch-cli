@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { existsSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync } from "node:fs";
 import { resolve } from "node:path";
 import { $ } from "bun";
 import type { AgentName, ImplementerResult, RoleResult, RunRole, RunSpec, RunState, RunStatus } from "./types.ts";
@@ -12,8 +12,10 @@ import { argvForDisplay, createForgeAdapter, detectForge } from "./forge.ts";
 import { runSupervisor, writeInitialRunFiles } from "./supervisor.ts";
 import {
   HELP_TOPICS,
+  decisionHelp,
   eventsTailHelp,
   mirrorHelp,
+  mirrorSyncHelp,
   resultCommandHelp,
   runCreateHelp,
   runHelp,
@@ -47,6 +49,22 @@ type LocatedRun = {
   run_id: string;
   run_dir: string;
 };
+
+type DecisionVerdict = "accept" | "rework";
+
+interface DecisionRecord {
+  verdict: DecisionVerdict;
+  run_id: string;
+  reason: string | null;
+  ts: string;
+}
+
+interface OutboxCommentPayload {
+  kind: "comment";
+  mr: string;
+  body: string;
+  created_at: string;
+}
 
 class CliError extends Error {}
 
@@ -130,6 +148,30 @@ function readTextFile(path: string): string | null {
   } catch {
     return null;
   }
+}
+
+function pendingOutboxDir(mrDir: string): string {
+  return `${mrDir}/outbox/pending`;
+}
+
+function sentOutboxDir(mrDir: string): string {
+  return `${mrDir}/outbox/sent`;
+}
+
+function pendingOutboxFiles(mrDir: string): string[] {
+  const pendingDir = pendingOutboxDir(mrDir);
+  if (!existsSync(pendingDir)) return [];
+  return readdirSync(pendingDir, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
+    .map((entry) => entry.name)
+    .sort();
+}
+
+function enqueueComment(mrDir: string, payload: OutboxCommentPayload): string {
+  const filename = `${utcCompact()}-${randomHex(4)}.json`;
+  const path = `${pendingOutboxDir(mrDir)}/${filename}`;
+  writeJsonAtomic(path, payload);
+  return path;
 }
 
 function runListRows(runsRoot: string): RunListRow[] {
@@ -304,6 +346,26 @@ function mirrorBody(mr: string, runId: string, result: RoleResult, status: RunSt
     "Summary:",
     "",
     resultSummary(result),
+  ].join("\n");
+}
+
+function decisionBody(
+  mr: string,
+  runId: string,
+  decision: DecisionRecord,
+  result: RoleResult,
+  status: RunStatus | null,
+): string {
+  return [
+    "### orch decision",
+    "",
+    `- MR/PR: ${mr}`,
+    `- Run: ${runId}`,
+    `- Decision: ${decision.verdict}`,
+    `- Reason: ${decision.reason ?? "none"}`,
+    `- Created: ${decision.ts}`,
+    "",
+    mirrorBody(mr, runId, result, status),
   ].join("\n");
 }
 
@@ -485,6 +547,8 @@ async function result(args: ParsedArgs): Promise<number> {
 }
 
 async function mirror(args: ParsedArgs): Promise<number> {
+  if (args.positionals[1] === "sync") return mirrorSync(args);
+
   const mr = flagString(args, "mr");
   const worktree = resolve(flagString(args, "worktree", process.cwd()));
   const execute = flagBool(args, "execute");
@@ -495,7 +559,7 @@ async function mirror(args: ParsedArgs): Promise<number> {
     return 0;
   }
 
-  const adapter = createForgeAdapter(forge, execute);
+  const adapter = createForgeAdapter(forge, execute, worktree);
   if (!adapter) throw new Error(`unsupported forge: ${forge}`);
 
   const root = mrStateDir(repo.repo_key, mr);
@@ -519,6 +583,117 @@ async function mirror(args: ParsedArgs): Promise<number> {
   if (command.stdout) process.stdout.write(command.stdout);
   if (command.stderr) process.stderr.write(command.stderr);
   return command.exit_code && command.exit_code !== 0 ? command.exit_code : 0;
+}
+
+async function decision(args: ParsedArgs): Promise<number> {
+  const verdict = args.positionals[1];
+  if (verdict !== "accept" && verdict !== "rework") {
+    throw new CliError("usage: orch decision accept|rework --mr <id> --run <run_id> [--reason <text>] [--worktree <path>]");
+  }
+  const mr = flagString(args, "mr");
+  const runId = flagString(args, "run");
+  const reason = args.flags.has("reason") ? flagString(args, "reason") : null;
+  const worktree = resolve(flagString(args, "worktree", process.cwd()));
+  const repo = await getRepoIdentity(worktree);
+  const mrDir = mrStateDir(repo.repo_key, mr);
+  ensureStateLayout(mrDir);
+
+  const runsRoot = `${mrDir}/runs`;
+  const { result, status } = readMirrorResult(runsRoot, runId);
+  const ts = new Date().toISOString();
+  const record: DecisionRecord = { verdict, run_id: runId, reason, ts };
+  const runDir = `${runsRoot}/${runId}`;
+  writeJsonAtomic(`${runDir}/decision.json`, record);
+
+  const body = decisionBody(mr, runId, record, result, status);
+  const outboxPath = enqueueComment(mrDir, {
+    kind: "comment",
+    mr,
+    body,
+    created_at: ts,
+  });
+
+  printJson({
+    decision: verdict,
+    mr,
+    run_id: runId,
+    decision_path: `${runDir}/decision.json`,
+    outbox_path: outboxPath,
+  });
+  return 0;
+}
+
+function readOutboxComment(path: string): OutboxCommentPayload | null {
+  const payload = readJsonFile<Partial<OutboxCommentPayload> | null>(path, null);
+  if (
+    payload?.kind === "comment" &&
+    typeof payload.mr === "string" &&
+    typeof payload.body === "string" &&
+    typeof payload.created_at === "string"
+  ) {
+    return payload as OutboxCommentPayload;
+  }
+  return null;
+}
+
+async function mirrorSync(args: ParsedArgs): Promise<number> {
+  const mr = flagString(args, "mr");
+  const worktree = resolve(flagString(args, "worktree", process.cwd()));
+  const execute = flagBool(args, "execute");
+  const repo = await getRepoIdentity(worktree);
+  const forge = detectForge(repo.remote_url);
+  if (forge === "none") {
+    process.stdout.write("本仓库无 github/gitlab remote，跳过 mirror sync\n");
+    return 0;
+  }
+
+  const adapter = createForgeAdapter(forge, execute, worktree);
+  if (!adapter) throw new Error(`unsupported forge: ${forge}`);
+
+  const mrDir = mrStateDir(repo.repo_key, mr);
+  ensureStateLayout(mrDir);
+  const pending = pendingOutboxFiles(mrDir);
+  let failed = 0;
+  for (const file of pending) {
+    const pendingPath = `${pendingOutboxDir(mrDir)}/${file}`;
+    const payload = readOutboxComment(pendingPath);
+    if (!payload) {
+      printJson({
+        mirror: execute ? "failed" : "dry-run",
+        forge,
+        mr,
+        outbox_path: pendingPath,
+        error: "invalid outbox payload",
+      });
+      failed += 1;
+      continue;
+    }
+
+    const command = await adapter.postComment(payload.mr, payload.body);
+    const success = command.exit_code === 0;
+    printJson({
+      mirror: execute ? (success ? "sent" : "failed") : "dry-run",
+      forge,
+      mr: payload.mr,
+      outbox_path: pendingPath,
+      argv: command.argv,
+      command: argvForDisplay(command.argv),
+      exit_code: command.exit_code,
+    });
+    if (command.stdout) process.stdout.write(command.stdout);
+    if (command.stderr) process.stderr.write(command.stderr);
+
+    if (execute && success) {
+      renameSync(pendingPath, `${sentOutboxDir(mrDir)}/${file}`);
+    } else if (execute) {
+      failed += 1;
+    }
+  }
+
+  if (pending.length === 0) {
+    printJson({ mirror: execute ? "sent" : "dry-run", forge, mr, pending: 0 });
+  }
+  return failed > 0 ? 1 : 0;
 }
 
 async function main(): Promise<number> {
@@ -557,6 +732,14 @@ async function main(): Promise<number> {
       process.stdout.write(statusHelp());
       return 0;
     }
+    if (first === "decision") {
+      process.stdout.write(decisionHelp());
+      return 0;
+    }
+    if (first === "mirror" && second === "sync") {
+      process.stdout.write(mirrorSyncHelp());
+      return 0;
+    }
     if (first === "mirror") {
       process.stdout.write(mirrorHelp());
       return 0;
@@ -587,6 +770,7 @@ async function main(): Promise<number> {
   if (first === "events" && second === "tail") return eventsTail(args);
   if (first === "result") return result(args);
   if (first === "status") return status(args);
+  if (first === "decision") return decision(args);
   if (first === "mirror") return mirror(args);
   process.stderr.write(topLevelHelp());
   return 2;

@@ -1,7 +1,9 @@
 import { expect, test } from "bun:test";
 import {
+  decisionHelp,
   eventsTailHelp,
   mirrorHelp,
+  mirrorSyncHelp,
   resultCommandHelp,
   runCreateHelp,
   runHelp,
@@ -21,7 +23,9 @@ test("top-level help exposes positioning, commands, quickstart, and topics", () 
   expect(text).toContain("orch events tail");
   expect(text).toContain("orch result");
   expect(text).toContain("orch status");
+  expect(text).toContain("orch decision");
   expect(text).toContain("orch mirror");
+  expect(text).toContain("orch mirror sync");
   expect(text).toContain("Quickstart:");
   expect(text).toContain("orch <command> --help");
   expect(text).toContain("task-spec | result | events | concepts | forge");
@@ -66,11 +70,26 @@ test("command help exposes flags and runnable examples", () => {
   }
   expect(status).toContain("orch status --mr 123");
 
+  const decision = decisionHelp();
+  for (const flag of ["--mr", "--run", "--reason", "--worktree"]) {
+    expect(decision).toContain(flag);
+  }
+  expect(decision).toContain("outbox/pending");
+  expect(decision).toContain("orch decision accept --mr 123");
+
   const mirror = mirrorHelp();
   for (const flag of ["--mr", "--run", "--worktree", "--execute"]) {
     expect(mirror).toContain(flag);
   }
   expect(mirror).toContain("orch mirror --mr 123");
+  expect(mirror).toContain("orch mirror sync --mr 123");
+
+  const mirrorSync = mirrorSyncHelp();
+  for (const flag of ["--mr", "--worktree", "--execute"]) {
+    expect(mirrorSync).toContain(flag);
+  }
+  expect(mirrorSync).toContain("outbox/pending");
+  expect(mirrorSync).toContain("outbox/sent");
 });
 
 test("topic help covers task specs, results, events, and concepts", () => {
@@ -93,11 +112,13 @@ test("topic help covers task specs, results, events, and concepts", () => {
   expect(concepts).toContain("${XDG_STATE_HOME:-$HOME/.local/state}/orch/<repo_key>/mrs/<mr>/runs/<run_id>/");
   expect(concepts).toContain("A1:");
   expect(concepts).toContain("A2:");
+  expect(concepts).toContain("outbox/{pending,sent}");
   expect(concepts).toContain("Forge adapter:");
 
   const forge = topicHelp("forge");
   expect(forge).toContain("github.com remotes use gh");
   expect(forge).toContain("dry-run by default");
+  expect(forge).toContain("orch mirror sync");
   expect(forge).toContain("forge=none");
 });
 
