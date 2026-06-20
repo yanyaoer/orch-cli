@@ -69,6 +69,20 @@ interface OutboxCommentPayload {
 
 class CliError extends Error {}
 
+function stateDirectoryHint(path: string, error: unknown): CliError {
+  const detail = error instanceof Error ? error.message : String(error);
+  return new CliError(
+    [
+      `cannot create orch state directory: ${path}`,
+      detail,
+      "",
+      "orch stores runs under ${XDG_STATE_HOME:-$HOME/.local/state}/orch by default.",
+      "If you are running inside a restricted sandbox, either grant write access to that state directory or run with a writable state home, for example:",
+      "  XDG_STATE_HOME=/tmp/orch-state orch run create ...",
+    ].join("\n"),
+  );
+}
+
 function parseArgs(argv: string[]): ParsedArgs {
   const positionals: string[] = [];
   const flags = new Map<string, string | boolean>();
@@ -393,7 +407,11 @@ async function createRun(args: ParsedArgs): Promise<number> {
 
   const repo = await getRepoIdentity(worktree);
   const mrDir = mrStateDir(repo.repo_key, mr);
-  ensureStateLayout(mrDir);
+  try {
+    ensureStateLayout(mrDir);
+  } catch (error) {
+    throw stateDirectoryHint(mrDir, error);
+  }
   const mrLock = acquirePidfileLock(`${mrDir}/locks/mr.lock`);
   try {
     const taskSha = sha256(taskText);

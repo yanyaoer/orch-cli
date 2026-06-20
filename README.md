@@ -73,6 +73,16 @@ $ orch --help
 
 Other assets use the same naming pattern, for example `orch-linux-x64` and `orch-linux-arm64`.
 
+Sandboxed runners:
+
+`orch` writes to `${XDG_STATE_HOME:-$HOME/.local/state}/orch` by default. In restricted agent sandboxes, that directory may not be writable unless it is explicitly granted by the runner. Use a writable state home when needed:
+
+```sh
+$ XDG_STATE_HOME=/tmp/orch-state orch run create --mr demo --role reviewer --agent codex --tag review-a --worktree . --task task.md
+```
+
+This is a sandbox policy issue, not a binary install issue. The installed `~/.local/bin/orch` works normally in your shell; inside a restricted sandbox it still follows the sandbox's writable roots.
+
 ## Quickstart
 
 Create a worker task:

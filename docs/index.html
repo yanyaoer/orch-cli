@@ -585,7 +585,9 @@ $ orch status --mr 123 --json
 $ orch result --mr 123 --run review-a-...
 
 $ curl -L https://github.com/yanyaoer/orch-cli/releases/latest/download/orch-darwin-arm64 -o ~/.local/bin/orch
-$ chmod +x ~/.local/bin/orch</pre>
+$ chmod +x ~/.local/bin/orch
+
+$ XDG_STATE_HOME=/tmp/orch-state orch run create --mr demo --role reviewer --agent codex --tag review-a --worktree . --task task.md</pre>
         </div>
       </div>
     </section>
