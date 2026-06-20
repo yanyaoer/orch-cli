@@ -114,3 +114,42 @@ test("extractResultFromRunDir reads claude stream-json result and assistant text
   );
   expect(extractResultFromRunDir(assistantRunDir, spec("verifier", "verify-claude"))).toEqual(verifier);
 });
+
+test("extractResultFromRunDir reads pi message_end assistant text events", () => {
+  const runDir = tempDir();
+  const reviewer = {
+    schema: "orch.result/reviewer/v1",
+    run_id: "review-pi",
+    verdict: "approve",
+    reviews_run_id: "impl-a",
+    blocking_findings: [],
+    non_blocking_findings: [{ id: "pi-note", body: "parsed from pi native output" }],
+    suggested_tests: ["bun test"],
+  };
+  writeFileSync(
+    join(runDir, "native.jsonl"),
+    [
+      JSON.stringify({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "thinking", text: "ignore this" },
+            { type: "text", text: "```json\n" + JSON.stringify(reviewer) + "\n```" },
+          ],
+        },
+      }),
+      JSON.stringify({
+        type: "turn_end",
+        message: {
+          role: "assistant",
+          content: [{ type: "thinking", text: "valid JSON event, but no text candidate" }],
+        },
+      }),
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+
+  expect(extractResultFromRunDir(runDir, spec("reviewer", "review-pi"))).toEqual(reviewer);
+});

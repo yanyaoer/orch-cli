@@ -18,7 +18,7 @@ Shipped today:
 - `orch run list`, `orch status`, `orch events tail`, and `orch result` read local run state.
 - `orch decision` records `accept` or `rework` locally and queues a mirror comment.
 - `orch mirror` and `orch mirror sync` dry-run by default, then use `gh` or `glab` only with `--execute`.
-- Drivers exist for `codex` and `claude`.
+- Drivers exist for `codex`, `claude`, and `pi`.
 - Role result schemas exist for `implementer`, `reviewer`, and `verifier`.
 
 Not shipped yet:
@@ -26,7 +26,7 @@ Not shipped yet:
 - No long-running daemon.
 - No queue service or multi-machine state database.
 - No interactive attach/debug shell command in the current CLI.
-- No `agy` or `pi-agent` driver in the current implementation.
+- No `agy` driver in the current implementation.
 - [docs/multi-agent.md](docs/multi-agent.md) is historical context for the older tmux/MR-centered design, not the current quickstart path.
 
 ## Install
@@ -35,7 +35,7 @@ Prerequisites:
 
 - Bun
 - Git
-- `codex` and/or `claude` authenticated locally if you want real worker runs
+- `codex`, `claude`, and/or `pi` authenticated locally if you want real worker runs
 - Optional: `gh` for GitHub mirroring or `glab` for GitLab mirroring
 
 Development setup:
@@ -142,7 +142,7 @@ Mirror commands are dry-run by default. Without `--execute`, `orch` prints the p
 controller / human
   -> orch CLI
   -> per-run supervisor
-  -> codex or claude headless driver
+  -> codex, claude, or pi headless driver
   -> local run directory
   -> optional PR/MR mirror through outbox
 ```

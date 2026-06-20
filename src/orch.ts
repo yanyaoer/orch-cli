@@ -28,6 +28,7 @@ import {
 } from "./help.ts";
 import { runCodexDriver } from "../drivers/codex-headless.ts";
 import { runClaudeDriver } from "../drivers/claude-headless.ts";
+import { runPiDriver } from "../drivers/pi-headless.ts";
 
 interface ParsedArgs {
   positionals: string[];
@@ -402,7 +403,7 @@ async function createRun(args: ParsedArgs): Promise<number> {
   if (!isResultRole(role)) {
     throw new Error(`P1 only supports result-schema roles: implementer, reviewer, verifier (got ${role})`);
   }
-  if (agent !== "codex" && agent !== "claude") throw new Error(`unsupported agent: ${agent}`);
+  if (agent !== "codex" && agent !== "claude" && agent !== "pi") throw new Error(`unsupported agent: ${agent}`);
   if (!Number.isFinite(timeoutSec) || timeoutSec <= 0) throw new Error("--timeout-sec must be positive");
 
   const repo = await getRepoIdentity(worktree);
@@ -733,6 +734,7 @@ async function main(): Promise<number> {
   if (first === "__supervisor") return runSupervisor(flagString(args, "run-dir"), orchCommand());
   if (first === "__driver-codex") return runCodexDriver(process.argv.slice(3));
   if (first === "__driver-claude") return runClaudeDriver(process.argv.slice(3));
+  if (first === "__driver-pi") return runPiDriver(process.argv.slice(3));
 
   if (!first || hasHelp(args)) {
     if (!first) {
