@@ -109,6 +109,7 @@ export function extractResultFromRunDir(runDir: string, spec: RunSpec): RoleResu
     const claudeResultCandidates: string[] = [];
     const claudeAssistantCandidates: string[] = [];
     const codexCandidates: string[] = [];
+    const piCandidates: string[] = [];
     const rawLineCandidates: string[] = [];
     for (const line of readFileSync(nativePath, "utf8").split("\n")) {
       if (!line.trim()) continue;
@@ -116,7 +117,7 @@ export function extractResultFromRunDir(runDir: string, spec: RunSpec): RoleResu
         const event = JSON.parse(line) as {
           type?: unknown;
           result?: unknown;
-          message?: { content?: unknown };
+          message?: { role?: unknown; content?: unknown };
           item?: { type?: string; text?: string };
         };
         if (event.type === "result" && typeof event.result === "string") {
@@ -129,11 +130,24 @@ export function extractResultFromRunDir(runDir: string, spec: RunSpec): RoleResu
         if (event.item?.type === "agent_message" && typeof event.item.text === "string") {
           codexCandidates.push(event.item.text);
         }
+        if (
+          (event.type === "message_end" || event.type === "turn_end" || event.type === "agent_end") &&
+          event.message?.role === "assistant"
+        ) {
+          const text = textFromClaudeAssistantContent(event.message.content);
+          if (text) piCandidates.push(text);
+        }
       } catch {
         rawLineCandidates.push(line);
       }
     }
-    candidates.push(...claudeResultCandidates, ...claudeAssistantCandidates, ...codexCandidates, ...rawLineCandidates);
+    candidates.push(
+      ...claudeResultCandidates,
+      ...claudeAssistantCandidates,
+      ...codexCandidates,
+      ...piCandidates,
+      ...rawLineCandidates,
+    );
   }
 
   for (const candidate of candidates) {
