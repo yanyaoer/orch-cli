@@ -1,0 +1,653 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>orch-cli - daemonless multi-agent orchestration</title>
+  <style>
+    :root {
+      --bg: #f7f8fb;
+      --panel: #ffffff;
+      --text: #121826;
+      --muted: #5d667a;
+      --line: #d9deea;
+      --accent: #0f766e;
+      --accent-2: #b45309;
+      --accent-3: #2563eb;
+      --ink: #0f172a;
+      --code: #111827;
+      --code-text: #e5e7eb;
+      --shadow: 0 18px 50px rgba(31, 41, 55, 0.12);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background:
+        linear-gradient(180deg, rgba(255,255,255,0.84), rgba(247,248,251,0.96)),
+        radial-gradient(circle at 10% 0%, rgba(15,118,110,0.12), transparent 32%),
+        radial-gradient(circle at 90% 15%, rgba(37,99,235,0.10), transparent 28%),
+        var(--bg);
+      color: var(--text);
+    }
+
+    a {
+      color: var(--accent-3);
+      text-decoration: none;
+    }
+
+    a:hover {
+      text-decoration: underline;
+    }
+
+    .wrap {
+      width: min(1160px, calc(100% - 32px));
+      margin: 0 auto;
+    }
+
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 5;
+      border-bottom: 1px solid rgba(217, 222, 234, 0.8);
+      background: rgba(247, 248, 251, 0.84);
+      backdrop-filter: blur(12px);
+    }
+
+    nav {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      min-height: 64px;
+      gap: 16px;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-weight: 760;
+      color: var(--ink);
+    }
+
+    .mark {
+      display: inline-grid;
+      place-items: center;
+      width: 34px;
+      height: 34px;
+      border-radius: 8px;
+      background: var(--ink);
+      color: white;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 15px;
+    }
+
+    .nav-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
+    .lang {
+      display: inline-flex;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+      background: var(--panel);
+    }
+
+    .lang button,
+    .button {
+      min-height: 38px;
+      border: 0;
+      background: transparent;
+      color: var(--text);
+      padding: 0 14px;
+      font: inherit;
+      cursor: pointer;
+    }
+
+    .lang button.active {
+      background: var(--ink);
+      color: white;
+    }
+
+    .button {
+      display: inline-flex;
+      align-items: center;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      font-weight: 650;
+    }
+
+    main {
+      overflow: hidden;
+    }
+
+    .hero {
+      min-height: calc(100vh - 64px);
+      display: grid;
+      grid-template-columns: minmax(0, 0.95fr) minmax(460px, 1.05fr);
+      gap: 42px;
+      align-items: center;
+      padding: 58px 0 42px;
+    }
+
+    .eyebrow {
+      color: var(--accent);
+      font-size: 14px;
+      font-weight: 760;
+      text-transform: uppercase;
+      letter-spacing: 0;
+      margin: 0 0 14px;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(42px, 7vw, 82px);
+      line-height: 0.94;
+      letter-spacing: 0;
+      color: var(--ink);
+    }
+
+    .lead {
+      max-width: 640px;
+      margin: 24px 0 0;
+      color: var(--muted);
+      font-size: 20px;
+      line-height: 1.55;
+    }
+
+    .hero-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-top: 30px;
+    }
+
+    .primary {
+      border-color: var(--ink);
+      background: var(--ink);
+      color: white;
+    }
+
+    .terminal {
+      margin-top: 28px;
+      border-radius: 8px;
+      background: var(--code);
+      color: var(--code-text);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+      font: 13px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    .terminal-bar {
+      display: flex;
+      gap: 7px;
+      padding: 12px 14px;
+      border-bottom: 1px solid rgba(255,255,255,0.08);
+    }
+
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: #94a3b8;
+    }
+
+    pre {
+      margin: 0;
+      padding: 16px;
+      overflow-x: auto;
+      white-space: pre;
+    }
+
+    .visual {
+      background: rgba(255,255,255,0.72);
+      border: 1px solid rgba(217,222,234,0.88);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+      padding: 18px;
+    }
+
+    .visual svg {
+      display: block;
+      width: 100%;
+      height: auto;
+    }
+
+    section {
+      padding: 72px 0;
+      border-top: 1px solid rgba(217,222,234,0.8);
+    }
+
+    h2 {
+      margin: 0 0 16px;
+      font-size: clamp(28px, 4vw, 44px);
+      line-height: 1.08;
+      letter-spacing: 0;
+      color: var(--ink);
+    }
+
+    .section-lead {
+      max-width: 760px;
+      color: var(--muted);
+      font-size: 18px;
+      line-height: 1.6;
+      margin: 0 0 28px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 16px;
+    }
+
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 20px;
+      min-height: 170px;
+    }
+
+    .card h3 {
+      margin: 0 0 10px;
+      font-size: 18px;
+      color: var(--ink);
+    }
+
+    .card p,
+    li {
+      color: var(--muted);
+      line-height: 1.55;
+    }
+
+    .steps {
+      display: grid;
+      grid-template-columns: 0.85fr 1.15fr;
+      gap: 24px;
+      align-items: start;
+    }
+
+    .code-block {
+      border-radius: 8px;
+      background: var(--code);
+      color: var(--code-text);
+      overflow: hidden;
+    }
+
+    .split {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 18px;
+    }
+
+    footer {
+      padding: 38px 0 56px;
+      color: var(--muted);
+    }
+
+    [data-i18n] {
+      transition: opacity 120ms ease;
+    }
+
+    .zh [data-lang="en"],
+    .en [data-lang="zh"] {
+      display: none;
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation-duration: 0.001ms !important;
+        animation-iteration-count: 1 !important;
+        scroll-behavior: auto !important;
+      }
+    }
+
+    @media (max-width: 900px) {
+      .hero,
+      .steps,
+      .split,
+      .grid {
+        grid-template-columns: 1fr;
+      }
+
+      .hero {
+        min-height: auto;
+        padding-top: 38px;
+      }
+
+      .visual {
+        padding: 10px;
+      }
+    }
+
+    @media (max-width: 540px) {
+      .wrap {
+        width: min(100% - 22px, 1160px);
+      }
+
+      nav {
+        align-items: flex-start;
+        flex-direction: column;
+        padding: 12px 0;
+      }
+
+      h1 {
+        font-size: 42px;
+      }
+
+      .lead {
+        font-size: 18px;
+      }
+
+      .hero-actions,
+      .nav-actions {
+        width: 100%;
+      }
+
+      .button,
+      .lang {
+        flex: 1;
+        justify-content: center;
+      }
+    }
+  </style>
+</head>
+<body class="en">
+  <header>
+    <nav class="wrap" aria-label="Primary">
+      <a class="brand" href="#top" aria-label="orch-cli home">
+        <span class="mark">or</span>
+        <span>orch-cli</span>
+      </a>
+      <div class="nav-actions">
+        <div class="lang" aria-label="Language">
+          <button type="button" class="active" data-set-lang="en">EN</button>
+          <button type="button" data-set-lang="zh">中文</button>
+        </div>
+        <a class="button" href="https://github.com/yanyaoer/orch-cli">GitHub</a>
+      </div>
+    </nav>
+  </header>
+
+  <main id="top">
+    <div class="wrap hero">
+      <div>
+        <p class="eyebrow" data-lang="en">Daemonless multi-agent orchestration</p>
+        <p class="eyebrow" data-lang="zh">无常驻服务的多 Agent 编排</p>
+        <h1 data-lang="en">Run coding agents as reproducible local jobs.</h1>
+        <h1 data-lang="zh">把编码 Agent 变成可复现的本地任务。</h1>
+        <p class="lead" data-lang="en">
+          orch starts Codex or Claude in a supervised headless run, captures local state, validates a role-specific result, and mirrors decisions to PRs or MRs only when you ask it to.
+        </p>
+        <p class="lead" data-lang="zh">
+          orch 用 supervisor 启动 Codex 或 Claude headless worker，落盘本地状态，校验统一结果，并只在你明确执行时把裁决镜像到 PR 或 MR。
+        </p>
+        <div class="hero-actions">
+          <a class="button primary" href="#quickstart" data-lang="en">Start with the CLI</a>
+          <a class="button primary" href="#quickstart" data-lang="zh">从 CLI 开始</a>
+          <a class="button" href="#architecture" data-lang="en">View architecture</a>
+          <a class="button" href="#architecture" data-lang="zh">查看架构</a>
+        </div>
+        <div class="terminal" aria-label="Quick command">
+          <div class="terminal-bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>
+          <pre>$ orch run create --mr 123 --role reviewer --agent codex \
+  --tag review-a --worktree . --task task.md</pre>
+        </div>
+      </div>
+
+      <div class="visual" id="architecture" aria-label="Animated orch workflow diagram">
+        <svg viewBox="0 0 920 620" role="img" aria-labelledby="diagramTitle diagramDesc" xmlns="http://www.w3.org/2000/svg">
+          <title id="diagramTitle">orch workflow</title>
+          <desc id="diagramDesc">Controller sends a task to the orch CLI, which supervises a worker driver, writes local state, and optionally mirrors to a pull request or merge request.</desc>
+          <defs>
+            <linearGradient id="nodeA" x1="0" x2="1">
+              <stop offset="0" stop-color="#0f766e"/>
+              <stop offset="1" stop-color="#2563eb"/>
+            </linearGradient>
+            <filter id="soft" x="-20%" y="-20%" width="140%" height="140%">
+              <feDropShadow dx="0" dy="8" stdDeviation="10" flood-color="#0f172a" flood-opacity="0.14"/>
+            </filter>
+            <marker id="arrow" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="8" markerHeight="8" orient="auto">
+              <path d="M2 2 L10 6 L2 10 Z" fill="#64748b"/>
+            </marker>
+            <style>
+              .node { fill: #fff; stroke: #cbd5e1; stroke-width: 2; filter: url(#soft); }
+              .nodeAccent { fill: url(#nodeA); stroke: none; filter: url(#soft); }
+              .label { font: 700 24px ui-sans-serif, system-ui; fill: #0f172a; }
+              .small { font: 500 15px ui-sans-serif, system-ui; fill: #64748b; }
+              .line { fill: none; stroke: #94a3b8; stroke-width: 3; stroke-linecap: round; marker-end: url(#arrow); }
+              .pulse { fill: #b45309; }
+              .file { fill: #f8fafc; stroke: #cbd5e1; stroke-width: 2; }
+              .flow {
+                stroke-dasharray: 12 18;
+                animation: dash 1.8s linear infinite;
+              }
+              .pulse {
+                animation: hop 3.6s ease-in-out infinite;
+              }
+              .pulse.two { animation-delay: .75s; }
+              .pulse.three { animation-delay: 1.5s; }
+              .heartbeat { animation: blink 1.6s ease-in-out infinite; }
+              @keyframes dash { to { stroke-dashoffset: -60; } }
+              @keyframes hop {
+                0%, 18% { transform: translate(90px, 120px); opacity: 0; }
+                25%, 42% { transform: translate(285px, 120px); opacity: 1; }
+                50%, 66% { transform: translate(475px, 120px); opacity: 1; }
+                75%, 92% { transform: translate(650px, 360px); opacity: 1; }
+                100% { transform: translate(790px, 360px); opacity: 0; }
+              }
+              @keyframes blink {
+                0%, 100% { opacity: .35; }
+                50% { opacity: 1; }
+              }
+            </style>
+          </defs>
+
+          <rect x="24" y="24" width="872" height="572" rx="18" fill="#f8fafc" stroke="#e2e8f0"/>
+
+          <path class="line flow" d="M190 135 H350"/>
+          <path class="line flow" d="M530 135 H700"/>
+          <path class="line flow" d="M760 190 V312"/>
+          <path class="line flow" d="M690 390 H535"/>
+          <path class="line flow" d="M385 390 H230"/>
+          <path class="line flow" d="M230 312 V205"/>
+
+          <g transform="translate(60 80)">
+            <rect class="node" width="170" height="110" rx="12"/>
+            <text class="label" x="24" y="46">Controller</text>
+            <text class="small" x="24" y="75">human / agent</text>
+          </g>
+
+          <g transform="translate(350 80)">
+            <rect class="nodeAccent" width="190" height="110" rx="12"/>
+            <text class="label" x="28" y="46" fill="#fff">orch CLI</text>
+            <text class="small" x="28" y="75" fill="#dbeafe">stateless call</text>
+          </g>
+
+          <g transform="translate(700 80)">
+            <rect class="node" width="160" height="110" rx="12"/>
+            <text class="label" x="24" y="46">Supervisor</text>
+            <text class="small" x="24" y="75">pid / pgid</text>
+          </g>
+
+          <g transform="translate(665 320)">
+            <rect class="node" width="210" height="130" rx="12"/>
+            <text class="label" x="24" y="42">Driver</text>
+            <text class="small" x="24" y="70">codex / claude</text>
+            <circle class="heartbeat" cx="170" cy="38" r="9" fill="#0f766e"/>
+          </g>
+
+          <g transform="translate(350 320)">
+            <rect class="node" width="210" height="130" rx="12"/>
+            <text class="label" x="24" y="42">Run State</text>
+            <text class="small" x="24" y="70">status + events</text>
+            <text class="small" x="24" y="96">native + result</text>
+          </g>
+
+          <g transform="translate(65 320)">
+            <rect class="node" width="205" height="130" rx="12"/>
+            <text class="label" x="24" y="42">Outbox</text>
+            <text class="small" x="24" y="70">dry-run first</text>
+            <text class="small" x="24" y="96">gh / glab later</text>
+          </g>
+
+          <g transform="translate(138 500)">
+            <rect class="file" x="0" y="0" width="150" height="58" rx="8"/>
+            <text class="small" x="18" y="35">spec.json</text>
+          </g>
+          <g transform="translate(330 500)">
+            <rect class="file" x="0" y="0" width="160" height="58" rx="8"/>
+            <text class="small" x="18" y="35">events.jsonl</text>
+          </g>
+          <g transform="translate(532 500)">
+            <rect class="file" x="0" y="0" width="165" height="58" rx="8"/>
+            <text class="small" x="18" y="35">result.json</text>
+          </g>
+
+          <circle class="pulse" cx="0" cy="0" r="8"/>
+          <circle class="pulse two" cx="0" cy="0" r="8"/>
+          <circle class="pulse three" cx="0" cy="0" r="8"/>
+        </svg>
+      </div>
+    </div>
+
+    <section>
+      <div class="wrap">
+        <h2 data-lang="en">Local state first. Provider streams second.</h2>
+        <h2 data-lang="zh">本地状态优先，模型原始流其次。</h2>
+        <p class="section-lead" data-lang="en">
+          The controller does not have to remember what happened. orch snapshots the task, records lifecycle events, keeps native provider output, and validates one role-specific result before marking the run done.
+        </p>
+        <p class="section-lead" data-lang="zh">
+          主控不需要把上下文记在聊天里。orch 会快照任务、记录生命周期事件、保留 provider 原始输出，并在终态前校验角色专属的结果 JSON。
+        </p>
+        <div class="grid">
+          <article class="card">
+            <h3 data-lang="en">Daemonless</h3>
+            <h3 data-lang="zh">无 daemon</h3>
+            <p data-lang="en">Each command reads local state, advances one action, and exits. The supervisor lives only for a single run.</p>
+            <p data-lang="zh">每个命令读取本地状态、推进一次动作，然后退出。supervisor 生命周期只覆盖单个 run。</p>
+          </article>
+          <article class="card">
+            <h3 data-lang="en">Auditable</h3>
+            <h3 data-lang="zh">可审计</h3>
+            <p data-lang="en">A run directory contains spec, status, normalized events, native logs, and result artifacts.</p>
+            <p data-lang="zh">每个 run 目录都包含 spec、status、标准事件、原始日志和结果产物。</p>
+          </article>
+          <article class="card">
+            <h3 data-lang="en">Mirror-safe</h3>
+            <h3 data-lang="zh">镜像安全</h3>
+            <p data-lang="en">PR/MR writes go through an outbox and stay dry-run until `--execute` is passed.</p>
+            <p data-lang="zh">PR/MR 写入先进入 outbox；没有 `--execute` 就只打印计划命令。</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section id="quickstart">
+      <div class="wrap steps">
+        <div>
+          <h2 data-lang="en">Quickstart</h2>
+          <h2 data-lang="zh">快速开始</h2>
+          <p class="section-lead" data-lang="en">
+            Install with Bun, build the local binary, then dispatch a role-scoped task to Codex or Claude.
+          </p>
+          <p class="section-lead" data-lang="zh">
+            使用 Bun 安装和构建本地 binary，然后把带角色边界的任务派发给 Codex 或 Claude。
+          </p>
+        </div>
+        <div class="code-block">
+          <pre>$ bun install
+$ bun test
+$ bun run build
+$ cp ./dist/orch ~/.local/bin/orch
+
+$ orch run create \
+  --mr 123 \
+  --role reviewer \
+  --agent codex \
+  --tag review-a \
+  --worktree . \
+  --task task.md
+
+$ orch status --mr 123 --json
+$ orch result --mr 123 --run review-a-...
+
+$ curl -L https://github.com/yanyaoer/orch-cli/releases/latest/download/orch-darwin-arm64 -o ~/.local/bin/orch
+$ chmod +x ~/.local/bin/orch</pre>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="wrap">
+        <h2 data-lang="en">What ships now</h2>
+        <h2 data-lang="zh">当前已实现</h2>
+        <div class="split">
+          <div class="card">
+            <h3 data-lang="en">Commands</h3>
+            <h3 data-lang="zh">命令</h3>
+            <ul>
+              <li><code>run create</code>, <code>run list</code>, <code>status</code></li>
+              <li><code>events tail</code>, <code>result</code></li>
+              <li><code>decision</code>, <code>mirror</code>, <code>mirror sync</code></li>
+            </ul>
+          </div>
+          <div class="card">
+            <h3 data-lang="en">Boundaries</h3>
+            <h3 data-lang="zh">边界</h3>
+            <ul data-lang="en">
+              <li>No long-running daemon yet.</li>
+              <li>No interactive attach/debug shell command yet.</li>
+              <li>Drivers currently target Codex and Claude.</li>
+            </ul>
+            <ul data-lang="zh">
+              <li>当前没有常驻 daemon。</li>
+              <li>当前没有交互式 attach/debug shell 命令。</li>
+              <li>当前 driver 覆盖 Codex 和 Claude。</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="wrap">
+      <span data-lang="en">Source: </span>
+      <span data-lang="zh">源码：</span>
+      <a href="https://github.com/yanyaoer/orch-cli">github.com/yanyaoer/orch-cli</a>
+    </div>
+  </footer>
+
+  <script>
+    const root = document.body;
+    const buttons = Array.from(document.querySelectorAll("[data-set-lang]"));
+    function setLang(lang) {
+      root.classList.toggle("zh", lang === "zh");
+      root.classList.toggle("en", lang !== "zh");
+      document.documentElement.lang = lang === "zh" ? "zh-CN" : "en";
+      buttons.forEach((button) => {
+        button.classList.toggle("active", button.dataset.setLang === lang);
+      });
+      localStorage.setItem("orch-lang", lang);
+    }
+    buttons.forEach((button) => {
+      button.addEventListener("click", () => setLang(button.dataset.setLang));
+    });
+    const saved = localStorage.getItem("orch-lang");
+    if (saved === "zh" || saved === "en") setLang(saved);
+  </script>
+</body>
+</html>
