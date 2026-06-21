@@ -12,6 +12,7 @@ import { argvForDisplay, createForgeAdapter, detectForge } from "./forge.ts";
 import { runSupervisor, writeInitialRunFiles } from "./supervisor.ts";
 import {
   HELP_TOPICS,
+  bundleHelp,
   chatgptBridgeHelp,
   decisionHelp,
   eventsTailHelp,
@@ -32,6 +33,7 @@ import { runClaudeDriver } from "../drivers/claude-headless.ts";
 import { deployWorker, locateBridgeDir, runChatgptBridge } from "../drivers/chatgpt-bridge.ts";
 import { runPiDriver } from "../drivers/pi-headless.ts";
 import { addWorkspace, chatgptBridgeConfigPath, readBridgeConfig, writeBridgeConfig } from "./config.ts";
+import { BUNDLE_REL_PATH, buildBundle, type BundleOptions } from "./bundle.ts";
 
 interface ParsedArgs {
   positionals: string[];
@@ -814,6 +816,79 @@ async function chatgptBridge(args: ParsedArgs): Promise<number> {
   return connectWithLock(worker.ws_url, token, worktree);
 }
 
+// parseArgs collapses repeated flags into one Map entry, so re-scan raw argv to
+// collect every --name value (used for repeatable --path / --glob).
+function collectFlags(name: string): string[] {
+  const argv = process.argv.slice(2);
+  const out: string[] = [];
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i]!;
+    if (arg === `--${name}`) {
+      const next = argv[i + 1];
+      if (next && !next.startsWith("--")) {
+        out.push(next);
+        i += 1;
+      }
+    } else if (arg.startsWith(`--${name}=`)) {
+      out.push(arg.slice(name.length + 3));
+    }
+  }
+  return out;
+}
+
+function flagNumber(args: ParsedArgs, name: string): number | undefined {
+  if (!args.flags.has(name)) return undefined;
+  const value = Number(flagString(args, name));
+  if (!Number.isFinite(value)) throw new CliError(`--${name} must be a number`);
+  return value;
+}
+
+async function copyToClipboard(text: string): Promise<boolean> {
+  try {
+    const proc = Bun.spawn(["pbcopy"], { stdin: new TextEncoder().encode(text), stdout: "ignore", stderr: "ignore" });
+    return (await proc.exited) === 0;
+  } catch {
+    return false;
+  }
+}
+
+async function bundle(args: ParsedArgs): Promise<number> {
+  const worktree = resolve(flagString(args, "worktree", process.cwd()));
+  const options: BundleOptions = {
+    worktree,
+    title: args.flags.has("title") ? flagString(args, "title") : undefined,
+    selectedPaths: collectFlags("path"),
+    extraGlobs: collectFlags("glob"),
+    includeImportantFiles: !flagBool(args, "no-important-files"),
+    includeChangedFiles: !flagBool(args, "no-changed-files"),
+    includeDiff: !flagBool(args, "no-diff"),
+    maxFiles: flagNumber(args, "max-files"),
+    maxFileBytes: flagNumber(args, "max-file-bytes"),
+    maxDiffBytes: flagNumber(args, "max-diff-bytes"),
+    maxTotalBytes: flagNumber(args, "max-total-bytes"),
+  };
+
+  const built = await buildBundle(options);
+  const outPath = args.flags.has("out") ? resolve(flagString(args, "out")) : `${worktree}/${BUNDLE_REL_PATH}`;
+  writeTextAtomic(outPath, built.markdown);
+
+  let copied = false;
+  if (flagBool(args, "copy")) {
+    copied = await copyToClipboard(built.markdown);
+    if (!copied) process.stderr.write("warn: clipboard copy failed (pbcopy unavailable); bundle was still written.\n");
+  }
+
+  printJson({
+    out: outPath,
+    bytes: built.bytes,
+    files_included: built.filesIncluded.length,
+    files_skipped: built.filesSkipped.length,
+    truncated: built.truncated,
+    copied,
+  });
+  return 0;
+}
+
 async function main(): Promise<number> {
   const args = parseArgs(process.argv.slice(2));
   const [first, second] = args.positionals;
@@ -867,6 +942,10 @@ async function main(): Promise<number> {
       process.stdout.write(chatgptBridgeHelp());
       return 0;
     }
+    if (first === "bundle") {
+      process.stdout.write(bundleHelp());
+      return 0;
+    }
     if (first === "help") {
       process.stdout.write(second && isHelpTopic(second) ? topicHelp(second) : topLevelHelp());
       return 0;
@@ -896,6 +975,7 @@ async function main(): Promise<number> {
   if (first === "decision") return decision(args);
   if (first === "mirror") return mirror(args);
   if (first === "chatgpt-bridge") return chatgptBridge(args);
+  if (first === "bundle") return bundle(args);
   process.stderr.write(topLevelHelp());
   return 2;
 }

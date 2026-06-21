@@ -20,6 +20,7 @@ export function topLevelHelp(): string {
     "  orch mirror        Mirror a local run result summary to a PR/MR comment",
     "  orch mirror sync   Send queued outbox comments to a PR/MR",
     "  orch chatgpt-bridge  Deploy + connect the read-only ChatGPT bridge (Cloudflare Worker)",
+    "  orch bundle        Export a self-contained context bundle for tool-less models",
     "",
     "Quickstart:",
     "  orch run create --mr 123 --role implementer --agent codex --tag impl-a --worktree . --task task.md",
@@ -390,6 +391,45 @@ export function chatgptBridgeHelp(): string {
     "  orch chatgpt-bridge --worktree .                 # deploy (first run) + connect",
     "  orch chatgpt-bridge --no-connect                 # deploy + print mcp_url only",
     "  orch chatgpt-bridge --url ws://localhost:8787/ws --token test   # local dev",
+  ]);
+}
+
+export function bundleHelp(): string {
+  return lines([
+    "orch bundle: export a self-contained markdown context bundle for tool-less models",
+    "",
+    "Usage:",
+    "  orch bundle [--worktree <path>] [--path <file>]... [--glob <pat>]... [flags]",
+    "",
+    "Why:",
+    "  Some strong models (e.g. ChatGPT Pro / gpt-5.5-pro) reason without MCP tools and",
+    "  cannot read your repo. This packs a repo snapshot (tree, status, diff, key files)",
+    "  into one markdown file you paste in for review/planning. Execute the plan later",
+    "  with `orch run create --agent codex|pi`.",
+    "",
+    "Flags:",
+    "  --worktree <path>        Repo to snapshot; defaults to the current directory",
+    "  --path <file>            Include this file (repeatable)",
+    "  --glob <pat>             Include files matching this glob (repeatable)",
+    "  --title <t>              Bundle title heading",
+    "  --out <file>             Output path; defaults to <worktree>/.ai-bridge/pro-context.md",
+    "  --copy                   Also copy the markdown to the clipboard (macOS pbcopy)",
+    "  --no-diff                Skip the git diff section",
+    "  --no-important-files     Do not auto-include important root files (README, package.json, ...)",
+    "  --no-changed-files       Do not auto-include git-changed files",
+    "  --max-files <n>          Max files embedded (default 24)",
+    "  --max-file-bytes <n>     Max bytes per embedded file (default 60000)",
+    "  --max-diff-bytes <n>     Max bytes of git diff (default 80000)",
+    "  --max-total-bytes <n>    Max total bundle bytes before truncation (default 700000)",
+    "  --help                   Show this help",
+    "",
+    "Safety:",
+    "  All paths pass the bridge path guard; .env, private keys, .git, and node_modules",
+    "  are always excluded, and obvious inline secrets are redacted.",
+    "",
+    "Examples:",
+    "  orch bundle --worktree .",
+    "  orch bundle --path src/orch.ts --glob 'src/**/*.ts' --copy",
   ]);
 }
 

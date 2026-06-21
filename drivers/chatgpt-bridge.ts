@@ -63,13 +63,13 @@ function truncate(text: string, maxBytes: number): string {
   return `${text.slice(0, maxBytes)}\n... [truncated ${text.length - maxBytes} chars]`;
 }
 
-interface RunResult {
+export interface RunResult {
   code: number;
   stdout: string;
   stderr: string;
 }
 
-async function run(cmd: string[], cwd: string, stdin?: string): Promise<RunResult> {
+export async function run(cmd: string[], cwd: string, stdin?: string): Promise<RunResult> {
   const proc = Bun.spawn(cmd, {
     cwd,
     stdout: "pipe",
