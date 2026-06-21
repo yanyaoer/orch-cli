@@ -30,6 +30,7 @@ import {
 import { runCodexDriver } from "../drivers/codex-headless.ts";
 import { runClaudeDriver } from "../drivers/claude-headless.ts";
 import { runChatgptBridge } from "../drivers/chatgpt-bridge.ts";
+import { runPiDriver } from "../drivers/pi-headless.ts";
 
 interface ParsedArgs {
   positionals: string[];
@@ -70,6 +71,20 @@ interface OutboxCommentPayload {
 }
 
 class CliError extends Error {}
+
+function stateDirectoryHint(path: string, error: unknown): CliError {
+  const detail = error instanceof Error ? error.message : String(error);
+  return new CliError(
+    [
+      `cannot create orch state directory: ${path}`,
+      detail,
+      "",
+      "orch stores runs under ${XDG_STATE_HOME:-$HOME/.local/state}/orch by default.",
+      "If you are running inside a restricted sandbox, either grant write access to that state directory or run with a writable state home, for example:",
+      "  XDG_STATE_HOME=/tmp/orch-state orch run create ...",
+    ].join("\n"),
+  );
+}
 
 function parseArgs(argv: string[]): ParsedArgs {
   const positionals: string[] = [];
@@ -390,12 +405,16 @@ async function createRun(args: ParsedArgs): Promise<number> {
   if (!isResultRole(role)) {
     throw new Error(`P1 only supports result-schema roles: implementer, reviewer, verifier (got ${role})`);
   }
-  if (agent !== "codex" && agent !== "claude") throw new Error(`unsupported agent: ${agent}`);
+  if (agent !== "codex" && agent !== "claude" && agent !== "pi") throw new Error(`unsupported agent: ${agent}`);
   if (!Number.isFinite(timeoutSec) || timeoutSec <= 0) throw new Error("--timeout-sec must be positive");
 
   const repo = await getRepoIdentity(worktree);
   const mrDir = mrStateDir(repo.repo_key, mr);
-  ensureStateLayout(mrDir);
+  try {
+    ensureStateLayout(mrDir);
+  } catch (error) {
+    throw stateDirectoryHint(mrDir, error);
+  }
   const mrLock = acquirePidfileLock(`${mrDir}/locks/mr.lock`);
   try {
     const taskSha = sha256(taskText);
@@ -724,6 +743,7 @@ async function main(): Promise<number> {
   if (first === "__supervisor") return runSupervisor(flagString(args, "run-dir"), orchCommand());
   if (first === "__driver-codex") return runCodexDriver(process.argv.slice(3));
   if (first === "__driver-claude") return runClaudeDriver(process.argv.slice(3));
+  if (first === "__driver-pi") return runPiDriver(process.argv.slice(3));
 
   if (!first || hasHelp(args)) {
     if (!first) {

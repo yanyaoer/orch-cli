@@ -8,7 +8,7 @@ export type RunRole =
 
 export type ResultRole = "implementer" | "reviewer" | "verifier";
 
-export type AgentName = "codex" | "claude";
+export type AgentName = "codex" | "claude" | "pi";
 
 export type RunState =
   | "created"
@@ -131,4 +131,3 @@ export const writeRoles = new Set<RunRole>([
 export function isResultRole(role: RunRole): role is ResultRole {
   return role === "implementer" || role === "reviewer" || role === "verifier";
 }
-

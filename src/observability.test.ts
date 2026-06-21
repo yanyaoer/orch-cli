@@ -226,12 +226,36 @@ const runId = runIdFromPrompt(prompt);
 console.log(JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "working" }] } }));
 console.log(JSON.stringify({ type: "result", result: JSON.stringify(result(runId, "claude")) }));
 `;
+  const pi = `#!/usr/bin/env bun
+${common}
+const args = Bun.argv.slice(2);
+const expected = ["-p", "--mode", "json", "--no-session"];
+if (JSON.stringify(args) !== JSON.stringify(expected)) {
+  console.error("unexpected pi argv: " + JSON.stringify(args));
+  process.exit(13);
+}
+const prompt = await Bun.stdin.text();
+const runId = runIdFromPrompt(prompt);
+console.log(JSON.stringify({
+  type: "message_end",
+  message: {
+    role: "assistant",
+    content: [
+      { type: "thinking", text: "ignored" },
+      { type: "text", text: JSON.stringify(result(runId, "pi")) },
+    ],
+  },
+}));
+`;
   const codexPath = join(binDir, "codex");
   const claudePath = join(binDir, "claude");
+  const piPath = join(binDir, "pi");
   writeFileSync(codexPath, codex, "utf8");
   writeFileSync(claudePath, claude, "utf8");
+  writeFileSync(piPath, pi, "utf8");
   chmodSync(codexPath, 0o755);
   chmodSync(claudePath, 0o755);
+  chmodSync(piPath, 0o755);
 }
 
 test("observability commands read local run state", async () => {
@@ -484,7 +508,7 @@ test("write-role worktree lock is shared within an MR and across MRs", async () 
   await expectOneDoneOneLockHeld({ firstMr: "mr-a", secondMr: "mr-b" });
 });
 
-test("codex and claude drivers can complete from provider-native output without fallback", async () => {
+test("codex, claude, and pi drivers can complete from provider-native output without fallback", async () => {
   const root = mkdtempSync(join(tmpdir(), "orch-provider-e2e-"));
   const stateHome = join(root, "state");
   const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
@@ -495,7 +519,7 @@ test("codex and claude drivers can complete from provider-native output without 
   writeProviderShims(binDir);
   const env = { XDG_STATE_HOME: stateHome, PATH: `${binDir}:${process.env.PATH ?? ""}` };
 
-  for (const provider of ["codex", "claude"] as const) {
+  for (const provider of ["codex", "claude", "pi"] as const) {
     const created = await runOrch(
       [
         "run",
