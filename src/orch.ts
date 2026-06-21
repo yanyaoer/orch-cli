@@ -29,8 +29,9 @@ import {
 } from "./help.ts";
 import { runCodexDriver } from "../drivers/codex-headless.ts";
 import { runClaudeDriver } from "../drivers/claude-headless.ts";
-import { runChatgptBridge } from "../drivers/chatgpt-bridge.ts";
+import { deployWorker, locateBridgeDir, runChatgptBridge } from "../drivers/chatgpt-bridge.ts";
 import { runPiDriver } from "../drivers/pi-headless.ts";
+import { addWorkspace, chatgptBridgeConfigPath, readBridgeConfig, writeBridgeConfig } from "./config.ts";
 
 interface ParsedArgs {
   positionals: string[];
@@ -731,10 +732,46 @@ async function mirrorSync(args: ParsedArgs): Promise<number> {
 }
 
 async function chatgptBridge(args: ParsedArgs): Promise<number> {
-  const url = flagString(args, "url");
-  const token = flagString(args, "token");
   const worktree = resolve(flagString(args, "worktree", process.cwd()));
-  return runChatgptBridge({ url, token, worktree });
+  const now = new Date().toISOString();
+
+  // Direct mode: explicit --url + --token connect to an already-running Worker
+  // (e.g. local `wrangler dev`). We never deploy or overwrite the saved worker.
+  if (args.flags.has("url") && args.flags.has("token")) {
+    const url = flagString(args, "url");
+    const token = flagString(args, "token");
+    writeBridgeConfig(addWorkspace(readBridgeConfig(), worktree, now));
+    if (flagBool(args, "no-connect")) {
+      printJson({ mode: "direct", ws_url: url, worktree, connected: false });
+      return 0;
+    }
+    return runChatgptBridge({ url, token, worktree });
+  }
+
+  // Managed mode: deploy the Worker on demand, persist worker + token, reuse next time.
+  let cfg = readBridgeConfig();
+  if (!cfg.worker || !cfg.token || flagBool(args, "redeploy")) {
+    const bridgeDir = locateBridgeDir(args.flags.has("bridge-dir") ? flagString(args, "bridge-dir") : undefined);
+    const deployed = await deployWorker(bridgeDir);
+    cfg = { ...cfg, worker: deployed.worker, token: deployed.token };
+  }
+  const worker = cfg.worker!;
+  const token = cfg.token!;
+  cfg = addWorkspace(cfg, worktree, now);
+  writeBridgeConfig(cfg);
+
+  printJson({
+    mode: "managed",
+    worker: worker.name,
+    mcp_url: worker.mcp_url,
+    ws_url: worker.ws_url,
+    worktree,
+    config_path: chatgptBridgeConfigPath(),
+    hint: "Paste mcp_url into ChatGPT → Settings → Apps → Developer mode → Create.",
+  });
+
+  if (flagBool(args, "no-connect")) return 0;
+  return runChatgptBridge({ url: worker.ws_url, token, worktree });
 }
 
 async function main(): Promise<number> {

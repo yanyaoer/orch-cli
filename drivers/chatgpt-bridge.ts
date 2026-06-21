@@ -1,7 +1,9 @@
 #!/usr/bin/env bun
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { randomBytes } from "node:crypto";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { RPC, isRpcRequest, type RpcRequest, type RpcResponse } from "../chatgpt-bridge/src/protocol.ts";
+import { buildBridgeUrls, parseWorkersUrl, type BridgeWorker } from "../src/config.ts";
 
 export interface ChatgptBridgeOptions {
   url: string;
@@ -67,14 +69,77 @@ interface RunResult {
   stderr: string;
 }
 
-async function run(cmd: string[], cwd: string): Promise<RunResult> {
-  const proc = Bun.spawn(cmd, { cwd, stdout: "pipe", stderr: "pipe", stdin: "ignore" });
+async function run(cmd: string[], cwd: string, stdin?: string): Promise<RunResult> {
+  const proc = Bun.spawn(cmd, {
+    cwd,
+    stdout: "pipe",
+    stderr: "pipe",
+    // Feed secrets through stdin (kept out of argv) when provided.
+    stdin: stdin === undefined ? "ignore" : new TextEncoder().encode(stdin),
+  });
   const [stdout, stderr] = await Promise.all([
     new Response(proc.stdout).text(),
     new Response(proc.stderr).text(),
   ]);
   const code = await proc.exited;
   return { code, stdout, stderr };
+}
+
+// Locate the chatgpt-bridge Worker source. Prefer an explicit --bridge-dir;
+// otherwise resolve it relative to this driver (repo-root/chatgpt-bridge). After
+// bundling to a single binary that relative path is gone, so fail loudly with a
+// hint instead of silently doing the wrong thing.
+export function locateBridgeDir(explicit?: string): string {
+  if (explicit) {
+    const dir = resolve(explicit);
+    if (!existsSync(join(dir, "wrangler.jsonc"))) {
+      throw new Error(`--bridge-dir is not a chatgpt-bridge Worker source (no wrangler.jsonc): ${dir}`);
+    }
+    return dir;
+  }
+  const candidate = resolve(import.meta.dir, "..", "chatgpt-bridge");
+  if (existsSync(join(candidate, "wrangler.jsonc"))) return candidate;
+  throw new Error(
+    "cannot locate the chatgpt-bridge Worker source; run inside the orch repo or pass --bridge-dir <path>.",
+  );
+}
+
+// Idempotently deploy the Worker and attach a fresh BRIDGE_TOKEN, returning the
+// saved worker record plus the token. Ordering matters: `wrangler deploy` must
+// create the Worker before `wrangler secret put` can attach a secret to it.
+export async function deployWorker(bridgeDir: string): Promise<{ worker: BridgeWorker; token: string }> {
+  let who: RunResult;
+  try {
+    who = await run(["wrangler", "whoami"], bridgeDir);
+  } catch {
+    throw new Error("wrangler not found on PATH; install it and run `wrangler login` first.");
+  }
+  if (who.code !== 0) {
+    throw new Error(`wrangler is not logged in; run \`wrangler login\` first.\n${(who.stderr || who.stdout).trim()}`);
+  }
+
+  if (!existsSync(join(bridgeDir, "node_modules"))) {
+    log("installing Worker dependencies (bun install)");
+    const install = await run(["bun", "install"], bridgeDir);
+    if (install.code !== 0) throw new Error(`bun install failed in ${bridgeDir}\n${install.stderr.trim()}`);
+  }
+
+  log("deploying Worker (wrangler deploy)");
+  const deploy = await run(["wrangler", "deploy"], bridgeDir);
+  if (deploy.code !== 0) {
+    throw new Error(`wrangler deploy failed\n${(deploy.stderr || deploy.stdout).trim()}`);
+  }
+  const url = parseWorkersUrl(`${deploy.stdout}\n${deploy.stderr}`);
+  if (!url) throw new Error(`no *.workers.dev URL found in wrangler deploy output:\n${deploy.stdout}`);
+
+  const token = randomBytes(24).toString("hex");
+  log("setting BRIDGE_TOKEN secret (wrangler secret put)");
+  const secret = await run(["wrangler", "secret", "put", "BRIDGE_TOKEN"], bridgeDir, `${token}\n`);
+  if (secret.code !== 0) throw new Error(`wrangler secret put BRIDGE_TOKEN failed\n${(secret.stderr || secret.stdout).trim()}`);
+
+  const { mcp_url, ws_url } = buildBridgeUrls(url, token);
+  const name = new URL(url).hostname.split(".")[0] ?? "orch-chatgpt-bridge";
+  return { worker: { name, url, mcp_url, ws_url, deployed_at: new Date().toISOString() }, token };
 }
 
 function fileSummary(root: string, name: string): { present: boolean; summary?: string } {

@@ -41,15 +41,48 @@ root. Traversal (`..`), absolute paths, and symlinks pointing outside the root
 are rejected. `.env*`, `.git/`, `node_modules/`, `.ssh/`, and private-key files
 (`*.pem`, `*.key`, `id_rsa`, …) are always blocked. There are no write tools.
 
-## Deploy
+## One-stop command
+
+From the repo you want to expose (read-only), with `wrangler` installed and
+`wrangler login` already done:
+
+```bash
+orch chatgpt-bridge --worktree .
+```
+
+On first run this **deploys the Worker**, generates a strong `BRIDGE_TOKEN`,
+derives the MCP/WebSocket URLs, saves them to the config below, registers the
+worktree, and connects. Later runs reuse the saved Worker. The printed `mcp_url`
+is what you paste into ChatGPT (see *Connect ChatGPT* below).
+
+```bash
+orch chatgpt-bridge --no-connect    # deploy + print mcp_url only, do not connect
+orch chatgpt-bridge --redeploy      # force a fresh deploy + new token
+orch chatgpt-bridge --bridge-dir /path/to/chatgpt-bridge   # custom Worker source
+```
+
+Ordering note: a Cloudflare secret can only attach to an existing Worker, so the
+command runs `wrangler deploy` first (creating the Worker), then
+`wrangler secret put BRIDGE_TOKEN` (which triggers a new version with the secret).
+
+### Config
+
+`${XDG_CONFIG_HOME:-$HOME/.config}/orch/chatgpt-bridge.json` (mode `0600`, since
+it stores the token) holds the deployed `worker` (name + url + mcp_url + ws_url),
+the `token`, and the registered `workspaces`.
+
+The agent reconnects automatically (exponential backoff, max 30 s) and exits
+cleanly on Ctrl-C.
+
+## Manual deploy (optional)
+
+If you prefer to manage the Worker yourself:
 
 1. `cd chatgpt-bridge && bun install`
-2. `wrangler secret put BRIDGE_TOKEN` — set a strong shared secret.
-3. `wrangler deploy` → note the URL, e.g. `https://orch-chatgpt-bridge.<acct>.workers.dev`
+2. `wrangler deploy` → note the URL, e.g. `https://orch-chatgpt-bridge.<acct>.workers.dev`
+3. `wrangler secret put BRIDGE_TOKEN` — set a strong shared secret.
 
-## Run the local agent
-
-From the repo you want to expose (read-only):
+Then connect directly (does not deploy or overwrite the saved Worker):
 
 ```bash
 orch chatgpt-bridge --worktree . \
@@ -57,14 +90,12 @@ orch chatgpt-bridge --worktree . \
   --token <BRIDGE_TOKEN>
 ```
 
-It reconnects automatically (exponential backoff, max 30 s) and exits cleanly on
-Ctrl-C.
-
 ## Connect ChatGPT
 
 ChatGPT → Settings → Apps → Advanced → **Developer mode** → Create:
 
-- URL: `https://orch-chatgpt-bridge.<acct>.workers.dev/mcp?token=<BRIDGE_TOKEN>`
+- URL: the `mcp_url` printed by `orch chatgpt-bridge`, e.g.
+  `https://orch-chatgpt-bridge.<acct>.workers.dev/mcp?token=<BRIDGE_TOKEN>`
 
 Then enable the app in a conversation and select model `gpt-5.5-pro`.
 
