@@ -19,6 +19,7 @@ Shipped today:
 - `orch decision` records `accept` or `rework` locally and queues a mirror comment.
 - `orch mirror` and `orch mirror sync` dry-run by default, then use `gh` or `glab` only with `--execute`.
 - Drivers exist for `codex`, `claude`, and `pi`.
+- `orch chatgpt-bridge` deploys a Cloudflare Worker (no tunnel) and connects ChatGPT (Developer Mode, e.g. `gpt-5.5-pro`) to a read-only view of the worktree.
 - Role result schemas exist for `implementer`, `reviewer`, and `verifier`.
 
 Not shipped yet:
@@ -37,6 +38,7 @@ Prerequisites:
 - Git
 - `codex`, `claude`, and/or `pi` authenticated locally if you want real worker runs
 - Optional: `gh` for GitHub mirroring or `glab` for GitLab mirroring
+- Optional: `wrangler` and a Cloudflare account for `orch chatgpt-bridge`
 
 Development setup:
 
@@ -203,6 +205,7 @@ orch status        Read local run status for an MR
 orch decision      Record accept/rework and queue a PR/MR mirror comment
 orch mirror        Mirror one local run result summary to a PR/MR comment
 orch mirror sync   Send queued outbox comments to a PR/MR
+orch chatgpt-bridge  Deploy + connect the read-only ChatGPT bridge (Cloudflare Worker)
 ```
 
 Use command help as the source of truth:

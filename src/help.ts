@@ -19,7 +19,7 @@ export function topLevelHelp(): string {
     "  orch decision      Record accept/rework and queue a PR/MR mirror comment",
     "  orch mirror        Mirror a local run result summary to a PR/MR comment",
     "  orch mirror sync   Send queued outbox comments to a PR/MR",
-    "  orch chatgpt-bridge  Run the local read-only agent for the ChatGPT bridge Worker",
+    "  orch chatgpt-bridge  Deploy + connect the read-only ChatGPT bridge (Cloudflare Worker)",
     "",
     "Quickstart:",
     "  orch run create --mr 123 --role implementer --agent codex --tag impl-a --worktree . --task task.md",
