@@ -4,7 +4,7 @@ import { resolve } from "node:path";
 import { $ } from "bun";
 import type { AgentName, ImplementerResult, RoleResult, RunRole, RunSpec, RunState, RunStatus } from "./types.ts";
 import { isResultRole, writeRoles } from "./types.ts";
-import { acquirePidfileLock } from "./locks.ts";
+import { acquirePidfileLock, LockHeldError } from "./locks.ts";
 import { randomHex, sha256 } from "./hash.ts";
 import { ensureStateLayout, getRepoIdentity, lockPathForWorktree, mrStateDir, orchStateRoot } from "./paths.ts";
 import { jsonBytes, readJsonFile, writeJsonAtomic, writeTextAtomic } from "./json.ts";
@@ -737,6 +737,40 @@ async function mirrorSync(args: ParsedArgs): Promise<number> {
   return failed > 0 ? 1 : 0;
 }
 
+// Only one local agent may bind a given Worker bridge at a time. A second one
+// would fight the first over the singleton BridgeDO ("newest wins" → endless
+// reconnect loop). Guard with a pidfile lock keyed by the bridge host; stale
+// locks (dead holder) are reclaimed automatically by acquirePidfileLock.
+async function connectWithLock(url: string, token: string, worktree: string): Promise<number> {
+  let host: string;
+  try {
+    host = new URL(url).host;
+  } catch {
+    host = url;
+  }
+  const lockPath = `${orchStateRoot()}/chatgpt-bridge-locks/${sha256(host)}.lock`;
+  let lock;
+  try {
+    lock = acquirePidfileLock(lockPath);
+  } catch (error) {
+    if (error instanceof LockHeldError) {
+      throw new CliError(
+        [
+          `another orch chatgpt-bridge is already connected to ${host}${error.holderPid ? ` (pid ${error.holderPid})` : ""}.`,
+          "Only one local agent may bind a Worker bridge at a time.",
+          error.holderPid ? `Stop the other one first:  kill ${error.holderPid}` : "Stop the other instance first.",
+        ].join("\n"),
+      );
+    }
+    throw error;
+  }
+  try {
+    return await runChatgptBridge({ url, token, worktree });
+  } finally {
+    lock.release();
+  }
+}
+
 async function chatgptBridge(args: ParsedArgs): Promise<number> {
   const worktree = resolve(flagString(args, "worktree", process.cwd()));
   const now = new Date().toISOString();
@@ -751,7 +785,7 @@ async function chatgptBridge(args: ParsedArgs): Promise<number> {
       printJson({ mode: "direct", ws_url: url, worktree, connected: false });
       return 0;
     }
-    return runChatgptBridge({ url, token, worktree });
+    return connectWithLock(url, token, worktree);
   }
 
   // Managed mode: deploy the Worker on demand, persist worker + token, reuse next time.
@@ -777,7 +811,7 @@ async function chatgptBridge(args: ParsedArgs): Promise<number> {
   });
 
   if (flagBool(args, "no-connect")) return 0;
-  return runChatgptBridge({ url: worker.ws_url, token, worktree });
+  return connectWithLock(worker.ws_url, token, worktree);
 }
 
 async function main(): Promise<number> {
