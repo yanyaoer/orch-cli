@@ -59,6 +59,8 @@ export function runCreateHelp(): string {
     "  --retry                   Create a new run even when --idempotency-key already exists",
     "  --allow-dirty             Acknowledge dirty write-role worktree and suppress the warning",
     "  --timeout-sec <seconds>   Worker timeout; defaults to 14400",
+    "  --dry-run                Resolve and print the planned run without writing state or spawning",
+    "  --json                   With --dry-run, emit the dry-run plan as JSON instead of text",
     "  --help                    Show this help",
     "",
     "Example:",

@@ -6,6 +6,7 @@ import { acquirePidfileLock, LockHeldError, type PidfileLock } from "./locks.ts"
 import { countLines, appendJsonLine, readJsonFile, writeJsonAtomic } from "./json.ts";
 import { fallbackResult, validateRoleResult } from "./schema.ts";
 import { lockPathForWorktree } from "./paths.ts";
+import { buildWorkerEnv } from "../drivers/driver-common.ts";
 
 function now(): string {
   return new Date().toISOString();
@@ -182,7 +183,7 @@ export async function runSupervisor(runDir: string, orchCommand: string[]): Prom
       stdin: "ignore",
       stdout: "pipe",
       stderr: "pipe",
-      env: process.env,
+      env: buildWorkerEnv(),
     },
   );
 

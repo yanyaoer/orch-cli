@@ -341,6 +341,238 @@ test("observability commands read local run state", async () => {
   expect(humanResult.stdout).toContain("bun test (exit 0): passed");
 });
 
+test("run create dry-run resolves plans without writing state", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orch-dry-run-test-"));
+  const stateHome = join(root, "state");
+  const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
+  await initGitWorktree(worktree);
+  const taskText = "inspect only\n";
+  const taskPath = join(root, "task.md");
+  writeFileSync(taskPath, taskText, "utf8");
+
+  const result = await runOrch(
+    [
+      "run",
+      "create",
+      "--mr",
+      "789",
+      "--role",
+      "implementer",
+      "--agent",
+      "codex",
+      "--tag",
+      "dry-run",
+      "--worktree",
+      worktree,
+      "--task",
+      taskPath,
+      "--timeout-sec",
+      "12",
+      "--dry-run",
+      "--json",
+    ],
+    { XDG_STATE_HOME: stateHome },
+  );
+
+  expect(result).toMatchObject({ exitCode: 0, stderr: "" });
+  const payload = JSON.parse(result.stdout) as {
+    dry_run: boolean;
+    repo: { repo_root: string };
+    mr_dir: string;
+    task_sha: string;
+    idempotency_key: string;
+    run_id: string;
+    run_id_preview: string;
+    run_dir: string;
+    status_path: string;
+    worktree_lock: string;
+    dirty: boolean;
+    base_sha: string;
+    timeout_sec: number;
+    supervisor_plan: { argv: string[]; spawn: boolean };
+    driver_plan: { argv: string[]; spawn: boolean };
+  };
+  const taskSha = sha256(taskText);
+  expect(payload.dry_run).toBe(true);
+  expect(payload.repo.repo_root).toBe(worktree);
+  expect(payload.mr_dir).toContain(join(stateHome, "orch"));
+  expect(payload.task_sha).toBe(taskSha);
+  expect(payload.idempotency_key).toBe(`mr789:dry-run:${taskSha}`);
+  expect(payload.run_id_preview.startsWith("dry-run-")).toBe(true);
+  expect(payload.run_id).toBe(payload.run_id_preview);
+  expect(payload.worktree_lock.startsWith(join(stateHome, "orch", "worktree-locks"))).toBe(true);
+  expect(payload.dirty).toBe(false);
+  expect(payload.base_sha).toHaveLength(40);
+  expect(payload.timeout_sec).toBe(12);
+  expect(payload.supervisor_plan).toMatchObject({ spawn: false });
+  expect(payload.supervisor_plan.argv).toContain("__supervisor");
+  expect(payload.driver_plan).toMatchObject({ spawn: false });
+  expect(payload.driver_plan.argv).toContain("__driver-codex");
+  expect(existsSync(payload.run_dir)).toBe(false);
+  expect(existsSync(payload.status_path)).toBe(false);
+
+  const human = await runOrch(
+    [
+      "run",
+      "create",
+      "--mr",
+      "790",
+      "--role",
+      "reviewer",
+      "--agent",
+      "claude",
+      "--tag",
+      "review-dry",
+      "--worktree",
+      worktree,
+      "--task",
+      taskPath,
+      "--dry-run",
+    ],
+    { XDG_STATE_HOME: stateHome },
+  );
+  expect(human).toMatchObject({ exitCode: 0, stderr: "" });
+  expect(human.stdout).toContain("dry-run: orch run create review-dry-");
+  expect(human.stdout).toContain("supervisor:");
+  expect(human.stdout).toContain("__driver-claude");
+  expect(existsSync(stateHome)).toBe(false);
+});
+
+test("run create dry-run previews idempotent reuse without spawn plan", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orch-dry-run-idem-test-"));
+  const stateHome = join(root, "state");
+  const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
+  await initGitWorktree(worktree);
+  const taskPath = join(root, "task.md");
+  writeFileSync(taskPath, "reuse me\n", "utf8");
+  const env = { XDG_STATE_HOME: stateHome, ORCH_DRIVER_FAKE_RESULT: "1" };
+
+  const created = await runOrch(
+    [
+      "run",
+      "create",
+      "--mr",
+      "791",
+      "--role",
+      "implementer",
+      "--agent",
+      "codex",
+      "--tag",
+      "idem-dry",
+      "--worktree",
+      worktree,
+      "--task",
+      taskPath,
+      "--idempotency-key",
+      "idem-dry-run",
+      "--timeout-sec",
+      "10",
+    ],
+    env,
+  );
+  expect(created).toMatchObject({ exitCode: 0, stderr: "" });
+  const createdPayload = JSON.parse(created.stdout) as { run_id: string; run_dir: string; status_path: string };
+  await waitForRunDone(createdPayload.status_path);
+
+  const preview = await runOrch(
+    [
+      "run",
+      "create",
+      "--mr",
+      "791",
+      "--role",
+      "implementer",
+      "--agent",
+      "codex",
+      "--tag",
+      "idem-dry",
+      "--worktree",
+      worktree,
+      "--task",
+      taskPath,
+      "--idempotency-key",
+      "idem-dry-run",
+      "--timeout-sec",
+      "10",
+      "--dry-run",
+      "--json",
+    ],
+    env,
+  );
+  expect(preview).toMatchObject({ exitCode: 0, stderr: "" });
+  const payload = JSON.parse(preview.stdout) as {
+    idempotent: boolean;
+    existing_run_id: string | null;
+    state: string;
+    run_id: string;
+    run_id_preview: string | null;
+    run_dir: string;
+    status_path: string;
+    result_path: string;
+    events_path: string | null;
+    supervisor_plan: null | { argv: string[] };
+    driver_plan: null | { argv: string[] };
+  };
+  expect(payload).toMatchObject({
+    idempotent: true,
+    existing_run_id: createdPayload.run_id,
+    state: "done",
+    run_id: createdPayload.run_id,
+    run_id_preview: null,
+    run_dir: createdPayload.run_dir,
+    status_path: createdPayload.status_path,
+    result_path: join(createdPayload.run_dir, "result.json"),
+    events_path: null,
+    supervisor_plan: null,
+    driver_plan: null,
+  });
+
+  const retryPreview = await runOrch(
+    [
+      "run",
+      "create",
+      "--mr",
+      "791",
+      "--role",
+      "implementer",
+      "--agent",
+      "codex",
+      "--tag",
+      "idem-dry",
+      "--worktree",
+      worktree,
+      "--task",
+      taskPath,
+      "--idempotency-key",
+      "idem-dry-run",
+      "--retry",
+      "--timeout-sec",
+      "10",
+      "--dry-run",
+      "--json",
+    ],
+    env,
+  );
+  expect(retryPreview).toMatchObject({ exitCode: 0, stderr: "" });
+  const retryPayload = JSON.parse(retryPreview.stdout) as {
+    idempotent: boolean;
+    existing_run_id: string | null;
+    run_id: string;
+    run_id_preview: string | null;
+    run_dir: string;
+    supervisor_plan: { spawn: boolean };
+    driver_plan: { spawn: boolean };
+  };
+  expect(retryPayload.idempotent).toBe(false);
+  expect(retryPayload.existing_run_id).toBe(createdPayload.run_id);
+  expect(retryPayload.run_id).not.toBe(createdPayload.run_id);
+  expect(retryPayload.run_id_preview).toBe(retryPayload.run_id);
+  expect(retryPayload.supervisor_plan).toMatchObject({ spawn: false });
+  expect(retryPayload.driver_plan).toMatchObject({ spawn: false });
+  expect(existsSync(retryPayload.run_dir)).toBe(false);
+  expect(readdirSync(join(stateHome, "orch", repoKeyFromRemote(worktree, worktree), "mrs", "791", "runs"))).toHaveLength(1);
+});
+
 test("run create writes spec.json, hashes landed bytes, warns on dirty write-role, and preserves retry history", async () => {
   const root = mkdtempSync(join(tmpdir(), "orch-create-test-"));
   const stateHome = join(root, "state");
@@ -501,6 +733,181 @@ test("decision records local verdict and queues mirror outbox payload", async ()
   expect(sync.stdout).toContain("gh pr comment 123 --body");
   expect(readdirSync(pendingDir).filter((file) => file.endsWith(".json"))).toHaveLength(1);
   expect(readdirSync(sentDir).filter((file) => file.endsWith(".json"))).toHaveLength(0);
+});
+
+test("decision refuses unsafe mirror body before writing outbox payload", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orch-decision-leak-test-"));
+  const stateHome = join(root, "state");
+  const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
+  const remote = "git@github.com:example/repo.git";
+  await runCmd(["git", "init"], worktree);
+  await runCmd(["git", "remote", "add", "origin", remote], worktree);
+
+  const repoKey = repoKeyFromRemote(remote, worktree);
+  const mr = "124";
+  const runId = "impl-a-20260619T120000Z-def456";
+  const mrDir = join(stateHome, "orch", repoKey, "mrs", mr);
+  const runDir = join(mrDir, "runs", runId);
+  mkdirSync(runDir, { recursive: true });
+
+  const status: RunStatus = {
+    run_id: runId,
+    mr,
+    role: "implementer",
+    agent: "codex",
+    tag: "impl-a",
+    state: "done",
+    pid: null,
+    pgid: null,
+    started_at: "2026-06-19T12:00:00.000Z",
+    updated_at: "2026-06-19T12:01:00.000Z",
+    exit_code: 0,
+    timeout_sec: 3600,
+    last_event_seq: 1,
+    native_event_count: 0,
+    provider_resume_id: null,
+    worktree,
+    base_sha: "base",
+    head_sha: "head",
+  };
+  const result: ImplementerResult = {
+    schema: "orch.result/implementer/v1",
+    run_id: runId,
+    verdict: "completed",
+    summary: "safe summary",
+    base_sha: "base",
+    head_sha: "head",
+    changed_files: ["src/orch.ts"],
+    tests: [],
+    acceptance: [],
+    risks: [],
+    rollback: "revert",
+  };
+  writeFileSync(join(runDir, "status.json"), `${JSON.stringify(status, null, 2)}\n`, "utf8");
+  writeFileSync(join(runDir, "result.json"), `${JSON.stringify(result, null, 2)}\n`, "utf8");
+
+  const decision = await runOrch(
+    [
+      "decision",
+      "accept",
+      "--mr",
+      mr,
+      "--run",
+      runId,
+      "--worktree",
+      worktree,
+      "--reason",
+      "reviewed in .claude/settings.json",
+    ],
+    { XDG_STATE_HOME: stateHome },
+  );
+
+  expect(decision.exitCode).toBe(1);
+  expect(decision.stdout).toBe("");
+  expect(decision.stderr).toContain("refusing to mirror comment body");
+  expect(decision.stderr).toContain("ORCH_MIRROR_ALLOW_PRIVATE=1");
+  expect(existsSync(join(runDir, "decision.json"))).toBe(false);
+  expect(readdirSync(join(mrDir, "outbox", "pending")).filter((file) => file.endsWith(".json"))).toHaveLength(0);
+});
+
+test("mirror dry-run refuses unsafe body before posting", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orch-mirror-leak-test-"));
+  const stateHome = join(root, "state");
+  const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
+  const remote = "git@github.com:example/repo.git";
+  await runCmd(["git", "init"], worktree);
+  await runCmd(["git", "remote", "add", "origin", remote], worktree);
+
+  const repoKey = repoKeyFromRemote(remote, worktree);
+  const mr = "125";
+  const runId = "impl-a-20260619T120000Z-ghi789";
+  const runDir = join(stateHome, "orch", repoKey, "mrs", mr, "runs", runId);
+  mkdirSync(runDir, { recursive: true });
+
+  const status: RunStatus = {
+    run_id: runId,
+    mr,
+    role: "implementer",
+    agent: "codex",
+    tag: "impl-a",
+    state: "done",
+    pid: null,
+    pgid: null,
+    started_at: "2026-06-19T12:00:00.000Z",
+    updated_at: "2026-06-19T12:01:00.000Z",
+    exit_code: 0,
+    timeout_sec: 3600,
+    last_event_seq: 1,
+    native_event_count: 0,
+    provider_resume_id: null,
+    worktree,
+    base_sha: "base",
+    head_sha: "head",
+  };
+  const result: ImplementerResult = {
+    schema: "orch.result/implementer/v1",
+    run_id: runId,
+    verdict: "completed",
+    summary: "wrote files under /Users/alice/project",
+    base_sha: "base",
+    head_sha: "head",
+    changed_files: ["src/orch.ts"],
+    tests: [],
+    acceptance: [],
+    risks: [],
+    rollback: "revert",
+  };
+  writeFileSync(join(runDir, "status.json"), `${JSON.stringify(status, null, 2)}\n`, "utf8");
+  writeFileSync(join(runDir, "result.json"), `${JSON.stringify(result, null, 2)}\n`, "utf8");
+
+  const mirrored = await runOrch(["mirror", "--mr", mr, "--run", runId, "--worktree", worktree], {
+    XDG_STATE_HOME: stateHome,
+  });
+
+  expect(mirrored.exitCode).toBe(1);
+  expect(mirrored.stdout).toBe("");
+  expect(mirrored.stderr).toContain("refusing to mirror comment body");
+  expect(mirrored.stderr).toContain("ORCH_MIRROR_ALLOW_PRIVATE=1");
+  expect(mirrored.stderr).not.toContain("gh pr comment");
+});
+
+test("mirror sync dry-run refuses unsafe queued payload before posting", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orch-mirror-sync-leak-test-"));
+  const stateHome = join(root, "state");
+  const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
+  const remote = "git@github.com:example/repo.git";
+  await runCmd(["git", "init"], worktree);
+  await runCmd(["git", "remote", "add", "origin", remote], worktree);
+
+  const repoKey = repoKeyFromRemote(remote, worktree);
+  const mr = "126";
+  const mrDir = join(stateHome, "orch", repoKey, "mrs", mr);
+  const pendingDir = join(mrDir, "outbox", "pending");
+  mkdirSync(pendingDir, { recursive: true });
+  writeFileSync(
+    join(pendingDir, "unsafe.json"),
+    `${JSON.stringify(
+      {
+        kind: "comment",
+        mr,
+        body: "state lives in .local/state/orch/example",
+        created_at: "2026-06-19T12:00:00.000Z",
+      },
+      null,
+      2,
+    )}\n`,
+    "utf8",
+  );
+
+  const sync = await runOrch(["mirror", "sync", "--mr", mr, "--worktree", worktree], { XDG_STATE_HOME: stateHome });
+
+  expect(sync.exitCode).toBe(1);
+  expect(sync.stderr).toBe("");
+  expect(sync.stdout).toContain("refusing to mirror comment body");
+  expect(sync.stdout).toContain("ORCH_MIRROR_ALLOW_PRIVATE=1");
+  expect(sync.stdout).not.toContain("gh pr comment");
+  expect(readdirSync(pendingDir).filter((file) => file.endsWith(".json"))).toHaveLength(1);
+  expect(readdirSync(join(mrDir, "outbox", "sent")).filter((file) => file.endsWith(".json"))).toHaveLength(0);
 });
 
 test("write-role worktree lock is shared within an MR and across MRs", async () => {

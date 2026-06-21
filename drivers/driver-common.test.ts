@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { extractResultFromRunDir } from "./driver-common.ts";
+import { buildWorkerEnv, extractResultFromRunDir, extractResultFromText } from "./driver-common.ts";
 import type { RunSpec } from "../src/types.ts";
 
 const tempDirs: string[] = [];
@@ -36,6 +36,49 @@ function spec(role: RunSpec["role"], runId: string): RunSpec {
     created_at: "2026-06-19T12:00:00.000Z",
   };
 }
+
+test("buildWorkerEnv preserves normal env and removes recursive tool settings", () => {
+  const baseEnv = {
+    PATH: "/usr/bin",
+    HOME: "/home/orch",
+    ANTHROPIC_API_KEY: "keep-auth",
+    OPENAI_API_KEY: "keep-openai-auth",
+    CODEX_HOME: "/home/orch/.codex",
+    ORCH_DRIVER_FAKE_RESULT: "1",
+    CLAUDECODE: "1",
+    CLAUDE_CODE_CHILD_SESSION: "1",
+    CLAUDE_CODE_SESSION_ID: "session",
+    CLAUDE_CODE_ENTRYPOINT: "entry",
+    CLAUDE_CODE_SSE_PORT: "1234",
+    CLAUDE_CODE_AUTO_CONNECT_IDE: "true",
+    MCP_CONFIG: "/tmp/mcp.json",
+    CODEX_MCP_CONFIG: "/tmp/codex-mcp.json",
+    ORCH_MCP_URL: "http://127.0.0.1:9999/mcp",
+    EMPTY_VALUE: undefined,
+  };
+  const env = buildWorkerEnv(baseEnv);
+
+  expect(env.PATH).toBe("/usr/bin");
+  expect(env.HOME).toBe("/home/orch");
+  expect(env.ANTHROPIC_API_KEY).toBe("keep-auth");
+  expect(env.OPENAI_API_KEY).toBe("keep-openai-auth");
+  expect(env.CODEX_HOME).toBe("/home/orch/.codex");
+  expect(env.ORCH_DRIVER_FAKE_RESULT).toBe("1");
+  expect(env.CLAUDE_CODE_AUTO_CONNECT_IDE).toBe("false");
+  expect(env.CLAUDE_CODE_MCP_ALLOWLIST_ENV).toBe("1");
+  expect("CLAUDECODE" in env).toBe(false);
+  expect("CLAUDE_CODE_CHILD_SESSION" in env).toBe(false);
+  expect("CLAUDE_CODE_SESSION_ID" in env).toBe(false);
+  expect("CLAUDE_CODE_ENTRYPOINT" in env).toBe(false);
+  expect("CLAUDE_CODE_SSE_PORT" in env).toBe(false);
+  expect("MCP_CONFIG" in env).toBe(false);
+  expect("CODEX_MCP_CONFIG" in env).toBe(false);
+  expect("ORCH_MCP_URL" in env).toBe(false);
+  expect("EMPTY_VALUE" in env).toBe(false);
+  expect(baseEnv.CLAUDECODE).toBe("1");
+  expect(baseEnv.MCP_CONFIG).toBe("/tmp/mcp.json");
+  expect(buildWorkerEnv(env)).toEqual(env);
+});
 
 test("extractResultFromRunDir preserves codex agent_message extraction", () => {
   const runDir = tempDir();
@@ -152,4 +195,48 @@ test("extractResultFromRunDir reads pi message_end assistant text events", () =>
   );
 
   expect(extractResultFromRunDir(runDir, spec("reviewer", "review-pi"))).toEqual(reviewer);
+});
+
+test("extractResultFromRunDir accepts codex final text wrapped by schema key", () => {
+  const runDir = tempDir();
+  const reviewer = {
+    schema: "orch.result/reviewer/v1",
+    run_id: "review-codex",
+    verdict: "approve",
+    reviews_run_id: "impl-a",
+    blocking_findings: [],
+    non_blocking_findings: [],
+    suggested_tests: ["bun test"],
+  };
+  writeFileSync(
+    join(runDir, "native.jsonl"),
+    `${JSON.stringify({ item: { type: "agent_message", text: JSON.stringify({ "orch.result/reviewer/v1": reviewer }) } })}\n`,
+    "utf8",
+  );
+
+  expect(extractResultFromRunDir(runDir, spec("reviewer", "review-codex"))).toEqual(reviewer);
+  expect(extractResultFromText(JSON.stringify({ result: reviewer }), spec("reviewer", "review-codex"))).toEqual(reviewer);
+  expect(extractResultFromText(JSON.stringify({ metadata: reviewer }), spec("reviewer", "review-codex"))).toBeNull();
+});
+
+test("extractResultFromRunDir accepts claude final text with prose before result JSON", () => {
+  const runDir = tempDir();
+  const verifier = {
+    schema: "orch.result/verifier/v1",
+    run_id: "verify-claude-prose",
+    verdict: "pass",
+    verifies_run_id: "impl-a",
+    commands: [{ cmd: "bun test drivers/driver-common.test.ts", exit_code: 0, summary: "passed" }],
+    acceptance: [{ id: "result-extraction", status: "pass" }],
+  };
+  writeFileSync(
+    join(runDir, "native.jsonl"),
+    `${JSON.stringify({
+      type: "result",
+      result: `I checked the implementation first {not JSON}.\n${JSON.stringify(verifier)}\nNo further notes.`,
+    })}\n`,
+    "utf8",
+  );
+
+  expect(extractResultFromRunDir(runDir, spec("verifier", "verify-claude-prose"))).toEqual(verifier);
 });

@@ -1,6 +1,6 @@
 import { closeSync, existsSync, openSync, readFileSync, writeFileSync, writeSync } from "node:fs";
-import type { RunSpec, RoleResult } from "../src/types.ts";
-import { fallbackResult, validateRoleResult } from "../src/schema.ts";
+import { isResultRole, type RunSpec, type RoleResult } from "../src/types.ts";
+import { fallbackResult, resultSchemaName, validateRoleResult } from "../src/schema.ts";
 import { writeJsonAtomic } from "../src/json.ts";
 
 export interface DriverArgs {
@@ -48,41 +48,138 @@ export function buildPrompt(spec: RunSpec, provider: string): string {
   ].join("\n");
 }
 
+const recursiveToolEnvKeys = [
+  // Inherited Claude Code tool subprocess/session markers can make nested drivers
+  // attach back to the parent tool/MCP session. Keep auth, model, HOME, and PATH intact.
+  "CLAUDECODE",
+  "CLAUDE_CODE_CHILD_SESSION",
+  "CLAUDE_CODE_SESSION_ID",
+  "CLAUDE_CODE_ENTRYPOINT",
+  "CLAUDE_CODE_SSE_PORT",
+  // Common direct MCP config env names used by wrappers and bridges.
+  "MCP_CONFIG",
+  "MCP_CONFIG_PATH",
+  "MCP_SERVER_CONFIG",
+  "MCP_SERVER_URL",
+  "MCP_SERVERS",
+  "MCP_TOOLS",
+  "CLAUDE_CODE_MCP_CONFIG",
+  "CLAUDE_MCP_CONFIG",
+  "CODEX_MCP_CONFIG",
+  "OPENAI_MCP_CONFIG",
+  // orch bridge/tool endpoint env names must not recursively leak to workers.
+  "ORCH_MCP_URL",
+  "ORCH_MCP_TOKEN",
+  "ORCH_MCP_WS_URL",
+  "ORCH_TOOL_SERVER_URL",
+] as const;
+
+export function buildWorkerEnv(baseEnv: NodeJS.ProcessEnv = process.env): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(baseEnv)) {
+    if (value !== undefined) env[key] = value;
+  }
+
+  for (const key of recursiveToolEnvKeys) delete env[key];
+  // Claude-specific hardening: do not auto-connect nested IDE/tool sessions, and
+  // restrict any child-started Claude MCP servers to their own explicit allowlist.
+  env.CLAUDE_CODE_AUTO_CONNECT_IDE = "false";
+  env.CLAUDE_CODE_MCP_ALLOWLIST_ENV = "1";
+  return env;
+}
+
 function tryParseJson(text: string): unknown | null {
-  const trimmed = text.trim();
-  if (!trimmed) return null;
   try {
-    return JSON.parse(trimmed);
+    return JSON.parse(text.trim());
   } catch {
-    // Continue with extraction heuristics.
+    return null;
   }
+}
 
-  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/);
-  if (fenced?.[1]) {
-    try {
-      return JSON.parse(fenced[1].trim());
-    } catch {
-      // Continue.
+function findJsonObjectEnd(text: string, start: number): number | null {
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let index = start; index < text.length; index++) {
+    const char = text[index];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (char === '"') {
+      inString = true;
+    } else if (char === "{") {
+      depth++;
+    } else if (char === "}") {
+      depth--;
+      if (depth === 0) return index;
+      if (depth < 0) return null;
     }
   }
 
-  const start = trimmed.indexOf("{");
-  const end = trimmed.lastIndexOf("}");
-  if (start >= 0 && end > start) {
-    try {
-      return JSON.parse(trimmed.slice(start, end + 1));
-    } catch {
-      return null;
-    }
+  return null;
+}
+
+function parsedJsonCandidates(text: string): unknown[] {
+  const trimmed = text.trim();
+  if (!trimmed) return [];
+
+  const direct = tryParseJson(trimmed);
+  if (direct !== null) return [direct];
+
+  const candidates: unknown[] = [];
+  const seen = new Set<string>();
+  const pushJson = (json: string): void => {
+    const key = json.trim();
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    const parsed = tryParseJson(key);
+    if (parsed !== null) candidates.push(parsed);
+  };
+
+  for (const fenced of trimmed.matchAll(/```(?:json)?\s*([\s\S]*?)```/g)) {
+    if (fenced[1]) pushJson(fenced[1]);
+  }
+
+  for (let start = 0; start < trimmed.length; start++) {
+    if (trimmed[start] !== "{") continue;
+    const end = findJsonObjectEnd(trimmed, start);
+    if (end === null) continue;
+    pushJson(trimmed.slice(start, end + 1));
+  }
+
+  return candidates;
+}
+
+function roleResultFromCandidate(value: unknown, spec: RunSpec): RoleResult | null {
+  if (validateRoleResult(spec.role, value).ok) return value as RoleResult;
+
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  if (!isResultRole(spec.role)) return null;
+
+  const obj = value as Record<string, unknown>;
+  const schemaName = resultSchemaName(spec.role);
+  for (const key of [schemaName, "result"]) {
+    const wrapped = obj[key];
+    if (validateRoleResult(spec.role, wrapped).ok) return wrapped as RoleResult;
   }
   return null;
 }
 
 export function extractResultFromText(text: string, spec: RunSpec): RoleResult | null {
-  const parsed = tryParseJson(text);
-  if (!parsed) return null;
-  const validation = validateRoleResult(spec.role, parsed);
-  return validation.ok ? (parsed as RoleResult) : null;
+  for (const candidate of parsedJsonCandidates(text)) {
+    const result = roleResultFromCandidate(candidate, spec);
+    if (result) return result;
+  }
+  return null;
 }
 
 function textFromClaudeAssistantContent(content: unknown): string | null {

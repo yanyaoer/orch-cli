@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 import {
+  buildWorkerEnv,
   buildPrompt,
   extractResultFromRunDir,
   maybeWriteFakeResult,
@@ -24,7 +25,7 @@ export async function runClaudeDriver(argv: string[]): Promise<number> {
       stdin: "pipe",
       stdout: "pipe",
       stderr: "inherit",
-      env: process.env,
+      env: buildWorkerEnv(),
     },
   );
   proc.stdin.write(prompt);

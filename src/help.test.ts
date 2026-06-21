@@ -46,6 +46,8 @@ test("command help exposes flags and runnable examples", () => {
     "--retry",
     "--allow-dirty",
     "--timeout-sec",
+    "--dry-run",
+    "--json",
   ]) {
     expect(runCreate).toContain(flag);
   }

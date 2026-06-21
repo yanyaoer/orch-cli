@@ -9,6 +9,7 @@ import { randomHex, sha256 } from "./hash.ts";
 import { ensureStateLayout, getRepoIdentity, lockPathForWorktree, mrStateDir, orchStateRoot } from "./paths.ts";
 import { jsonBytes, readJsonFile, writeJsonAtomic, writeTextAtomic } from "./json.ts";
 import { argvForDisplay, createForgeAdapter, detectForge } from "./forge.ts";
+import { findPrivateLeak, privateLeakAllowed, privateLeakErrorMessage } from "./leak.ts";
 import { runSupervisor, writeInitialRunFiles } from "./supervisor.ts";
 import {
   HELP_TOPICS,
@@ -74,6 +75,12 @@ interface OutboxCommentPayload {
 }
 
 class CliError extends Error {}
+
+function assertMirrorBodySafe(body: string): void {
+  if (privateLeakAllowed()) return;
+  const finding = findPrivateLeak(body);
+  if (finding) throw new CliError(privateLeakErrorMessage(finding));
+}
 
 function stateDirectoryHint(path: string, error: unknown): CliError {
   const detail = error instanceof Error ? error.message : String(error);
@@ -195,6 +202,7 @@ function pendingOutboxFiles(mrDir: string): string[] {
 }
 
 function enqueueComment(mrDir: string, payload: OutboxCommentPayload): string {
+  assertMirrorBodySafe(payload.body);
   const filename = `${utcCompact()}-${randomHex(4)}.json`;
   const path = `${pendingOutboxDir(mrDir)}/${filename}`;
   writeJsonAtomic(path, payload);
@@ -419,6 +427,81 @@ async function createRun(args: ParsedArgs): Promise<number> {
 
   const repo = await getRepoIdentity(worktree);
   const mrDir = mrStateDir(repo.repo_key, mr);
+  const taskSha = sha256(taskText);
+  const idempotencyKey = flagString(args, "idempotency-key", `mr${mr}:${tag}:${taskSha}`);
+  const idempotencyPath = `${mrDir}/idempotency.json`;
+  const dryRun = flagBool(args, "dry-run");
+  if (dryRun) {
+    const retry = flagBool(args, "retry");
+    const dirty = await gitDirty(worktree);
+    const baseSha = await gitHead(worktree);
+    const existing = readIdempotency(idempotencyPath)[idempotencyKey];
+    const idempotent = Boolean(existing && !retry);
+    const id = idempotent ? existing!.run_id : runId(tag);
+    const runDir = idempotent ? existing!.run_dir : `${mrDir}/runs/${id}`;
+    const specPath = `${runDir}/spec.json`;
+    const payload = {
+      dry_run: true,
+      mr,
+      role,
+      agent,
+      tag,
+      repo,
+      repo_key: repo.repo_key,
+      mr_dir: mrDir,
+      task_path: taskPath,
+      task_sha: taskSha,
+      idempotency_key: idempotencyKey,
+      idempotent,
+      existing_run_id: existing?.run_id ?? null,
+      state: idempotent ? statusState(existing!) : "would_start",
+      run_id: id,
+      run_id_preview: idempotent ? null : id,
+      run_dir: runDir,
+      status_path: idempotent ? existing!.status_path : `${runDir}/status.json`,
+      result_path: idempotent ? existing!.result_path : `${runDir}/result.json`,
+      events_path: idempotent ? null : `${runDir}/events.jsonl`,
+      worktree_lock: lockPathForWorktree(worktree),
+      dirty: dirty.length > 0,
+      base_sha: baseSha,
+      timeout_sec: timeoutSec,
+      supervisor_plan: idempotent
+        ? null
+        : {
+            argv: [...orchCommand(), "__supervisor", "--run-dir", runDir],
+            cwd: worktree,
+            spawn: false,
+          },
+      driver_plan: idempotent
+        ? null
+        : {
+            argv: [...orchCommand(), `__driver-${agent}`, "--spec", specPath, "--run-dir", runDir, "--worktree", worktree],
+            cwd: worktree,
+            spawn: false,
+          },
+    };
+    if (flagBool(args, "json")) {
+      printJson(payload);
+    } else {
+      const lines = [
+        `dry-run: orch run create ${payload.run_id_preview ?? payload.run_id}`,
+        `repo: ${repo.repo_key}`,
+        `mr_dir: ${mrDir}`,
+        `task_sha: ${taskSha}`,
+        `idempotency_key: ${idempotencyKey}`,
+        `idempotent: ${payload.idempotent}`,
+        `state: ${payload.state}`,
+        `worktree_lock: ${payload.worktree_lock}`,
+        `dirty: ${payload.dirty}`,
+        `base_sha: ${baseSha}`,
+        `timeout_sec: ${timeoutSec}`,
+      ];
+      if (payload.supervisor_plan) lines.push(`supervisor: ${payload.supervisor_plan.argv.join(" ")}`);
+      if (payload.driver_plan) lines.push(`driver: ${payload.driver_plan.argv.join(" ")}`);
+      process.stdout.write(lines.join("\n") + "\n");
+    }
+    return 0;
+  }
   try {
     ensureStateLayout(mrDir);
   } catch (error) {
@@ -426,9 +509,6 @@ async function createRun(args: ParsedArgs): Promise<number> {
   }
   const mrLock = acquirePidfileLock(`${mrDir}/locks/mr.lock`);
   try {
-    const taskSha = sha256(taskText);
-    const idempotencyKey = flagString(args, "idempotency-key", `mr${mr}:${tag}:${taskSha}`);
-    const idempotencyPath = `${mrDir}/idempotency.json`;
     const idempotency = readIdempotency(idempotencyPath);
     const existing = idempotency[idempotencyKey];
     if (existing && !flagBool(args, "retry")) {
@@ -484,6 +564,8 @@ async function createRun(args: ParsedArgs): Promise<number> {
         stdin: "ignore",
         stdout: "ignore",
         stderr: "ignore",
+        // The supervisor is an orch process; AI/tool subprocess env is sanitized
+        // at the supervisor→driver and driver→provider boundaries.
         env: process.env,
       },
     );
@@ -612,6 +694,7 @@ async function mirror(args: ParsedArgs): Promise<number> {
 
   const { result, status } = readMirrorResult(runsRoot, runId);
   const body = mirrorBody(mr, runId, result, status);
+  assertMirrorBodySafe(body);
   const command = await adapter.postComment(mr, body);
 
   printJson({
@@ -645,10 +728,11 @@ async function decision(args: ParsedArgs): Promise<number> {
   const { result, status } = readMirrorResult(runsRoot, runId);
   const ts = new Date().toISOString();
   const record: DecisionRecord = { verdict, run_id: runId, reason, ts };
+  const body = decisionBody(mr, runId, record, result, status);
+  assertMirrorBodySafe(body);
   const runDir = `${runsRoot}/${runId}`;
   writeJsonAtomic(`${runDir}/decision.json`, record);
 
-  const body = decisionBody(mr, runId, record, result, status);
   const outboxPath = enqueueComment(mrDir, {
     kind: "comment",
     mr,
@@ -712,6 +796,19 @@ async function mirrorSync(args: ParsedArgs): Promise<number> {
       continue;
     }
 
+    try {
+      assertMirrorBodySafe(payload.body);
+    } catch (error) {
+      printJson({
+        mirror: execute ? "failed" : "dry-run",
+        forge,
+        mr: payload.mr,
+        outbox_path: pendingPath,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      failed += 1;
+      continue;
+    }
     const command = await adapter.postComment(payload.mr, payload.body);
     const success = command.exit_code === 0;
     printJson({
