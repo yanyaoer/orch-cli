@@ -12,6 +12,7 @@ import { argvForDisplay, createForgeAdapter, detectForge } from "./forge.ts";
 import { runSupervisor, writeInitialRunFiles } from "./supervisor.ts";
 import {
   HELP_TOPICS,
+  chatgptBridgeHelp,
   decisionHelp,
   eventsTailHelp,
   mirrorHelp,
@@ -28,6 +29,7 @@ import {
 } from "./help.ts";
 import { runCodexDriver } from "../drivers/codex-headless.ts";
 import { runClaudeDriver } from "../drivers/claude-headless.ts";
+import { runChatgptBridge } from "../drivers/chatgpt-bridge.ts";
 
 interface ParsedArgs {
   positionals: string[];
@@ -709,6 +711,13 @@ async function mirrorSync(args: ParsedArgs): Promise<number> {
   return failed > 0 ? 1 : 0;
 }
 
+async function chatgptBridge(args: ParsedArgs): Promise<number> {
+  const url = flagString(args, "url");
+  const token = flagString(args, "token");
+  const worktree = resolve(flagString(args, "worktree", process.cwd()));
+  return runChatgptBridge({ url, token, worktree });
+}
+
 async function main(): Promise<number> {
   const args = parseArgs(process.argv.slice(2));
   const [first, second] = args.positionals;
@@ -757,6 +766,10 @@ async function main(): Promise<number> {
       process.stdout.write(mirrorHelp());
       return 0;
     }
+    if (first === "chatgpt-bridge") {
+      process.stdout.write(chatgptBridgeHelp());
+      return 0;
+    }
     if (first === "help") {
       process.stdout.write(second && isHelpTopic(second) ? topicHelp(second) : topLevelHelp());
       return 0;
@@ -785,6 +798,7 @@ async function main(): Promise<number> {
   if (first === "status") return status(args);
   if (first === "decision") return decision(args);
   if (first === "mirror") return mirror(args);
+  if (first === "chatgpt-bridge") return chatgptBridge(args);
   process.stderr.write(topLevelHelp());
   return 2;
 }

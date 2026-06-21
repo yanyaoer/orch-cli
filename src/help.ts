@@ -19,6 +19,7 @@ export function topLevelHelp(): string {
     "  orch decision      Record accept/rework and queue a PR/MR mirror comment",
     "  orch mirror        Mirror a local run result summary to a PR/MR comment",
     "  orch mirror sync   Send queued outbox comments to a PR/MR",
+    "  orch chatgpt-bridge  Run the local read-only agent for the ChatGPT bridge Worker",
     "",
     "Quickstart:",
     "  orch run create --mr 123 --role implementer --agent codex --tag impl-a --worktree . --task task.md",
@@ -349,6 +350,27 @@ export function unknownTopicHelp(topic: string): string {
     "",
     "Use:",
     "  orch help <topic>",
+  ]);
+}
+
+export function chatgptBridgeHelp(): string {
+  return lines([
+    "orch chatgpt-bridge: run the local read-only agent for the ChatGPT bridge Worker",
+    "",
+    "Usage:",
+    "  orch chatgpt-bridge --url <ws(s)://host/ws> --token <T> [--worktree <path>]",
+    "",
+    "Flags:",
+    "  --url <url>         Worker WebSocket endpoint, e.g. wss://<worker>.workers.dev/ws (required)",
+    "  --token <token>     Shared secret matching the Worker's BRIDGE_TOKEN (required)",
+    "  --worktree <path>   Worktree the remote may read; defaults to the current directory",
+    "  --help              Show this help",
+    "",
+    "The agent dials out to the Worker over WebSocket (no inbound port / tunnel) and",
+    "serves read-only tools scoped to the worktree: open_workspace, read, search, show_changes.",
+    "",
+    "Example:",
+    "  orch chatgpt-bridge --worktree . --url wss://orch-chatgpt-bridge.workers.dev/ws --token $BRIDGE_TOKEN",
   ]);
 }
 

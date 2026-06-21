@@ -1,0 +1,21 @@
+{
+  "name": "orch-chatgpt-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "agents": "^0.16.2",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "wrangler": "^4.103.0",
+    "@cloudflare/workers-types": "^4.20260621.1",
+    "typescript": "^5.9.2"
+  }
+}

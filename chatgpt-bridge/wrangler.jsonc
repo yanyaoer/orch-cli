@@ -1,0 +1,18 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "orch-chatgpt-bridge",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-06-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+  "durable_objects": {
+    "bindings": [
+      { "name": "BRIDGE_DO", "class_name": "BridgeDO" },
+      { "name": "BRIDGE_MCP", "class_name": "BridgeMcp" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["BridgeDO", "BridgeMcp"] }
+  ]
+  // BRIDGE_TOKEN is a secret: `wrangler secret put BRIDGE_TOKEN`
+}
