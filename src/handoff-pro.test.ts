@@ -11,7 +11,7 @@ import {
   redactSensitiveText,
   truncateText,
   unique,
-} from "./bundle.ts";
+} from "./handoff-pro.ts";
 
 const tempDirs: string[] = [];
 

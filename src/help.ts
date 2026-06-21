@@ -20,7 +20,7 @@ export function topLevelHelp(): string {
     "  orch mirror        Mirror a local run result summary to a PR/MR comment",
     "  orch mirror sync   Send queued outbox comments to a PR/MR",
     "  orch chatgpt-bridge  Deploy + connect the read-only ChatGPT bridge (Cloudflare Worker)",
-    "  orch bundle        Export a self-contained context bundle for tool-less models",
+    "  orch handoff-pro   Hand off full repo context to a tool-less model (e.g. gpt-5.5-pro)",
     "",
     "Quickstart:",
     "  orch run create --mr 123 --role implementer --agent codex --tag impl-a --worktree . --task task.md",
@@ -394,25 +394,28 @@ export function chatgptBridgeHelp(): string {
   ]);
 }
 
-export function bundleHelp(): string {
+export function handoffProHelp(): string {
   return lines([
-    "orch bundle: export a self-contained markdown context bundle for tool-less models",
+    "orch handoff-pro: hand off full repo context to a model that cannot call tools",
     "",
     "Usage:",
-    "  orch bundle [--worktree <path>] [--path <file>]... [--glob <pat>]... [flags]",
+    "  orch handoff-pro [--worktree <path>] [--path <file>]... [--glob <pat>]... [flags]",
     "",
     "Why:",
-    "  Some strong models (e.g. ChatGPT Pro / gpt-5.5-pro) reason without MCP tools and",
-    "  cannot read your repo. This packs a repo snapshot (tree, status, diff, key files)",
-    "  into one markdown file you paste in for review/planning. Execute the plan later",
-    "  with `orch run create --agent codex|pi`.",
+    "  A normal sub-agent handoff is terse: the agent has tools and reads the repo",
+    "  itself. handoff-pro is the opposite — strong models that reason WITHOUT tools",
+    "  (e.g. ChatGPT Pro / gpt-5.5-pro) cannot read your repo, so this packs a full",
+    "  snapshot (tree, status, diff, key + changed file contents) into one markdown",
+    "  blob you paste in for review/planning. Execute the resulting plan with",
+    "  `orch run create --agent codex|pi --task <plan>`.",
     "",
     "Flags:",
     "  --worktree <path>        Repo to snapshot; defaults to the current directory",
     "  --path <file>            Include this file (repeatable)",
     "  --glob <pat>             Include files matching this glob (repeatable)",
     "  --title <t>              Bundle title heading",
-    "  --out <file>             Output path; defaults to <worktree>/.ai-bridge/pro-context.md",
+    "  --out <file>             Output path; defaults to",
+    "                           ${XDG_STATE_HOME:-$HOME/.local/state}/orch/<repo_key>/handoffs/context-<ts>.md",
     "  --copy                   Also copy the markdown to the clipboard (macOS pbcopy)",
     "  --no-diff                Skip the git diff section",
     "  --no-important-files     Do not auto-include important root files (README, package.json, ...)",
@@ -425,11 +428,12 @@ export function bundleHelp(): string {
     "",
     "Safety:",
     "  All paths pass the bridge path guard; .env, private keys, .git, and node_modules",
-    "  are always excluded, and obvious inline secrets are redacted.",
+    "  are always excluded, and obvious inline secrets are redacted. Output lives under",
+    "  XDG_STATE (user-private), never inside the worktree.",
     "",
     "Examples:",
-    "  orch bundle --worktree .",
-    "  orch bundle --path src/orch.ts --glob 'src/**/*.ts' --copy",
+    "  orch handoff-pro --worktree . --copy",
+    "  orch handoff-pro --path src/orch.ts --glob 'src/**/*.ts' --copy",
   ]);
 }
 

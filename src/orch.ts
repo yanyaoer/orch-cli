@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync } from "node:fs";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import { $ } from "bun";
 import type { AgentName, ImplementerResult, RoleResult, RunRole, RunSpec, RunState, RunStatus } from "./types.ts";
 import { isResultRole, writeRoles } from "./types.ts";
@@ -12,8 +12,8 @@ import { argvForDisplay, createForgeAdapter, detectForge } from "./forge.ts";
 import { runSupervisor, writeInitialRunFiles } from "./supervisor.ts";
 import {
   HELP_TOPICS,
-  bundleHelp,
   chatgptBridgeHelp,
+  handoffProHelp,
   decisionHelp,
   eventsTailHelp,
   mirrorHelp,
@@ -33,7 +33,7 @@ import { runClaudeDriver } from "../drivers/claude-headless.ts";
 import { deployWorker, locateBridgeDir, runChatgptBridge } from "../drivers/chatgpt-bridge.ts";
 import { runPiDriver } from "../drivers/pi-headless.ts";
 import { addWorkspace, chatgptBridgeConfigPath, readBridgeConfig, writeBridgeConfig } from "./config.ts";
-import { BUNDLE_REL_PATH, buildBundle, type BundleOptions } from "./bundle.ts";
+import { buildBundle, type BundleOptions } from "./handoff-pro.ts";
 
 interface ParsedArgs {
   positionals: string[];
@@ -852,7 +852,7 @@ async function copyToClipboard(text: string): Promise<boolean> {
   }
 }
 
-async function bundle(args: ParsedArgs): Promise<number> {
+async function handoffPro(args: ParsedArgs): Promise<number> {
   const worktree = resolve(flagString(args, "worktree", process.cwd()));
   const options: BundleOptions = {
     worktree,
@@ -869,7 +869,17 @@ async function bundle(args: ParsedArgs): Promise<number> {
   };
 
   const built = await buildBundle(options);
-  const outPath = args.flags.has("out") ? resolve(flagString(args, "out")) : `${worktree}/${BUNDLE_REL_PATH}`;
+  // Default output lives under XDG_STATE (per-repo), never inside the worktree:
+  // the bundle holds full source + diff and must not risk being committed or
+  // swept up by project-level sync/share tooling.
+  let outPath: string;
+  if (args.flags.has("out")) {
+    outPath = resolve(flagString(args, "out"));
+  } else {
+    const repo = await getRepoIdentity(worktree);
+    outPath = `${orchStateRoot()}/${repo.repo_key}/handoffs/context-${utcCompact()}.md`;
+  }
+  mkdirSync(dirname(outPath), { recursive: true });
   writeTextAtomic(outPath, built.markdown);
 
   let copied = false;
@@ -942,8 +952,8 @@ async function main(): Promise<number> {
       process.stdout.write(chatgptBridgeHelp());
       return 0;
     }
-    if (first === "bundle") {
-      process.stdout.write(bundleHelp());
+    if (first === "handoff-pro") {
+      process.stdout.write(handoffProHelp());
       return 0;
     }
     if (first === "help") {
@@ -975,7 +985,7 @@ async function main(): Promise<number> {
   if (first === "decision") return decision(args);
   if (first === "mirror") return mirror(args);
   if (first === "chatgpt-bridge") return chatgptBridge(args);
-  if (first === "bundle") return bundle(args);
+  if (first === "handoff-pro") return handoffPro(args);
   process.stderr.write(topLevelHelp());
   return 2;
 }
