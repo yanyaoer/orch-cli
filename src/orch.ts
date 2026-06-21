@@ -1,10 +1,10 @@
 #!/usr/bin/env bun
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync } from "node:fs";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import { $ } from "bun";
 import type { AgentName, ImplementerResult, RoleResult, RunRole, RunSpec, RunState, RunStatus } from "./types.ts";
 import { isResultRole, writeRoles } from "./types.ts";
-import { acquirePidfileLock } from "./locks.ts";
+import { acquirePidfileLock, LockHeldError } from "./locks.ts";
 import { randomHex, sha256 } from "./hash.ts";
 import { ensureStateLayout, getRepoIdentity, lockPathForWorktree, mrStateDir, orchStateRoot } from "./paths.ts";
 import { jsonBytes, readJsonFile, writeJsonAtomic, writeTextAtomic } from "./json.ts";
@@ -12,6 +12,8 @@ import { argvForDisplay, createForgeAdapter, detectForge } from "./forge.ts";
 import { runSupervisor, writeInitialRunFiles } from "./supervisor.ts";
 import {
   HELP_TOPICS,
+  chatgptBridgeHelp,
+  handoffProHelp,
   decisionHelp,
   eventsTailHelp,
   mirrorHelp,
@@ -28,7 +30,10 @@ import {
 } from "./help.ts";
 import { runCodexDriver } from "../drivers/codex-headless.ts";
 import { runClaudeDriver } from "../drivers/claude-headless.ts";
+import { deployWorker, locateBridgeDir, runChatgptBridge } from "../drivers/chatgpt-bridge.ts";
 import { runPiDriver } from "../drivers/pi-headless.ts";
+import { addWorkspace, chatgptBridgeConfigPath, readBridgeConfig, writeBridgeConfig } from "./config.ts";
+import { buildBundle, type BundleOptions } from "./handoff-pro.ts";
 
 interface ParsedArgs {
   positionals: string[];
@@ -103,7 +108,13 @@ function parseArgs(argv: string[]): ParsedArgs {
       positionals.push(arg);
       continue;
     }
-    const key = arg.slice(2);
+    const body = arg.slice(2);
+    const eq = body.indexOf("=");
+    if (eq >= 0) {
+      flags.set(body.slice(0, eq), body.slice(eq + 1));
+      continue;
+    }
+    const key = body;
     const next = argv[i + 1];
     if (!next || next.startsWith("--")) {
       flags.set(key, true);
@@ -728,6 +739,166 @@ async function mirrorSync(args: ParsedArgs): Promise<number> {
   return failed > 0 ? 1 : 0;
 }
 
+// Only one local agent may bind a given Worker bridge at a time. A second one
+// would fight the first over the singleton BridgeDO ("newest wins" → endless
+// reconnect loop). Guard with a pidfile lock keyed by the bridge host; stale
+// locks (dead holder) are reclaimed automatically by acquirePidfileLock.
+async function connectWithLock(url: string, token: string, worktree: string): Promise<number> {
+  let host: string;
+  try {
+    host = new URL(url).host;
+  } catch {
+    host = url;
+  }
+  const lockPath = `${orchStateRoot()}/chatgpt-bridge-locks/${sha256(host)}.lock`;
+  let lock;
+  try {
+    lock = acquirePidfileLock(lockPath);
+  } catch (error) {
+    if (error instanceof LockHeldError) {
+      throw new CliError(
+        [
+          `another orch chatgpt-bridge is already connected to ${host}${error.holderPid ? ` (pid ${error.holderPid})` : ""}.`,
+          "Only one local agent may bind a Worker bridge at a time.",
+          error.holderPid ? `Stop the other one first:  kill ${error.holderPid}` : "Stop the other instance first.",
+        ].join("\n"),
+      );
+    }
+    throw error;
+  }
+  try {
+    return await runChatgptBridge({ url, token, worktree });
+  } finally {
+    lock.release();
+  }
+}
+
+async function chatgptBridge(args: ParsedArgs): Promise<number> {
+  const worktree = resolve(flagString(args, "worktree", process.cwd()));
+  const now = new Date().toISOString();
+
+  // Direct mode: explicit --url + --token connect to an already-running Worker
+  // (e.g. local `wrangler dev`). We never deploy or overwrite the saved worker.
+  if (args.flags.has("url") && args.flags.has("token")) {
+    const url = flagString(args, "url");
+    const token = flagString(args, "token");
+    writeBridgeConfig(addWorkspace(readBridgeConfig(), worktree, now));
+    if (flagBool(args, "no-connect")) {
+      printJson({ mode: "direct", ws_url: url, worktree, connected: false });
+      return 0;
+    }
+    return connectWithLock(url, token, worktree);
+  }
+
+  // Managed mode: deploy the Worker on demand, persist worker + token, reuse next time.
+  let cfg = readBridgeConfig();
+  if (!cfg.worker || !cfg.token || flagBool(args, "redeploy")) {
+    const bridgeDir = locateBridgeDir(args.flags.has("bridge-dir") ? flagString(args, "bridge-dir") : undefined);
+    const deployed = await deployWorker(bridgeDir);
+    cfg = { ...cfg, worker: deployed.worker, token: deployed.token };
+  }
+  const worker = cfg.worker!;
+  const token = cfg.token!;
+  cfg = addWorkspace(cfg, worktree, now);
+  writeBridgeConfig(cfg);
+
+  printJson({
+    mode: "managed",
+    worker: worker.name,
+    mcp_url: worker.mcp_url,
+    ws_url: worker.ws_url,
+    worktree,
+    config_path: chatgptBridgeConfigPath(),
+    hint: "Paste mcp_url into ChatGPT → Settings → Apps → Developer mode → Create.",
+  });
+
+  if (flagBool(args, "no-connect")) return 0;
+  return connectWithLock(worker.ws_url, token, worktree);
+}
+
+// parseArgs collapses repeated flags into one Map entry, so re-scan raw argv to
+// collect every --name value (used for repeatable --path / --glob).
+function collectFlags(name: string): string[] {
+  const argv = process.argv.slice(2);
+  const out: string[] = [];
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i]!;
+    if (arg === `--${name}`) {
+      const next = argv[i + 1];
+      if (next && !next.startsWith("--")) {
+        out.push(next);
+        i += 1;
+      }
+    } else if (arg.startsWith(`--${name}=`)) {
+      out.push(arg.slice(name.length + 3));
+    }
+  }
+  return out;
+}
+
+function flagNumber(args: ParsedArgs, name: string): number | undefined {
+  if (!args.flags.has(name)) return undefined;
+  const value = Number(flagString(args, name));
+  if (!Number.isFinite(value)) throw new CliError(`--${name} must be a number`);
+  return value;
+}
+
+async function copyToClipboard(text: string): Promise<boolean> {
+  try {
+    const proc = Bun.spawn(["pbcopy"], { stdin: new TextEncoder().encode(text), stdout: "ignore", stderr: "ignore" });
+    return (await proc.exited) === 0;
+  } catch {
+    return false;
+  }
+}
+
+async function handoffPro(args: ParsedArgs): Promise<number> {
+  const worktree = resolve(flagString(args, "worktree", process.cwd()));
+  const options: BundleOptions = {
+    worktree,
+    title: args.flags.has("title") ? flagString(args, "title") : undefined,
+    selectedPaths: collectFlags("path"),
+    extraGlobs: collectFlags("glob"),
+    includeImportantFiles: !flagBool(args, "no-important-files"),
+    includeChangedFiles: !flagBool(args, "no-changed-files"),
+    includeDiff: !flagBool(args, "no-diff"),
+    maxFiles: flagNumber(args, "max-files"),
+    maxFileBytes: flagNumber(args, "max-file-bytes"),
+    maxDiffBytes: flagNumber(args, "max-diff-bytes"),
+    maxTotalBytes: flagNumber(args, "max-total-bytes"),
+  };
+
+  const built = await buildBundle(options);
+  // Default output lives under XDG_STATE (per-repo), never inside the worktree:
+  // the bundle holds full source + diff and must not risk being committed or
+  // swept up by project-level sync/share tooling.
+  let outPath: string;
+  if (args.flags.has("out")) {
+    outPath = resolve(flagString(args, "out"));
+  } else {
+    const repo = await getRepoIdentity(worktree);
+    outPath = `${orchStateRoot()}/${repo.repo_key}/handoffs/context-${utcCompact()}.md`;
+  }
+  mkdirSync(dirname(outPath), { recursive: true });
+  writeTextAtomic(outPath, built.markdown);
+
+  let copied = false;
+  if (flagBool(args, "copy")) {
+    copied = await copyToClipboard(built.markdown);
+    if (!copied) process.stderr.write("warn: clipboard copy failed (pbcopy unavailable); bundle was still written.\n");
+  }
+
+  printJson({
+    out: outPath,
+    bytes: built.bytes,
+    files_included: built.filesIncluded.length,
+    files_skipped: built.filesSkipped.length,
+    truncated: built.truncated,
+    copied,
+  });
+  return 0;
+}
+
 async function main(): Promise<number> {
   const args = parseArgs(process.argv.slice(2));
   const [first, second] = args.positionals;
@@ -777,6 +948,14 @@ async function main(): Promise<number> {
       process.stdout.write(mirrorHelp());
       return 0;
     }
+    if (first === "chatgpt-bridge") {
+      process.stdout.write(chatgptBridgeHelp());
+      return 0;
+    }
+    if (first === "handoff-pro") {
+      process.stdout.write(handoffProHelp());
+      return 0;
+    }
     if (first === "help") {
       process.stdout.write(second && isHelpTopic(second) ? topicHelp(second) : topLevelHelp());
       return 0;
@@ -805,6 +984,8 @@ async function main(): Promise<number> {
   if (first === "status") return status(args);
   if (first === "decision") return decision(args);
   if (first === "mirror") return mirror(args);
+  if (first === "chatgpt-bridge") return chatgptBridge(args);
+  if (first === "handoff-pro") return handoffPro(args);
   process.stderr.write(topLevelHelp());
   return 2;
 }
