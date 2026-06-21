@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { resolveSafePath } from "./chatgpt-bridge.ts";
+import { locateBridgeDir, resolveSafePath } from "./chatgpt-bridge.ts";
 import { PendingRegistry, type RpcResponse } from "../chatgpt-bridge/src/protocol.ts";
 
 const tempDirs: string[] = [];
@@ -47,6 +47,18 @@ test("resolveSafePath blocks sensitive files and dirs", () => {
   expect(() => resolveSafePath(root, "node_modules/pkg/index.js")).toThrow(/blocked/);
   expect(() => resolveSafePath(root, "deploy/server.pem")).toThrow(/blocked/);
   expect(() => resolveSafePath(root, ".ssh/id_rsa")).toThrow(/blocked/);
+});
+
+test("locateBridgeDir accepts the worker dir or a parent that contains it", () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "orch-locate-")));
+  tempDirs.push(root);
+  const workerDir = join(root, "chatgpt-bridge");
+  mkdirSync(workerDir);
+  writeFileSync(join(workerDir, "wrangler.jsonc"), "{}\n");
+  // Pointing at the worker dir itself, or its parent, both resolve to the worker dir.
+  expect(locateBridgeDir(workerDir)).toBe(workerDir);
+  expect(locateBridgeDir(root)).toBe(workerDir);
+  expect(() => locateBridgeDir(join(root, "nope"))).toThrow(/no chatgpt-bridge Worker source/);
 });
 
 test("PendingRegistry resolves a matching response", async () => {

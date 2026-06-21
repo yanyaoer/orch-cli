@@ -89,16 +89,27 @@ async function run(cmd: string[], cwd: string, stdin?: string): Promise<RunResul
 // otherwise resolve it relative to this driver (repo-root/chatgpt-bridge). After
 // bundling to a single binary that relative path is gone, so fail loudly with a
 // hint instead of silently doing the wrong thing.
+// A Worker source dir is one that holds wrangler.jsonc; accept either the dir
+// itself or a `chatgpt-bridge/` subdir under it (so `--bridge-dir .` at the repo
+// root works too).
+function bridgeDirAt(dir: string): string | null {
+  if (existsSync(join(dir, "wrangler.jsonc"))) return dir;
+  const nested = join(dir, "chatgpt-bridge");
+  if (existsSync(join(nested, "wrangler.jsonc"))) return nested;
+  return null;
+}
+
 export function locateBridgeDir(explicit?: string): string {
   if (explicit) {
-    const dir = resolve(explicit);
-    if (!existsSync(join(dir, "wrangler.jsonc"))) {
-      throw new Error(`--bridge-dir is not a chatgpt-bridge Worker source (no wrangler.jsonc): ${dir}`);
+    const found = bridgeDirAt(resolve(explicit));
+    if (!found) {
+      throw new Error(`--bridge-dir has no chatgpt-bridge Worker source (no wrangler.jsonc): ${resolve(explicit)}`);
     }
-    return dir;
+    return found;
   }
-  const candidate = resolve(import.meta.dir, "..", "chatgpt-bridge");
-  if (existsSync(join(candidate, "wrangler.jsonc"))) return candidate;
+  // Source runs resolve next to the repo; a compiled binary falls back to cwd.
+  const found = bridgeDirAt(resolve(import.meta.dir, "..")) ?? bridgeDirAt(process.cwd());
+  if (found) return found;
   throw new Error(
     "cannot locate the chatgpt-bridge Worker source; run inside the orch repo or pass --bridge-dir <path>.",
   );

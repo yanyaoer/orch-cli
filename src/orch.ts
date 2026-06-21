@@ -106,7 +106,13 @@ function parseArgs(argv: string[]): ParsedArgs {
       positionals.push(arg);
       continue;
     }
-    const key = arg.slice(2);
+    const body = arg.slice(2);
+    const eq = body.indexOf("=");
+    if (eq >= 0) {
+      flags.set(body.slice(0, eq), body.slice(eq + 1));
+      continue;
+    }
+    const key = body;
     const next = argv[i + 1];
     if (!next || next.startsWith("--")) {
       flags.set(key, true);
