@@ -388,16 +388,18 @@
         <h1 data-lang="en">Run coding agents as reproducible local jobs.</h1>
         <h1 data-lang="zh">把编码 Agent 变成可复现的本地任务。</h1>
         <p class="lead" data-lang="en">
-          orch starts Codex or Claude in a supervised headless run, captures local state, validates a role-specific result, and mirrors decisions to PRs or MRs only when you ask it to.
+          orch starts Codex, Claude, or pi in a supervised headless run, captures local state, validates a role-specific result, and mirrors decisions to PRs or MRs only when you ask it to.
         </p>
         <p class="lead" data-lang="zh">
-          orch 用 supervisor 启动 Codex 或 Claude headless worker，落盘本地状态，校验统一结果，并只在你明确执行时把裁决镜像到 PR 或 MR。
+          orch 用 supervisor 启动 Codex、Claude 或 pi headless worker，落盘本地状态，校验统一结果，并只在你明确执行时把裁决镜像到 PR 或 MR。
         </p>
         <div class="hero-actions">
           <a class="button primary" href="#quickstart" data-lang="en">Start with the CLI</a>
           <a class="button primary" href="#quickstart" data-lang="zh">从 CLI 开始</a>
           <a class="button" href="#architecture" data-lang="en">View architecture</a>
           <a class="button" href="#architecture" data-lang="zh">查看架构</a>
+          <a class="button" href="https://github.com/yanyaoer/orch-cli/releases/latest" data-lang="en">Latest release</a>
+          <a class="button" href="https://github.com/yanyaoer/orch-cli/releases/latest" data-lang="zh">最新发布</a>
         </div>
         <div class="terminal" aria-label="Quick command">
           <div class="terminal-bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>
@@ -561,10 +563,10 @@
           <h2 data-lang="en">Quickstart</h2>
           <h2 data-lang="zh">快速开始</h2>
           <p class="section-lead" data-lang="en">
-            Install with Bun, build the local binary, then dispatch a role-scoped task to Codex or Claude.
+            Install with Bun or a release binary, then dispatch a role-scoped task to Codex, Claude, or pi.
           </p>
           <p class="section-lead" data-lang="zh">
-            使用 Bun 安装和构建本地 binary，然后把带角色边界的任务派发给 Codex 或 Claude。
+            使用 Bun 或 release binary 安装，然后把带角色边界的任务派发给 Codex、Claude 或 pi。
           </p>
         </div>
         <div class="code-block">
@@ -604,6 +606,7 @@ $ XDG_STATE_HOME=/tmp/orch-state orch run create --mr demo --role reviewer --age
               <li><code>run create</code>, <code>run list</code>, <code>status</code></li>
               <li><code>events tail</code>, <code>result</code></li>
               <li><code>decision</code>, <code>mirror</code>, <code>mirror sync</code></li>
+              <li><code>chatgpt-bridge</code> <span data-lang="en">for a read-only Cloudflare Worker MCP bridge</span><span data-lang="zh">提供只读 Cloudflare Worker MCP 桥接</span></li>
             </ul>
           </div>
           <div class="card">
@@ -618,6 +621,7 @@ $ XDG_STATE_HOME=/tmp/orch-state orch run create --mr demo --role reviewer --age
               <li>当前没有常驻 daemon。</li>
               <li>当前没有交互式 attach/debug shell 命令。</li>
               <li>当前 driver 覆盖 Codex、Claude 和 pi。</li>
+              <li><code>chatgpt-bridge</code> 提供只读 Cloudflare Worker MCP 桥接。</li>
             </ul>
           </div>
         </div>

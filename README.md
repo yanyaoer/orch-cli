@@ -8,11 +8,13 @@ Daemonless multi-agent orchestration for coding work.
 
 Project page: `docs/index.html` is ready for GitHub Pages and includes a bilingual animated overview.
 
+Latest release: `v0.0.2` ([CHANGELOG.md](CHANGELOG.md)).
+
 ## Current Scope
 
 This repository is the v2 MVP described in [docs/orch-mvp-spec.md](docs/orch-mvp-spec.md).
 
-Shipped today:
+Shipped in `v0.0.2`:
 
 - `orch run create` starts one supervised headless worker run.
 - `orch run list`, `orch status`, `orch events tail`, and `orch result` read local run state.
@@ -21,6 +23,7 @@ Shipped today:
 - Drivers exist for `codex`, `claude`, and `pi`.
 - `orch chatgpt-bridge` deploys a Cloudflare Worker (no tunnel) and connects ChatGPT (Developer Mode, e.g. `gpt-5.5-pro`) to a read-only view of the worktree.
 - Role result schemas exist for `implementer`, `reviewer`, and `verifier`.
+- Provider session controls are explicit: defaults avoid latest-session resume, exact resume requires `--session-mode resume_exact --session-id <id>`, and idempotency keys include session settings.
 
 Not shipped yet:
 
