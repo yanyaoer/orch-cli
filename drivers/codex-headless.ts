@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import {
   buildWorkerEnv,
+  buildProviderArgv,
   buildPrompt,
   extractResultFromRunDir,
   maybeWriteFakeResult,
@@ -18,9 +19,8 @@ export async function runCodexDriver(argv: string[]): Promise<number> {
   if (await maybeWriteFakeResult(args.runDir, spec, "codex")) return 0;
 
   const prompt = buildPrompt(spec, "codex");
-  const lastMessagePath = `${args.runDir}/last_message.txt`;
   const proc = Bun.spawn(
-    ["codex", "exec", "--json", "--cd", args.worktree, "--output-last-message", lastMessagePath, "-"],
+    buildProviderArgv("codex", spec, args.runDir, args.worktree),
     {
       cwd: args.worktree,
       stdin: "pipe",

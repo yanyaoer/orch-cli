@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import {
   buildWorkerEnv,
+  buildProviderArgv,
   buildPrompt,
   extractResultFromRunDir,
   maybeWriteFakeResult,
@@ -19,7 +20,7 @@ export async function runClaudeDriver(argv: string[]): Promise<number> {
 
   const prompt = buildPrompt(spec, "claude");
   const proc = Bun.spawn(
-    ["claude", "-p", "--verbose", "--output-format", "stream-json", "--input-format", "text"],
+    buildProviderArgv("claude", spec, args.runDir, args.worktree),
     {
       cwd: args.worktree,
       stdin: "pipe",

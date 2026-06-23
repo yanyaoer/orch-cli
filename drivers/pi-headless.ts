@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import {
   buildWorkerEnv,
+  buildProviderArgv,
   buildPrompt,
   extractResultFromRunDir,
   maybeWriteFakeResult,
@@ -18,7 +19,7 @@ export async function runPiDriver(argv: string[]): Promise<number> {
   if (await maybeWriteFakeResult(args.runDir, spec, "pi")) return 0;
 
   const prompt = buildPrompt(spec, "pi");
-  const proc = Bun.spawn(["pi", "-p", "--mode", "json", "--no-session"], {
+  const proc = Bun.spawn(buildProviderArgv("pi", spec, args.runDir, args.worktree), {
     cwd: args.worktree,
     stdin: "pipe",
     stdout: "pipe",

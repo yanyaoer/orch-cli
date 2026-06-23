@@ -10,6 +10,8 @@ export type ResultRole = "implementer" | "reviewer" | "verifier";
 
 export type AgentName = "codex" | "claude" | "pi";
 
+export type ProviderSessionMode = "ephemeral" | "fresh_persistent" | "resume_exact";
+
 export type RunState =
   | "created"
   | "starting"
@@ -35,6 +37,9 @@ export interface RunSpec {
   role: RunRole;
   agent: AgentName;
   tag: string;
+  provider_session_name: string | null;
+  provider_session_id: string | null;
+  provider_session_mode: ProviderSessionMode;
   idempotency_key: string;
   repo_key: string;
   worktree: string;
@@ -52,6 +57,9 @@ export interface RunStatus {
   role: RunRole;
   agent: AgentName;
   tag: string;
+  provider_session_name: string | null;
+  provider_session_id: string | null;
+  provider_session_mode: ProviderSessionMode;
   state: RunState;
   pid: number | null;
   pgid: number | null;

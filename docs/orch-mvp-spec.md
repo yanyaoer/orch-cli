@@ -169,7 +169,8 @@ created → starting → running → done
 ## 11. attach / resume 语义
 
 - **attach**：headless worker 无交互 stdin；`attach` = `tail -f native.jsonl events.jsonl stderr.log` + 打印 worktree/spec/result 路径。要人接管用 `debug shell`。
-- **resume 是优化，不是正确性基础**：run 正确性以 `spec.json / worktree diff / result.json / events.jsonl` 为准。每个 run 记 `provider_resume_id / base_sha / spec_sha`；provider 没吐稳定 id 就**新建 run / rework run**，不硬续。
+- **resume 是优化，不是正确性基础**：run 正确性以 `spec.json / worktree diff / result.json / events.jsonl` 为准。每个 run 记 `provider_session_name / provider_session_id / provider_session_mode / provider_resume_id / base_sha / spec_sha`；默认不使用 latest-session 语义，provider 没吐稳定 id 就**新建 run / rework run**，不硬续。
+- **provider session policy**：`fresh_persistent` 启动新 provider 会话，`ephemeral` 不保存 provider 会话，`resume_exact` 只接受显式 `--session-id`。禁止自动生成 Claude `--continue`、Codex `--last` 这类“最近会话”参数。
 
 ## 12. 实施顺序（每步独立产出价值）
 

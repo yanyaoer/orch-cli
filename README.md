@@ -176,9 +176,10 @@ ${XDG_STATE_HOME:-$HOME/.local/state}/orch/<repo_key>/mrs/<mr>/outbox/{pending,s
 
 `orch` is deliberately file-first and conservative:
 
-- Idempotency: the default key is `mr<id>:<tag>:<task_sha>`, so repeated `run create` calls reuse an existing run unless `--retry` is passed.
+- Idempotency: the default key includes `mr`, `tag`, `task_sha`, and provider session settings, so repeated equivalent `run create` calls reuse an existing run unless `--retry` is passed.
 - Worktree locking: write roles take a worktree lock. Reviewer and verifier roles inspect artifacts and do not take the write lock.
 - Native stream isolation: provider output is stored in `native.jsonl`; controllers should read normalized `events.jsonl`, `status.json`, and `result.json`.
+- Provider sessions: default runs do not resume the latest provider session. Claude/Codex start fresh headless sessions, Pi stays ephemeral; exact resume requires explicit `--session-mode resume_exact --session-id <id>`.
 - Schema gate: the supervisor validates `result.json` before marking a run `done`.
 - Local-first mirroring: PR/MR comments go to `outbox/pending/` first. Network sends are opt-in with `--execute`.
 

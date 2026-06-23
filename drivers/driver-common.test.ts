@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildWorkerEnv, extractResultFromRunDir, extractResultFromText } from "./driver-common.ts";
+import { buildProviderArgv, buildWorkerEnv, extractResultFromRunDir, extractResultFromText } from "./driver-common.ts";
 import type { RunSpec } from "../src/types.ts";
 
 const tempDirs: string[] = [];
@@ -25,6 +25,9 @@ function spec(role: RunSpec["role"], runId: string): RunSpec {
     role,
     agent: "claude",
     tag: role,
+    provider_session_name: null,
+    provider_session_id: null,
+    provider_session_mode: "fresh_persistent",
     idempotency_key: runId,
     repo_key: "local/repo",
     worktree: "/tmp/repo",
@@ -78,6 +81,79 @@ test("buildWorkerEnv preserves normal env and removes recursive tool settings", 
   expect(baseEnv.CLAUDECODE).toBe("1");
   expect(baseEnv.MCP_CONFIG).toBe("/tmp/mcp.json");
   expect(buildWorkerEnv(env)).toEqual(env);
+});
+
+test("buildProviderArgv keeps defaults fresh and only resumes exact sessions", () => {
+  const base = spec("implementer", "impl-session");
+
+  expect(buildProviderArgv("claude", base, "/run", "/worktree")).toEqual([
+    "claude",
+    "-p",
+    "--verbose",
+    "--output-format",
+    "stream-json",
+    "--input-format",
+    "text",
+  ]);
+  expect(buildProviderArgv("codex", base, "/run", "/worktree")).toEqual([
+    "codex",
+    "exec",
+    "--json",
+    "--cd",
+    "/worktree",
+    "--output-last-message",
+    "/run/last_message.txt",
+    "-",
+  ]);
+  expect(buildProviderArgv("pi", { ...base, provider_session_mode: "ephemeral" }, "/run", "/worktree")).toEqual([
+    "pi",
+    "-p",
+    "--mode",
+    "json",
+    "--no-session",
+  ]);
+
+  expect(
+    buildProviderArgv(
+      "claude",
+      {
+        ...base,
+        provider_session_name: "mr123-review",
+        provider_session_mode: "resume_exact",
+        provider_session_id: "123e4567-e89b-12d3-a456-426614174000",
+      },
+      "/run",
+      "/worktree",
+    ),
+  ).toEqual([
+    "claude",
+    "-p",
+    "--verbose",
+    "--output-format",
+    "stream-json",
+    "--input-format",
+    "text",
+    "--name",
+    "mr123-review",
+    "--resume",
+    "123e4567-e89b-12d3-a456-426614174000",
+  ]);
+  expect(
+    buildProviderArgv(
+      "codex",
+      { ...base, provider_session_mode: "resume_exact", provider_session_id: "thread-123" },
+      "/run",
+      "/worktree",
+    ),
+  ).toEqual(["codex", "exec", "resume", "--json", "--output-last-message", "/run/last_message.txt", "thread-123", "-"]);
+  expect(
+    buildProviderArgv(
+      "pi",
+      { ...base, provider_session_mode: "resume_exact", provider_session_id: "pi-session" },
+      "/run",
+      "/worktree",
+    ),
+  ).toEqual(["pi", "-p", "--mode", "json", "--session-id", "pi-session"]);
 });
 
 test("extractResultFromRunDir preserves codex agent_message extraction", () => {

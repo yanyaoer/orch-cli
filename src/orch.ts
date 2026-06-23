@@ -2,7 +2,7 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { $ } from "bun";
-import type { AgentName, ImplementerResult, RoleResult, RunRole, RunSpec, RunState, RunStatus } from "./types.ts";
+import type { AgentName, ImplementerResult, ProviderSessionMode, RoleResult, RunRole, RunSpec, RunState, RunStatus } from "./types.ts";
 import { isResultRole, writeRoles } from "./types.ts";
 import { acquirePidfileLock, LockHeldError } from "./locks.ts";
 import { randomHex, sha256 } from "./hash.ts";
@@ -35,6 +35,7 @@ import { deployWorker, locateBridgeDir, runChatgptBridge } from "../drivers/chat
 import { runPiDriver } from "../drivers/pi-headless.ts";
 import { addWorkspace, chatgptBridgeConfigPath, readBridgeConfig, writeBridgeConfig } from "./config.ts";
 import { buildBundle, type BundleOptions } from "./handoff-pro.ts";
+import { buildProviderArgv } from "../drivers/driver-common.ts";
 
 interface ParsedArgs {
   positionals: string[];
@@ -158,6 +159,96 @@ function utcCompact(date = new Date()): string {
 
 function runId(tag: string): string {
   return `${tag}-${utcCompact()}-${randomHex(3)}`;
+}
+
+function isProviderSessionMode(value: string): value is ProviderSessionMode {
+  return value === "ephemeral" || value === "fresh_persistent" || value === "resume_exact";
+}
+
+function defaultProviderSessionMode(agent: AgentName): ProviderSessionMode {
+  return agent === "pi" ? "ephemeral" : "fresh_persistent";
+}
+
+function isUuid(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+type ProviderSessionConfig = Pick<RunSpec, "provider_session_name" | "provider_session_id" | "provider_session_mode">;
+
+function providerSessionConfig(args: ParsedArgs, agent: AgentName): ProviderSessionConfig {
+  const modeValue = flagString(args, "session-mode", defaultProviderSessionMode(agent));
+  if (!isProviderSessionMode(modeValue)) {
+    throw new Error("--session-mode must be ephemeral|fresh_persistent|resume_exact");
+  }
+  const name = args.flags.has("session-name") ? flagString(args, "session-name").trim() : null;
+  const id = args.flags.has("session-id") ? flagString(args, "session-id").trim() : null;
+
+  if (name === "") throw new Error("--session-name must not be empty");
+  if (id === "") throw new Error("--session-id must not be empty");
+  if (modeValue === "resume_exact" && !id) throw new Error("--session-mode resume_exact requires --session-id");
+  if (id && modeValue !== "resume_exact") throw new Error("--session-id requires --session-mode resume_exact");
+  if (agent === "pi" && modeValue === "ephemeral" && name) {
+    throw new Error("pi --session-name requires --session-mode fresh_persistent or resume_exact");
+  }
+  if (agent === "codex" && name) {
+    throw new Error("codex does not support --session-name in headless exec; use --session-id with --session-mode resume_exact");
+  }
+  if (agent === "claude" && id && !isUuid(id)) {
+    throw new Error("claude --session-id/--resume requires a UUID");
+  }
+
+  return { provider_session_name: name, provider_session_id: id, provider_session_mode: modeValue };
+}
+
+function providerSessionFingerprint(session: ProviderSessionConfig): string {
+  return sha256(`${session.provider_session_mode}:${session.provider_session_name ?? ""}:${session.provider_session_id ?? ""}`).slice(
+    0,
+    12,
+  );
+}
+
+function providerSessionFromValue(value: unknown, fallbackAgent: AgentName): ProviderSessionConfig {
+  const obj = value && typeof value === "object" && !Array.isArray(value) ? (value as Partial<RunSpec>) : {};
+  const agent = obj.agent === "codex" || obj.agent === "claude" || obj.agent === "pi" ? obj.agent : fallbackAgent;
+  const mode =
+    typeof obj.provider_session_mode === "string" && isProviderSessionMode(obj.provider_session_mode)
+      ? obj.provider_session_mode
+      : defaultProviderSessionMode(agent);
+  return {
+    provider_session_name: typeof obj.provider_session_name === "string" ? obj.provider_session_name : null,
+    provider_session_id: typeof obj.provider_session_id === "string" ? obj.provider_session_id : null,
+    provider_session_mode: mode,
+  };
+}
+
+function existingProviderSession(existing: IdempotencyRecord, fallbackAgent: AgentName): ProviderSessionConfig {
+  const spec = readJsonFile<Partial<RunSpec> | null>(`${existing.run_dir}/spec.json`, null);
+  if (spec) return providerSessionFromValue(spec, fallbackAgent);
+  const status = readJsonFile<Partial<RunStatus> | null>(existing.status_path, null);
+  return providerSessionFromValue(status, fallbackAgent);
+}
+
+function assertProviderSessionCompatible(
+  existing: IdempotencyRecord,
+  requested: ProviderSessionConfig,
+  fallbackAgent: AgentName,
+): ProviderSessionConfig {
+  const stored = existingProviderSession(existing, fallbackAgent);
+  if (
+    stored.provider_session_name !== requested.provider_session_name ||
+    stored.provider_session_id !== requested.provider_session_id ||
+    stored.provider_session_mode !== requested.provider_session_mode
+  ) {
+    throw new CliError(
+      [
+        "idempotent run already exists with different provider session settings",
+        `existing: ${stored.provider_session_mode}/${stored.provider_session_name ?? "none"}/${stored.provider_session_id ?? "none"}`,
+        `requested: ${requested.provider_session_mode}/${requested.provider_session_name ?? "none"}/${requested.provider_session_id ?? "none"}`,
+        "Pass --retry to create a new run with different provider session settings.",
+      ].join("\n"),
+    );
+  }
+  return stored;
 }
 
 async function gitHead(worktree: string): Promise<string> {
@@ -424,11 +515,13 @@ async function createRun(args: ParsedArgs): Promise<number> {
   }
   if (agent !== "codex" && agent !== "claude" && agent !== "pi") throw new Error(`unsupported agent: ${agent}`);
   if (!Number.isFinite(timeoutSec) || timeoutSec <= 0) throw new Error("--timeout-sec must be positive");
+  const providerSession = providerSessionConfig(args, agent);
 
   const repo = await getRepoIdentity(worktree);
   const mrDir = mrStateDir(repo.repo_key, mr);
   const taskSha = sha256(taskText);
-  const idempotencyKey = flagString(args, "idempotency-key", `mr${mr}:${tag}:${taskSha}`);
+  const defaultIdempotencyKey = `mr${mr}:${tag}:${taskSha}:session-${providerSessionFingerprint(providerSession)}`;
+  const idempotencyKey = flagString(args, "idempotency-key", defaultIdempotencyKey);
   const idempotencyPath = `${mrDir}/idempotency.json`;
   const dryRun = flagBool(args, "dry-run");
   if (dryRun) {
@@ -436,16 +529,39 @@ async function createRun(args: ParsedArgs): Promise<number> {
     const dirty = await gitDirty(worktree);
     const baseSha = await gitHead(worktree);
     const existing = readIdempotency(idempotencyPath)[idempotencyKey];
+    const existingSession = existing && !retry ? assertProviderSessionCompatible(existing, providerSession, agent) : null;
+    const effectiveSession = existingSession ?? providerSession;
     const idempotent = Boolean(existing && !retry);
     const id = idempotent ? existing!.run_id : runId(tag);
     const runDir = idempotent ? existing!.run_dir : `${mrDir}/runs/${id}`;
     const specPath = `${runDir}/spec.json`;
+    const specPreview: RunSpec = {
+      version: 1,
+      run_id: id,
+      mr,
+      role,
+      agent,
+      tag,
+      ...effectiveSession,
+      idempotency_key: idempotencyKey,
+      repo_key: repo.repo_key,
+      worktree,
+      task_path: taskPath,
+      task_text: taskText,
+      task_sha: taskSha,
+      base_sha: baseSha,
+      timeout_sec: timeoutSec,
+      created_at: new Date().toISOString(),
+    };
     const payload = {
       dry_run: true,
       mr,
       role,
       agent,
       tag,
+      provider_session_name: effectiveSession.provider_session_name,
+      provider_session_id: effectiveSession.provider_session_id,
+      provider_session_mode: effectiveSession.provider_session_mode,
       repo,
       repo_key: repo.repo_key,
       mr_dir: mrDir,
@@ -479,6 +595,13 @@ async function createRun(args: ParsedArgs): Promise<number> {
             cwd: worktree,
             spawn: false,
           },
+      provider_plan: idempotent
+        ? null
+        : {
+            argv: buildProviderArgv(agent, specPreview, runDir, worktree),
+            cwd: worktree,
+            spawn: false,
+          },
     };
     if (flagBool(args, "json")) {
       printJson(payload);
@@ -491,6 +614,9 @@ async function createRun(args: ParsedArgs): Promise<number> {
         `idempotency_key: ${idempotencyKey}`,
         `idempotent: ${payload.idempotent}`,
         `state: ${payload.state}`,
+        `provider_session_mode: ${payload.provider_session_mode}`,
+        `provider_session_name: ${payload.provider_session_name ?? "none"}`,
+        `provider_session_id: ${payload.provider_session_id ?? "none"}`,
         `worktree_lock: ${payload.worktree_lock}`,
         `dirty: ${payload.dirty}`,
         `base_sha: ${baseSha}`,
@@ -498,6 +624,7 @@ async function createRun(args: ParsedArgs): Promise<number> {
       ];
       if (payload.supervisor_plan) lines.push(`supervisor: ${payload.supervisor_plan.argv.join(" ")}`);
       if (payload.driver_plan) lines.push(`driver: ${payload.driver_plan.argv.join(" ")}`);
+      if (payload.provider_plan) lines.push(`provider: ${payload.provider_plan.argv.join(" ")}`);
       process.stdout.write(lines.join("\n") + "\n");
     }
     return 0;
@@ -512,11 +639,15 @@ async function createRun(args: ParsedArgs): Promise<number> {
     const idempotency = readIdempotency(idempotencyPath);
     const existing = idempotency[idempotencyKey];
     if (existing && !flagBool(args, "retry")) {
+      const existingSession = assertProviderSessionCompatible(existing, providerSession, agent);
       const state = statusState(existing);
       printJson({
         run_id: existing.run_id,
         state,
         idempotent: true,
+        provider_session_name: existingSession.provider_session_name,
+        provider_session_id: existingSession.provider_session_id,
+        provider_session_mode: existingSession.provider_session_mode,
         status_path: existing.status_path,
         result_path: existing.result_path,
       });
@@ -541,6 +672,7 @@ async function createRun(args: ParsedArgs): Promise<number> {
       role,
       agent,
       tag,
+      ...providerSession,
       idempotency_key: idempotencyKey,
       repo_key: repo.repo_key,
       worktree,
@@ -583,6 +715,9 @@ async function createRun(args: ParsedArgs): Promise<number> {
     printJson({
       run_id: id,
       state: "starting",
+      provider_session_name: providerSession.provider_session_name,
+      provider_session_id: providerSession.provider_session_id,
+      provider_session_mode: providerSession.provider_session_mode,
       supervisor_pid: proc.pid,
       repo_key: repo.repo_key,
       mr_dir: mrDir,

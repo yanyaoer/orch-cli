@@ -46,6 +46,9 @@ test("command help exposes flags and runnable examples", () => {
     "--retry",
     "--allow-dirty",
     "--timeout-sec",
+    "--session-mode",
+    "--session-name",
+    "--session-id",
     "--dry-run",
     "--json",
   ]) {

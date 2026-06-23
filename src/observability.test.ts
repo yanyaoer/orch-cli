@@ -274,6 +274,9 @@ test("observability commands read local run state", async () => {
     role: "implementer",
     agent: "codex",
     tag: "impl-a",
+    provider_session_name: null,
+    provider_session_id: null,
+    provider_session_mode: "fresh_persistent",
     state: "done",
     pid: null,
     pgid: null,
@@ -384,6 +387,9 @@ test("run create dry-run resolves plans without writing state", async () => {
     run_id: string;
     run_id_preview: string;
     run_dir: string;
+    provider_session_name: string | null;
+    provider_session_id: string | null;
+    provider_session_mode: string;
     status_path: string;
     worktree_lock: string;
     dirty: boolean;
@@ -391,23 +397,31 @@ test("run create dry-run resolves plans without writing state", async () => {
     timeout_sec: number;
     supervisor_plan: { argv: string[]; spawn: boolean };
     driver_plan: { argv: string[]; spawn: boolean };
+    provider_plan: { argv: string[]; spawn: boolean };
   };
   const taskSha = sha256(taskText);
   expect(payload.dry_run).toBe(true);
   expect(payload.repo.repo_root).toBe(worktree);
   expect(payload.mr_dir).toContain(join(stateHome, "orch"));
   expect(payload.task_sha).toBe(taskSha);
-  expect(payload.idempotency_key).toBe(`mr789:dry-run:${taskSha}`);
+  expect(payload.idempotency_key.startsWith(`mr789:dry-run:${taskSha}:session-`)).toBe(true);
   expect(payload.run_id_preview.startsWith("dry-run-")).toBe(true);
   expect(payload.run_id).toBe(payload.run_id_preview);
   expect(payload.worktree_lock.startsWith(join(stateHome, "orch", "worktree-locks"))).toBe(true);
   expect(payload.dirty).toBe(false);
   expect(payload.base_sha).toHaveLength(40);
+  expect(payload.provider_session_name).toBeNull();
+  expect(payload.provider_session_id).toBeNull();
+  expect(payload.provider_session_mode).toBe("fresh_persistent");
   expect(payload.timeout_sec).toBe(12);
   expect(payload.supervisor_plan).toMatchObject({ spawn: false });
   expect(payload.supervisor_plan.argv).toContain("__supervisor");
   expect(payload.driver_plan).toMatchObject({ spawn: false });
   expect(payload.driver_plan.argv).toContain("__driver-codex");
+  expect(payload.provider_plan).toMatchObject({ spawn: false });
+  expect(payload.provider_plan.argv).toContain("codex");
+  expect(payload.provider_plan.argv).not.toContain("resume");
+  expect(payload.provider_plan.argv).not.toContain("--last");
   expect(existsSync(payload.run_dir)).toBe(false);
   expect(existsSync(payload.status_path)).toBe(false);
 
@@ -427,6 +441,8 @@ test("run create dry-run resolves plans without writing state", async () => {
       worktree,
       "--task",
       taskPath,
+      "--session-name",
+      "review-dry-session",
       "--dry-run",
     ],
     { XDG_STATE_HOME: stateHome },
@@ -435,7 +451,116 @@ test("run create dry-run resolves plans without writing state", async () => {
   expect(human.stdout).toContain("dry-run: orch run create review-dry-");
   expect(human.stdout).toContain("supervisor:");
   expect(human.stdout).toContain("__driver-claude");
+  expect(human.stdout).toContain("provider_session_name: review-dry-session");
+  expect(human.stdout).toContain("provider:");
+  expect(human.stdout).toContain("--name review-dry-session");
   expect(existsSync(stateHome)).toBe(false);
+});
+
+test("run create rejects unsafe provider session combinations", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orch-session-validation-test-"));
+  const stateHome = join(root, "state");
+  const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
+  await initGitWorktree(worktree);
+
+  const codexNamed = await runOrch(
+    [
+      "run",
+      "create",
+      "--mr",
+      "session-validation",
+      "--role",
+      "reviewer",
+      "--agent",
+      "codex",
+      "--tag",
+      "named-codex",
+      "--worktree",
+      worktree,
+      "--session-name",
+      "not-supported",
+      "--dry-run",
+    ],
+    { XDG_STATE_HOME: stateHome },
+  );
+  expect(codexNamed.exitCode).toBe(1);
+  expect(codexNamed.stderr).toContain("codex does not support --session-name");
+  expect(existsSync(stateHome)).toBe(false);
+
+  const claudeFreshId = await runOrch(
+    [
+      "run",
+      "create",
+      "--mr",
+      "session-validation",
+      "--role",
+      "reviewer",
+      "--agent",
+      "claude",
+      "--tag",
+      "fresh-id",
+      "--worktree",
+      worktree,
+      "--session-id",
+      "123e4567-e89b-12d3-a456-426614174000",
+      "--dry-run",
+    ],
+    { XDG_STATE_HOME: stateHome },
+  );
+  expect(claudeFreshId.exitCode).toBe(1);
+  expect(claudeFreshId.stderr).toContain("--session-id requires --session-mode resume_exact");
+  expect(existsSync(stateHome)).toBe(false);
+
+  const piFreshId = await runOrch(
+    [
+      "run",
+      "create",
+      "--mr",
+      "session-validation",
+      "--role",
+      "reviewer",
+      "--agent",
+      "pi",
+      "--tag",
+      "pi-fresh-id",
+      "--worktree",
+      worktree,
+      "--session-mode",
+      "fresh_persistent",
+      "--session-id",
+      "pi-session",
+      "--dry-run",
+    ],
+    { XDG_STATE_HOME: stateHome },
+  );
+  expect(piFreshId.exitCode).toBe(1);
+  expect(piFreshId.stderr).toContain("--session-id requires --session-mode resume_exact");
+  expect(existsSync(stateHome)).toBe(false);
+
+  const claudeBadId = await runOrch(
+    [
+      "run",
+      "create",
+      "--mr",
+      "session-validation",
+      "--role",
+      "reviewer",
+      "--agent",
+      "claude",
+      "--tag",
+      "bad-claude",
+      "--worktree",
+      worktree,
+      "--session-mode",
+      "resume_exact",
+      "--session-id",
+      "latest",
+      "--dry-run",
+    ],
+    { XDG_STATE_HOME: stateHome },
+  );
+  expect(claudeBadId.exitCode).toBe(1);
+  expect(claudeBadId.stderr).toContain("requires a UUID");
 });
 
 test("run create dry-run previews idempotent reuse without spawn plan", async () => {
@@ -567,10 +692,113 @@ test("run create dry-run previews idempotent reuse without spawn plan", async ()
   expect(retryPayload.existing_run_id).toBe(createdPayload.run_id);
   expect(retryPayload.run_id).not.toBe(createdPayload.run_id);
   expect(retryPayload.run_id_preview).toBe(retryPayload.run_id);
+
   expect(retryPayload.supervisor_plan).toMatchObject({ spawn: false });
   expect(retryPayload.driver_plan).toMatchObject({ spawn: false });
   expect(existsSync(retryPayload.run_dir)).toBe(false);
   expect(readdirSync(join(stateHome, "orch", repoKeyFromRemote(worktree, worktree), "mrs", "791", "runs"))).toHaveLength(1);
+});
+
+test("run create rejects idempotent reuse with different provider session settings", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orch-session-idem-test-"));
+  const stateHome = join(root, "state");
+  const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
+  await initGitWorktree(worktree);
+  const taskPath = join(root, "task.md");
+  writeFileSync(taskPath, "same task\n", "utf8");
+  const env = { XDG_STATE_HOME: stateHome, ORCH_DRIVER_FAKE_RESULT: "1" };
+
+  const created = await runOrch(
+    [
+      "run",
+      "create",
+      "--mr",
+      "session-idem",
+      "--role",
+      "reviewer",
+      "--agent",
+      "claude",
+      "--tag",
+      "review-session",
+      "--worktree",
+      worktree,
+      "--task",
+      taskPath,
+      "--idempotency-key",
+      "same-key",
+      "--timeout-sec",
+      "10",
+    ],
+    env,
+  );
+  expect(created).toMatchObject({ exitCode: 0, stderr: "" });
+  const createdPayload = JSON.parse(created.stdout) as { status_path: string };
+  await waitForRunDone(createdPayload.status_path);
+
+  const mismatch = await runOrch(
+    [
+      "run",
+      "create",
+      "--mr",
+      "session-idem",
+      "--role",
+      "reviewer",
+      "--agent",
+      "claude",
+      "--tag",
+      "review-session",
+      "--worktree",
+      worktree,
+      "--task",
+      taskPath,
+      "--idempotency-key",
+      "same-key",
+      "--session-mode",
+      "resume_exact",
+      "--session-id",
+      "123e4567-e89b-12d3-a456-426614174000",
+      "--dry-run",
+      "--json",
+    ],
+    env,
+  );
+  expect(mismatch.exitCode).toBe(1);
+  expect(mismatch.stderr).toContain("idempotent run already exists with different provider session settings");
+
+  const retry = await runOrch(
+    [
+      "run",
+      "create",
+      "--mr",
+      "session-idem",
+      "--role",
+      "reviewer",
+      "--agent",
+      "claude",
+      "--tag",
+      "review-session",
+      "--worktree",
+      worktree,
+      "--task",
+      taskPath,
+      "--idempotency-key",
+      "same-key",
+      "--session-mode",
+      "resume_exact",
+      "--session-id",
+      "123e4567-e89b-12d3-a456-426614174000",
+      "--retry",
+      "--dry-run",
+      "--json",
+    ],
+    env,
+  );
+  expect(retry).toMatchObject({ exitCode: 0, stderr: "" });
+  const retryPayload = JSON.parse(retry.stdout) as { idempotent: boolean; provider_session_mode: string; provider_session_id: string | null; provider_plan: { argv: string[] } };
+  expect(retryPayload.idempotent).toBe(false);
+  expect(retryPayload.provider_session_mode).toBe("resume_exact");
+  expect(retryPayload.provider_session_id).toBe("123e4567-e89b-12d3-a456-426614174000");
+  expect(retryPayload.provider_plan.argv).toContain("--resume");
 });
 
 test("run create writes spec.json, hashes landed bytes, warns on dirty write-role, and preserves retry history", async () => {
@@ -614,6 +842,13 @@ test("run create writes spec.json, hashes landed bytes, warns on dirty write-rol
   expect(existsSync(join(firstPayload.run_dir, "spec.json"))).toBe(true);
   expect(existsSync(join(firstPayload.run_dir, "spec.yml"))).toBe(false);
   const specBytes = readFileSync(join(firstPayload.run_dir, "spec.json"), "utf8");
+  const storedSpec = JSON.parse(specBytes) as { provider_session_name: string | null; provider_session_id: string | null; provider_session_mode: string };
+  expect(storedSpec).toMatchObject({
+    provider_session_name: null,
+    provider_session_id: null,
+    provider_session_mode: "fresh_persistent",
+  });
+  expect(firstStatus.provider_session_mode).toBe("fresh_persistent");
   const specSha = JSON.parse(readFileSync(join(firstPayload.run_dir, "spec.sha256"), "utf8")) as { sha256: string };
   expect(specSha.sha256).toBe(sha256(specBytes));
 
@@ -678,6 +913,9 @@ test("decision records local verdict and queues mirror outbox payload", async ()
     role: "implementer",
     agent: "codex",
     tag: "impl-a",
+    provider_session_name: null,
+    provider_session_id: null,
+    provider_session_mode: "fresh_persistent",
     state: "done",
     pid: null,
     pgid: null,
@@ -756,6 +994,9 @@ test("decision refuses unsafe mirror body before writing outbox payload", async 
     role: "implementer",
     agent: "codex",
     tag: "impl-a",
+    provider_session_name: null,
+    provider_session_id: null,
+    provider_session_mode: "fresh_persistent",
     state: "done",
     pid: null,
     pgid: null,
@@ -830,6 +1071,9 @@ test("mirror dry-run refuses unsafe body before posting", async () => {
     role: "implementer",
     agent: "codex",
     tag: "impl-a",
+    provider_session_name: null,
+    provider_session_id: null,
+    provider_session_mode: "fresh_persistent",
     state: "done",
     pid: null,
     pgid: null,

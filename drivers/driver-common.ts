@@ -1,5 +1,5 @@
 import { closeSync, existsSync, openSync, readFileSync, writeFileSync, writeSync } from "node:fs";
-import { isResultRole, type RunSpec, type RoleResult } from "../src/types.ts";
+import { isResultRole, type AgentName, type RunSpec, type RoleResult } from "../src/types.ts";
 import { fallbackResult, resultSchemaName, validateRoleResult } from "../src/schema.ts";
 import { writeJsonAtomic } from "../src/json.ts";
 
@@ -38,6 +38,8 @@ export function buildPrompt(spec: RunSpec, provider: string): string {
     `Run id: ${spec.run_id}`,
     `Role: ${spec.role}`,
     `Worktree: ${spec.worktree}`,
+    `Provider session mode: ${spec.provider_session_mode}`,
+    `Provider session name: ${spec.provider_session_name ?? "none"}`,
     "",
     "Execute the task below. Your final answer must be a single JSON object matching this orch schema.",
     `Required schema field: "${schemaName}".`,
@@ -86,6 +88,39 @@ export function buildWorkerEnv(baseEnv: NodeJS.ProcessEnv = process.env): Record
   env.CLAUDE_CODE_AUTO_CONNECT_IDE = "false";
   env.CLAUDE_CODE_MCP_ALLOWLIST_ENV = "1";
   return env;
+}
+
+export function buildProviderArgv(provider: AgentName, spec: RunSpec, runDir: string, worktree: string): string[] {
+  if (provider === "claude") {
+    const argv = ["claude", "-p", "--verbose", "--output-format", "stream-json", "--input-format", "text"];
+    if (spec.provider_session_name) argv.push("--name", spec.provider_session_name);
+    if (spec.provider_session_mode === "ephemeral") {
+      argv.push("--no-session-persistence");
+    } else if (spec.provider_session_mode === "resume_exact" && spec.provider_session_id) {
+      argv.push("--resume", spec.provider_session_id);
+    }
+    return argv;
+  }
+
+  if (provider === "codex") {
+    const lastMessagePath = `${runDir}/last_message.txt`;
+    if (spec.provider_session_mode === "resume_exact" && spec.provider_session_id) {
+      return ["codex", "exec", "resume", "--json", "--output-last-message", lastMessagePath, spec.provider_session_id, "-"];
+    }
+    const argv = ["codex", "exec", "--json", "--cd", worktree, "--output-last-message", lastMessagePath];
+    if (spec.provider_session_mode === "ephemeral") argv.push("--ephemeral");
+    argv.push("-");
+    return argv;
+  }
+
+  const argv = ["pi", "-p", "--mode", "json"];
+  if (spec.provider_session_mode === "ephemeral") {
+    argv.push("--no-session");
+  } else if (spec.provider_session_mode === "resume_exact" && spec.provider_session_id) {
+    argv.push("--session-id", spec.provider_session_id);
+  }
+  if (spec.provider_session_name) argv.push("--name", spec.provider_session_name);
+  return argv;
 }
 
 function tryParseJson(text: string): unknown | null {

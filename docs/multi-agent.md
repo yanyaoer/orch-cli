@@ -2,6 +2,7 @@
 
 > 主控 = 主 Claude（orchestrator）；worker = 跑在常驻 tmux 交互 session 里的原生 CLI（codex / claude / ~~agy~~）。
 > 每个任务 1:1 绑定一个 glab MR；MR = 跨会话/跨机的中心状态载体。派发与回报全程**结构化**，禁自由文本随意发挥。
+> 注意：本文是历史 tmux 方案，包含 `codex resume --last` 等 latest-session 语义；当前 headless orch 默认不 resume 最近会话，精确恢复只应通过显式 provider session id。
 
 ---
 
