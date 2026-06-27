@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildProviderArgv, buildWorkerEnv, extractResultFromRunDir, extractResultFromText } from "./driver-common.ts";
+import { buildPrompt, buildProviderArgv, buildWorkerEnv, extractResultFromRunDir, extractResultFromText } from "./driver-common.ts";
 import type { RunSpec } from "../src/types.ts";
 
 const tempDirs: string[] = [];
@@ -81,6 +81,13 @@ test("buildWorkerEnv preserves normal env and removes recursive tool settings", 
   expect(baseEnv.CLAUDECODE).toBe("1");
   expect(baseEnv.MCP_CONFIG).toBe("/tmp/mcp.json");
   expect(buildWorkerEnv(env)).toEqual(env);
+});
+
+test("buildPrompt names schema property and forbids worktree result files", () => {
+  const prompt = buildPrompt(spec("reviewer", "review-prompt"), "pi");
+  expect(prompt).toContain('"schema": "orch.result/reviewer/v1"');
+  expect(prompt).toContain("Do not create or edit result files in the worktree");
+  expect(prompt).not.toContain("Required schema field");
 });
 
 test("buildProviderArgv keeps defaults fresh and only resumes exact sessions", () => {
@@ -273,16 +280,45 @@ test("extractResultFromRunDir reads pi message_end assistant text events", () =>
   expect(extractResultFromRunDir(runDir, spec("reviewer", "review-pi"))).toEqual(reviewer);
 });
 
-test("extractResultFromRunDir accepts codex final text wrapped by schema key", () => {
+test("extractResultFromRunDir reads pi agent_end messages", () => {
   const runDir = tempDir();
   const reviewer = {
     schema: "orch.result/reviewer/v1",
-    run_id: "review-codex",
+    run_id: "review-pi-agent-end",
     verdict: "approve",
     reviews_run_id: "impl-a",
     blocking_findings: [],
+    non_blocking_findings: [{ body: "parsed from pi agent_end messages" }],
+    suggested_tests: ["bun test"],
+  };
+  writeFileSync(
+    join(runDir, "native.jsonl"),
+    `${JSON.stringify({
+      type: "agent_end",
+      messages: [
+        { role: "user", content: [{ type: "text", text: "ignored" }] },
+        { role: "assistant", content: [{ type: "text", text: JSON.stringify(reviewer) }] },
+      ],
+    })}\n`,
+    "utf8",
+  );
+
+  expect(extractResultFromRunDir(runDir, spec("reviewer", "review-pi-agent-end"))).toEqual(reviewer);
+});
+
+test("extractResultFromRunDir accepts schema-key and partial reviewer wrappers", () => {
+  const runDir = tempDir();
+  const reviewer = {
+    verdict: "approve",
+    blocking_findings: [],
     non_blocking_findings: [],
     suggested_tests: ["bun test"],
+  };
+  const expected = {
+    schema: "orch.result/reviewer/v1",
+    run_id: "review-codex",
+    reviews_run_id: "",
+    ...reviewer,
   };
   writeFileSync(
     join(runDir, "native.jsonl"),
@@ -290,9 +326,14 @@ test("extractResultFromRunDir accepts codex final text wrapped by schema key", (
     "utf8",
   );
 
-  expect(extractResultFromRunDir(runDir, spec("reviewer", "review-codex"))).toEqual(reviewer);
-  expect(extractResultFromText(JSON.stringify({ result: reviewer }), spec("reviewer", "review-codex"))).toEqual(reviewer);
+  expect(extractResultFromRunDir(runDir, spec("reviewer", "review-codex"))).toEqual(expected);
+  const worktree = tempDir();
+  writeFileSync(join(worktree, "reviewer-result.json"), JSON.stringify({ "orch.result/reviewer/v1": reviewer }), "utf8");
+  expect(extractResultFromRunDir(tempDir(), { ...spec("reviewer", "review-codex"), worktree })).toBeNull();
+  expect(extractResultFromText(JSON.stringify({ result: reviewer }), spec("reviewer", "review-codex"))).toEqual(expected);
+  expect(extractResultFromText(JSON.stringify({ schema: "orch.result/reviewer/v1", run_id: "review-codex", ...reviewer }), spec("reviewer", "review-codex"))).toEqual(expected);
   expect(extractResultFromText(JSON.stringify({ metadata: reviewer }), spec("reviewer", "review-codex"))).toBeNull();
+  expect(extractResultFromText(JSON.stringify({ schema: "orch.result/reviewer/v1", run_id: "old-run", ...reviewer }), spec("reviewer", "review-codex"))).toBeNull();
 });
 
 test("extractResultFromRunDir accepts claude final text with prose before result JSON", () => {

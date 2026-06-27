@@ -19,6 +19,8 @@ import {
   eventsTailHelp,
   mirrorHelp,
   mirrorSyncHelp,
+  mailHelp,
+  workspaceHelp,
   resultCommandHelp,
   runCreateHelp,
   runHelp,
@@ -35,12 +37,10 @@ import { deployWorker, locateBridgeDir, runChatgptBridge } from "../drivers/chat
 import { runPiDriver } from "../drivers/pi-headless.ts";
 import { addWorkspace, chatgptBridgeConfigPath, readBridgeConfig, writeBridgeConfig } from "./config.ts";
 import { buildBundle, type BundleOptions } from "./handoff-pro.ts";
+import { mail } from "./mail-cli.ts";
+import { workspace } from "./workspace-cli.ts";
+import { CliError, collectFlags, flagBool, flagNumber, flagString, hasHelp, parseArgs, printJson, type ParsedArgs } from "./cli.ts";
 import { buildProviderArgv } from "../drivers/driver-common.ts";
-
-interface ParsedArgs {
-  positionals: string[];
-  flags: Map<string, string | boolean>;
-}
 
 type IdempotencyRecord = {
   run_id: string;
@@ -75,8 +75,6 @@ interface OutboxCommentPayload {
   created_at: string;
 }
 
-class CliError extends Error {}
-
 function assertMirrorBodySafe(body: string): void {
   if (privateLeakAllowed()) return;
   const finding = findPrivateLeak(body);
@@ -95,58 +93,6 @@ function stateDirectoryHint(path: string, error: unknown): CliError {
       "  XDG_STATE_HOME=/tmp/orch-state orch run create ...",
     ].join("\n"),
   );
-}
-
-function parseArgs(argv: string[]): ParsedArgs {
-  const positionals: string[] = [];
-  const flags = new Map<string, string | boolean>();
-  for (let i = 0; i < argv.length; i += 1) {
-    const arg = argv[i]!;
-    if (arg === "-n") {
-      const next = argv[i + 1];
-      if (!next || next.startsWith("-")) {
-        flags.set("n", true);
-      } else {
-        flags.set("n", next);
-        i += 1;
-      }
-      continue;
-    }
-    if (!arg.startsWith("--")) {
-      positionals.push(arg);
-      continue;
-    }
-    const body = arg.slice(2);
-    const eq = body.indexOf("=");
-    if (eq >= 0) {
-      flags.set(body.slice(0, eq), body.slice(eq + 1));
-      continue;
-    }
-    const key = body;
-    const next = argv[i + 1];
-    if (!next || next.startsWith("--")) {
-      flags.set(key, true);
-    } else {
-      flags.set(key, next);
-      i += 1;
-    }
-  }
-  return { positionals, flags };
-}
-
-function flagString(args: ParsedArgs, name: string, fallback?: string): string {
-  const value = args.flags.get(name);
-  if (typeof value === "string") return value;
-  if (fallback !== undefined) return fallback;
-  throw new Error(`missing --${name}`);
-}
-
-function flagBool(args: ParsedArgs, name: string): boolean {
-  return args.flags.get(name) === true;
-}
-
-function hasHelp(args: ParsedArgs): boolean {
-  return args.flags.has("help");
 }
 
 function isHelpTopic(value: string): value is HelpTopic {
@@ -261,10 +207,6 @@ async function gitDirty(worktree: string): Promise<string> {
   } catch {
     return "";
   }
-}
-
-function printJson(value: unknown): void {
-  process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
 }
 
 function readTextFile(path: string): string | null {
@@ -1048,33 +990,6 @@ async function chatgptBridge(args: ParsedArgs): Promise<number> {
   return connectWithLock(worker.ws_url, token, worktree);
 }
 
-// parseArgs collapses repeated flags into one Map entry, so re-scan raw argv to
-// collect every --name value (used for repeatable --path / --glob).
-function collectFlags(name: string): string[] {
-  const argv = process.argv.slice(2);
-  const out: string[] = [];
-  for (let i = 0; i < argv.length; i += 1) {
-    const arg = argv[i]!;
-    if (arg === `--${name}`) {
-      const next = argv[i + 1];
-      if (next && !next.startsWith("--")) {
-        out.push(next);
-        i += 1;
-      }
-    } else if (arg.startsWith(`--${name}=`)) {
-      out.push(arg.slice(name.length + 3));
-    }
-  }
-  return out;
-}
-
-function flagNumber(args: ParsedArgs, name: string): number | undefined {
-  if (!args.flags.has(name)) return undefined;
-  const value = Number(flagString(args, name));
-  if (!Number.isFinite(value)) throw new CliError(`--${name} must be a number`);
-  return value;
-}
-
 async function copyToClipboard(text: string): Promise<boolean> {
   try {
     const proc = Bun.spawn(["pbcopy"], { stdin: new TextEncoder().encode(text), stdout: "ignore", stderr: "ignore" });
@@ -1089,8 +1004,8 @@ async function handoffPro(args: ParsedArgs): Promise<number> {
   const options: BundleOptions = {
     worktree,
     title: args.flags.has("title") ? flagString(args, "title") : undefined,
-    selectedPaths: collectFlags("path"),
-    extraGlobs: collectFlags("glob"),
+    selectedPaths: collectFlags(args, "path"),
+    extraGlobs: collectFlags(args, "glob"),
     includeImportantFiles: !flagBool(args, "no-important-files"),
     includeChangedFiles: !flagBool(args, "no-changed-files"),
     includeDiff: !flagBool(args, "no-diff"),
@@ -1172,6 +1087,14 @@ async function main(): Promise<number> {
       process.stdout.write(decisionHelp());
       return 0;
     }
+    if (first === "mail") {
+      process.stdout.write(mailHelp());
+      return 0;
+    }
+    if (first === "workspace") {
+      process.stdout.write(workspaceHelp());
+      return 0;
+    }
     if (first === "mirror" && second === "sync") {
       process.stdout.write(mirrorSyncHelp());
       return 0;
@@ -1216,6 +1139,8 @@ async function main(): Promise<number> {
   if (first === "status") return status(args);
   if (first === "decision") return decision(args);
   if (first === "mirror") return mirror(args);
+  if (first === "mail") return mail(args, { orchCommand, locateRun, readMirrorResult });
+  if (first === "workspace") return workspace(args);
   if (first === "chatgpt-bridge") return chatgptBridge(args);
   if (first === "handoff-pro") return handoffPro(args);
   process.stderr.write(topLevelHelp());

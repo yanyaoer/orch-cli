@@ -21,6 +21,8 @@ export function topLevelHelp(): string {
     "  orch mirror sync   Send queued outbox comments to a PR/MR",
     "  orch chatgpt-bridge  Deploy + connect the read-only ChatGPT bridge (Cloudflare Worker)",
     "  orch handoff-pro   Hand off full repo context to a tool-less model (e.g. gpt-5.5-pro)",
+    "  orch mail          Queue, locally deliver, and import signed orch mail events",
+    "  orch workspace     Add or list project workspaces for mail routing",
     "",
     "Quickstart:",
     "  orch run create --mr 123 --role implementer --agent codex --tag impl-a --worktree . --task task.md",
@@ -229,6 +231,68 @@ export function mirrorSyncHelp(): string {
     "Examples:",
     "  orch mirror sync --mr 123",
     "  orch mirror sync --mr 123 --execute",
+  ]);
+}
+
+export function workspaceHelp(): string {
+  return lines([
+    "orch workspace: manage project workspaces used by mail routing",
+    "",
+    "Usage:",
+    "  orch workspace add --id <id> --path <dir>",
+    "  orch workspace list",
+    "",
+    "Behavior:",
+    "  Stores project directories in ${XDG_CONFIG_HOME:-$HOME/.config}/orch/config.json.",
+    "  Mail tasks can reference a workspace with --workspace <id>.",
+    "",
+    "Examples:",
+    "  orch workspace add --id orch-cli --path .",
+    "  orch mail submit --thread th_plan --workspace orch-cli --task task.md",
+  ]);
+}
+
+export function mailHelp(): string {
+  return lines([
+    "orch mail: local signed-mail message bus for orch task dispatch",
+    "",
+    "Usage:",
+    "  orch mail agent defaults",
+    "  orch mail agent bind --id <id> --address <addr> --provider <name> --role <role> [--work-mode <mode>] [--session-mode <mode>] [--auto-invite]",
+    "  orch mail agent list",
+    "  orch mail submit --thread <id> [--mr <id>] --workspace <id> --task <file>",
+    "  orch mail route --thread <id> [--worktree <path>]",
+    "  orch mail claim --thread <id> --agent <id> [--mr <id>] [--dry-run] [--worktree <path>]",
+    "  orch mail assign --thread <id> --role <role> --task <file> [--to-agent <id>] [--parent-event <event>]",
+    "  orch mail reply result --thread <id> --run <run_id> --from-agent <id> [--to-agent <id>] [--parent-event <event>]",
+    "  orch mail compose decision --thread <id> --run <run_id> [--from-agent <id>] [--to-agent <id>] [--worktree <path>]",
+    "  orch mail deliver-local|import|list|path --thread <id> [flags]; orch mail neomutt [--json]; orch mail sendmail [--thread <id>]",
+    "",
+    "Behavior:",
+    "  agent defaults configures orch-router plus codex/claude/pi local mailboxes with roles and work modes.",
+    "  submit sends a signed router task to orch-router@local.orch; route first expands imported router tasks into implementer mail only.",
+    "  after an implementer replies with result.submitted, route fans that concrete result out to reviewer and verifier mail.",
+    "  claim atomically leases assigned mail tasks and starts orch run create; use --dry-run to preview without launching a provider.",
+    "  assign selects auto-invite agents by role, or a single --to-agent, and queues task.requested mail.",
+    "  reply result sends a signed result.submitted mail back into the same thread.",
+    "  deliver-local copies queued .eml files into inbox/raw, mirrors them into a Maildir at mail/threads/<id>/maildir/, and moves them to outbox/sent/.",
+    "  neomutt opens NeoMutt by default; without --thread it reads every configured workspace and thread.",
+    "  NeoMutt send is wired to orch mail sendmail: messages to orch-router@local.orch become signed router tasks, then route+deliver locally.",
+    "  Pass --json to print the generated rc/maildir/mailboxes instead of launching NeoMutt.",
+    "  Invalid, unsigned, wrong-thread, or wrong-repo messages are written to inbox/quarantine/ and never trigger runs.",
+    "  Successful non-dry-run claims are acked under claims/*.claim.json and mail-claimed.json; failed starts are nacked for retry.",
+    "  NeoMutt macros: F5 deliver, F6 import selected, F7 route+deliver, F10 assign, F11 reply result.",
+    "",
+    "Examples:",
+    "  orch mail agent defaults",
+    "  orch workspace add --id orch-cli --path .",
+    "  orch mail submit --thread th_plan --mr 123 --workspace orch-cli --task task.md",
+    "  RAW=$(orch mail deliver-local --thread th_plan | bun -e 'const p=JSON.parse(await Bun.stdin.text()); console.log(p.delivered[0]?.to ?? \"\")')",
+    "  orch mail import --thread th_plan --file \"$RAW\"",
+    "  orch mail route --thread th_plan",
+    "  orch mail claim --thread th_plan --agent codex-implementer --dry-run",
+    "  orch mail neomutt",
+    "  orch mail neomutt --json",
   ]);
 }
 
