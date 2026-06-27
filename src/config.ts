@@ -21,6 +21,36 @@ export interface BridgeConfig {
   workspaces: BridgeWorkspace[];
 }
 
+export interface OrchWorkspace {
+  id: string;
+  path: string;
+  added_at: string;
+}
+
+export interface OrchConfig {
+  version: 1;
+  workspaces: Record<string, OrchWorkspace>;
+}
+
+export interface MailAgentDefinition {
+  id: string;
+  address: string;
+  provider: string;
+  roles: string[];
+  capabilities: string[];
+  max_concurrency: number;
+  trust: "internal" | "external";
+  auto_invite: boolean;
+  work_mode: string;
+  provider_session_mode: "ephemeral" | "fresh_persistent" | "resume_exact";
+  updated_at: string;
+}
+
+export interface MailAgentsConfig {
+  version: 1;
+  agents: Record<string, MailAgentDefinition>;
+}
+
 export function configHome(): string {
   return process.env.XDG_CONFIG_HOME ?? `${process.env.HOME}/.config`;
 }
@@ -33,6 +63,14 @@ export function chatgptBridgeConfigPath(): string {
   return `${orchConfigDir()}/chatgpt-bridge.json`;
 }
 
+export function mailAgentsConfigPath(): string {
+  return `${orchConfigDir()}/mail-agents.json`;
+}
+
+export function orchConfigPath(): string {
+  return `${orchConfigDir()}/config.json`;
+}
+
 export function readBridgeConfig(): BridgeConfig {
   return readJsonFile<BridgeConfig>(chatgptBridgeConfigPath(), { workspaces: [] });
 }
@@ -43,6 +81,45 @@ export function writeBridgeConfig(cfg: BridgeConfig): void {
   mkdirSync(orchConfigDir(), { recursive: true });
   writeJsonAtomic(path, cfg);
   chmodSync(path, 0o600);
+}
+
+export function readMailAgentsConfig(): MailAgentsConfig {
+  return readJsonFile<MailAgentsConfig>(mailAgentsConfigPath(), { version: 1, agents: {} });
+}
+
+export function writeMailAgentsConfig(cfg: MailAgentsConfig): void {
+  const path = mailAgentsConfigPath();
+  mkdirSync(orchConfigDir(), { recursive: true });
+  writeJsonAtomic(path, cfg);
+  chmodSync(path, 0o600);
+}
+
+export function readOrchConfig(): OrchConfig {
+  return readJsonFile<OrchConfig>(orchConfigPath(), { version: 1, workspaces: {} });
+}
+
+export function writeOrchConfig(cfg: OrchConfig): void {
+  const path = orchConfigPath();
+  mkdirSync(orchConfigDir(), { recursive: true });
+  writeJsonAtomic(path, cfg);
+  chmodSync(path, 0o600);
+}
+
+export function upsertWorkspace(cfg: OrchConfig, id: string, path: string, now: string): OrchConfig {
+  const resolved = canonicalPath(path);
+  const workspaces = Object.fromEntries(Object.entries(cfg.workspaces).filter(([, workspace]) => canonicalPath(workspace.path) !== resolved));
+  workspaces[id] = { id, path: resolved, added_at: now };
+  return { version: 1, workspaces };
+}
+
+export function upsertMailAgent(cfg: MailAgentsConfig, agent: MailAgentDefinition): MailAgentsConfig {
+  return {
+    version: 1,
+    agents: {
+      ...cfg.agents,
+      [agent.id]: agent,
+    },
+  };
 }
 
 function canonicalPath(path: string): string {

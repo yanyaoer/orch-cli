@@ -2,6 +2,22 @@
 
 All notable user-facing changes are recorded here.
 
+## [0.0.3] - 2026-06-25
+
+### Features
+
+- Replaced the orchestration bus with the local mail/Maildir implementation and added a typed bus abstraction for router, claim, ack, and nack flows.
+- Added mail agent and workspace CLI surfaces for default agent materialization, agent listing, and workspace inspection.
+
+### Reliability
+
+- Added the local install script so replacing an existing compiled `orch` binary removes the old target before copying the new Mach-O.
+- Simplified provider driver launch flow and shared driver command construction across Codex, Claude, and pi.
+
+### Documentation
+
+- Updated README and GitHub Pages quickstart content for the mail bus, local install path, and current CLI commands.
+
 ## [0.0.2] - 2026-06-23
 
 ### Features

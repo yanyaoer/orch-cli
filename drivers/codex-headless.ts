@@ -1,48 +1,8 @@
 #!/usr/bin/env bun
-import {
-  buildWorkerEnv,
-  buildProviderArgv,
-  buildPrompt,
-  extractResultFromRunDir,
-  maybeWriteFakeResult,
-  parseDriverArgs,
-  pipeToFile,
-  readSpec,
-  synthesizeResult,
-  writeExitCode,
-  writeResult,
-} from "./driver-common.ts";
+import { runProviderDriver } from "./driver-common.ts";
 
 export async function runCodexDriver(argv: string[]): Promise<number> {
-  const args = parseDriverArgs(argv);
-  const spec = readSpec(args.specPath);
-  if (await maybeWriteFakeResult(args.runDir, spec, "codex")) return 0;
-
-  const prompt = buildPrompt(spec, "codex");
-  const proc = Bun.spawn(
-    buildProviderArgv("codex", spec, args.runDir, args.worktree),
-    {
-      cwd: args.worktree,
-      stdin: "pipe",
-      stdout: "pipe",
-      stderr: "inherit",
-      env: buildWorkerEnv(),
-    },
-  );
-  proc.stdin.write(prompt);
-  proc.stdin.end();
-
-  await pipeToFile(proc.stdout, `${args.runDir}/native.jsonl`);
-  const code = await proc.exited;
-  writeExitCode(args.runDir, code);
-
-  const extracted = extractResultFromRunDir(args.runDir, spec);
-  writeResult(
-    args.runDir,
-    spec,
-    extracted ?? synthesizeResult(spec, code === 0 ? "codex did not return a valid orch result JSON" : `codex exited ${code}`),
-  );
-  return code;
+  return runProviderDriver("codex", argv);
 }
 
 if (import.meta.main) {

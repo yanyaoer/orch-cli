@@ -22,12 +22,83 @@ function array(value: unknown): value is unknown[] {
   return Array.isArray(value);
 }
 
+function record(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
 function requireFields(obj: Record<string, unknown>, fields: string[]): string[] {
   return fields.filter((field) => {
     const value = obj[field];
     if (typeof value === "string") return value.trim() === "";
     if (Array.isArray(value)) return false;
     return value === undefined || value === null;
+  });
+}
+
+function validateStringArray(obj: Record<string, unknown>, field: string, errors: string[]): void {
+  if (!array(obj[field])) {
+    errors.push(`${field} must be an array`);
+    return;
+  }
+  obj[field].forEach((item, index) => {
+    if (typeof item !== "string") errors.push(`${field}[${index}] must be a string`);
+  });
+}
+
+function validateCommands(obj: Record<string, unknown>, field: string, errors: string[]): void {
+  if (!array(obj[field])) {
+    errors.push(`${field} must be an array`);
+    return;
+  }
+  obj[field].forEach((item, index) => {
+    if (!record(item)) {
+      errors.push(`${field}[${index}] must be an object`);
+      return;
+    }
+    if (!nonEmptyString(item.cmd)) errors.push(`${field}[${index}].cmd is required`);
+    if (typeof item.exit_code !== "number") errors.push(`${field}[${index}].exit_code must be a number`);
+    if (!nonEmptyString(item.summary)) errors.push(`${field}[${index}].summary is required`);
+  });
+}
+
+function validateAcceptance(obj: Record<string, unknown>, field: string, errors: string[], evidenceAllowed: boolean): void {
+  if (!array(obj[field])) {
+    errors.push(`${field} must be an array`);
+    return;
+  }
+  obj[field].forEach((item, index) => {
+    if (!record(item)) {
+      errors.push(`${field}[${index}] must be an object`);
+      return;
+    }
+    if (!nonEmptyString(item.id)) errors.push(`${field}[${index}].id is required`);
+    if (!nonEmptyString(item.status)) errors.push(`${field}[${index}].status is required`);
+    if (!evidenceAllowed && item.evidence !== undefined) errors.push(`${field}[${index}].evidence is not supported`);
+    if (item.evidence !== undefined && typeof item.evidence !== "string") errors.push(`${field}[${index}].evidence must be a string`);
+  });
+}
+
+function validateFindings(obj: Record<string, unknown>, field: string, errors: string[], blocking: boolean): void {
+  if (!array(obj[field])) {
+    errors.push(`${field} must be an array`);
+    return;
+  }
+  obj[field].forEach((item, index) => {
+    if (!record(item)) {
+      errors.push(`${field}[${index}] must be an object`);
+      return;
+    }
+    if (!nonEmptyString(item.body)) errors.push(`${field}[${index}].body is required`);
+    for (const optional of ["id", "severity", "file"]) {
+      if (item[optional] !== undefined && typeof item[optional] !== "string") {
+        errors.push(`${field}[${index}].${optional} must be a string`);
+      }
+    }
+    if (blocking) {
+      for (const required of ["id", "severity", "file"]) {
+        if (!nonEmptyString(item[required])) errors.push(`${field}[${index}].${required} is required`);
+      }
+    }
   });
 }
 
@@ -53,9 +124,10 @@ export function validateRoleResult(role: RunRole, value: unknown): ValidationRes
     const missing = requireFields(obj, ["verdict", "summary", "base_sha", "head_sha", "rollback"]);
     errors.push(...missing.map((field) => `${field} is required`));
     if (obj.verdict !== "completed" && obj.verdict !== "failed") errors.push("verdict must be completed|failed");
-    for (const field of ["changed_files", "tests", "acceptance", "risks"]) {
-      if (!array(obj[field])) errors.push(`${field} must be an array`);
-    }
+    validateStringArray(obj, "changed_files", errors);
+    validateCommands(obj, "tests", errors);
+    validateAcceptance(obj, "acceptance", errors, true);
+    validateStringArray(obj, "risks", errors);
   } else if (role === "reviewer") {
     const missing = requireFields(obj, ["verdict"]);
     errors.push(...missing.map((field) => `${field} is required`));
@@ -63,17 +135,16 @@ export function validateRoleResult(role: RunRole, value: unknown): ValidationRes
     if (obj.verdict !== "approve" && obj.verdict !== "request_changes") {
       errors.push("verdict must be approve|request_changes");
     }
-    for (const field of ["blocking_findings", "non_blocking_findings", "suggested_tests"]) {
-      if (!array(obj[field])) errors.push(`${field} must be an array`);
-    }
+    validateFindings(obj, "blocking_findings", errors, true);
+    validateFindings(obj, "non_blocking_findings", errors, false);
+    validateStringArray(obj, "suggested_tests", errors);
   } else {
     const missing = requireFields(obj, ["verdict"]);
     errors.push(...missing.map((field) => `${field} is required`));
     if (typeof obj.verifies_run_id !== "string") errors.push("verifies_run_id must be a string");
     if (obj.verdict !== "pass" && obj.verdict !== "fail") errors.push("verdict must be pass|fail");
-    for (const field of ["commands", "acceptance"]) {
-      if (!array(obj[field])) errors.push(`${field} must be an array`);
-    }
+    validateCommands(obj, "commands", errors);
+    validateAcceptance(obj, "acceptance", errors, false);
   }
 
   return { ok: errors.length === 0, errors };

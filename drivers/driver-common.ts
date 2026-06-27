@@ -42,8 +42,8 @@ export function buildPrompt(spec: RunSpec, provider: string): string {
     `Provider session name: ${spec.provider_session_name ?? "none"}`,
     "",
     "Execute the task below. Your final answer must be a single JSON object matching this orch schema.",
-    `Required schema field: "${schemaName}".`,
-    "Do not wrap the JSON in Markdown.",
+    `The top-level JSON object must include: "schema": "${schemaName}".`,
+    "Do not wrap the JSON in Markdown. Do not create or edit result files in the worktree; return the JSON as your final answer only.",
     "",
     "Task:",
     spec.task_text || "(no task text supplied)",
@@ -195,7 +195,8 @@ function parsedJsonCandidates(text: string): unknown[] {
 }
 
 function roleResultFromCandidate(value: unknown, spec: RunSpec): RoleResult | null {
-  if (validateRoleResult(spec.role, value).ok) return value as RoleResult;
+  const normalized = normalizedRoleResult(value, spec);
+  if (normalized) return normalized;
 
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   if (!isResultRole(spec.role)) return null;
@@ -203,10 +204,26 @@ function roleResultFromCandidate(value: unknown, spec: RunSpec): RoleResult | nu
   const obj = value as Record<string, unknown>;
   const schemaName = resultSchemaName(spec.role);
   for (const key of [schemaName, "result"]) {
-    const wrapped = obj[key];
-    if (validateRoleResult(spec.role, wrapped).ok) return wrapped as RoleResult;
+    const wrapped = normalizedRoleResult(obj[key], spec);
+    if (wrapped) return wrapped;
   }
   return null;
+}
+
+function normalizedRoleResult(value: unknown, spec: RunSpec): RoleResult | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  if (!isResultRole(spec.role)) return null;
+
+  const schemaName = resultSchemaName(spec.role);
+  const obj = { ...(value as Record<string, unknown>) };
+  if (obj.run_id !== undefined && obj.run_id !== spec.run_id) return null;
+  if (validateRoleResult(spec.role, obj).ok) return obj as unknown as RoleResult;
+  if (obj.schema === undefined) obj.schema = schemaName;
+  if (obj.run_id === undefined) obj.run_id = spec.run_id;
+  if (spec.role === "reviewer" && obj.reviews_run_id === undefined) obj.reviews_run_id = "";
+  if (spec.role === "verifier" && obj.verifies_run_id === undefined) obj.verifies_run_id = "";
+
+  return validateRoleResult(spec.role, obj).ok ? (obj as unknown as RoleResult) : null;
 }
 
 export function extractResultFromText(text: string, spec: RunSpec): RoleResult | null {
@@ -250,6 +267,7 @@ export function extractResultFromRunDir(runDir: string, spec: RunSpec): RoleResu
           type?: unknown;
           result?: unknown;
           message?: { role?: unknown; content?: unknown };
+          messages?: Array<{ role?: unknown; content?: unknown }>;
           item?: { type?: string; text?: string };
         };
         if (event.type === "result" && typeof event.result === "string") {
@@ -263,11 +281,18 @@ export function extractResultFromRunDir(runDir: string, spec: RunSpec): RoleResu
           codexCandidates.push(event.item.text);
         }
         if (
-          (event.type === "message_end" || event.type === "turn_end" || event.type === "agent_end") &&
+          (event.type === "message_end" || event.type === "turn_end") &&
           event.message?.role === "assistant"
         ) {
           const text = textFromClaudeAssistantContent(event.message.content);
           if (text) piCandidates.push(text);
+        }
+        if (event.type === "agent_end" && Array.isArray(event.messages)) {
+          for (const message of event.messages) {
+            if (message.role !== "assistant") continue;
+            const text = textFromClaudeAssistantContent(message.content);
+            if (text) piCandidates.push(text);
+          }
         }
       } catch {
         rawLineCandidates.push(line);
@@ -377,4 +402,37 @@ export async function pipeToFile(stream: ReadableStream<Uint8Array> | null, path
   } finally {
     closeSync(fd);
   }
+}
+
+export async function runProviderDriver(provider: AgentName, argv: string[]): Promise<number> {
+  const args = parseDriverArgs(argv);
+  const spec = readSpec(args.specPath);
+  if (await maybeWriteFakeResult(args.runDir, spec, provider)) return 0;
+
+  const prompt = buildPrompt(spec, provider);
+  const proc = Bun.spawn(buildProviderArgv(provider, spec, args.runDir, args.worktree), {
+    cwd: args.worktree,
+    stdin: "pipe",
+    stdout: "pipe",
+    stderr: "inherit",
+    env: buildWorkerEnv(),
+  });
+  proc.stdin.write(prompt);
+  proc.stdin.end();
+
+  await pipeToFile(proc.stdout, `${args.runDir}/native.jsonl`);
+  const code = await proc.exited;
+  writeExitCode(args.runDir, code);
+
+  const extracted = extractResultFromRunDir(args.runDir, spec);
+  writeResult(
+    args.runDir,
+    spec,
+    extracted ??
+      synthesizeResult(
+        spec,
+        code === 0 ? `${provider} did not return a valid orch result JSON` : `${provider} exited ${code}`,
+      ),
+  );
+  return code;
 }

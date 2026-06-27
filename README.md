@@ -8,17 +8,18 @@ Daemonless multi-agent orchestration for coding work.
 
 Project page: `docs/index.html` is ready for GitHub Pages and includes a bilingual animated overview.
 
-Latest release: `v0.0.2` ([CHANGELOG.md](CHANGELOG.md)).
+Latest release: `v0.0.3` ([CHANGELOG.md](CHANGELOG.md)).
 
 ## Current Scope
 
 This repository is the v2 MVP described in [docs/orch-mvp-spec.md](docs/orch-mvp-spec.md).
 
-Shipped in `v0.0.2`:
+Shipped in `v0.0.3`:
 
 - `orch run create` starts one supervised headless worker run.
 - `orch run list`, `orch status`, `orch events tail`, and `orch result` read local run state.
 - `orch decision` records `accept` or `rework` locally and queues a mirror comment.
+- `orch mail` provides the local message bus: signed mail events, Maildir delivery, router dispatch, atomic task claim, and result-driven review/verify follow-ups.
 - `orch mirror` and `orch mirror sync` dry-run by default, then use `gh` or `glab` only with `--execute`.
 - Drivers exist for `codex`, `claude`, and `pi`.
 - `orch chatgpt-bridge` deploys a Cloudflare Worker (no tunnel) and connects ChatGPT (Developer Mode, e.g. `gpt-5.5-pro`) to a read-only view of the worktree.
@@ -28,7 +29,7 @@ Shipped in `v0.0.2`:
 Not shipped yet:
 
 - No long-running daemon.
-- No queue service or multi-machine state database.
+- No multi-machine state database; the shipped bus is local mail/Maildir state.
 - No interactive attach/debug shell command in the current CLI.
 - No `agy` driver in the current implementation.
 - [docs/multi-agent.md](docs/multi-agent.md) is historical context for the older tmux/MR-centered design, not the current quickstart path.
@@ -49,20 +50,19 @@ Development setup:
 $ bun install
 $ bun test
 $ bun run build
-$ orch --help
+$ bun run orch --help
 ```
 
 Run directly from source:
 
 ```sh
-$ orch --help
+$ bun run orch --help
 ```
 
 Build a single local binary:
 
 ```sh
-$ bun run build
-$ cp ./dist/orch ~/.local/bin/orch
+$ bun run install:local
 $ orch --help
 ```
 
@@ -139,16 +139,43 @@ $ orch mirror sync --mr 123 --execute
 
 Mirror commands are dry-run by default. Without `--execute`, `orch` prints the planned `gh` or `glab` argv and does not touch the network.
 
+## Mail Bus Dispatch
+
+`orch mail` is the local message bus for multi-agent dispatch. It writes signed `orch.mail/event/v1` messages as `.eml` files, imports verified events into `mail-events.jsonl`, and keeps a Maildir view for NeoMutt or other mail tools.
+
+```sh
+$ orch mail agent defaults
+$ orch workspace add --id orch-cli --path .
+$ orch mail submit --thread th_123 --mr 123 --workspace orch-cli --task task.md
+$ RAW=$(orch mail deliver-local --thread th_123 | bun -e 'const p=JSON.parse(await Bun.stdin.text()); console.log(p.delivered[0]?.to ?? "")')
+$ orch mail import --thread th_123 --file "$RAW"
+$ orch mail route --thread th_123
+$ orch mail claim --thread th_123 --agent codex-implementer
+```
+
+Routing is result-driven:
+
+1. `submit` queues a router task for `orch-router@local.orch`.
+2. `route` turns the imported router task into one implementer task, usually `codex-implementer`.
+3. `claim` atomically leases the task and starts `orch run create`.
+4. `reply result` publishes the implementer's `result.json` as `result.submitted`.
+5. A later `route` fans that result out to reviewer and verifier agents, so Claude/Pi review actual Codex output instead of racing on the original prompt.
+
+The `MaildirBus` adapter in `src/bus.ts` is intentionally small: `publish*`, `import*`, `listEvents`, `claimTasks`, `ackTask`, and `nackTask`. Claims are stored under `mail/threads/<thread>/claims/` with a lease record, then acknowledged into the legacy `mail-claimed.json` projection after `orch run create` succeeds.
+
 ## How It Works
 
 `orch` is a stateless reconciler. Every command reads local state, performs one action, and exits.
 
 ```text
 controller / human
-  -> orch CLI
+  -> orch mail submit / sendmail
+  -> MaildirBus signed event log
+  -> orch mail route / claim
   -> per-run supervisor
   -> codex, claude, or pi headless driver
-  -> local run directory
+  -> result.submitted mail
+  -> reviewer / verifier follow-up tasks
   -> optional PR/MR mirror through outbox
 ```
 
@@ -175,6 +202,19 @@ Outbox comments are stored under:
 ${XDG_STATE_HOME:-$HOME/.local/state}/orch/<repo_key>/mrs/<mr>/outbox/{pending,sent}/
 ```
 
+Mail bus state is stored under:
+
+```text
+${XDG_STATE_HOME:-$HOME/.local/state}/orch/<repo_key>/mail/threads/<thread>/
+```
+
+Important mail files:
+
+- `outbox/pending/*.eml`: signed events queued for local delivery.
+- `maildir/{new,cur,tmp}`: Maildir view for NeoMutt.
+- `inbox/events/mail-events.jsonl`: verified append-only event projection.
+- `claims/*.claim.json`: atomic task leases and ack/nack records.
+
 ## Safety Model
 
 `orch` is deliberately file-first and conservative:
@@ -185,6 +225,8 @@ ${XDG_STATE_HOME:-$HOME/.local/state}/orch/<repo_key>/mrs/<mr>/outbox/{pending,s
 - Provider sessions: default runs do not resume the latest provider session. Claude/Codex start fresh headless sessions, Pi stays ephemeral; exact resume requires explicit `--session-mode resume_exact --session-id <id>`.
 - Schema gate: the supervisor validates `result.json` before marking a run `done`.
 - Local-first mirroring: PR/MR comments go to `outbox/pending/` first. Network sends are opt-in with `--execute`.
+- Mail bus claims: `claimTasks` creates a per-event lease with atomic `O_EXCL`; `ackTask` is written only after `orch run create` succeeds, and `nackTask` records failed starts for retry.
+- Result-driven review: reviewer and verifier mail tasks are routed from `result.submitted` implementer events, not from the original router task.
 
 ## Result Contract
 
@@ -207,6 +249,8 @@ orch events tail   Print a run's local events.jsonl
 orch result        Print a run's local result.json
 orch status        Read local run status for an MR
 orch decision      Record accept/rework and queue a PR/MR mirror comment
+orch mail          Local signed-mail bus: submit, route, claim, reply, import
+orch workspace     Register local workspaces for mail routing
 orch mirror        Mirror one local run result summary to a PR/MR comment
 orch mirror sync   Send queued outbox comments to a PR/MR
 orch chatgpt-bridge  Deploy + connect the read-only ChatGPT bridge (Cloudflare Worker)
@@ -227,8 +271,7 @@ $ orch help forge
 
 ```sh
 $ bun test
-$ bun run build
-$ cp ./dist/orch ~/.local/bin/orch
+$ bun run install:local
 $ orch --help
 ```
 

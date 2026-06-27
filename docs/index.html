@@ -388,10 +388,10 @@
         <h1 data-lang="en">Run coding agents as reproducible local jobs.</h1>
         <h1 data-lang="zh">把编码 Agent 变成可复现的本地任务。</h1>
         <p class="lead" data-lang="en">
-          orch starts Codex, Claude, or pi in a supervised headless run, captures local state, validates a role-specific result, and mirrors decisions to PRs or MRs only when you ask it to.
+          orch dispatches Codex, Claude, or pi through a signed local mail bus, claims work atomically, validates role-specific results, and routes review/verify only after an implementer result is submitted.
         </p>
         <p class="lead" data-lang="zh">
-          orch 用 supervisor 启动 Codex、Claude 或 pi headless worker，落盘本地状态，校验统一结果，并只在你明确执行时把裁决镜像到 PR 或 MR。
+          orch 通过签名本地 mail bus 派发 Codex、Claude 或 pi，原子 claim 任务，校验角色结果，并在 implementer 提交结果后再派发 review/verify。
         </p>
         <div class="hero-actions">
           <a class="button primary" href="#quickstart" data-lang="en">Start with the CLI</a>
@@ -403,15 +403,18 @@
         </div>
         <div class="terminal" aria-label="Quick command">
           <div class="terminal-bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>
-          <pre>$ orch run create --mr 123 --role reviewer --agent codex \
-  --tag review-a --worktree . --task task.md</pre>
+          <pre>$ orch mail submit --thread th_123 --mr 123 --workspace orch-cli --task task.md
+$ RAW=$(orch mail deliver-local --thread th_123 | bun -e 'const p=JSON.parse(await Bun.stdin.text()); console.log(p.delivered[0]?.to ?? "")')
+$ orch mail import --thread th_123 --file "$RAW"
+$ orch mail route --thread th_123
+$ orch mail claim --thread th_123 --agent codex-implementer</pre>
         </div>
       </div>
 
       <div class="visual" id="architecture" aria-label="Animated orch workflow diagram">
         <svg viewBox="0 0 920 620" role="img" aria-labelledby="diagramTitle diagramDesc" xmlns="http://www.w3.org/2000/svg">
           <title id="diagramTitle">orch workflow</title>
-          <desc id="diagramDesc">Controller sends a task to the orch CLI, which supervises a worker driver, writes local state, and optionally mirrors to a pull request or merge request.</desc>
+          <desc id="diagramDesc">Controller submits a signed mail task, MaildirBus routes and claims it, a driver writes run state, and result.submitted mail triggers reviewer and verifier follow-up work.</desc>
           <defs>
             <linearGradient id="nodeA" x1="0" x2="1">
               <stop offset="0" stop-color="#0f766e"/>
@@ -473,14 +476,14 @@
 
           <g transform="translate(350 80)">
             <rect class="nodeAccent" width="190" height="110" rx="12"/>
-            <text class="label" x="28" y="46" fill="#fff">orch CLI</text>
-            <text class="small" x="28" y="75" fill="#dbeafe">stateless call</text>
+            <text class="label" x="28" y="46" fill="#fff">MaildirBus</text>
+            <text class="small" x="28" y="75" fill="#dbeafe">signed events</text>
           </g>
 
           <g transform="translate(700 80)">
             <rect class="node" width="160" height="110" rx="12"/>
-            <text class="label" x="24" y="46">Supervisor</text>
-            <text class="small" x="24" y="75">pid / pgid</text>
+            <text class="label" x="24" y="46">Claim</text>
+            <text class="small" x="24" y="75">lease / ack</text>
           </g>
 
           <g transform="translate(665 320)">
@@ -499,9 +502,9 @@
 
           <g transform="translate(65 320)">
             <rect class="node" width="205" height="130" rx="12"/>
-            <text class="label" x="24" y="42">Outbox</text>
-            <text class="small" x="24" y="70">dry-run first</text>
-            <text class="small" x="24" y="96">gh / glab later</text>
+            <text class="label" x="24" y="42">Follow-up</text>
+            <text class="small" x="24" y="70">review / verify</text>
+            <text class="small" x="24" y="96">after result</text>
           </g>
 
           <g transform="translate(138 500)">
@@ -510,7 +513,7 @@
           </g>
           <g transform="translate(330 500)">
             <rect class="file" x="0" y="0" width="160" height="58" rx="8"/>
-            <text class="small" x="18" y="35">events.jsonl</text>
+            <text class="small" x="18" y="35">mail-events</text>
           </g>
           <g transform="translate(532 500)">
             <rect class="file" x="0" y="0" width="165" height="58" rx="8"/>
@@ -526,13 +529,13 @@
 
     <section>
       <div class="wrap">
-        <h2 data-lang="en">Local state first. Provider streams second.</h2>
-        <h2 data-lang="zh">本地状态优先，模型原始流其次。</h2>
+        <h2 data-lang="en">Signed local mail is the bus.</h2>
+        <h2 data-lang="zh">签名本地邮件就是消息总线。</h2>
         <p class="section-lead" data-lang="en">
-          The controller does not have to remember what happened. orch snapshots the task, records lifecycle events, keeps native provider output, and validates one role-specific result before marking the run done.
+          The controller does not need a daemon or external queue. orch stores signed task/result events in Maildir-backed local state, then routes reviewer and verifier work from the implementer's submitted result.
         </p>
         <p class="section-lead" data-lang="zh">
-          主控不需要把上下文记在聊天里。orch 会快照任务、记录生命周期事件、保留 provider 原始输出，并在终态前校验角色专属的结果 JSON。
+          主控不需要 daemon 或外部队列。orch 把签名 task/result 事件写入 Maildir 本地状态，并基于 implementer 提交的结果派发 reviewer 和 verifier。
         </p>
         <div class="grid">
           <article class="card">
@@ -542,16 +545,16 @@
             <p data-lang="zh">每个命令读取本地状态、推进一次动作，然后退出。supervisor 生命周期只覆盖单个 run。</p>
           </article>
           <article class="card">
-            <h3 data-lang="en">Auditable</h3>
-            <h3 data-lang="zh">可审计</h3>
-            <p data-lang="en">A run directory contains spec, status, normalized events, native logs, and result artifacts.</p>
-            <p data-lang="zh">每个 run 目录都包含 spec、status、标准事件、原始日志和结果产物。</p>
+            <h3 data-lang="en">Mail-bus auditable</h3>
+            <h3 data-lang="zh">Mail bus 可审计</h3>
+            <p data-lang="en">A thread contains signed .eml files, verified mail-events.jsonl, Maildir messages, and per-event claim records.</p>
+            <p data-lang="zh">每个 thread 都包含签名 .eml、已验证的 mail-events.jsonl、Maildir 消息和逐事件 claim 记录。</p>
           </article>
           <article class="card">
-            <h3 data-lang="en">Mirror-safe</h3>
-            <h3 data-lang="zh">镜像安全</h3>
-            <p data-lang="en">PR/MR writes go through an outbox and stay dry-run until `--execute` is passed.</p>
-            <p data-lang="zh">PR/MR 写入先进入 outbox；没有 `--execute` 就只打印计划命令。</p>
+            <h3 data-lang="en">Result-driven review</h3>
+            <h3 data-lang="zh">基于结果的 review</h3>
+            <p data-lang="en">Reviewer and verifier tasks are created from result.submitted, so cross-review audits actual implementer output.</p>
+            <p data-lang="zh">reviewer 和 verifier 任务由 result.submitted 触发，因此交叉 review 审的是真实实现产物。</p>
           </article>
         </div>
       </div>
@@ -563,33 +566,31 @@
           <h2 data-lang="en">Quickstart</h2>
           <h2 data-lang="zh">快速开始</h2>
           <p class="section-lead" data-lang="en">
-            Install with Bun or a release binary, then dispatch a role-scoped task to Codex, Claude, or pi.
+            Install with Bun or a release binary, configure default mail agents, then dispatch a task through the local mail bus.
           </p>
           <p class="section-lead" data-lang="zh">
-            使用 Bun 或 release binary 安装，然后把带角色边界的任务派发给 Codex、Claude 或 pi。
+            使用 Bun 或 release binary 安装，配置默认 mail agents，然后通过本地 mail bus 派发任务。
           </p>
         </div>
         <div class="code-block">
           <pre>$ bun install
 $ bun test
-$ bun run build
-$ cp ./dist/orch ~/.local/bin/orch
+$ bun run install:local
 
-$ orch run create \
-  --mr 123 \
-  --role reviewer \
-  --agent codex \
-  --tag review-a \
-  --worktree . \
-  --task task.md
+$ orch mail agent defaults
+$ orch workspace add --id orch-cli --path .
+$ orch mail submit --thread th_123 --mr 123 --workspace orch-cli --task task.md
+$ orch mail deliver-local --thread th_123
+$ orch mail import --thread th_123 --file <raw-eml>
+$ orch mail route --thread th_123
+$ orch mail claim --thread th_123 --agent codex-implementer
 
-$ orch status --mr 123 --json
-$ orch result --mr 123 --run review-a-...
-
-$ curl -L https://github.com/yanyaoer/orch-cli/releases/latest/download/orch-darwin-arm64 -o ~/.local/bin/orch
-$ chmod +x ~/.local/bin/orch
-
-$ XDG_STATE_HOME=/tmp/orch-state orch run create --mr demo --role reviewer --agent codex --tag review-a --worktree . --task task.md</pre>
+$ orch mail reply result --thread th_123 --run impl-a-... --from-agent codex-implementer
+$ orch mail deliver-local --thread th_123
+$ orch mail import --thread th_123 --file <result-eml>
+$ orch mail route --thread th_123
+$ orch mail claim --thread th_123 --agent claude-reviewer
+$ orch mail claim --thread th_123 --agent pi-verifier</pre>
         </div>
       </div>
     </section>
@@ -604,9 +605,10 @@ $ XDG_STATE_HOME=/tmp/orch-state orch run create --mr demo --role reviewer --age
             <h3 data-lang="zh">命令</h3>
             <ul>
               <li><code>run create</code>, <code>run list</code>, <code>status</code></li>
+              <li><code>mail submit</code>, <code>mail route</code>, <code>mail claim</code>, <code>mail reply result</code></li>
               <li><code>events tail</code>, <code>result</code></li>
               <li><code>decision</code>, <code>mirror</code>, <code>mirror sync</code></li>
-              <li><code>chatgpt-bridge</code> <span data-lang="en">for a read-only Cloudflare Worker MCP bridge</span><span data-lang="zh">提供只读 Cloudflare Worker MCP 桥接</span></li>
+              <li><code>chatgpt-bridge</code>, <code>handoff-pro</code></li>
             </ul>
           </div>
           <div class="card">
@@ -614,12 +616,12 @@ $ XDG_STATE_HOME=/tmp/orch-state orch run create --mr demo --role reviewer --age
             <h3 data-lang="zh">边界</h3>
             <ul data-lang="en">
               <li>No long-running daemon yet.</li>
-              <li>No interactive attach/debug shell command yet.</li>
+              <li>The shipped message bus is local Maildir state, not a multi-machine database.</li>
               <li>Drivers currently target Codex, Claude, and pi.</li>
             </ul>
             <ul data-lang="zh">
               <li>当前没有常驻 daemon。</li>
-              <li>当前没有交互式 attach/debug shell 命令。</li>
+              <li>当前消息总线是本地 Maildir 状态，不是多机数据库。</li>
               <li>当前 driver 覆盖 Codex、Claude 和 pi。</li>
               <li><code>chatgpt-bridge</code> 提供只读 Cloudflare Worker MCP 桥接。</li>
             </ul>

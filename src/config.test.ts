@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { addWorkspace, buildBridgeUrls, parseWorkersUrl, readBridgeConfig, type BridgeConfig } from "./config.ts";
+import { addWorkspace, buildBridgeUrls, parseWorkersUrl, readBridgeConfig, readOrchConfig, readMailAgentsConfig, upsertMailAgent, upsertWorkspace, type BridgeConfig, type MailAgentsConfig } from "./config.ts";
 
 const tempDirs: string[] = [];
 
@@ -56,6 +56,59 @@ test("readBridgeConfig returns an empty workspace list when no config exists", (
   process.env.XDG_CONFIG_HOME = tempDir();
   try {
     expect(readBridgeConfig()).toEqual({ workspaces: [] });
+  } finally {
+    if (prev === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = prev;
+  }
+});
+
+test("mail agent config records mailbox and capabilities by id", () => {
+  const prev = process.env.XDG_CONFIG_HOME;
+  process.env.XDG_CONFIG_HOME = tempDir();
+  try {
+    const empty = readMailAgentsConfig();
+    expect(empty).toEqual({ version: 1, agents: {} });
+    const cfg: MailAgentsConfig = upsertMailAgent(empty, {
+      id: "codex-review-a",
+      address: "orch+codex.review.a@example.com",
+      provider: "codex",
+      roles: ["reviewer"],
+      capabilities: ["tests"],
+      max_concurrency: 2,
+      trust: "internal",
+      auto_invite: true,
+      work_mode: "review",
+      provider_session_mode: "fresh_persistent",
+      updated_at: "2026-06-24T00:00:00.000Z",
+    });
+    expect(cfg.agents["codex-review-a"]).toMatchObject({
+      address: "orch+codex.review.a@example.com",
+      provider: "codex",
+      roles: ["reviewer"],
+      capabilities: ["tests"],
+      max_concurrency: 2,
+      work_mode: "review",
+      provider_session_mode: "fresh_persistent",
+    });
+  } finally {
+    if (prev === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = prev;
+  }
+});
+
+test("orch config records project workspaces by id", () => {
+  const prev = process.env.XDG_CONFIG_HOME;
+  const dir = tempDir();
+  process.env.XDG_CONFIG_HOME = tempDir();
+  try {
+    const empty = readOrchConfig();
+    expect(empty).toEqual({ version: 1, workspaces: {} });
+    const cfg = upsertWorkspace(empty, "orch-cli", dir, "2026-06-24T00:00:00.000Z");
+    expect(cfg.workspaces["orch-cli"]).toMatchObject({
+      id: "orch-cli",
+      path: dir,
+      added_at: "2026-06-24T00:00:00.000Z",
+    });
   } finally {
     if (prev === undefined) delete process.env.XDG_CONFIG_HOME;
     else process.env.XDG_CONFIG_HOME = prev;
