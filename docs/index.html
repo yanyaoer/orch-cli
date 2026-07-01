@@ -388,10 +388,10 @@
         <h1 data-lang="en">Run coding agents as reproducible local jobs.</h1>
         <h1 data-lang="zh">把编码 Agent 变成可复现的本地任务。</h1>
         <p class="lead" data-lang="en">
-          orch dispatches Codex, Claude, or pi through a signed local mail bus, claims work atomically, validates role-specific results, and routes review/verify only after an implementer result is submitted.
+          orch dispatches Codex, Claude, pi, or agy through a signed local mail bus, claims work atomically, validates role-specific results, and routes review/verify only after an implementer result is submitted.
         </p>
         <p class="lead" data-lang="zh">
-          orch 通过签名本地 mail bus 派发 Codex、Claude 或 pi，原子 claim 任务，校验角色结果，并在 implementer 提交结果后再派发 review/verify。
+          orch 通过签名本地 mail bus 派发 Codex、Claude、pi 或 agy，原子 claim 任务，校验角色结果，并在 implementer 提交结果后再派发 review/verify。
         </p>
         <div class="hero-actions">
           <a class="button primary" href="#quickstart" data-lang="en">Start with the CLI</a>
@@ -489,7 +489,7 @@ $ orch mail claim --thread th_123 --agent codex-implementer</pre>
           <g transform="translate(665 320)">
             <rect class="node" width="210" height="130" rx="12"/>
             <text class="label" x="24" y="42">Driver</text>
-            <text class="small" x="24" y="70">codex / claude / pi</text>
+            <text class="small" x="24" y="70">codex / claude / pi / agy</text>
             <circle class="heartbeat" cx="170" cy="38" r="9" fill="#0f766e"/>
           </g>
 
@@ -605,6 +605,7 @@ $ orch mail claim --thread th_123 --agent pi-verifier</pre>
             <h3 data-lang="zh">命令</h3>
             <ul>
               <li><code>run create</code>, <code>run list</code>, <code>status</code></li>
+              <li><code>cross-review</code>, <code>fanout</code>, <code>investigate</code></li>
               <li><code>mail submit</code>, <code>mail route</code>, <code>mail claim</code>, <code>mail reply result</code></li>
               <li><code>events tail</code>, <code>result</code></li>
               <li><code>decision</code>, <code>mirror</code>, <code>mirror sync</code></li>
@@ -617,12 +618,12 @@ $ orch mail claim --thread th_123 --agent pi-verifier</pre>
             <ul data-lang="en">
               <li>No long-running daemon yet.</li>
               <li>The shipped message bus is local Maildir state, not a multi-machine database.</li>
-              <li>Drivers currently target Codex, Claude, and pi.</li>
+              <li>Drivers target Codex, Claude, pi, and agy. Permissions match the role: reviewer runs read-only/sandboxed; agy (Gemini 3.1 Pro) is reviewer-only.</li>
             </ul>
             <ul data-lang="zh">
               <li>当前没有常驻 daemon。</li>
               <li>当前消息总线是本地 Maildir 状态，不是多机数据库。</li>
-              <li>当前 driver 覆盖 Codex、Claude 和 pi。</li>
+              <li>当前 driver 覆盖 Codex、Claude、pi 和 agy；权限随角色匹配:reviewer 以只读/沙箱方式运行,agy(Gemini 3.1 Pro)仅限 reviewer。</li>
               <li><code>chatgpt-bridge</code> 提供只读 Cloudflare Worker MCP 桥接。</li>
             </ul>
           </div>

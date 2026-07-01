@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import {
   decisionHelp,
   eventsTailHelp,
+  fanoutHelp,
   mirrorHelp,
   mirrorSyncHelp,
   resultCommandHelp,
@@ -20,6 +21,9 @@ test("top-level help exposes positioning, commands, quickstart, and topics", () 
   expect(text).toContain("daemonless multi-agent orchestrator");
   expect(text).toContain("orch run create");
   expect(text).toContain("orch run list");
+  expect(text).toContain("orch cross-review");
+  expect(text).toContain("orch fanout");
+  expect(text).toContain("orch investigate");
   expect(text).toContain("orch events tail");
   expect(text).toContain("orch result");
   expect(text).toContain("orch status");
@@ -29,6 +33,18 @@ test("top-level help exposes positioning, commands, quickstart, and topics", () 
   expect(text).toContain("Quickstart:");
   expect(text).toContain("orch <command> --help");
   expect(text).toContain("task-spec | result | events | concepts | forge");
+});
+
+test("fanout help covers the three commands, agent flag, and examples", () => {
+  const text = fanoutHelp();
+  for (const command of ["cross-review", "fanout", "investigate"]) expect(text).toContain(command);
+  expect(text).toContain("--thread");
+  expect(text).toContain("--to-agent");
+  expect(text).toContain("--role");
+  expect(text).toContain("--dry-run");
+  expect(text).toContain("orch cross-review --thread review-123");
+  expect(text).toContain("orch fanout --thread verify-123 --role verifier");
+  expect(text).toContain("orch investigate --thread research-1");
 });
 
 test("command help exposes flags and runnable examples", () => {

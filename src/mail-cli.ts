@@ -11,6 +11,7 @@ import {
   type MailAgentDefinition,
 } from "./config.ts";
 import { readJsonFile, writeJsonAtomic, writeTextAtomic } from "./json.ts";
+import { sha256 } from "./hash.ts";
 import {
   deliverLocalMail,
   ensureMailDirs,
@@ -90,6 +91,21 @@ function defaultMailAgents(now: string): MailAgentDefinition[] {
       auto_invite: true,
       work_mode: "review",
       provider_session_mode: "fresh_persistent",
+      updated_at: now,
+    },
+    {
+      id: "agy-reviewer",
+      address: "orch+agy.reviewer@local.orch",
+      provider: "agy",
+      roles: ["reviewer"],
+      capabilities: ["code-review", "research", "long-context"],
+      max_concurrency: 1,
+      trust: "internal",
+      // Not auto-invited into router followups (keeps gemini out of every review);
+      // cross-review / investigate add it explicitly via defaultAgentIds.
+      auto_invite: false,
+      work_mode: "review",
+      provider_session_mode: "ephemeral",
       updated_at: now,
     },
     {
@@ -387,7 +403,14 @@ function agentById(id: string): MailAgentDefinition {
 }
 
 function mailAgentProvider(agent: MailAgentDefinition): AgentName {
-  if (agent.provider === "codex" || agent.provider === "claude" || agent.provider === "pi") return agent.provider;
+  if (
+    agent.provider === "codex" ||
+    agent.provider === "claude" ||
+    agent.provider === "pi" ||
+    agent.provider === "agy"
+  ) {
+    return agent.provider;
+  }
   throw new CliError(`mail agent ${agent.id} uses unsupported run provider: ${agent.provider}`);
 }
 
@@ -414,6 +437,7 @@ async function claimMailTasks(
   fallbackWorktree: string,
   repoKey: string,
   context: MailCliContext,
+  opts: { eventIds?: string[] } = {},
 ): Promise<Array<{ event_id: string; role: string; agent_id: string; mr: string; run: unknown }>> {
   const agent = agentById(flagString(args, "agent"));
   const limit = flagNumber(args, "limit") ?? Number.POSITIVE_INFINITY;
@@ -421,13 +445,20 @@ async function claimMailTasks(
   if (limit <= 0) throw new CliError("--limit must be positive");
   const bus = new MaildirBus(threadDir, thread, repoKey);
   const dryRun = flagBool(args, "dry-run");
+  const eventIds = opts.eventIds ? new Set(opts.eventIds) : null;
   const leases: Array<BusTaskLease | { event: TaskRequestedMailEvent; claim_path: null; lease_id: null }> = dryRun
     ? bus
         .listEvents()
-        .filter((event): event is TaskRequestedMailEvent => event.type === "task.requested" && event.assigned_agent?.id === agent.id && Boolean(event.event_id))
+        .filter(
+          (event): event is TaskRequestedMailEvent =>
+            event.type === "task.requested" &&
+            event.assigned_agent?.id === agent.id &&
+            Boolean(event.event_id) &&
+            (!eventIds || eventIds.has(event.event_id)),
+        )
         .slice(0, limit)
         .map((event) => ({ event, claim_path: null, lease_id: null }))
-    : bus.claimTasks({ agent_id: agent.id, limit });
+    : bus.claimTasks({ agent_id: agent.id, limit, event_ids: opts.eventIds });
   const out: Array<{ event_id: string; role: string; agent_id: string; mr: string; run: unknown }> = [];
   for (const lease of leases) {
     try {
@@ -477,6 +508,148 @@ async function claimMailTasks(
     }
   }
   return out;
+}
+
+function autoInviteAgentsForRole(cfg: ReturnType<typeof readMailAgentsConfig>, role: string): MailAgentDefinition[] {
+  return Object.values(cfg.agents)
+    .filter((agent) => agent.auto_invite && agent.roles.includes(role))
+    .sort((a, b) => a.id.localeCompare(b.id));
+}
+
+// Clones parsed args with --agent overridden so claimMailTasks can run per target agent.
+function withAgentFlag(args: ParsedArgs, agentId: string): ParsedArgs {
+  const flags = new Map(args.flags);
+  flags.set("agent", agentId);
+  return { positionals: args.positionals, flags, flagValues: args.flagValues };
+}
+
+function fanoutAssignment(
+  bus: MaildirBus,
+  args: {
+    agent: MailAgentDefinition;
+    from: string;
+    taskText: string;
+    taskSha: string;
+    role: string;
+    parentEventId: string | null;
+    mr: string | null;
+    workspace: { id: string; path: string } | null;
+  },
+): Record<string, unknown> & { agent_id: string; event_id: string } {
+  const existing = bus.findTask({
+    agent_id: args.agent.id,
+    role: args.role,
+    task_sha: args.taskSha,
+    parent_event_id: args.parentEventId,
+    mr: args.mr,
+    workspace: args.workspace,
+  });
+  if (existing) {
+    return {
+      agent_id: args.agent.id,
+      address: args.agent.address,
+      idempotent: true,
+      event_id: existing.event.event_id,
+      task_sha256: existing.event.task.sha256,
+      claim_state: existing.claim_state,
+    };
+  }
+
+  return {
+    agent_id: args.agent.id,
+    address: args.agent.address,
+    idempotent: false,
+    ...bus.publishTask({
+      from: args.from,
+      taskText: args.taskText,
+      role: args.role,
+      parentEventId: args.parentEventId,
+      mr: args.mr,
+      workspace: args.workspace,
+      agent: args.agent,
+    }),
+  };
+}
+
+export interface MailFanoutOptions {
+  command: string;
+  // Fixed role for the command; when omitted the role is read from --role (fanout).
+  role?: string;
+  // Default mail-agent ids when neither --to-agent nor role auto-invite applies.
+  defaultAgentIds?: string[];
+}
+
+// Mail-native fan-out: derive mr/worktree from the thread, publish one task per
+// target agent, then claim+run each. Replaces the need for explicit --mr.
+export async function mailFanout(args: ParsedArgs, context: MailCliContext, opts: MailFanoutOptions): Promise<number> {
+  const thread = flagString(args, "thread");
+  const worktree = mailWorktree(args);
+  const repo = await getRepoIdentity(worktree);
+  const threadDir = mailThreadDir(repo.repo_key, thread);
+  ensureMailDirs(threadDir);
+  const bus = new MaildirBus(threadDir, thread, repo.repo_key);
+
+  const role = opts.role ?? flagString(args, "role");
+  if (!isResultRole(role as RunRole)) {
+    throw new CliError(`fan-out only supports result-schema roles: implementer, reviewer, verifier (got ${role})`);
+  }
+
+  const cfg = readMailAgentsConfig();
+  const requested = collectFlags(args, "to-agent");
+  const candidates =
+    requested.length > 0
+      ? requested.map((id) => agentById(id))
+      : opts.defaultAgentIds
+        ? opts.defaultAgentIds.map((id) => cfg.agents[id]).filter((agent): agent is MailAgentDefinition => Boolean(agent))
+        : autoInviteAgentsForRole(cfg, role);
+
+  const seen = new Set<string>();
+  const agents = candidates.filter((agent) => (seen.has(agent.id) ? false : (seen.add(agent.id), true)));
+  if (agents.length === 0) {
+    throw new CliError(
+      `no mail agents for role ${role}; run 'orch mail agent defaults' or pass --to-agent <id>`,
+    );
+  }
+  for (const agent of agents) {
+    if (!agent.roles.includes(role)) throw new CliError(`mail agent ${agent.id} does not support role ${role}`);
+  }
+
+  if (flagBool(args, "dry-run")) {
+    printJson({
+      mail: opts.command,
+      thread,
+      role,
+      worktree,
+      dry_run: true,
+      agents: agents.map((agent) => ({ agent_id: agent.id, provider: agent.provider })),
+    });
+    return 0;
+  }
+
+  const taskText = readFileSync(resolve(flagString(args, "task")), "utf8");
+  const taskSha = sha256(taskText);
+  const workspace = workspaceForMail(args.flags.has("workspace") ? flagString(args, "workspace") : undefined);
+  const from = flagString(args, "from", "human@local.orch");
+  const parentEventId = args.flags.has("parent-event") ? flagString(args, "parent-event") : null;
+  const mr = args.flags.has("mr") ? flagString(args, "mr") : null;
+
+  const assigned = agents.map((agent) =>
+    fanoutAssignment(bus, { agent, from, taskText, taskSha, role, parentEventId, mr, workspace }),
+  );
+
+  // Deliver + import so the freshly published task.requested events are claimable.
+  const delivered = deliverLocalMail(threadDir);
+  for (const item of delivered) bus.importRaw(readFileSync(item.to, "utf8"), thread, repo.repo_key);
+
+  const runs: unknown[] = [];
+  for (const agent of agents) {
+    const eventIds = assigned.filter((item) => item.agent_id === agent.id).map((item) => item.event_id);
+    const claimed = await claimMailTasks(withAgentFlag(args, agent.id), threadDir, thread, worktree, repo.repo_key, context, { eventIds });
+    runs.push(...claimed);
+  }
+
+  printJson({ mail: opts.command, thread, role, worktree, assigned, runs });
+  return 0;
 }
 
 export async function mail(args: ParsedArgs, context: MailCliContext): Promise<number> {
@@ -620,10 +793,7 @@ export async function mail(args: ParsedArgs, context: MailCliContext): Promise<n
     const workspace = workspaceForMail(args.flags.has("workspace") ? flagString(args, "workspace") : undefined);
     const agents = args.flags.has("to-agent")
       ? [agentById(flagString(args, "to-agent"))]
-      : Object.values(cfg.agents)
-          .filter((agent) => agent.auto_invite && agent.roles.includes(role))
-          .sort((a, b) => a.id.localeCompare(b.id))
-          .slice(0, limit);
+      : autoInviteAgentsForRole(cfg, role).slice(0, limit);
     if (agents.length === 0) throw new CliError(`no auto-invite mail agents found for role: ${role}`);
     const assigned = agents.map((agent) => ({
       agent_id: agent.id,

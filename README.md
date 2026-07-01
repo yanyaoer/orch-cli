@@ -20,8 +20,11 @@ Shipped in `v0.0.3`:
 - `orch run list`, `orch status`, `orch events tail`, and `orch result` read local run state.
 - `orch decision` records `accept` or `rework` locally and queues a mirror comment.
 - `orch mail` provides the local message bus: signed mail events, Maildir delivery, router dispatch, atomic task claim, and result-driven review/verify follow-ups.
+- `orch cross-review`, `orch fanout`, and `orch investigate` fan one task across several agents in a single command. They route through the mail layer, so a `--thread <id>` supplies the mr and workspace context (no `--mr` needed).
 - `orch mirror` and `orch mirror sync` dry-run by default, then use `gh` or `glab` only with `--execute`.
-- Drivers exist for `codex`, `claude`, and `pi`.
+- Drivers exist for `codex`, `claude`, `pi`, and `agy`.
+- Permissions match the role: the read-only `reviewer` role launches each provider without write access (claude plan mode, codex `--sandbox read-only`, pi read-only tools, agy `--sandbox`). `verifier` and write roles keep write-capable access.
+- `agy` (Gemini 3.1 Pro) is restricted to the `reviewer` role and runs sandboxed read-only; orch rejects it for any other role.
 - `orch chatgpt-bridge` deploys a Cloudflare Worker (no tunnel) and connects ChatGPT (Developer Mode, e.g. `gpt-5.5-pro`) to a read-only view of the worktree.
 - Role result schemas exist for `implementer`, `reviewer`, and `verifier`.
 - Provider session controls are explicit: defaults avoid latest-session resume, exact resume requires `--session-mode resume_exact --session-id <id>`, and idempotency keys include session settings.
@@ -31,7 +34,6 @@ Not shipped yet:
 - No long-running daemon.
 - No multi-machine state database; the shipped bus is local mail/Maildir state.
 - No interactive attach/debug shell command in the current CLI.
-- No `agy` driver in the current implementation.
 - [docs/multi-agent.md](docs/multi-agent.md) is historical context for the older tmux/MR-centered design, not the current quickstart path.
 
 ## Install
@@ -40,7 +42,7 @@ Prerequisites:
 
 - Bun
 - Git
-- `codex`, `claude`, and/or `pi` authenticated locally if you want real worker runs
+- `codex`, `claude`, `pi`, and/or `agy` authenticated locally if you want real worker runs
 - Optional: `gh` for GitHub mirroring or `glab` for GitLab mirroring
 - Optional: `wrangler` and a Cloudflare account for `orch chatgpt-bridge`
 
@@ -163,6 +165,24 @@ Routing is result-driven:
 
 The `MaildirBus` adapter in `src/bus.ts` is intentionally small: `publish*`, `import*`, `listEvents`, `claimTasks`, `ackTask`, and `nackTask`. Claims are stored under `mail/threads/<thread>/claims/` with a lease record, then acknowledged into the legacy `mail-claimed.json` projection after `orch run create` succeeds.
 
+## Fan-out Dispatch
+
+`cross-review`, `fanout`, and `investigate` are one-shot wrappers over the mail bus. Each resolves one `task.requested` per target agent into a thread, reusing an existing task with the same thread/role/agent/task hash when present, then claims only those resolved task events. Because they go through mail, the `--thread <id>` supplies the mr (defaults to the thread id) and the workspace worktree — there is no `--mr` flag.
+
+```sh
+$ orch mail agent defaults                       # once: register the default agents
+$ orch cross-review --thread review-123 --task review.md
+$ orch fanout --thread verify-123 --role verifier --to-agent pi-verifier --task verify.md
+$ orch investigate --thread research-1 --task question.md
+$ orch status --mr review-123                     # follow the runs (mr == thread)
+```
+
+- `cross-review`: reviewer role; default agents `claude-reviewer` + `agy-reviewer` (distinct model families).
+- `fanout`: any result role via `--role`; default agents are the auto-invited agents for that role.
+- `investigate`: reviewer role for read-only research; default agents `agy-reviewer` + `claude-reviewer`.
+- `--to-agent <mail-agent-id>` (repeatable) overrides the default roster; `--dry-run` prints the resolved agents without publishing.
+- Re-running the same thread with the same task is idempotent: already-acked assignments are reused and not run again; nacked or expired assignments can be claimed without publishing duplicates.
+
 ## How It Works
 
 `orch` is a stateless reconciler. Every command reads local state, performs one action, and exits.
@@ -173,7 +193,7 @@ controller / human
   -> MaildirBus signed event log
   -> orch mail route / claim
   -> per-run supervisor
-  -> codex, claude, or pi headless driver
+  -> codex, claude, pi, or agy headless driver
   -> result.submitted mail
   -> reviewer / verifier follow-up tasks
   -> optional PR/MR mirror through outbox
@@ -245,6 +265,9 @@ The driver prompt asks the provider to return exactly one JSON object. The drive
 ```text
 orch run create    Start one headless worker run for an MR task
 orch run list      List local runs for an MR
+orch cross-review  Review one diff in parallel with several agents (via mail thread)
+orch fanout        Run one task across several agents, any result role (via mail thread)
+orch investigate   Read-only research/analysis, defaults to gemini-3.1-pro (via mail thread)
 orch events tail   Print a run's local events.jsonl
 orch result        Print a run's local result.json
 orch status        Read local run status for an MR

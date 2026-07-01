@@ -6,7 +6,7 @@ import type { AgentName, ImplementerResult, ProviderSessionMode, RoleResult, Run
 import { isResultRole, writeRoles } from "./types.ts";
 import { acquirePidfileLock, LockHeldError } from "./locks.ts";
 import { randomHex, sha256 } from "./hash.ts";
-import { ensureStateLayout, getRepoIdentity, lockPathForWorktree, mrStateDir, orchStateRoot } from "./paths.ts";
+import { ensureStateLayout, getRepoIdentity, lockPathForWorktree, mrStateDir, orchStateRoot, type RepoIdentity } from "./paths.ts";
 import { jsonBytes, readJsonFile, writeJsonAtomic, writeTextAtomic } from "./json.ts";
 import { argvForDisplay, createForgeAdapter, detectForge } from "./forge.ts";
 import { findPrivateLeak, privateLeakAllowed, privateLeakErrorMessage } from "./leak.ts";
@@ -17,6 +17,7 @@ import {
   handoffProHelp,
   decisionHelp,
   eventsTailHelp,
+  fanoutHelp,
   mirrorHelp,
   mirrorSyncHelp,
   mailHelp,
@@ -35,12 +36,13 @@ import { runCodexDriver } from "../drivers/codex-headless.ts";
 import { runClaudeDriver } from "../drivers/claude-headless.ts";
 import { deployWorker, locateBridgeDir, runChatgptBridge } from "../drivers/chatgpt-bridge.ts";
 import { runPiDriver } from "../drivers/pi-headless.ts";
+import { runAgyDriver } from "../drivers/agy-headless.ts";
 import { addWorkspace, chatgptBridgeConfigPath, readBridgeConfig, writeBridgeConfig } from "./config.ts";
 import { buildBundle, type BundleOptions } from "./handoff-pro.ts";
-import { mail } from "./mail-cli.ts";
+import { mail, mailFanout, type MailCliContext } from "./mail-cli.ts";
 import { workspace } from "./workspace-cli.ts";
 import { CliError, collectFlags, flagBool, flagNumber, flagString, hasHelp, parseArgs, printJson, type ParsedArgs } from "./cli.ts";
-import { buildProviderArgv } from "../drivers/driver-common.ts";
+import { buildPrompt, buildProviderArgv } from "../drivers/driver-common.ts";
 
 type IdempotencyRecord = {
   run_id: string;
@@ -112,7 +114,7 @@ function isProviderSessionMode(value: string): value is ProviderSessionMode {
 }
 
 function defaultProviderSessionMode(agent: AgentName): ProviderSessionMode {
-  return agent === "pi" ? "ephemeral" : "fresh_persistent";
+  return agent === "pi" || agent === "agy" ? "ephemeral" : "fresh_persistent";
 }
 
 function isUuid(value: string): boolean {
@@ -155,7 +157,10 @@ function providerSessionFingerprint(session: ProviderSessionConfig): string {
 
 function providerSessionFromValue(value: unknown, fallbackAgent: AgentName): ProviderSessionConfig {
   const obj = value && typeof value === "object" && !Array.isArray(value) ? (value as Partial<RunSpec>) : {};
-  const agent = obj.agent === "codex" || obj.agent === "claude" || obj.agent === "pi" ? obj.agent : fallbackAgent;
+  const agent =
+    obj.agent === "codex" || obj.agent === "claude" || obj.agent === "pi" || obj.agent === "agy"
+      ? obj.agent
+      : fallbackAgent;
   const mode =
     typeof obj.provider_session_mode === "string" && isProviderSessionMode(obj.provider_session_mode)
       ? obj.provider_session_mode
@@ -442,6 +447,17 @@ function decisionBody(
   ].join("\n");
 }
 
+const VALID_AGENTS: readonly AgentName[] = ["codex", "claude", "pi", "agy"];
+
+function validateRunAgent(agent: AgentName, role: RunRole): void {
+  if (!VALID_AGENTS.includes(agent)) throw new Error(`unsupported agent: ${agent}`);
+  // agy = gemini-3.1-pro runs read-only (sandboxed), so it only fits the pure
+  // analysis role; verifier needs to execute and write roles edit the worktree.
+  if (agent === "agy" && role !== "reviewer") {
+    throw new Error(`agy (gemini-3.1-pro) is read-only; use it for reviewer analysis only, not ${role}`);
+  }
+}
+
 async function createRun(args: ParsedArgs): Promise<number> {
   const mr = flagString(args, "mr");
   const role = flagString(args, "role") as RunRole;
@@ -455,7 +471,7 @@ async function createRun(args: ParsedArgs): Promise<number> {
   if (!isResultRole(role)) {
     throw new Error(`P1 only supports result-schema roles: implementer, reviewer, verifier (got ${role})`);
   }
-  if (agent !== "codex" && agent !== "claude" && agent !== "pi") throw new Error(`unsupported agent: ${agent}`);
+  validateRunAgent(agent, role);
   if (!Number.isFinite(timeoutSec) || timeoutSec <= 0) throw new Error("--timeout-sec must be positive");
   const providerSession = providerSessionConfig(args, agent);
 
@@ -540,7 +556,7 @@ async function createRun(args: ParsedArgs): Promise<number> {
       provider_plan: idempotent
         ? null
         : {
-            argv: buildProviderArgv(agent, specPreview, runDir, worktree),
+            argv: buildProviderArgv(agent, specPreview, runDir, worktree, buildPrompt(specPreview, agent)),
             cwd: worktree,
             spawn: false,
           },
@@ -571,6 +587,52 @@ async function createRun(args: ParsedArgs): Promise<number> {
     }
     return 0;
   }
+  printJson(
+    await startRun({
+      args,
+      mr,
+      role,
+      agent,
+      tag,
+      worktree,
+      taskPath,
+      taskText,
+      taskSha,
+      timeoutSec,
+      providerSession,
+      repo,
+      mrDir,
+      idempotencyKey,
+      idempotencyPath,
+    }),
+  );
+  return 0;
+}
+
+interface StartRunInput {
+  args: ParsedArgs;
+  mr: string;
+  role: RunRole;
+  agent: AgentName;
+  tag: string;
+  worktree: string;
+  taskPath: string | null;
+  taskText: string;
+  taskSha: string;
+  timeoutSec: number;
+  providerSession: ProviderSessionConfig;
+  repo: RepoIdentity;
+  mrDir: string;
+  idempotencyKey: string;
+  idempotencyPath: string;
+}
+
+// Spawns a single supervised run and returns its create payload. Shared by
+// `run create` and the fan-out commands (cross-review / fanout / investigate).
+async function startRun(input: StartRunInput): Promise<Record<string, unknown>> {
+  const { args, mr, role, agent, tag, worktree, taskPath, taskText, taskSha, timeoutSec } = input;
+  const { providerSession, repo, mrDir, idempotencyKey, idempotencyPath } = input;
+
   try {
     ensureStateLayout(mrDir);
   } catch (error) {
@@ -582,18 +644,16 @@ async function createRun(args: ParsedArgs): Promise<number> {
     const existing = idempotency[idempotencyKey];
     if (existing && !flagBool(args, "retry")) {
       const existingSession = assertProviderSessionCompatible(existing, providerSession, agent);
-      const state = statusState(existing);
-      printJson({
+      return {
         run_id: existing.run_id,
-        state,
+        state: statusState(existing),
         idempotent: true,
         provider_session_name: existingSession.provider_session_name,
         provider_session_id: existingSession.provider_session_id,
         provider_session_mode: existingSession.provider_session_mode,
         status_path: existing.status_path,
         result_path: existing.result_path,
-      });
-      return 0;
+      };
     }
 
     const dirty = await gitDirty(worktree);
@@ -654,7 +714,7 @@ async function createRun(args: ParsedArgs): Promise<number> {
     };
     writeJsonAtomic(idempotencyPath, idempotency);
 
-    printJson({
+    return {
       run_id: id,
       state: "starting",
       provider_session_name: providerSession.provider_session_name,
@@ -668,11 +728,40 @@ async function createRun(args: ParsedArgs): Promise<number> {
       events_path: `${runDir}/events.jsonl`,
       worktree_lock: lockPathForWorktree(worktree),
       dirty: dirty.length > 0,
-    });
-    return 0;
+    };
   } finally {
     mrLock.release();
   }
+}
+
+// The fan-out commands route through the mail layer: the thread carries the mr
+// and workspace context, so no --mr is needed. Each derives its role/agents and
+// delegates to mailFanout (publish one task per agent → claim+run).
+function mailFanoutContext(): MailCliContext {
+  return { orchCommand, locateRun, readMirrorResult };
+}
+
+// cross-review: one diff reviewed in parallel by distinct model families.
+async function crossReview(args: ParsedArgs): Promise<number> {
+  return mailFanout(args, mailFanoutContext(), {
+    command: "cross-review",
+    role: "reviewer",
+    defaultAgentIds: ["claude-reviewer", "agy-reviewer"],
+  });
+}
+
+// fanout: generic — run any result role across --to-agent / auto-invited agents.
+async function fanout(args: ParsedArgs): Promise<number> {
+  return mailFanout(args, mailFanoutContext(), { command: "fanout" });
+}
+
+// investigate: read-only research/analysis, defaults to the gemini + claude reviewers.
+async function investigate(args: ParsedArgs): Promise<number> {
+  return mailFanout(args, mailFanoutContext(), {
+    command: "investigate",
+    role: "reviewer",
+    defaultAgentIds: ["agy-reviewer", "claude-reviewer"],
+  });
 }
 
 async function status(args: ParsedArgs): Promise<number> {
@@ -1053,6 +1142,7 @@ async function main(): Promise<number> {
   if (first === "__driver-codex") return runCodexDriver(process.argv.slice(3));
   if (first === "__driver-claude") return runClaudeDriver(process.argv.slice(3));
   if (first === "__driver-pi") return runPiDriver(process.argv.slice(3));
+  if (first === "__driver-agy") return runAgyDriver(process.argv.slice(3));
 
   if (!first || hasHelp(args)) {
     if (!first) {
@@ -1069,6 +1159,10 @@ async function main(): Promise<number> {
     }
     if (first === "run") {
       process.stdout.write(runHelp());
+      return 0;
+    }
+    if (first === "cross-review" || first === "fanout" || first === "investigate") {
+      process.stdout.write(fanoutHelp());
       return 0;
     }
     if (first === "events" && second === "tail") {
@@ -1134,6 +1228,9 @@ async function main(): Promise<number> {
 
   if (first === "run" && second === "create") return createRun(args);
   if (first === "run" && second === "list") return runList(args);
+  if (first === "cross-review") return crossReview(args);
+  if (first === "fanout") return fanout(args);
+  if (first === "investigate") return investigate(args);
   if (first === "events" && second === "tail") return eventsTail(args);
   if (first === "result") return result(args);
   if (first === "status") return status(args);

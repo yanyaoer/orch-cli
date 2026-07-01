@@ -163,6 +163,95 @@ test("buildProviderArgv keeps defaults fresh and only resumes exact sessions", (
   ).toEqual(["pi", "-p", "--mode", "json", "--session-id", "pi-session"]);
 });
 
+test("buildProviderArgv runs agy gemini-3.1-pro print mode sandboxed for review", () => {
+  const base = spec("reviewer", "agy-review");
+
+  expect(buildProviderArgv("agy", { ...base, provider_session_mode: "ephemeral" }, "/run", "/worktree", "do review")).toEqual([
+    "agy",
+    "--print=do review",
+    "--model",
+    "Gemini 3.1 Pro (High)",
+    "--sandbox",
+  ]);
+
+  expect(
+    buildProviderArgv(
+      "agy",
+      { ...base, provider_session_mode: "resume_exact", provider_session_id: "conv-123" },
+      "/run",
+      "/worktree",
+      "do review",
+    ),
+  ).toEqual([
+    "agy",
+    "--print=do review",
+    "--model",
+    "Gemini 3.1 Pro (High)",
+    "--sandbox",
+    "--conversation",
+    "conv-123",
+  ]);
+});
+
+test("buildProviderArgv matches read-only posture to the reviewer role per provider", () => {
+  const base = spec("reviewer", "review-posture");
+
+  // claude reviewer runs in plan mode (read-only, no edits).
+  expect(buildProviderArgv("claude", base, "/run", "/worktree")).toEqual([
+    "claude",
+    "-p",
+    "--verbose",
+    "--output-format",
+    "stream-json",
+    "--input-format",
+    "text",
+    "--permission-mode",
+    "plan",
+  ]);
+
+  // codex reviewer runs with the read-only sandbox.
+  expect(buildProviderArgv("codex", base, "/run", "/worktree")).toEqual([
+    "codex",
+    "exec",
+    "--json",
+    "--cd",
+    "/worktree",
+    "--output-last-message",
+    "/run/last_message.txt",
+    "--sandbox",
+    "read-only",
+    "-",
+  ]);
+
+  // pi reviewer is restricted to read-only tools.
+  expect(buildProviderArgv("pi", { ...base, provider_session_mode: "ephemeral" }, "/run", "/worktree")).toEqual([
+    "pi",
+    "-p",
+    "--mode",
+    "json",
+    "--tools",
+    "read,grep,find,ls",
+    "--no-session",
+  ]);
+});
+
+test("extractResultFromRunDir parses agy multi-line plain-text JSON", () => {
+  const runDir = tempDir();
+  const result = {
+    schema: "orch.result/reviewer/v1",
+    run_id: "agy-review",
+    verdict: "approve",
+    reviews_run_id: "agy-review",
+    blocking_findings: [],
+    non_blocking_findings: [],
+    suggested_tests: [],
+  };
+  // agy prints pretty-printed JSON spanning multiple lines (no native event wrapper).
+  writeFileSync(join(runDir, "native.jsonl"), `Here is the review:\n${JSON.stringify(result, null, 2)}\n`);
+
+  expect(extractResultFromRunDir(runDir, spec("reviewer", "agy-review"))).toEqual(result);
+});
+
 test("extractResultFromRunDir preserves codex agent_message extraction", () => {
   const runDir = tempDir();
   const result = {

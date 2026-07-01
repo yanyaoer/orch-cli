@@ -336,6 +336,68 @@ test("mail claim nacks unsupported run roles instead of leaving claimed leases",
   expect(claimRecord.reason).toContain("mail task role cannot start a run: debugger");
 });
 
+test("cross-review fans one task across reviewer agents via mail, deriving mr from the thread", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orch-cross-review-test-"));
+  const stateHome = join(root, "state");
+  const configHome = join(root, "config");
+  const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
+  const remote = "git@github.com:example/repo.git";
+  await initRepo(worktree, remote);
+  const env = { XDG_STATE_HOME: stateHome, XDG_CONFIG_HOME: configHome };
+  const thread = "review-pr-1";
+  const taskPath = join(root, "review.md");
+  writeFileSync(taskPath, "Review the pending diff.\n", "utf8");
+
+  const defaults = await runOrch(["mail", "agent", "defaults"], env);
+  expect(defaults).toMatchObject({ exitCode: 0, stderr: "" });
+
+  // dry-run resolves the default reviewer roster without publishing or running.
+  const dry = await runOrch(["cross-review", "--thread", thread, "--task", taskPath, "--worktree", worktree, "--dry-run"], env);
+  expect(dry).toMatchObject({ exitCode: 0, stderr: "" });
+  const dryPayload = JSON.parse(dry.stdout) as { dry_run: boolean; agents: Array<{ agent_id: string }> };
+  expect(dryPayload.dry_run).toBe(true);
+  expect(dryPayload.agents.map((agent) => agent.agent_id)).toEqual(["claude-reviewer", "agy-reviewer"]);
+
+  // real fan-out with the fake driver: publish + claim + run each agent.
+  const fan = await runOrch(["cross-review", "--thread", thread, "--task", taskPath, "--worktree", worktree], {
+    ...env,
+    ORCH_DRIVER_FAKE_RESULT: "1",
+  });
+  expect(fan).toMatchObject({ exitCode: 0, stderr: "" });
+  const payload = JSON.parse(fan.stdout) as {
+    mail: string;
+    assigned: Array<{ agent_id: string }>;
+    runs: Array<{ agent_id: string; role: string; mr: string; run: { run_id: string } }>;
+  };
+  expect(payload.mail).toBe("cross-review");
+  expect(payload.assigned.map((item) => item.agent_id)).toEqual(["claude-reviewer", "agy-reviewer"]);
+  expect(payload.runs).toHaveLength(2);
+  for (const run of payload.runs) {
+    expect(run.role).toBe("reviewer");
+    expect(run.mr).toBe(thread); // mr derived from the thread; no --mr was passed
+    expect(run.run.run_id).toBeTruthy();
+  }
+  // both runs land under mr == thread in the local state tree.
+  const runsRoot = join(stateHome, "orch", repoKeyFromRemote(remote, worktree), "mrs", thread, "runs");
+  expect(readdirSync(runsRoot)).toHaveLength(2);
+
+  const fanAgain = await runOrch(["cross-review", "--thread", thread, "--task", taskPath, "--worktree", worktree], {
+    ...env,
+    ORCH_DRIVER_FAKE_RESULT: "1",
+  });
+  expect(fanAgain).toMatchObject({ exitCode: 0, stderr: "" });
+  const againPayload = JSON.parse(fanAgain.stdout) as {
+    assigned: Array<{ agent_id: string; idempotent: boolean; claim_state: string }>;
+    runs: unknown[];
+  };
+  expect(againPayload.assigned.map((item) => [item.agent_id, item.idempotent, item.claim_state])).toEqual([
+    ["claude-reviewer", true, "acked"],
+    ["agy-reviewer", true, "acked"],
+  ]);
+  expect(againPayload.runs).toEqual([]);
+  expect(readdirSync(runsRoot)).toHaveLength(2);
+});
+
 test("mail submit to router routes default codex claude pi agents", async () => {
   const root = mkdtempSync(join(tmpdir(), "orch-mail-router-test-"));
   const stateHome = join(root, "state");
@@ -350,7 +412,14 @@ test("mail submit to router routes default codex claude pi agents", async () => 
   const defaults = await runOrch(["mail", "agent", "defaults"], env);
   expect(defaults).toMatchObject({ exitCode: 0, stderr: "" });
   const defaultAgents = JSON.parse(defaults.stdout).agents as Array<{ id: string; provider: string; work_mode: string }>;
-  expect(defaultAgents.map((agent) => agent.id)).toEqual(["claude-reviewer", "codex-implementer", "orch-router", "pi-verifier"]);
+  expect(defaultAgents.map((agent) => agent.id)).toEqual([
+    "agy-reviewer",
+    "claude-reviewer",
+    "codex-implementer",
+    "orch-router",
+    "pi-verifier",
+  ]);
+  expect(defaultAgents.map((agent) => [agent.provider, agent.work_mode])).toContainEqual(["agy", "review"]);
   expect(defaultAgents.map((agent) => [agent.provider, agent.work_mode])).toContainEqual(["codex", "implement"]);
   expect(defaultAgents.map((agent) => [agent.provider, agent.work_mode])).toContainEqual(["claude", "review"]);
   expect(defaultAgents.map((agent) => [agent.provider, agent.work_mode])).toContainEqual(["pi", "verify"]);

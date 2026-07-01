@@ -8,7 +8,7 @@ export type RunRole =
 
 export type ResultRole = "implementer" | "reviewer" | "verifier";
 
-export type AgentName = "codex" | "claude" | "pi";
+export type AgentName = "codex" | "claude" | "pi" | "agy";
 
 export type ProviderSessionMode = "ephemeral" | "fresh_persistent" | "resume_exact";
 

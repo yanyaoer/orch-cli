@@ -59,3 +59,35 @@ test("claim replacement is serialized and preserves attempts", () => {
   expect(second[0]!.lease_id).not.toBe(first[0]!.lease_id);
   expect(JSON.parse(readFileSync(second[0]!.claim_path, "utf8"))).toMatchObject({ attempts: 2, state: "claimed" });
 });
+
+test("claimTasks can be scoped to explicit event ids", () => {
+  const threadDir = tempDir();
+  const bus = new MaildirBus(threadDir, "th_claim", "local/repo");
+  bus.appendEventForTest(taskEvent("evt_old"));
+  bus.appendEventForTest(taskEvent("evt_new"));
+
+  const leases = bus.claimTasks({
+    agent_id: "codex-reviewer",
+    event_ids: ["evt_new"],
+    now: new Date("2026-06-25T00:00:00.000Z"),
+  });
+
+  expect(leases.map((lease) => lease.event.event_id)).toEqual(["evt_new"]);
+});
+
+test("findTask locates an existing assignment by task fingerprint", () => {
+  const threadDir = tempDir();
+  const bus = new MaildirBus(threadDir, "th_claim", "local/repo");
+  bus.appendEventForTest(taskEvent("evt_existing"));
+
+  expect(
+    bus.findTask({
+      agent_id: "codex-reviewer",
+      role: "reviewer",
+      task_sha: "sha",
+      parent_event_id: null,
+      mr: null,
+      workspace: null,
+    }),
+  ).toMatchObject({ event: { event_id: "evt_existing" }, claim_state: null });
+});

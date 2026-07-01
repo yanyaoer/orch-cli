@@ -90,9 +90,44 @@ export function buildWorkerEnv(baseEnv: NodeJS.ProcessEnv = process.env): Record
   return env;
 }
 
-export function buildProviderArgv(provider: AgentName, spec: RunSpec, runDir: string, worktree: string): string[] {
+export const AGY_MODEL = "Gemini 3.1 Pro (High)";
+
+// Worktree permission posture matched to the role's constraint. `reviewer` is the
+// pure read-only analysis role, so its provider is launched without write access.
+// Write roles (implementer/...) and `verifier` (which must run tests/commands)
+// keep each provider's default write-capable posture.
+export function isReadOnlyRole(role: RunSpec["role"]): boolean {
+  return role === "reviewer";
+}
+
+export function buildProviderArgv(
+  provider: AgentName,
+  spec: RunSpec,
+  runDir: string,
+  worktree: string,
+  prompt = "",
+): string[] {
+  const readOnly = isReadOnlyRole(spec.role);
+
+  if (provider === "agy") {
+    // agy = gemini-3.1-pro, reviewer-only. --sandbox keeps it read-only (no
+    // worktree edits); the prompt rides in argv (print mode ignores stdin).
+    const argv = [
+      "agy",
+      "--print=" + prompt,
+      "--model",
+      AGY_MODEL,
+      readOnly ? "--sandbox" : "--dangerously-skip-permissions",
+    ];
+    if (spec.provider_session_mode === "resume_exact" && spec.provider_session_id) {
+      argv.push("--conversation", spec.provider_session_id);
+    }
+    return argv;
+  }
+
   if (provider === "claude") {
     const argv = ["claude", "-p", "--verbose", "--output-format", "stream-json", "--input-format", "text"];
+    if (readOnly) argv.push("--permission-mode", "plan");
     if (spec.provider_session_name) argv.push("--name", spec.provider_session_name);
     if (spec.provider_session_mode === "ephemeral") {
       argv.push("--no-session-persistence");
@@ -105,15 +140,20 @@ export function buildProviderArgv(provider: AgentName, spec: RunSpec, runDir: st
   if (provider === "codex") {
     const lastMessagePath = `${runDir}/last_message.txt`;
     if (spec.provider_session_mode === "resume_exact" && spec.provider_session_id) {
-      return ["codex", "exec", "resume", "--json", "--output-last-message", lastMessagePath, spec.provider_session_id, "-"];
+      const resume = ["codex", "exec", "resume", "--json", "--output-last-message", lastMessagePath];
+      if (readOnly) resume.push("--sandbox", "read-only");
+      resume.push(spec.provider_session_id, "-");
+      return resume;
     }
     const argv = ["codex", "exec", "--json", "--cd", worktree, "--output-last-message", lastMessagePath];
+    if (readOnly) argv.push("--sandbox", "read-only");
     if (spec.provider_session_mode === "ephemeral") argv.push("--ephemeral");
     argv.push("-");
     return argv;
   }
 
   const argv = ["pi", "-p", "--mode", "json"];
+  if (readOnly) argv.push("--tools", "read,grep,find,ls");
   if (spec.provider_session_mode === "ephemeral") {
     argv.push("--no-session");
   } else if (spec.provider_session_mode === "resume_exact" && spec.provider_session_id) {
@@ -260,7 +300,8 @@ export function extractResultFromRunDir(runDir: string, spec: RunSpec): RoleResu
     const codexCandidates: string[] = [];
     const piCandidates: string[] = [];
     const rawLineCandidates: string[] = [];
-    for (const line of readFileSync(nativePath, "utf8").split("\n")) {
+    const nativeText = readFileSync(nativePath, "utf8");
+    for (const line of nativeText.split("\n")) {
       if (!line.trim()) continue;
       try {
         const event = JSON.parse(line) as {
@@ -304,6 +345,9 @@ export function extractResultFromRunDir(runDir: string, spec: RunSpec): RoleResu
       ...codexCandidates,
       ...piCandidates,
       ...rawLineCandidates,
+      // Plain-text providers (agy) emit a multi-line response; the JSON object
+      // may span lines, so try the whole stream as one candidate too.
+      nativeText,
     );
   }
 
@@ -410,14 +454,15 @@ export async function runProviderDriver(provider: AgentName, argv: string[]): Pr
   if (await maybeWriteFakeResult(args.runDir, spec, provider)) return 0;
 
   const prompt = buildPrompt(spec, provider);
-  const proc = Bun.spawn(buildProviderArgv(provider, spec, args.runDir, args.worktree), {
+  const proc = Bun.spawn(buildProviderArgv(provider, spec, args.runDir, args.worktree, prompt), {
     cwd: args.worktree,
     stdin: "pipe",
     stdout: "pipe",
     stderr: "inherit",
     env: buildWorkerEnv(),
   });
-  proc.stdin.write(prompt);
+  // agy reads the prompt from argv (print mode); everyone else gets it on stdin.
+  if (provider !== "agy") proc.stdin.write(prompt);
   proc.stdin.end();
 
   await pipeToFile(proc.stdout, `${args.runDir}/native.jsonl`);

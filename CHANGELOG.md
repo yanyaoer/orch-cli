@@ -2,6 +2,14 @@
 
 All notable user-facing changes are recorded here.
 
+## [Unreleased]
+
+### Features
+
+- Added the `agy` provider driver (Gemini 3.1 Pro), restricted to the read-only `reviewer` role and launched sandboxed (`--sandbox`); orch rejects it for every other role.
+- Matched provider permissions to the role: the `reviewer` role now launches each provider without worktree write access (claude plan mode, codex `--sandbox read-only`, pi read-only tools, agy `--sandbox`). `verifier` and write roles keep write-capable access.
+- Added `orch cross-review`, `orch fanout`, and `orch investigate`: one-shot fan-out of a single task across several agents. They route through the mail layer, so a `--thread <id>` supplies the mr and workspace context instead of `--mr`.
+
 ## [0.0.3] - 2026-06-25
 
 ### Features

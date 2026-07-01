@@ -35,6 +35,21 @@ export interface BusClaimOptions {
   limit?: number;
   lease_ms?: number;
   now?: Date;
+  event_ids?: string[];
+}
+
+export interface BusTaskFingerprint {
+  agent_id: string;
+  role: string;
+  task_sha: string;
+  parent_event_id?: string | null;
+  mr?: string | null;
+  workspace?: { id: string; path: string } | null;
+}
+
+export interface BusTaskReference {
+  event: TaskRequestedMailEvent;
+  claim_state: "claimed" | "acked" | "nacked" | null;
 }
 
 export interface OrchBus {
@@ -44,6 +59,7 @@ export interface OrchBus {
   importRaw(raw: string, expectedThreadId?: string, expectedRepoKey?: string): ImportMailResult;
   importAuto(raw: string): AutoImportMailResult;
   listEvents(): OrchMailEvent[];
+  findTask(options: BusTaskFingerprint): BusTaskReference | null;
   claimTasks(options: BusClaimOptions): BusTaskLease[];
   ackTask(lease: BusTaskLease, run: unknown): void;
   nackTask(lease: BusTaskLease, reason: string): void;
@@ -89,6 +105,20 @@ function canReplaceClaim(record: ClaimRecord | null, nowMs: number): boolean {
   return Number.isFinite(expires) && expires <= nowMs;
 }
 
+function nullableString(value: string | null | undefined): string | null {
+  return value ?? null;
+}
+
+function workspaceMatches(
+  actual: TaskRequestedMailEvent["workspace"] | undefined,
+  expected: BusTaskFingerprint["workspace"],
+): boolean {
+  const left = actual ?? null;
+  const right = expected ?? null;
+  if (!left || !right) return left === right;
+  return left.id === right.id && left.path === right.path;
+}
+
 export class MaildirBus implements OrchBus {
   constructor(
     public readonly threadDir: string,
@@ -131,17 +161,34 @@ export class MaildirBus implements OrchBus {
     return out;
   }
 
+  findTask(options: BusTaskFingerprint): BusTaskReference | null {
+    for (const event of this.listEvents()) {
+      if (event.type !== "task.requested") continue;
+      if (event.assigned_agent?.id !== options.agent_id) continue;
+      if (event.role !== options.role) continue;
+      if (event.task.sha256 !== options.task_sha) continue;
+      if (nullableString(event.parent_event_id) !== nullableString(options.parent_event_id)) continue;
+      if (nullableString(event.mr) !== nullableString(options.mr)) continue;
+      if (!workspaceMatches(event.workspace, options.workspace)) continue;
+      const claim = readClaim(claimRecordPath(this.threadDir, event.event_id));
+      return { event, claim_state: claim?.state ?? null };
+    }
+    return null;
+  }
+
   claimTasks(options: BusClaimOptions): BusTaskLease[] {
     const now = options.now ?? new Date();
     const nowMs = now.getTime();
     const limit = options.limit ?? Number.POSITIVE_INFINITY;
     const leaseMs = options.lease_ms ?? DEFAULT_LEASE_MS;
+    const eventIds = options.event_ids ? new Set(options.event_ids) : null;
     if (limit <= 0) return [];
     const leases: BusTaskLease[] = [];
     for (const event of this.listEvents()) {
       if (leases.length >= limit) break;
       if (event.type !== "task.requested") continue;
       if (event.assigned_agent?.id !== options.agent_id) continue;
+      if (eventIds && !eventIds.has(event.event_id)) continue;
       const path = claimRecordPath(this.threadDir, event.event_id);
       let claimLock;
       try {
