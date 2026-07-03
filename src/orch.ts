@@ -247,10 +247,13 @@ function mrFromForgeUrl(text: string): string | null {
 }
 
 // Resolution sources for an omitted --mr, strongest first: an explicit
-// "MR: <id-or-url>" header line in the task spec, then any GitLab
-// merge-request / GitHub pull URL in the task text.
+// "MR: <id-or-url>" line in the task's leading header block (before the first
+// blank line, alongside Role:/Goal:), then any GitLab merge-request / GitHub
+// pull URL in the task text. Quoted prose later in the task cannot hijack the
+// header form.
 function mrFromTask(taskText: string): string | null {
-  const header = taskText.match(/^\s*MR\s*:\s*(\S+)\s*$/im)?.[1];
+  const headBlock = taskText.split(/\r?\n\s*\r?\n/, 1)[0] ?? "";
+  const header = headBlock.match(/^\s*MR\s*:\s*(\S+)\s*$/im)?.[1];
   if (header) return mrFromForgeUrl(header) ?? header;
   return mrFromForgeUrl(taskText);
 }
@@ -391,7 +394,12 @@ function locateRun(repoKey: string, runId: string, mr?: string): LocatedRun {
     const mrs = matches.map((match) => match.mr).join(", ");
     throw new CliError(`run id ${runId} exists under multiple MRs (${mrs}); pass --mr to disambiguate`);
   }
-  return matches[0]!;
+  const located = matches[0]!;
+  // Directory names are sanitized (feature/foo → feature_foo); the run's own
+  // status records the raw mr value, which is what downstream consumers
+  // (decision bodies, outbox payloads) must carry.
+  const recorded = readJsonFile<RunStatus | null>(`${located.run_dir}/status.json`, null)?.mr;
+  return recorded ? { ...located, mr: recorded } : located;
 }
 
 function parseTailLines(args: ParsedArgs): number | null {
@@ -950,14 +958,19 @@ function mrStatusSection(repoKey: string, mr: string): { mr: string; state_dir: 
         .filter((item): item is RunStatus => item !== null)
         .map((run) => ({ ...run, stale: looksStale(run) }))
     : [];
-  return { mr, state_dir: root, runs };
+  // Prefer the raw mr recorded in the runs over the sanitized directory name.
+  return { mr: runs[0]?.mr ?? mr, state_dir: root, runs };
 }
 
 async function status(args: ParsedArgs): Promise<number> {
   const worktree = resolve(flagString(args, "worktree", process.cwd()));
   const repo = await getRepoIdentity(worktree);
   const explicitMr = args.flags.has("mr") ? flagString(args, "mr") : null;
-  const sections = (explicitMr ? [explicitMr] : mrIdsForRepo(repo.repo_key)).map((mr) => mrStatusSection(repo.repo_key, mr));
+  // Aggregate view hides MRs without runs (empty dirs from aborted creates);
+  // an explicit --mr always shows its section, even when empty.
+  const sections = (explicitMr ? [explicitMr] : mrIdsForRepo(repo.repo_key))
+    .map((mr) => mrStatusSection(repo.repo_key, mr))
+    .filter((section) => explicitMr !== null || section.runs.length > 0);
 
   if (flagBool(args, "json")) {
     if (explicitMr) {
@@ -969,7 +982,6 @@ async function status(args: ParsedArgs): Promise<number> {
     return 0;
   }
   for (const section of sections) {
-    if (section.runs.length === 0 && !explicitMr) continue;
     process.stdout.write(`MR ${section.mr} (${repo.repo_key})\n`);
     for (const run of section.runs) {
       const state = run.stale ? `${run.state} (stale?)` : run.state;
@@ -997,13 +1009,13 @@ async function runReap(args: ParsedArgs): Promise<number> {
       const ageMs = Date.now() - Date.parse(status.updated_at ?? "");
       const orphanedBeforeSpawn = status.pid === null && Number.isFinite(ageMs) && ageMs > 60 * 60 * 1000;
       if (!looksStale(status) && !orphanedBeforeSpawn) {
-        running.push({ mr, run_id: id });
+        running.push({ mr: status.mr, run_id: id });
         continue;
       }
       writeJsonAtomic(statusPath, { ...status, state: "stale", updated_at: new Date().toISOString() });
       const eventsPath = `${runsRoot}/${id}/events.jsonl`;
       appendJsonLine(eventsPath, { type: "stale", seq: countLines(eventsPath), ts: new Date().toISOString() });
-      reaped.push({ mr, run_id: id });
+      reaped.push({ mr: status.mr, run_id: id });
     }
   }
   printJson({ reaped, still_running: running });

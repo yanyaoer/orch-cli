@@ -6,7 +6,7 @@ All notable user-facing changes are recorded here.
 
 ### Usage-driven interface improvements
 
-- `--mr` is now optional almost everywhere. `run create` resolves it from an `MR: <id-or-url>` line in the task, then a GitLab merge-request / GitHub pull URL in the task text, then the current branch name (the source is reported as `mr_source`). `status`, `run list`, and `run reap` aggregate across all MRs in the repo when `--mr` is omitted, and `decision` locates the MR from the run id. `mirror` keeps requiring `--mr` since it posts to a real PR/MR number.
+- `--mr` is now optional almost everywhere. `run create` resolves it from an `MR: <id-or-url>` line in the task's leading header block, then a GitLab merge-request / GitHub pull URL in the task text, then the current branch name (the source is reported as `mr_source`). `status`, `run list`, and `run reap` aggregate across all MRs in the repo when `--mr` is omitted, and `decision` locates the MR from the run id. `mirror` keeps requiring `--mr` since it posts to a real PR/MR number. Scan paths report the raw recorded mr value, not the sanitized state-directory name. Note: `run reap` (unreleased) reports `reaped`/`still_running` as `{mr, run_id}` rows.
 
 - Result extraction now coerces benign schema deviations (verdict synonyms, object items in string arrays, string items in finding arrays, model-invented run ids) instead of discarding the whole result; replaying 49 real fallback runs recovered 5 outright.
 - When extraction still fails, the worker's raw final message is preserved as `result.raw.md` in the run dir and excerpted in the fallback summary, so `orch result` always has readable content (36 of 49 historical fallbacks).

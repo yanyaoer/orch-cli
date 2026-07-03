@@ -78,7 +78,7 @@ test("command help exposes flags and runnable examples", () => {
   for (const flag of ["--mr", "--worktree", "--json"]) {
     expect(runList).toContain(flag);
   }
-  expect(runList).toContain("run_id, role, agent, tag, state, started_at, exit_code");
+  expect(runList).toContain("run_id, mr, role, agent, tag, state, started_at, exit_code");
   expect(runList).toContain("orch run list --mr 123");
 
   const run = runHelp();

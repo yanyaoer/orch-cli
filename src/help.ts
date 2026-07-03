@@ -55,8 +55,9 @@ export function runCreateHelp(): string {
     "",
     "Flags:",
     "  --mr <id>                 MR or task id used under the local state directory; when omitted it is",
-    "                            resolved from an 'MR: <id-or-url>' line in the task, then a GitLab",
-    "                            merge-request / GitHub pull URL in the task text, then the current branch",
+    "                            resolved from an 'MR: <id-or-url>' line in the task's leading header block,",
+    "                            then a GitLab merge-request / github.com pull URL in the task text, then",
+    "                            the current branch (GitHub Enterprise hosts: use the MR: header)",
     "  --role <role>             Result role: implementer, reviewer, or verifier (required)",
     "  --agent <agent>           Headless provider driver: codex, claude, pi, or agy (required)",
     "                            agy = gemini-3.1-pro, reviewer role only (sandboxed, read-only);",
@@ -97,11 +98,11 @@ export function runListHelp(): string {
     "  --help                Show this help",
     "",
     "Output fields:",
-    "  run_id, role, agent, tag, state, started_at, exit_code",
+    "  run_id, mr, role, agent, tag, state, started_at, exit_code",
     "",
     "Examples:",
     "  orch run list --mr 123 --worktree .",
-    "  orch run list --mr 123 --json",
+    "  orch run list --worktree . --json    # all MRs in this repo",
   ]);
 }
 

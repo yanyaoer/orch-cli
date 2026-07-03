@@ -549,6 +549,47 @@ test("run create resolves an omitted --mr from the task text, then the branch", 
   // 4. Explicit --mr still wins over everything.
   const explicit = await runOrch([...base, "--task", urlTask, "--mr", "manual"], env);
   expect(JSON.parse(explicit.stdout)).toMatchObject({ mr: "manual", mr_source: "flag" });
+
+  // 5. An "MR:" line outside the leading header block (after a blank line) is
+  // quoted prose, not metadata — it must not hijack the resolution.
+  const proseTask = join(root, "prose-task.md");
+  writeFileSync(proseTask, "Goal: review\n\nSomeone wrote:\nMR: 999\n", "utf8");
+  const fromProse = await runOrch([...base, "--task", proseTask], env);
+  expect(JSON.parse(fromProse.stdout)).toMatchObject({ mr_source: "branch" });
+});
+
+test("branch-derived mr keeps its raw value through run list and decision", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orch-mr-raw-test-"));
+  const stateHome = join(root, "state");
+  const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
+  await initGitWorktree(worktree);
+  await runCmd(["git", "-C", worktree, "checkout", "-b", "feat/slash-branch"], worktree);
+  const env = { XDG_STATE_HOME: stateHome, ORCH_DRIVER_FAKE_RESULT: "1" };
+  const taskPath = join(root, "task.md");
+  writeFileSync(taskPath, "Review the pending diff.\n", "utf8");
+
+  const created = await runOrch(
+    ["run", "create", "--role", "reviewer", "--agent", "codex", "--tag", "raw", "--worktree", worktree, "--task", taskPath],
+    env,
+  );
+  expect(created).toMatchObject({ exitCode: 0 });
+  const payload = JSON.parse(created.stdout) as { mr: string; run_id: string; status_path: string; mr_dir: string };
+  expect(payload.mr).toBe("feat/slash-branch");
+  expect(payload.mr_dir.endsWith("feat_slash-branch")).toBe(true); // sanitized on disk
+  await waitForRunDone(payload.status_path);
+
+  // The aggregate views and the scan-based decision must report the raw value,
+  // not the sanitized directory name.
+  const list = await runOrch(["run", "list", "--worktree", worktree, "--json"], env);
+  expect(JSON.parse(list.stdout)).toMatchObject([{ run_id: payload.run_id, mr: "feat/slash-branch" }]);
+
+  const decided = await runOrch(["decision", "accept", "--run", payload.run_id, "--worktree", worktree, "--reason", "ok"], env);
+  expect(decided).toMatchObject({ exitCode: 0, stderr: "" });
+  const pendingDir = join(payload.mr_dir, "outbox", "pending");
+  const outboxFiles = readdirSync(pendingDir).filter((name) => name.endsWith(".json"));
+  expect(outboxFiles.length).toBe(1);
+  const outbox = JSON.parse(readFileSync(join(pendingDir, outboxFiles[0]!), "utf8")) as { mr: string };
+  expect(outbox.mr).toBe("feat/slash-branch");
 });
 
 test("run create rejects agy outside the reviewer role with a clean error", async () => {
