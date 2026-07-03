@@ -403,11 +403,12 @@
         </div>
         <div class="terminal" aria-label="Quick command">
           <div class="terminal-bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>
-          <pre>$ orch mail submit --thread th_123 --mr 123 --workspace orch-cli --task task.md
-$ RAW=$(orch mail deliver-local --thread th_123 | bun -e 'const p=JSON.parse(await Bun.stdin.text()); console.log(p.delivered[0]?.to ?? "")')
-$ orch mail import --thread th_123 --file "$RAW"
-$ orch mail route --thread th_123
-$ orch mail claim --thread th_123 --agent codex-implementer</pre>
+          <pre>$ orch mail agent defaults                    # once
+$ orch cross-review --thread review-123 --task review.md
+$ orch status                                 # all MRs; dead runs show stale?
+$ orch result --run &lt;run_id&gt; --wait           # blocks, renders findings
+$ orch run create --role reviewer --agent codex --task review.md
+                                              # --mr resolves from task/branch</pre>
         </div>
       </div>
 
@@ -566,31 +567,33 @@ $ orch mail claim --thread th_123 --agent codex-implementer</pre>
           <h2 data-lang="en">Quickstart</h2>
           <h2 data-lang="zh">快速开始</h2>
           <p class="section-lead" data-lang="en">
-            Install with Bun or a release binary, configure default mail agents, then dispatch a task through the local mail bus.
+            Install with Bun or a release binary, configure default mail agents once, then fan a task across agents in one command — publish, claim, and run all ride the local mail bus. The step-by-step submit/route/claim pipeline stays available for manual control.
           </p>
           <p class="section-lead" data-lang="zh">
-            使用 Bun 或 release binary 安装，配置默认 mail agents，然后通过本地 mail bus 派发任务。
+            使用 Bun 或 release binary 安装，配置一次默认 mail agents，然后一条命令把任务分发给多个 agent——发布、claim、运行全部走本地 mail bus。手动的 submit/route/claim 流水线仍然可用。
           </p>
         </div>
         <div class="code-block">
           <pre>$ bun install
-$ bun test
 $ bun run install:local
 
 $ orch mail agent defaults
 $ orch workspace add --id orch-cli --path .
-$ orch mail submit --thread th_123 --mr 123 --workspace orch-cli --task task.md
-$ orch mail deliver-local --thread th_123
-$ orch mail import --thread th_123 --file <raw-eml>
-$ orch mail route --thread th_123
-$ orch mail claim --thread th_123 --agent codex-implementer
 
-$ orch mail reply result --thread th_123 --run impl-a-... --from-agent codex-implementer
-$ orch mail deliver-local --thread th_123
-$ orch mail import --thread th_123 --file <result-eml>
-$ orch mail route --thread th_123
-$ orch mail claim --thread th_123 --agent claude-reviewer
-$ orch mail claim --thread th_123 --agent pi-verifier</pre>
+# one-shot fan-out: publish + claim + run per agent
+$ orch cross-review --thread review-123 --task review.md
+$ orch fanout --thread verify-1 --role verifier --to-agent pi-verifier --task verify.md
+$ orch investigate --thread research-1 --task question.md
+
+# follow the runs (mr == thread); --wait blocks until terminal
+$ orch status --mr review-123
+$ orch result --run &lt;run_id&gt; --wait
+
+# single supervised run; --mr resolves from an MR: header,
+# a merge-request/pull URL in the task, or the current branch
+$ orch run create --role reviewer --agent codex --task review.md
+$ orch run list
+$ orch run reap</pre>
         </div>
       </div>
     </section>
@@ -604,11 +607,11 @@ $ orch mail claim --thread th_123 --agent pi-verifier</pre>
             <h3 data-lang="en">Commands</h3>
             <h3 data-lang="zh">命令</h3>
             <ul>
-              <li><code>run create</code>, <code>run list</code>, <code>status</code></li>
+              <li><code>run create</code>, <code>run list</code>, <code>run reap</code>, <code>status</code></li>
               <li><code>cross-review</code>, <code>fanout</code>, <code>investigate</code></li>
               <li><code>mail submit</code>, <code>mail route</code>, <code>mail claim</code>, <code>mail reply result</code></li>
-              <li><code>events tail</code>, <code>result</code></li>
-              <li><code>decision</code>, <code>mirror</code>, <code>mirror sync</code></li>
+              <li><code>events tail</code>, <code>result --wait</code></li>
+              <li><code>decision</code>, <code>mirror</code>, <code>mirror sync</code>, <code>workspace</code></li>
               <li><code>chatgpt-bridge</code>, <code>handoff-pro</code></li>
             </ul>
           </div>
@@ -616,14 +619,17 @@ $ orch mail claim --thread th_123 --agent pi-verifier</pre>
             <h3 data-lang="en">Boundaries</h3>
             <h3 data-lang="zh">边界</h3>
             <ul data-lang="en">
-              <li>No long-running daemon yet.</li>
+              <li>No long-running daemon yet; stale runs are flagged on read and reaped explicitly.</li>
               <li>The shipped message bus is local Maildir state, not a multi-machine database.</li>
               <li>Drivers target Codex, Claude, pi, and agy. Permissions match the role: reviewer runs read-only/sandboxed; agy (Gemini 3.1 Pro) is reviewer-only.</li>
+              <li>Results are schema-validated with lenient coercion; when extraction fails the raw final message is kept as <code>result.raw.md</code>.</li>
+              <li><code>chatgpt-bridge</code> provides a read-only Cloudflare Worker MCP bridge.</li>
             </ul>
             <ul data-lang="zh">
-              <li>当前没有常驻 daemon。</li>
+              <li>当前没有常驻 daemon；僵尸 run 读取时标记 stale，可显式 reap。</li>
               <li>当前消息总线是本地 Maildir 状态，不是多机数据库。</li>
               <li>当前 driver 覆盖 Codex、Claude、pi 和 agy；权限随角色匹配:reviewer 以只读/沙箱方式运行,agy(Gemini 3.1 Pro)仅限 reviewer。</li>
+              <li>结果经宽松归一化后做 schema 校验；提取失败时原始产出保留为 <code>result.raw.md</code>。</li>
               <li><code>chatgpt-bridge</code> 提供只读 Cloudflare Worker MCP 桥接。</li>
             </ul>
           </div>

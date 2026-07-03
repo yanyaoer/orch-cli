@@ -14,10 +14,11 @@ Latest release: `v0.0.3` ([CHANGELOG.md](CHANGELOG.md)).
 
 This repository is the v2 MVP described in [docs/orch-mvp-spec.md](docs/orch-mvp-spec.md).
 
-Shipped in `v0.0.3`:
+Shipped on `main` (v0.0.3 plus unreleased changes, see [CHANGELOG.md](CHANGELOG.md)):
 
-- `orch run create` starts one supervised headless worker run. `--mr` is optional: it resolves from an `MR: <id-or-url>` task header, a merge-request/pull URL in the task text, or the current branch name.
-- `orch run list`, `orch status`, `orch events tail`, and `orch result` read local run state; omitting `--mr` aggregates across all MRs in the repo.
+- `orch run create` starts one supervised headless worker run. `--mr` is optional: it resolves from an `MR: <id-or-url>` line in the task's leading header block, a merge-request/pull URL in the task text, or the current branch name (`mr_source` reports which).
+- `orch run list`, `orch status`, `orch events tail`, and `orch result` read local run state; omitting `--mr` aggregates across all MRs in the repo. `orch result --wait` blocks until the run reaches a terminal state; reviewer results render findings, verifier results render commands and acceptance.
+- Non-terminal runs whose supervisor pid is gone show as `stale?`; `orch run reap` persists them as `stale`. A provider that exits 0 without any output fails its run instead of quietly reporting done.
 - `orch decision` records `accept` or `rework` locally and queues a mirror comment.
 - `orch mail` provides the local message bus: signed mail events, Maildir delivery, router dispatch, atomic task claim, and result-driven review/verify follow-ups.
 - `orch cross-review`, `orch fanout`, and `orch investigate` fan one task across several agents in a single command. They route through the mail layer, so a `--thread <id>` supplies the mr and workspace context (no `--mr` needed).
@@ -94,26 +95,25 @@ This is a sandbox policy issue, not a binary install issue. The installed `~/.lo
 
 ## Quickstart
 
-Create a worker task:
+Create a worker task (the optional `MR:` header pins the state namespace; a merge-request/pull URL in the text works too):
 
 ```md
 Role: reviewer
-Worktree: /path/to/repo
+MR: https://gitlab.example.com/group/repo/-/merge_requests/123
 Goal: Review the implementation and report blocking issues.
 Acceptance: Return orch.result/reviewer/v1 JSON with concrete findings.
 ```
 
-Start a run:
+Start a run — `--mr` resolves from the task header, a forge URL in the task text, or the current branch:
 
 ```sh
-$ orch run create \
-  --mr 123 \
-  --role reviewer \
-  --agent codex \
-  --tag review-a \
-  --worktree . \
-  --task task.md \
-  --timeout-sec 3600
+$ orch run create --role reviewer --agent codex --worktree . --task task.md
+```
+
+Block until it finishes and read the findings:
+
+```sh
+$ orch result --run review-a-20260619T120000-abc123 --wait
 ```
 
 Preview a pi run with a non-default registered model:
@@ -125,20 +125,19 @@ $ orch run create --mr demo --role reviewer --agent pi --tag pi-fable \
   --dry-run
 ```
 
-Observe it:
+Observe it (omit `--mr` to aggregate every MR in the repo; dead-pid runs show as `stale?`):
 
 ```sh
-$ orch run list --mr 123 --worktree .
-$ orch status --mr 123 --json --worktree .
-$ orch events tail --mr 123 --run review-a-20260619T120000-abc123 -n 20
-$ orch result --mr 123 --run review-a-20260619T120000-abc123
+$ orch run list --worktree .
+$ orch status --json --worktree .
+$ orch events tail --run review-a-20260619T120000-abc123 -n 20
+$ orch run reap            # persist stale for runs whose supervisor died
 ```
 
-Record a controller decision:
+Record a controller decision (the run id locates its MR):
 
 ```sh
 $ orch decision accept \
-  --mr 123 \
   --run review-a-20260619T120000-abc123 \
   --reason "reviewed"
 ```
@@ -191,7 +190,7 @@ $ orch status --mr review-123                     # follow the runs (mr == threa
 - `cross-review`: reviewer role; default agents `claude-reviewer` (opus, high effort) + `agy-reviewer` (distinct model families).
 - `fanout`: any result role via `--role`; default agents are the auto-invited agents for that role.
 - `investigate`: reviewer role for read-only research; default agents `agy-reviewer` + `claude-reviewer`.
-- `--to-agent <mail-agent-id>` (repeatable) overrides the default roster; `--dry-run` prints the resolved agents without publishing.
+- `--to-agent <mail-agent-id>` (repeatable) overrides the default roster; `--dry-run` prints the resolved agents without publishing; `--model <ref>` forwards a provider model override to every spawned run.
 - Re-running the same thread with the same task is idempotent: already-acked assignments are reused and not run again; nacked or expired assignments can be claimed without publishing duplicates.
 
 ## How It Works
@@ -258,6 +257,8 @@ Important mail files:
 - Local-first mirroring: PR/MR comments go to `outbox/pending/` first. Network sends are opt-in with `--execute`.
 - Mail bus claims: `claimTasks` creates a per-event lease with atomic `O_EXCL`; `ackTask` is written only after `orch run create` succeeds, and `nackTask` records failed starts for retry.
 - Result-driven review: reviewer and verifier mail tasks are routed from `result.submitted` implementer events, not from the original router task.
+- Honest terminal states: a provider that exits 0 with no output fails its run, and `orch run reap` persists `stale` for runs whose supervisor died.
+- Worker env hardening: spawned workers drop recursive tool/MCP variables, strip `node_modules/.bin` PATH entries (stale provider CLIs cannot shadow the real ones), and replace a fish `SHELL` with bash.
 
 ## Result Contract
 
@@ -333,8 +334,8 @@ $ XDG_STATE_HOME=/tmp/orch-demo-state orch status --mr demo --json
 
 The current MVP intentionally avoids a daemon. Natural next steps are:
 
-- richer stale/timeout policy and retry ergonomics
-- better provider resume support
-- `attach` as log tailing and `debug shell` as human takeover helpers
-- more provider drivers once the driver contract is stable
+- `orch doctor`: preflight checks for provider binaries, versions, flags, and roster consistency
+- `orch verdict`: aggregate cross-review verdicts per thread for one-glance decisions
+- reviewer runs against an immutable artifact (temporary worktree at `base_sha`) instead of the live worktree
+- better provider resume support; `attach` as log tailing and `debug shell` as human takeover helpers
 - daemon or queue service only when unattended multi-machine orchestration becomes real
