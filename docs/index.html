@@ -3,634 +3,662 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="light dark">
-  <title>orch-cli - daemonless multi-agent orchestration</title>
+  <meta name="color-scheme" content="dark light">
+  <meta name="description" content="orch runs headless coding agents (codex, claude, pi, agy) as supervised, auditable local jobs — no daemon, signed local mail bus, schema-validated results.">
+  <title>orch-cli — daemonless multi-agent orchestration</title>
   <style>
     :root {
-      --bg: #f7f8fb;
-      --panel: #ffffff;
-      --text: #121826;
-      --muted: #5d667a;
-      --line: #d9deea;
-      --accent: #0f766e;
-      --accent-2: #b45309;
-      --accent-3: #2563eb;
-      --ink: #0f172a;
-      --code: #111827;
-      --code-text: #e5e7eb;
-      --shadow: 0 18px 50px rgba(31, 41, 55, 0.12);
-      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --bg: #0b0f14;
+      --panel: #10161d;
+      --panel-2: #0e141b;
+      --line: #1d2833;
+      --line-strong: #2c3b49;
+      --text: #dbe4ee;
+      --muted: #8aa0b4;
+      --faint: #5d7183;
+      --accent: #2dd4bf;
+      --accent-dim: rgba(45, 212, 191, 0.14);
+      --amber: #f4b350;
+      --green: #4ade80;
+      --red: #f87171;
+      --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
     }
 
-    * {
-      box-sizing: border-box;
+    @media (prefers-color-scheme: light) {
+      :root {
+        --bg: #fbfcfd;
+        --panel: #ffffff;
+        --panel-2: #f2f5f8;
+        --line: #e2e8ee;
+        --line-strong: #c6d2dc;
+        --text: #1a2632;
+        --muted: #596b7d;
+        --faint: #8496a6;
+        --accent: #0d9488;
+        --accent-dim: rgba(13, 148, 136, 0.10);
+        --amber: #b45309;
+        --green: #15803d;
+        --red: #b91c1c;
+      }
     }
+
+    * { box-sizing: border-box; }
 
     body {
       margin: 0;
-      background:
-        linear-gradient(180deg, rgba(255,255,255,0.84), rgba(247,248,251,0.96)),
-        radial-gradient(circle at 10% 0%, rgba(15,118,110,0.12), transparent 32%),
-        radial-gradient(circle at 90% 15%, rgba(37,99,235,0.10), transparent 28%),
-        var(--bg);
+      background: var(--bg);
       color: var(--text);
+      font: 16.5px/1.7 var(--sans);
+      -webkit-font-smoothing: antialiased;
+      text-rendering: optimizeLegibility;
     }
 
-    a {
-      color: var(--accent-3);
-      text-decoration: none;
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; text-underline-offset: 3px; }
+
+    code {
+      font-family: var(--mono);
+      font-size: 0.88em;
+      background: var(--panel-2);
+      border-radius: 4px;
+      padding: 0.1em 0.4em;
     }
 
-    a:hover {
-      text-decoration: underline;
-    }
+    .wrap { width: min(1020px, calc(100% - 48px)); margin: 0 auto; }
+    .narrow { max-width: 660px; }
 
-    .wrap {
-      width: min(1160px, calc(100% - 32px));
-      margin: 0 auto;
-    }
-
+    /* ---------- header ---------- */
     header {
       position: sticky;
       top: 0;
-      z-index: 5;
-      border-bottom: 1px solid rgba(217, 222, 234, 0.8);
-      background: rgba(247, 248, 251, 0.84);
+      z-index: 10;
+      background: color-mix(in srgb, var(--bg) 88%, transparent);
       backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--line);
     }
 
     nav {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      min-height: 64px;
       gap: 16px;
+      min-height: 60px;
     }
 
     .brand {
+      font: 700 15px var(--mono);
+      color: var(--text);
+      white-space: nowrap;
+    }
+    .brand span { color: var(--accent); }
+
+    .nav-links {
       display: flex;
       align-items: center;
-      gap: 10px;
-      font-weight: 760;
-      color: var(--ink);
-    }
-
-    .mark {
-      display: inline-grid;
-      place-items: center;
-      width: 34px;
-      height: 34px;
-      border-radius: 8px;
-      background: var(--ink);
-      color: white;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      font-size: 15px;
-    }
-
-    .nav-actions {
-      display: flex;
-      align-items: center;
-      gap: 10px;
+      gap: 2px;
+      font-size: 14px;
       flex-wrap: wrap;
       justify-content: flex-end;
     }
+    .nav-links a { color: var(--muted); padding: 6px 11px; border-radius: 6px; }
+    .nav-links a:hover { color: var(--text); text-decoration: none; }
 
     .lang {
       display: inline-flex;
+      margin-left: 10px;
       border: 1px solid var(--line);
-      border-radius: 8px;
+      border-radius: 999px;
       overflow: hidden;
-      background: var(--panel);
     }
-
-    .lang button,
-    .button {
-      min-height: 38px;
+    .lang button {
+      font: 600 12px var(--mono);
       border: 0;
       background: transparent;
-      color: var(--text);
-      padding: 0 14px;
-      font: inherit;
+      color: var(--muted);
+      padding: 5px 12px;
       cursor: pointer;
     }
+    .lang button.active { background: var(--text); color: var(--bg); }
 
-    .lang button.active {
-      background: var(--ink);
-      color: white;
-    }
-
-    .button {
-      display: inline-flex;
-      align-items: center;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: var(--panel);
-      font-weight: 650;
-    }
-
-    main {
-      overflow: hidden;
-    }
-
-    .hero {
-      min-height: calc(100vh - 64px);
-      display: grid;
-      grid-template-columns: minmax(0, 0.95fr) minmax(460px, 1.05fr);
-      gap: 42px;
-      align-items: center;
-      padding: 58px 0 42px;
-    }
+    /* ---------- hero ---------- */
+    .hero { padding: 96px 0 64px; }
 
     .eyebrow {
+      font: 600 13px var(--mono);
+      letter-spacing: 0.02em;
       color: var(--accent);
-      font-size: 14px;
-      font-weight: 760;
-      text-transform: uppercase;
-      letter-spacing: 0;
-      margin: 0 0 14px;
+      margin: 0 0 20px;
     }
 
     h1 {
       margin: 0;
-      font-size: clamp(42px, 7vw, 82px);
-      line-height: 0.94;
-      letter-spacing: 0;
-      color: var(--ink);
+      font-size: clamp(36px, 5.2vw, 60px);
+      font-weight: 650;
+      line-height: 1.06;
+      letter-spacing: -0.028em;
+      max-width: 20ch;
     }
 
     .lead {
+      max-width: 620px;
+      margin: 26px 0 0;
+      color: var(--muted);
+      font-size: 18.5px;
+      line-height: 1.65;
+    }
+    .lead strong { color: var(--text); font-weight: 600; }
+
+    .hero-actions { display: flex; flex-wrap: wrap; gap: 10px; margin: 34px 0 0; }
+
+    .button {
+      display: inline-flex;
+      align-items: center;
+      font: 600 14px var(--sans);
+      color: var(--text);
+      border: 1px solid var(--line-strong);
+      border-radius: 8px;
+      padding: 10px 18px;
+      background: transparent;
+    }
+    .button:hover { border-color: var(--accent); color: var(--accent); text-decoration: none; }
+    .button.primary { background: var(--accent); border-color: var(--accent); color: var(--bg); }
+    .button.primary:hover { filter: brightness(1.07); color: var(--bg); }
+
+    /* ---------- architecture (svg flow) ---------- */
+    .flow { padding: 8px 0 0; }
+
+    .flow-figure { margin: 0; }
+    .flow-figure svg { display: block; width: 100%; height: auto; }
+
+    .flow-caption {
       max-width: 640px;
-      margin: 24px 0 0;
-      color: var(--muted);
-      font-size: 20px;
-      line-height: 1.55;
+      margin: 18px auto 0;
+      text-align: center;
+      color: var(--faint);
+      font-size: 14px;
+    }
+    .flow-caption .rs { color: var(--amber); font-family: var(--mono); font-size: 0.92em; }
+
+    .n-box { fill: var(--panel); stroke: var(--line-strong); stroke-width: 1.25; }
+    .n-box.hot { stroke: var(--accent); fill: color-mix(in srgb, var(--accent-dim) 60%, var(--panel)); }
+    .n-name { font: 600 15px var(--sans); fill: var(--text); }
+    .n-sub { font: 500 11.5px var(--mono); fill: var(--faint); }
+    .edge { stroke: var(--line-strong); stroke-width: 1.4; fill: none; }
+    .edge.back { stroke: color-mix(in srgb, var(--amber) 44%, var(--line-strong)); }
+    .e-label { font: 600 11px var(--mono); fill: var(--amber); }
+    .e-label.t { fill: var(--accent); }
+    .arrowhead { fill: var(--line-strong); }
+    .arrowhead.back { fill: color-mix(in srgb, var(--amber) 44%, var(--line-strong)); }
+
+    .particle { r: 4px; fill: var(--accent); opacity: 0; display: none; }
+    .particle.res { fill: var(--amber); }
+
+    @supports (offset-path: path("M0 0 H10")) {
+      .particle { display: block; animation: travel 5.6s linear infinite; }
+      .p1 { offset-path: path("M172 78 H268"); animation-delay: 0s; }
+      .p2 { offset-path: path("M436 78 H532"); animation-delay: 0.8s; }
+      .p3 { offset-path: path("M700 78 H796"); animation-delay: 1.6s; }
+      .p4 { offset-path: path("M862 110 V218"); animation-delay: 2.4s; }
+      .p5 { offset-path: path("M796 250 H436"); animation-delay: 3.2s; }
+      .p6 { offset-path: path("M352 218 V110"); animation-delay: 4.4s; }
     }
 
-    .hero-actions {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 12px;
-      margin-top: 30px;
+    @keyframes travel {
+      0%   { offset-distance: 0%; opacity: 0; }
+      2%   { opacity: 1; }
+      15%  { opacity: 1; }
+      19%  { offset-distance: 100%; opacity: 0; }
+      100% { offset-distance: 100%; opacity: 0; }
     }
+    /* the long return edge gets a little more time */
+    .p5 { animation-duration: 5.6s; }
 
-    .primary {
-      border-color: var(--ink);
-      background: var(--ink);
-      color: white;
-    }
+    /* ---------- sections ---------- */
+    section { padding: 96px 0 0; }
 
-    .terminal {
-      margin-top: 28px;
-      border-radius: 8px;
-      background: var(--code);
-      color: var(--code-text);
-      box-shadow: var(--shadow);
-      overflow: hidden;
-      font: 13px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    }
-
-    .terminal-bar {
-      display: flex;
-      gap: 7px;
-      padding: 12px 14px;
-      border-bottom: 1px solid rgba(255,255,255,0.08);
-    }
-
-    .dot {
-      width: 10px;
-      height: 10px;
-      border-radius: 50%;
-      background: #94a3b8;
-    }
-
-    pre {
-      margin: 0;
-      padding: 16px;
-      overflow-x: auto;
-      white-space: pre;
-    }
-
-    .visual {
-      background: rgba(255,255,255,0.72);
-      border: 1px solid rgba(217,222,234,0.88);
-      border-radius: 8px;
-      box-shadow: var(--shadow);
-      padding: 18px;
-    }
-
-    .visual svg {
-      display: block;
-      width: 100%;
-      height: auto;
-    }
-
-    section {
-      padding: 72px 0;
-      border-top: 1px solid rgba(217,222,234,0.8);
-    }
-
+    .sec-no { font: 600 12.5px var(--mono); color: var(--faint); margin: 0 0 12px; letter-spacing: 0.04em; }
     h2 {
-      margin: 0 0 16px;
-      font-size: clamp(28px, 4vw, 44px);
-      line-height: 1.08;
-      letter-spacing: 0;
-      color: var(--ink);
+      margin: 0;
+      font-size: clamp(26px, 3.4vw, 36px);
+      font-weight: 650;
+      line-height: 1.15;
+      letter-spacing: -0.02em;
     }
+    .sec-lead { max-width: 660px; color: var(--muted); margin: 16px 0 0; }
+    .sec-head { margin-bottom: 40px; }
 
-    .section-lead {
-      max-width: 760px;
-      color: var(--muted);
-      font-size: 18px;
-      line-height: 1.6;
-      margin: 0 0 28px;
-    }
+    .grid3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 36px; }
+    .point h3 { margin: 0 0 8px; font-size: 17px; font-weight: 650; }
+    .point p { margin: 0; color: var(--muted); font-size: 15px; }
 
-    .grid {
-      display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-      gap: 16px;
-    }
+    /* roles matrix */
+    .table-scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; }
+    table { border-collapse: collapse; width: 100%; min-width: 700px; font-size: 14.5px; }
+    th, td { text-align: left; padding: 14px 18px; border-bottom: 1px solid var(--line); vertical-align: top; }
+    tr:last-child td { border-bottom: 0; }
+    th { color: var(--faint); font: 600 12.5px var(--mono); background: var(--panel-2); white-space: nowrap; }
+    td:first-child { font: 600 14px var(--mono); color: var(--text); white-space: nowrap; }
+    td { color: var(--muted); }
+    .yes { color: var(--green); }
+    .ro { color: var(--amber); }
+    .no { color: var(--red); }
+    .note { color: var(--faint); font-size: 14px; margin: 14px 2px 0; }
 
-    .card {
-      background: var(--panel);
+    /* observe */
+    .duo { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: stretch; }
+    .pane {
       border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 20px;
-      min-height: 170px;
-    }
-
-    .card h3 {
-      margin: 0 0 10px;
-      font-size: 18px;
-      color: var(--ink);
-    }
-
-    .card p,
-    li {
-      color: var(--muted);
-      line-height: 1.55;
-    }
-
-    .steps {
-      display: grid;
-      grid-template-columns: 0.85fr 1.15fr;
-      gap: 24px;
-      align-items: start;
-    }
-
-    .code-block {
-      border-radius: 8px;
-      background: var(--code);
-      color: var(--code-text);
+      border-radius: 10px;
       overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      background: var(--panel);
     }
+    .pane-title {
+      font: 600 12px var(--mono);
+      color: var(--faint);
+      padding: 11px 18px;
+      border-bottom: 1px solid var(--line);
+      background: var(--panel-2);
+      white-space: nowrap;
+      overflow-x: auto;
+    }
+    .pane pre { margin: 0; padding: 18px 20px; overflow-x: auto; font: 13px/1.85 var(--mono); color: var(--muted); flex: 1; }
+    .tf { color: var(--text); }
+    .tn { color: var(--faint); }
+    .auth { color: var(--accent); }
+    .k-tool { color: var(--amber); }
+    .k-final { color: var(--green); }
 
-    .split {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 18px;
-    }
+    /* quickstart */
+    .steps { display: grid; grid-template-columns: 0.78fr 1.22fr; gap: 40px; align-items: start; }
+    .code-block { border: 1px solid var(--line); border-radius: 10px; overflow: hidden; background: var(--panel); }
+    .code-block pre { margin: 0; padding: 20px 22px; overflow-x: auto; font: 13.5px/1.8 var(--mono); color: var(--muted); }
+    .p { color: var(--faint); user-select: none; }
+    .c { color: var(--text); font-weight: 600; }
+    .f { color: var(--accent); }
+    .cm { color: var(--faint); }
+
+    /* status */
+    .split { display: grid; grid-template-columns: 1fr 1fr; gap: 36px; }
+    .col h3 { margin: 0 0 12px; font-size: 17px; font-weight: 650; }
+    .col ul { margin: 0; padding-left: 18px; color: var(--muted); font-size: 15px; }
+    .col li { margin: 7px 0; }
+    .col li::marker { color: var(--faint); }
 
     footer {
-      padding: 38px 0 56px;
-      color: var(--muted);
+      margin-top: 110px;
+      border-top: 1px solid var(--line);
+      padding: 32px 0 56px;
+      color: var(--faint);
+      font: 500 13px var(--mono);
     }
+    footer .wrap { display: flex; flex-wrap: wrap; gap: 8px 26px; }
+    footer a { color: var(--muted); }
 
-    [data-i18n] {
-      transition: opacity 120ms ease;
-    }
-
-    .zh [data-lang="en"],
-    .en [data-lang="zh"] {
-      display: none;
-    }
+    /* language switch */
+    .zh [data-lang="en"], .en [data-lang="zh"] { display: none; }
 
     @media (prefers-reduced-motion: reduce) {
-      *, *::before, *::after {
-        animation-duration: 0.001ms !important;
-        animation-iteration-count: 1 !important;
-        scroll-behavior: auto !important;
-      }
+      .particle { display: none !important; }
     }
 
-    @media (max-width: 900px) {
-      .hero,
-      .steps,
-      .split,
-      .grid {
-        grid-template-columns: 1fr;
-      }
-
-      .hero {
-        min-height: auto;
-        padding-top: 38px;
-      }
-
-      .visual {
-        padding: 10px;
-      }
+    @media (max-width: 880px) {
+      .grid3, .duo, .steps, .split { grid-template-columns: 1fr; }
+      .grid3 { gap: 26px; }
+      .hero { padding-top: 60px; }
+      section { padding-top: 72px; }
+      /* keep the flow diagram readable: scroll it instead of shrinking it */
+      .flow-figure { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+      .flow-figure svg { min-width: 760px; }
     }
 
-    @media (max-width: 540px) {
-      .wrap {
-        width: min(100% - 22px, 1160px);
-      }
-
-      nav {
-        align-items: flex-start;
-        flex-direction: column;
-        padding: 12px 0;
-      }
-
-      h1 {
-        font-size: 42px;
-      }
-
-      .lead {
-        font-size: 18px;
-      }
-
-      .hero-actions,
-      .nav-actions {
-        width: 100%;
-      }
-
-      .button,
-      .lang {
-        flex: 1;
-        justify-content: center;
-      }
+    @media (max-width: 560px) {
+      .wrap { width: calc(100% - 30px); }
+      nav { flex-wrap: wrap; padding: 10px 0; }
+      .nav-links { justify-content: flex-start; }
     }
   </style>
 </head>
 <body class="en">
   <header>
     <nav class="wrap" aria-label="Primary">
-      <a class="brand" href="#top" aria-label="orch-cli home">
-        <span class="mark">or</span>
-        <span>orch-cli</span>
-      </a>
-      <div class="nav-actions">
+      <a class="brand" href="#top"><span>$</span> orch</a>
+      <div class="nav-links">
+        <a href="#flow" data-lang="en">architecture</a>
+        <a href="#flow" data-lang="zh">架构</a>
+        <a href="#roles" data-lang="en">roles</a>
+        <a href="#roles" data-lang="zh">角色</a>
+        <a href="#observe" data-lang="en">observe</a>
+        <a href="#observe" data-lang="zh">观测</a>
+        <a href="#quickstart" data-lang="en">quickstart</a>
+        <a href="#quickstart" data-lang="zh">上手</a>
+        <a href="https://github.com/yanyaoer/orch-cli">GitHub</a>
         <div class="lang" aria-label="Language">
           <button type="button" class="active" data-set-lang="en">EN</button>
           <button type="button" data-set-lang="zh">中文</button>
         </div>
-        <a class="button" href="https://github.com/yanyaoer/orch-cli">GitHub</a>
       </div>
     </nav>
   </header>
 
   <main id="top">
     <div class="wrap hero">
-      <div>
-        <p class="eyebrow" data-lang="en">Daemonless multi-agent orchestration</p>
-        <p class="eyebrow" data-lang="zh">无常驻服务的多 Agent 编排</p>
-        <h1 data-lang="en">Run coding agents as reproducible local jobs.</h1>
-        <h1 data-lang="zh">把编码 Agent 变成可复现的本地任务。</h1>
-        <p class="lead" data-lang="en">
-          orch dispatches Codex, Claude, pi, or agy through a signed local mail bus, claims work atomically, validates role-specific results, and routes review/verify only after an implementer result is submitted.
-        </p>
-        <p class="lead" data-lang="zh">
-          orch 通过签名本地 mail bus 派发 Codex、Claude、pi 或 agy，原子 claim 任务，校验角色结果，并在 implementer 提交结果后再派发 review/verify。
-        </p>
-        <div class="hero-actions">
-          <a class="button primary" href="#quickstart" data-lang="en">Start with the CLI</a>
-          <a class="button primary" href="#quickstart" data-lang="zh">从 CLI 开始</a>
-          <a class="button" href="#architecture" data-lang="en">View architecture</a>
-          <a class="button" href="#architecture" data-lang="zh">查看架构</a>
-          <a class="button" href="https://github.com/yanyaoer/orch-cli/releases/latest" data-lang="en">Latest release</a>
-          <a class="button" href="https://github.com/yanyaoer/orch-cli/releases/latest" data-lang="zh">最新发布</a>
-        </div>
-        <div class="terminal" aria-label="Quick command">
-          <div class="terminal-bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>
-          <pre>$ orch mail agent defaults                    # once
-$ orch cross-review --thread review-123 --task review.md
-$ orch status                                 # all MRs; dead runs show stale?
-$ orch result --run &lt;run_id&gt; --wait           # blocks, renders findings
-$ orch run create --role reviewer --agent codex --task review.md
-                                              # --mr resolves from task/branch</pre>
-        </div>
-      </div>
-
-      <div class="visual" id="architecture" aria-label="Animated orch workflow diagram">
-        <svg viewBox="0 0 920 620" role="img" aria-labelledby="diagramTitle diagramDesc" xmlns="http://www.w3.org/2000/svg">
-          <title id="diagramTitle">orch workflow</title>
-          <desc id="diagramDesc">Controller submits a signed mail task, MaildirBus routes and claims it, a driver writes run state, and result.submitted mail triggers reviewer and verifier follow-up work.</desc>
-          <defs>
-            <linearGradient id="nodeA" x1="0" x2="1">
-              <stop offset="0" stop-color="#0f766e"/>
-              <stop offset="1" stop-color="#2563eb"/>
-            </linearGradient>
-            <filter id="soft" x="-20%" y="-20%" width="140%" height="140%">
-              <feDropShadow dx="0" dy="8" stdDeviation="10" flood-color="#0f172a" flood-opacity="0.14"/>
-            </filter>
-            <marker id="arrow" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="8" markerHeight="8" orient="auto">
-              <path d="M2 2 L10 6 L2 10 Z" fill="#64748b"/>
-            </marker>
-            <style>
-              .node { fill: #fff; stroke: #cbd5e1; stroke-width: 2; filter: url(#soft); }
-              .nodeAccent { fill: url(#nodeA); stroke: none; filter: url(#soft); }
-              .label { font: 700 24px ui-sans-serif, system-ui; fill: #0f172a; }
-              .small { font: 500 15px ui-sans-serif, system-ui; fill: #64748b; }
-              .line { fill: none; stroke: #94a3b8; stroke-width: 3; stroke-linecap: round; marker-end: url(#arrow); }
-              .pulse { fill: #b45309; }
-              .file { fill: #f8fafc; stroke: #cbd5e1; stroke-width: 2; }
-              .flow {
-                stroke-dasharray: 12 18;
-                animation: dash 1.8s linear infinite;
-              }
-              .pulse {
-                animation: hop 3.6s ease-in-out infinite;
-              }
-              .pulse.two { animation-delay: .75s; }
-              .pulse.three { animation-delay: 1.5s; }
-              .heartbeat { animation: blink 1.6s ease-in-out infinite; }
-              @keyframes dash { to { stroke-dashoffset: -60; } }
-              @keyframes hop {
-                0%, 18% { transform: translate(90px, 120px); opacity: 0; }
-                25%, 42% { transform: translate(285px, 120px); opacity: 1; }
-                50%, 66% { transform: translate(475px, 120px); opacity: 1; }
-                75%, 92% { transform: translate(650px, 360px); opacity: 1; }
-                100% { transform: translate(790px, 360px); opacity: 0; }
-              }
-              @keyframes blink {
-                0%, 100% { opacity: .35; }
-                50% { opacity: 1; }
-              }
-            </style>
-          </defs>
-
-          <rect x="24" y="24" width="872" height="572" rx="18" fill="#f8fafc" stroke="#e2e8f0"/>
-
-          <path class="line flow" d="M190 135 H350"/>
-          <path class="line flow" d="M530 135 H700"/>
-          <path class="line flow" d="M760 190 V312"/>
-          <path class="line flow" d="M690 390 H535"/>
-          <path class="line flow" d="M385 390 H230"/>
-          <path class="line flow" d="M230 312 V205"/>
-
-          <g transform="translate(60 80)">
-            <rect class="node" width="170" height="110" rx="12"/>
-            <text class="label" x="24" y="46">Controller</text>
-            <text class="small" x="24" y="75">human / agent</text>
-          </g>
-
-          <g transform="translate(350 80)">
-            <rect class="nodeAccent" width="190" height="110" rx="12"/>
-            <text class="label" x="28" y="46" fill="#fff">MaildirBus</text>
-            <text class="small" x="28" y="75" fill="#dbeafe">signed events</text>
-          </g>
-
-          <g transform="translate(700 80)">
-            <rect class="node" width="160" height="110" rx="12"/>
-            <text class="label" x="24" y="46">Claim</text>
-            <text class="small" x="24" y="75">lease / ack</text>
-          </g>
-
-          <g transform="translate(665 320)">
-            <rect class="node" width="210" height="130" rx="12"/>
-            <text class="label" x="24" y="42">Driver</text>
-            <text class="small" x="24" y="70">codex / claude / pi / agy</text>
-            <circle class="heartbeat" cx="170" cy="38" r="9" fill="#0f766e"/>
-          </g>
-
-          <g transform="translate(350 320)">
-            <rect class="node" width="210" height="130" rx="12"/>
-            <text class="label" x="24" y="42">Run State</text>
-            <text class="small" x="24" y="70">status + events</text>
-            <text class="small" x="24" y="96">native + result</text>
-          </g>
-
-          <g transform="translate(65 320)">
-            <rect class="node" width="205" height="130" rx="12"/>
-            <text class="label" x="24" y="42">Follow-up</text>
-            <text class="small" x="24" y="70">review / verify</text>
-            <text class="small" x="24" y="96">after result</text>
-          </g>
-
-          <g transform="translate(138 500)">
-            <rect class="file" x="0" y="0" width="150" height="58" rx="8"/>
-            <text class="small" x="18" y="35">spec.json</text>
-          </g>
-          <g transform="translate(330 500)">
-            <rect class="file" x="0" y="0" width="160" height="58" rx="8"/>
-            <text class="small" x="18" y="35">mail-events</text>
-          </g>
-          <g transform="translate(532 500)">
-            <rect class="file" x="0" y="0" width="165" height="58" rx="8"/>
-            <text class="small" x="18" y="35">result.json</text>
-          </g>
-
-          <circle class="pulse" cx="0" cy="0" r="8"/>
-          <circle class="pulse two" cx="0" cy="0" r="8"/>
-          <circle class="pulse three" cx="0" cy="0" r="8"/>
-        </svg>
+      <p class="eyebrow" data-lang="en">daemonless multi-agent orchestration</p>
+      <p class="eyebrow" data-lang="zh">无常驻服务的多 Agent 编排</p>
+      <h1 data-lang="en">Coding agents as supervised, auditable local jobs.</h1>
+      <h1 data-lang="zh">把编码 Agent 跑成可监督、可审计的本地任务。</h1>
+      <p class="lead" data-lang="en">
+        orch dispatches headless <strong>codex / claude / pi / agy</strong> workers through a signed
+        local mail bus, claims work atomically, and validates every result against a role schema.
+        <strong>No daemon</strong> — each command reads local files, advances one step, and exits.
+      </p>
+      <p class="lead" data-lang="zh">
+        orch 通过签名的本地 mail bus 派发 headless 的 <strong>codex / claude / pi / agy</strong> worker，
+        原子 claim 任务，并按角色 schema 校验每一个结果。<strong>没有 daemon</strong>——每个命令读本地文件、
+        推进一步、退出。
+      </p>
+      <div class="hero-actions">
+        <a class="button primary" href="#quickstart" data-lang="en">Quickstart</a>
+        <a class="button primary" href="#quickstart" data-lang="zh">快速开始</a>
+        <a class="button" href="https://github.com/yanyaoer/orch-cli/releases/latest" data-lang="en">Latest release</a>
+        <a class="button" href="https://github.com/yanyaoer/orch-cli/releases/latest" data-lang="zh">最新发布</a>
+        <a class="button" href="https://github.com/yanyaoer/orch-cli">GitHub</a>
       </div>
     </div>
 
-    <section>
+    <div class="wrap flow" id="flow">
+      <figure class="flow-figure" aria-label="orch information flow">
+        <svg viewBox="0 0 1020 330" role="img" aria-labelledby="flowTitle flowDesc" xmlns="http://www.w3.org/2000/svg">
+          <title id="flowTitle">orch information flow</title>
+          <desc id="flowDesc">A controller publishes a signed task to the mail bus; the task is claimed atomically and executed by a driver; the run writes local state; the submitted result flows back through the bus as review and verify follow-up tasks.</desc>
+
+          <defs>
+            <marker id="ah" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0 1.2 L9 5 L0 8.8 Z" class="arrowhead"/>
+            </marker>
+            <marker id="ahb" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0 1.2 L9 5 L0 8.8 Z" class="arrowhead back"/>
+            </marker>
+          </defs>
+
+          <!-- forward edges: task flow -->
+          <path class="edge" d="M172 78 H264" marker-end="url(#ah)"/>
+          <path class="edge" d="M436 78 H528" marker-end="url(#ah)"/>
+          <path class="edge" d="M700 78 H792" marker-end="url(#ah)"/>
+          <path class="edge" d="M862 110 V214" marker-end="url(#ah)"/>
+          <!-- return edges: result flow -->
+          <path class="edge back" d="M796 250 H440" marker-end="url(#ahb)"/>
+          <path class="edge back" d="M352 218 V114" marker-end="url(#ahb)"/>
+
+          <!-- edge labels -->
+          <text class="e-label" x="548" y="242" text-anchor="start">result.submitted</text>
+          <text class="e-label" x="366" y="170" text-anchor="start" data-lang="en">review / verify tasks</text>
+          <text class="e-label" x="366" y="170" text-anchor="start" data-lang="zh">review / verify 任务</text>
+
+          <!-- nodes: top row -->
+          <g transform="translate(28 46)">
+            <rect class="n-box" width="144" height="64" rx="10"/>
+            <text class="n-name" x="18" y="28">controller</text>
+            <text class="n-sub" x="18" y="48" data-lang="en">human / agent</text>
+            <text class="n-sub" x="18" y="48" data-lang="zh">人 / agent</text>
+          </g>
+          <g transform="translate(268 46)">
+            <rect class="n-box hot" width="168" height="64" rx="10"/>
+            <text class="n-name" x="18" y="28">mail bus</text>
+            <text class="n-sub" x="18" y="48" data-lang="en">signed .eml events</text>
+            <text class="n-sub" x="18" y="48" data-lang="zh">签名 .eml 事件</text>
+          </g>
+          <g transform="translate(532 46)">
+            <rect class="n-box" width="168" height="64" rx="10"/>
+            <text class="n-name" x="18" y="28">claim</text>
+            <text class="n-sub" x="18" y="48" data-lang="en">atomic lease · ack</text>
+            <text class="n-sub" x="18" y="48" data-lang="zh">原子租约 · ack</text>
+          </g>
+          <g transform="translate(796 46)">
+            <rect class="n-box" width="196" height="64" rx="10"/>
+            <text class="n-name" x="18" y="28">driver</text>
+            <text class="n-sub" x="18" y="48">codex · claude · pi · agy</text>
+          </g>
+
+          <!-- nodes: bottom row -->
+          <g transform="translate(796 218)">
+            <rect class="n-box" width="196" height="64" rx="10"/>
+            <text class="n-name" x="18" y="28">run state</text>
+            <text class="n-sub" x="18" y="48" data-lang="en">files under XDG_STATE</text>
+            <text class="n-sub" x="18" y="48" data-lang="zh">XDG_STATE 下的文件</text>
+          </g>
+          <g transform="translate(268 218)">
+            <rect class="n-box hot" width="168" height="64" rx="10"/>
+            <text class="n-name" x="18" y="28">follow-up</text>
+            <text class="n-sub" x="18" y="48" data-lang="en">result-driven review</text>
+            <text class="n-sub" x="18" y="48" data-lang="zh">结果驱动评审</text>
+          </g>
+
+          <!-- flowing particles (CSS offset-path; hidden without support / reduced motion) -->
+          <circle class="particle p1" cx="172" cy="78"/>
+          <circle class="particle p2" cx="436" cy="78"/>
+          <circle class="particle p3" cx="700" cy="78"/>
+          <circle class="particle p4" cx="862" cy="110"/>
+          <circle class="particle res p5" cx="796" cy="250"/>
+          <circle class="particle res p6" cx="352" cy="218"/>
+        </svg>
+      </figure>
+      <figcaption class="flow-caption" data-lang="en">
+        Review and verify tasks are routed from <span class="rs">result.submitted</span> —
+        cross-review audits the implementer's actual output, never the original prompt.
+      </figcaption>
+      <figcaption class="flow-caption" data-lang="zh">
+        review / verify 任务由 <span class="rs">result.submitted</span> 驱动——
+        交叉评审审的是 implementer 的真实产物，而不是原始 prompt。
+      </figcaption>
+    </div>
+
+    <section id="why">
       <div class="wrap">
-        <h2 data-lang="en">Signed local mail is the bus.</h2>
-        <h2 data-lang="zh">签名本地邮件就是消息总线。</h2>
-        <p class="section-lead" data-lang="en">
-          The controller does not need a daemon or external queue. orch stores signed task/result events in Maildir-backed local state, then routes reviewer and verifier work from the implementer's submitted result.
-        </p>
-        <p class="section-lead" data-lang="zh">
-          主控不需要 daemon 或外部队列。orch 把签名 task/result 事件写入 Maildir 本地状态，并基于 implementer 提交的结果派发 reviewer 和 verifier。
-        </p>
-        <div class="grid">
-          <article class="card">
+        <div class="grid3">
+          <article class="point">
             <h3 data-lang="en">Daemonless</h3>
             <h3 data-lang="zh">无 daemon</h3>
-            <p data-lang="en">Each command reads local state, advances one action, and exits. The supervisor lives only for a single run.</p>
-            <p data-lang="zh">每个命令读取本地状态、推进一次动作，然后退出。supervisor 生命周期只覆盖单个 run。</p>
+            <p data-lang="en">Every command is a stateless reconciler over local files. The per-run supervisor lives exactly as long as one run — process-group kill, timeout, heartbeat, honest terminal states.</p>
+            <p data-lang="zh">每个命令都是基于本地文件的无状态 reconciler。supervisor 与单个 run 同生共死——进程组 kill、超时、心跳、诚实的终止状态。</p>
           </article>
-          <article class="card">
-            <h3 data-lang="en">Mail-bus auditable</h3>
-            <h3 data-lang="zh">Mail bus 可审计</h3>
-            <p data-lang="en">A thread contains signed .eml files, verified mail-events.jsonl, Maildir messages, and per-event claim records.</p>
-            <p data-lang="zh">每个 thread 都包含签名 .eml、已验证的 mail-events.jsonl、Maildir 消息和逐事件 claim 记录。</p>
+          <article class="point">
+            <h3 data-lang="en">Auditable by files</h3>
+            <h3 data-lang="zh">文件即审计</h3>
+            <p data-lang="en">Signed events, verified <code>mail-events.jsonl</code>, per-event claim leases, immutable <code>spec.json</code>, append-only <code>events.jsonl</code>. Swap the controller, keep the state.</p>
+            <p data-lang="zh">签名事件、已验证的 <code>mail-events.jsonl</code>、逐事件 claim 租约、不可变 <code>spec.json</code>、只追加的 <code>events.jsonl</code>。换主控不丢状态。</p>
           </article>
-          <article class="card">
-            <h3 data-lang="en">Result-driven review</h3>
-            <h3 data-lang="zh">基于结果的 review</h3>
-            <p data-lang="en">Reviewer and verifier tasks are created from result.submitted, so cross-review audits actual implementer output.</p>
-            <p data-lang="zh">reviewer 和 verifier 任务由 result.submitted 触发，因此交叉 review 审的是真实实现产物。</p>
+          <article class="point">
+            <h3 data-lang="en">Schema-gated results</h3>
+            <h3 data-lang="zh">结果过 schema 门</h3>
+            <p data-lang="en">Workers must return <code>orch.result/&lt;role&gt;/v1</code> JSON. Benign deviations are coerced, failed extraction keeps the raw answer as <code>result.raw.md</code>, and silent zero-output exits fail the run.</p>
+            <p data-lang="zh">worker 必须返回 <code>orch.result/&lt;role&gt;/v1</code> JSON。无害偏差自动归一，提取失败时原始回答保留为 <code>result.raw.md</code>，零输出的静默退出按失败处理。</p>
           </article>
+        </div>
+      </div>
+    </section>
+
+    <section id="roles">
+      <div class="wrap">
+        <div class="sec-head">
+          <p class="sec-no">01 — ROLES</p>
+          <h2 data-lang="en">Permissions and models match the role.</h2>
+          <h2 data-lang="zh">权限与模型随角色匹配。</h2>
+          <p class="sec-lead" data-lang="en">
+            The reviewer role launches every provider read-only; write roles and the verifier keep
+            write-capable access. The claude driver also picks model and effort per role.
+          </p>
+          <p class="sec-lead" data-lang="zh">
+            reviewer 角色下所有 provider 都以只读方式启动；写角色与 verifier 保留写权限。claude driver
+            还会按角色选择模型与推理力度。
+          </p>
+        </div>
+
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>DRIVER</th>
+                <th><span data-lang="en">IMPLEMENTER · write</span><span data-lang="zh">IMPLEMENTER · 写</span></th>
+                <th><span data-lang="en">REVIEWER · read-only</span><span data-lang="zh">REVIEWER · 只读</span></th>
+                <th><span data-lang="en">VERIFIER · runs tests</span><span data-lang="zh">VERIFIER · 跑测试</span></th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>codex</td>
+                <td><span class="yes">✓</span> default write</td>
+                <td><span class="ro">✓</span> --sandbox read-only</td>
+                <td><span class="yes">✓</span></td>
+              </tr>
+              <tr>
+                <td>claude</td>
+                <td><span class="yes">✓</span> sonnet · effort medium</td>
+                <td><span class="ro">✓</span> plan mode · opus · effort high</td>
+                <td><span class="yes">✓</span> sonnet · effort low</td>
+              </tr>
+              <tr>
+                <td>pi</td>
+                <td><span class="yes">✓</span> default write</td>
+                <td><span class="ro">✓</span> tools: read · grep · find · ls</td>
+                <td><span class="yes">✓</span></td>
+              </tr>
+              <tr>
+                <td>agy · gemini 3.1 pro</td>
+                <td><span class="no">✗</span> rejected</td>
+                <td><span class="ro">✓</span> --sandbox · ephemeral</td>
+                <td><span class="no">✗</span> rejected</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="note" data-lang="en">An explicit <code>--model &lt;ref&gt;</code> is recorded in <code>spec.json</code> and overrides the provider model for model-aware drivers.</p>
+        <p class="note" data-lang="zh">显式 <code>--model &lt;ref&gt;</code> 会记录进 <code>spec.json</code>，并对支持模型选择的 driver 覆盖默认模型。</p>
+      </div>
+    </section>
+
+    <section id="observe">
+      <div class="wrap">
+        <div class="sec-head">
+          <p class="sec-no">02 — OBSERVE</p>
+          <h2 data-lang="en">One run directory tells the whole story.</h2>
+          <h2 data-lang="zh">一个 run 目录讲完整个故事。</h2>
+          <p class="sec-lead" data-lang="en">
+            Lifecycle authority stays in <code>events.jsonl</code> and <code>status.json</code>. The
+            provider-native stream is kept verbatim in <code>native.jsonl</code> — and
+            <code>events tail --native</code> normalizes it into provider-independent progress events,
+            so you watch every worker the same way.
+          </p>
+          <p class="sec-lead" data-lang="zh">
+            生命周期权威在 <code>events.jsonl</code> 与 <code>status.json</code>。provider 原生流原样保留在
+            <code>native.jsonl</code>——<code>events tail --native</code> 把它规范化为与 provider 无关的
+            进度事件，用同一种方式观察任何 worker。
+          </p>
+        </div>
+
+        <div class="duo">
+          <div class="pane">
+            <div class="pane-title">$XDG_STATE_HOME/orch/&lt;repo_key&gt;/mrs/&lt;mr&gt;/runs/&lt;run_id&gt;/</div>
+            <pre>├── <span class="tf">spec.json</span>      <span class="tn">immutable input snapshot</span>
+├── <span class="tf">status.json</span>    <span class="tn">state · pid · shas · resume id</span>
+├── <span class="tf">events.jsonl</span>   <span class="auth">orch lifecycle — the authority</span>
+├── <span class="tf">native.jsonl</span>   <span class="tn">provider stream, verbatim</span>
+├── <span class="tf">result.json</span>    <span class="tn">schema-validated role result</span>
+├── <span class="tf">stdout.log</span> · <span class="tf">stderr.log</span>
+└── <span class="tf">artifacts/</span></pre>
+          </div>
+          <div class="pane">
+            <div class="pane-title">$ orch events tail --run &lt;run_id&gt; --native</div>
+            <pre>{"kind":"session","format":"claude","session_id":"…"}
+{"kind":"<span class="k-tool">tool_use</span>","format":"claude","tool":"Bash","text":"bun test"}
+{"kind":"<span class="k-tool">tool_result</span>","format":"claude","text":"110 pass"}
+{"kind":"assistant","format":"codex","text":"all checks pass"}
+{"kind":"usage","format":"codex","usage":{"output_tokens":20}}
+{"kind":"<span class="k-final">final</span>","format":"claude","text":"{\"schema\":…}"}</pre>
+          </div>
         </div>
       </div>
     </section>
 
     <section id="quickstart">
       <div class="wrap steps">
-        <div>
-          <h2 data-lang="en">Quickstart</h2>
-          <h2 data-lang="zh">快速开始</h2>
-          <p class="section-lead" data-lang="en">
-            Install with Bun or a release binary, configure default mail agents once, then fan a task across agents in one command — publish, claim, and run all ride the local mail bus. The step-by-step submit/route/claim pipeline stays available for manual control.
+        <div class="sec-head" style="margin-bottom:0">
+          <p class="sec-no">03 — QUICKSTART</p>
+          <h2 data-lang="en">One command fans a task across agents.</h2>
+          <h2 data-lang="zh">一条命令把任务分发给多个 agent。</h2>
+          <p class="sec-lead" data-lang="en">
+            Install with Bun or a release binary, register default mail agents once, then publish,
+            claim, and run ride the local mail bus in one shot. The manual submit / route / claim
+            pipeline stays available for fine control.
           </p>
-          <p class="section-lead" data-lang="zh">
-            使用 Bun 或 release binary 安装，配置一次默认 mail agents，然后一条命令把任务分发给多个 agent——发布、claim、运行全部走本地 mail bus。手动的 submit/route/claim 流水线仍然可用。
+          <p class="sec-lead" data-lang="zh">
+            用 Bun 或 release binary 安装，注册一次默认 mail agents，之后发布、claim、运行一条命令
+            走完本地 mail bus。手动 submit / route / claim 流水线仍然可用。
           </p>
         </div>
         <div class="code-block">
-          <pre>$ bun install
-$ bun run install:local
+          <pre><span class="p">$</span> <span class="c">bun install</span> <span class="cm">&amp;&amp; bun run install:local</span>
+<span class="p">$</span> <span class="c">orch mail agent defaults</span>                    <span class="cm"># once</span>
+<span class="p">$</span> <span class="c">orch workspace add</span> <span class="f">--id</span> my-repo <span class="f">--path</span> .
 
-$ orch mail agent defaults
-$ orch workspace add --id orch-cli --path .
+<span class="cm"># one-shot fan-out: publish + claim + run per agent</span>
+<span class="p">$</span> <span class="c">orch cross-review</span> <span class="f">--thread</span> review-123 <span class="f">--task</span> review.md
+<span class="p">$</span> <span class="c">orch fanout</span> <span class="f">--thread</span> verify-1 <span class="f">--role</span> verifier <span class="f">--task</span> verify.md
+<span class="p">$</span> <span class="c">orch investigate</span> <span class="f">--thread</span> research-1 <span class="f">--task</span> question.md
 
-# one-shot fan-out: publish + claim + run per agent
-$ orch cross-review --thread review-123 --task review.md
-$ orch fanout --thread verify-1 --role verifier --to-agent pi-verifier --task verify.md
-$ orch investigate --thread research-1 --task question.md
+<span class="cm"># follow the runs (mr == thread)</span>
+<span class="p">$</span> <span class="c">orch status</span> <span class="f">--mr</span> review-123
+<span class="p">$</span> <span class="c">orch result</span> <span class="f">--run</span> &lt;run_id&gt; <span class="f">--wait</span>
+<span class="p">$</span> <span class="c">orch events tail</span> <span class="f">--run</span> &lt;run_id&gt; <span class="f">--native</span> <span class="f">-n</span> 20
 
-# follow the runs (mr == thread); --wait blocks until terminal
-$ orch status --mr review-123
-$ orch result --run &lt;run_id&gt; --wait
+<span class="cm"># single supervised run; --mr resolves from the task or branch</span>
+<span class="p">$</span> <span class="c">orch run create</span> <span class="f">--role</span> reviewer <span class="f">--agent</span> codex <span class="f">--task</span> review.md
 
-# single supervised run; --mr resolves from an MR: header,
-# a merge-request/pull URL in the task, or the current branch
-$ orch run create --role reviewer --agent codex --task review.md
-$ orch run list
-$ orch run reap</pre>
+<span class="cm"># record the verdict; mirror to PR/MR only with --execute</span>
+<span class="p">$</span> <span class="c">orch decision</span> accept <span class="f">--run</span> &lt;run_id&gt; <span class="f">--reason</span> "reviewed"
+<span class="p">$</span> <span class="c">orch mirror sync</span> <span class="f">--mr</span> 123 <span class="f">--execute</span></pre>
         </div>
       </div>
     </section>
 
-    <section>
+    <section id="ships">
       <div class="wrap">
-        <h2 data-lang="en">What ships now</h2>
-        <h2 data-lang="zh">当前已实现</h2>
+        <div class="sec-head">
+          <p class="sec-no">04 — STATUS</p>
+          <h2 data-lang="en">What ships now — and what doesn't.</h2>
+          <h2 data-lang="zh">已实现什么，边界在哪。</h2>
+        </div>
         <div class="split">
-          <div class="card">
+          <div class="col">
             <h3 data-lang="en">Commands</h3>
             <h3 data-lang="zh">命令</h3>
             <ul>
-              <li><code>run create</code>, <code>run list</code>, <code>run reap</code>, <code>status</code></li>
-              <li><code>cross-review</code>, <code>fanout</code>, <code>investigate</code></li>
-              <li><code>mail submit</code>, <code>mail route</code>, <code>mail claim</code>, <code>mail reply result</code></li>
-              <li><code>events tail</code>, <code>result --wait</code></li>
-              <li><code>decision</code>, <code>mirror</code>, <code>mirror sync</code>, <code>workspace</code></li>
-              <li><code>chatgpt-bridge</code>, <code>handoff-pro</code></li>
+              <li><code>run create</code> · <code>run list</code> · <code>run reap</code> · <code>status</code></li>
+              <li><code>cross-review</code> · <code>fanout</code> · <code>investigate</code></li>
+              <li><code>mail submit</code> · <code>mail route</code> · <code>mail claim</code> · <code>mail reply result</code></li>
+              <li><code>events tail [--native]</code> · <code>result --wait</code></li>
+              <li><code>decision</code> · <code>mirror</code> · <code>mirror sync</code> · <code>workspace</code></li>
+              <li><code>chatgpt-bridge</code> · <code>handoff-pro</code></li>
             </ul>
           </div>
-          <div class="card">
+          <div class="col">
             <h3 data-lang="en">Boundaries</h3>
             <h3 data-lang="zh">边界</h3>
             <ul data-lang="en">
-              <li>No long-running daemon yet; stale runs are flagged on read and reaped explicitly.</li>
+              <li>No long-running daemon; stale runs are flagged on read and reaped explicitly.</li>
               <li>The shipped message bus is local Maildir state, not a multi-machine database.</li>
-              <li>Drivers target Codex, Claude, pi, and agy. Permissions match the role: reviewer runs read-only/sandboxed; agy (Gemini 3.1 Pro) is reviewer-only.</li>
-              <li>Results are schema-validated with lenient coercion; when extraction fails the raw final message is kept as <code>result.raw.md</code>.</li>
-              <li><code>chatgpt-bridge</code> provides a read-only Cloudflare Worker MCP bridge.</li>
+              <li>Mirroring is outbox-first: nothing touches the network without <code>--execute</code>.</li>
+              <li>Provider sessions never auto-resume "latest"; exact resume needs an explicit session id.</li>
+              <li><code>chatgpt-bridge</code> is a read-only Cloudflare Worker MCP bridge.</li>
             </ul>
             <ul data-lang="zh">
-              <li>当前没有常驻 daemon；僵尸 run 读取时标记 stale，可显式 reap。</li>
+              <li>没有常驻 daemon；僵尸 run 读取时标记 stale，需显式 reap。</li>
               <li>当前消息总线是本地 Maildir 状态，不是多机数据库。</li>
-              <li>当前 driver 覆盖 Codex、Claude、pi 和 agy；权限随角色匹配:reviewer 以只读/沙箱方式运行,agy(Gemini 3.1 Pro)仅限 reviewer。</li>
-              <li>结果经宽松归一化后做 schema 校验；提取失败时原始产出保留为 <code>result.raw.md</code>。</li>
-              <li><code>chatgpt-bridge</code> 提供只读 Cloudflare Worker MCP 桥接。</li>
+              <li>PR/MR 镜像 outbox 先行：没有 <code>--execute</code> 不碰网络。</li>
+              <li>provider 会话从不自动续"最近一次"；精确恢复必须显式给 session id。</li>
+              <li><code>chatgpt-bridge</code> 是只读的 Cloudflare Worker MCP 桥。</li>
             </ul>
           </div>
         </div>
@@ -640,9 +668,11 @@ $ orch run reap</pre>
 
   <footer>
     <div class="wrap">
-      <span data-lang="en">Source: </span>
-      <span data-lang="zh">源码：</span>
-      <a href="https://github.com/yanyaoer/orch-cli">github.com/yanyaoer/orch-cli</a>
+      <span><a href="https://github.com/yanyaoer/orch-cli">github.com/yanyaoer/orch-cli</a></span>
+      <span data-lang="en">state lives in ${XDG_STATE_HOME:-~/.local/state}/orch</span>
+      <span data-lang="zh">状态位于 ${XDG_STATE_HOME:-~/.local/state}/orch</span>
+      <span data-lang="en">no daemon · no queue · just files</span>
+      <span data-lang="zh">无 daemon · 无队列 · 只有文件</span>
     </div>
   </footer>
 
