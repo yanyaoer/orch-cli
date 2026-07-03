@@ -36,7 +36,7 @@ claude / codex / pi / 人  ──▶  orch CLI  ──▶  本地状态目录 + 
 1. **MR 锁**：`orch run create` 先拿 `locks/mr.lock`（`flock`），再幂等检查。
 2. **run 幂等**：`--idempotency-key`（默认 `mr<id>:<tag>:<task_sha>`）；已存在则：running→返回 run_id，done→返回 result，failed→需 `--retry` 才新建。
 3. **worktree 写锁**：write-role（implementer/challenger/rework/debugger）拿 `locks/worktree.<sha256(abs)>.lock`，supervisor 持有到 run 结束；reviewer/verifier 评 artifact、**不拿锁**（D8）。
-4. **native 归一化**：provider 原生流落 `native.jsonl`，**不直接当 orch 事件**；normalizer 写 `events.jsonl`（MVP 可极简）。
+4. **native 归一化**：provider 原生流落 `native.jsonl`，**不直接当 orch 事件**；normalizer 写 `events.jsonl`（MVP 可极简）。现已落地读侧 normalizer（`src/native-events.ts`）：把 claude/codex/pi/agy 原生行统一映射为 session / assistant / tool_use / tool_result / usage / final / raw 进度事件，供 `orch events tail --native`、result 提取与 resume-id 检测共用一个解析层；`events.jsonl` 仍只承载 orch 生命周期事件，权威不变。
 5. **result schema**：`result.json` 必须过 per-role schema 校验（MVP 用 `jq` 查关键字段非空即可）。
 6. **MR outbox**：写 MR 先落 `outbox/pending/`，`glab` 成功后移 `outbox/sent/`；写失败不影响 run 完成。
 
@@ -168,7 +168,7 @@ created → starting → running → done
 
 ## 11. attach / resume 语义
 
-- **attach**：headless worker 无交互 stdin；`attach` = `tail -f native.jsonl events.jsonl stderr.log` + 打印 worktree/spec/result 路径。要人接管用 `debug shell`。
+- **attach**：headless worker 无交互 stdin；`attach` = `tail -f native.jsonl events.jsonl stderr.log` + 打印 worktree/spec/result 路径。要人接管用 `debug shell`。现已落地的替代读法：`orch events tail --native` 直接输出规范化后的 provider 进度事件，不必人肉读原生流。
 - **resume 是优化，不是正确性基础**：run 正确性以 `spec.json / worktree diff / result.json / events.jsonl` 为准。每个 run 记 `model / provider_session_name / provider_session_id / provider_session_mode / provider_resume_id / base_sha / spec_sha`；默认不使用 latest-session 语义，provider 没吐稳定 id 就**新建 run / rework run**，不硬续。
 - **provider session policy**：`fresh_persistent` 启动新 provider 会话，`ephemeral` 不保存 provider 会话，`resume_exact` 只接受显式 `--session-id`。禁止自动生成 Claude `--continue`、Codex `--last` 这类“最近会话”参数。
 

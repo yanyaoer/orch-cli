@@ -22,6 +22,7 @@ import { appendJsonLine, countLines, jsonBytes, readJsonFile, writeJsonAtomic, w
 import { argvForDisplay, createForgeAdapter, detectForge } from "./forge.ts";
 import { findPrivateLeak, privateLeakAllowed, privateLeakErrorMessage } from "./leak.ts";
 import { runSupervisor, writeInitialRunFiles } from "./supervisor.ts";
+import { normalizeNativeText } from "./native-events.ts";
 import {
   HELP_TOPICS,
   chatgptBridgeHelp,
@@ -1044,6 +1045,22 @@ async function eventsTail(args: ParsedArgs): Promise<number> {
   const lines = parseTailLines(args);
   const repo = await getRepoIdentity(worktree);
   const located = locateRun(repo.repo_key, runId, mr);
+
+  // --native renders provider-native stream output as normalized progress
+  // events (session/assistant/tool_use/tool_result/usage/final/raw) — a
+  // read-side view of what the worker is doing; orch lifecycle events stay in
+  // events.jsonl and remain the state authority.
+  if (flagBool(args, "native")) {
+    const nativePath = `${located.run_dir}/native.jsonl`;
+    const text = readTextFile(nativePath);
+    if (text === null) throw new CliError(`native.jsonl not found for run: ${runId}`);
+    const rendered = normalizeNativeText(text)
+      .map((event) => JSON.stringify(event))
+      .join("\n");
+    process.stdout.write(tailText(rendered ? `${rendered}\n` : "", lines));
+    return 0;
+  }
+
   const eventsPath = `${located.run_dir}/events.jsonl`;
   const text = readTextFile(eventsPath);
   if (text === null) throw new CliError(`events.jsonl not found for run: ${runId}`);

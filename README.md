@@ -18,6 +18,7 @@ Shipped on `main` (v0.0.3 plus unreleased changes, see [CHANGELOG.md](CHANGELOG.
 
 - `orch run create` starts one supervised headless worker run. `--mr` is optional: it resolves from an `MR: <id-or-url>` line in the task's leading header block, a merge-request/pull URL in the task text, or the current branch name (`mr_source` reports which).
 - `orch run list`, `orch status`, `orch events tail`, and `orch result` read local run state; omitting `--mr` aggregates across all MRs in the repo. `orch result --wait` blocks until the run reaches a terminal state; reviewer results render findings, verifier results render commands and acceptance.
+- `orch events tail --native` renders the provider-native stream (`native.jsonl`) as normalized progress events — `session`, `assistant`, `tool_use`, `tool_result`, `usage`, `final`, `raw` — so a controller can see what a worker is doing without parsing per-provider formats. The same normalizer (`src/native-events.ts`) backs result extraction and resume-id detection.
 - Non-terminal runs whose supervisor pid is gone show as `stale?`; `orch run reap` persists them as `stale`. A provider that exits 0 without any output fails its run instead of quietly reporting done.
 - `orch decision` records `accept` or `rework` locally and queues a mirror comment.
 - `orch mail` provides the local message bus: signed mail events, Maildir delivery, router dispatch, atomic task claim, and result-driven review/verify follow-ups.
@@ -131,6 +132,8 @@ Observe it (omit `--mr` to aggregate every MR in the repo; dead-pid runs show as
 $ orch run list --worktree .
 $ orch status --json --worktree .
 $ orch events tail --run review-a-20260619T120000-abc123 -n 20
+$ orch events tail --run review-a-20260619T120000-abc123 --native -n 20
+                           # provider progress: session/assistant/tool_use/tool_result/usage/final/raw
 $ orch run reap            # persist stale for runs whose supervisor died
 ```
 
@@ -221,7 +224,7 @@ Important run files:
 - `spec.sha256`: hash of the stored spec bytes
 - `status.json`: run lifecycle, pid/pgid, timestamps, exit code, resume id, git shas
 - `events.jsonl`: normalized orch events such as `created`, `running`, `heartbeat`, `done`, `failed`, `timeout`
-- `native.jsonl`: provider-native stream, kept for debugging but not treated as orch events
+- `native.jsonl`: provider-native stream, not treated as orch events; `orch events tail --native` renders it as normalized progress events
 - `stdout.log` and `stderr.log`: process output
 - `result.json`: role-specific result used for decisions
 - `artifacts/`: optional worker artifacts
@@ -251,7 +254,7 @@ Important mail files:
 
 - Idempotency: the default key includes `mr`, `tag`, `task_sha`, and provider session/model settings, so repeated equivalent `run create` calls reuse an existing run unless `--retry` is passed.
 - Worktree locking: write roles take a worktree lock. Reviewer and verifier roles inspect artifacts and do not take the write lock.
-- Native stream isolation: provider output is stored in `native.jsonl`; controllers should read normalized `events.jsonl`, `status.json`, and `result.json`.
+- Native stream isolation: provider output is stored in `native.jsonl`; controllers should read normalized `events.jsonl`, `status.json`, and `result.json`. For progress observability, `orch events tail --native` gives a read-side normalized view of the native stream without promoting it to run-state authority.
 - Provider sessions: default runs do not resume the latest provider session. Claude/Codex start fresh headless sessions, Pi stays ephemeral; exact resume requires explicit `--session-mode resume_exact --session-id <id>`.
 - Schema gate: the supervisor validates `result.json` before marking a run `done`.
 - Local-first mirroring: PR/MR comments go to `outbox/pending/` first. Network sends are opt-in with `--execute`.
@@ -281,7 +284,7 @@ orch run reap      Persist stale for non-terminal runs whose supervisor died
 orch cross-review  Review one diff in parallel with several agents (via mail thread)
 orch fanout        Run one task across several agents, any result role (via mail thread)
 orch investigate   Read-only research/analysis, defaults to gemini-3.1-pro (via mail thread)
-orch events tail   Print a run's local events.jsonl
+orch events tail   Print a run's local events.jsonl (--native: normalized provider progress)
 orch result        Print a run's local result.json
 orch status        Read local run status for an MR
 orch decision      Record accept/rework and queue a PR/MR mirror comment
@@ -290,6 +293,7 @@ orch workspace     Register local workspaces for mail routing
 orch mirror        Mirror one local run result summary to a PR/MR comment
 orch mirror sync   Send queued outbox comments to a PR/MR
 orch chatgpt-bridge  Deploy + connect the read-only ChatGPT bridge (Cloudflare Worker)
+orch handoff-pro   Hand off full repo context to a tool-less model (e.g. gpt-5.5-pro)
 ```
 
 Use command help as the source of truth:

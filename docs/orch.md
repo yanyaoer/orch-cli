@@ -35,6 +35,11 @@ Full usage lives in the CLI itself: `orch --help`, `orch <cmd> --help`,
   publishes one task per agent then claims+runs it; re-running a thread skips
   acked tasks. Needs `orch mail agent defaults` once. `--dry-run` shows the
   resolved agents without publishing. Follow with `orch status` / `orch result`.
+- **Watch what a worker is doing** → `orch events tail --run <id> --native`:
+  renders the provider-native stream (`native.jsonl`) as normalized progress
+  events (`session` / `assistant` / `tool_use` / `tool_result` / `usage` /
+  `final` / `raw`), provider-independent — no per-provider parsing. Lifecycle
+  authority stays with plain `orch events tail` (events.jsonl) + `orch status`.
 - **Let ChatGPT read this repo live** (a *tool-capable* model, gpt-5.5 non-Pro) →
   `orch chatgpt-bridge`: deploys a Cloudflare Worker MCP bridge (no tunnel) so
   ChatGPT Developer Mode can read the worktree. ⚠️ ChatGPT **Pro / heavy-reasoning

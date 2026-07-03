@@ -41,7 +41,9 @@ export function parseArgs(argv: string[]): ParsedArgs {
     }
     const key = body;
     const next = argv[i + 1];
-    if (!next || next.startsWith("--")) {
+    // -n is a flag of its own (special-cased above), never a flag value:
+    // without this, a boolean flag right before it swallows it (--native -n 2).
+    if (!next || next.startsWith("--") || next === "-n") {
       flags.set(key, true);
     } else {
       flags.set(key, next);

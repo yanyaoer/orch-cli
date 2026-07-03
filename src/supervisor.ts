@@ -6,6 +6,7 @@ import { acquirePidfileLock, LockHeldError, type PidfileLock } from "./locks.ts"
 import { countLines, appendJsonLine, readJsonFile, writeJsonAtomic } from "./json.ts";
 import { fallbackResult, validateRoleResult } from "./schema.ts";
 import { lockPathForWorktree } from "./paths.ts";
+import { providerResumeIdFromNativeText } from "./native-events.ts";
 import { buildWorkerEnv } from "../drivers/driver-common.ts";
 
 function now(): string {
@@ -100,22 +101,10 @@ async function gitHead(worktree: string): Promise<string | null> {
 
 function readProviderResumeId(runDir: string): string | null {
   try {
-    const lines = readFileSync(runDirFile(runDir, "native.jsonl"), "utf8").split("\n");
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      try {
-        const obj = JSON.parse(line) as Record<string, unknown>;
-        for (const key of ["session_id", "conversation_id", "provider_resume_id", "thread_id"]) {
-          if (typeof obj[key] === "string" && obj[key]) return obj[key] as string;
-        }
-      } catch {
-        continue;
-      }
-    }
+    return providerResumeIdFromNativeText(readFileSync(runDirFile(runDir, "native.jsonl"), "utf8"));
   } catch {
     return null;
   }
-  return null;
 }
 
 function ensureResult(runDir: string, spec: RunSpec, reason: string): void {

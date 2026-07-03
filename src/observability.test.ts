@@ -335,6 +335,35 @@ test("observability commands read local run state", async () => {
   expect(events).toMatchObject({ exitCode: 0, stderr: "" });
   expect(events.stdout).toBe("{\"type\":\"done\",\"seq\":1}\n");
 
+  // --native renders normalized provider events (noise lines dropped, session
+  // deduped), and -n slices the rendered events, not the raw file lines.
+  writeFileSync(
+    join(runDir, "native.jsonl"),
+    [
+      '{"type":"reasoning_delta","delta":"noise"}',
+      '{"type":"system","session_id":"sess-observe"}',
+      '{"type":"assistant","session_id":"sess-observe","message":{"role":"assistant","content":[{"type":"text","text":"inspecting"}]}}',
+      '{"type":"result","result":"done","session_id":"sess-observe"}',
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+  const native = await runOrch(["events", "tail", "--run", runId, "--worktree", worktree, "--native"], env);
+  expect(native).toMatchObject({ exitCode: 0, stderr: "" });
+  expect(native.stdout).toBe(
+    [
+      '{"kind":"session","format":"claude","session_id":"sess-observe"}',
+      '{"kind":"assistant","format":"claude","text":"inspecting"}',
+      '{"kind":"final","format":"claude","text":"done"}',
+      "",
+    ].join("\n"),
+  );
+  const nativeTail = await runOrch(["events", "tail", "--run", runId, "--worktree", worktree, "--native", "-n", "2"], env);
+  expect(nativeTail).toMatchObject({ exitCode: 0, stderr: "" });
+  expect(nativeTail.stdout).toBe(
+    ['{"kind":"assistant","format":"claude","text":"inspecting"}', '{"kind":"final","format":"claude","text":"done"}', ""].join("\n"),
+  );
+
   const jsonResult = await runOrch(["result", "--run", runId, "--mr", mr, "--worktree", worktree, "--json"], env);
   expect(jsonResult).toMatchObject({ exitCode: 0, stderr: "" });
   expect(jsonResult.stdout).toBe(`${rawResult}\n`);

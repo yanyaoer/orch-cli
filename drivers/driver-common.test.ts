@@ -578,6 +578,41 @@ test("extractResultFromRunDir reads pi message_end assistant text events", () =>
   expect(extractResultFromRunDir(runDir, spec("reviewer", "review-pi"))).toEqual(reviewer);
 });
 
+// Locks the candidate precedence of the normalizer-backed extraction: the
+// claude final message beats assistant/codex decoys, and raw candidates from
+// non-object JSON lines are tried but never accepted as results.
+test("extractResultFromRunDir prefers the claude final message in a mixed native stream", () => {
+  const runDir = tempDir();
+  const winner = {
+    schema: "orch.result/reviewer/v1",
+    run_id: "review-mixed",
+    verdict: "approve",
+    reviews_run_id: "impl-a",
+    blocking_findings: [],
+    non_blocking_findings: [],
+    suggested_tests: [],
+  };
+  const decoy = { ...winner, verdict: "request_changes" };
+  writeFileSync(
+    join(runDir, "native.jsonl"),
+    [
+      "[1, 2, 3]",
+      "plain text noise, not JSON",
+      JSON.stringify({ type: "reasoning_delta", delta: "stream noise" }),
+      JSON.stringify({
+        type: "assistant",
+        message: { role: "assistant", content: [{ type: "text", text: JSON.stringify(decoy) }] },
+      }),
+      JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify(decoy) } }),
+      JSON.stringify({ type: "result", result: JSON.stringify(winner) }),
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+
+  expect(extractResultFromRunDir(runDir, spec("reviewer", "review-mixed"))).toEqual(winner);
+});
+
 test("extractResultFromRunDir reads pi agent_end messages", () => {
   const runDir = tempDir();
   const reviewer = {

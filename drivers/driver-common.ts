@@ -2,6 +2,7 @@ import { closeSync, existsSync, openSync, readFileSync, writeFileSync, writeSync
 import { isResultRole, type AgentName, type RunSpec, type RoleResult } from "../src/types.ts";
 import { fallbackResult, resultSchemaName, validateRoleResult } from "../src/schema.ts";
 import { writeJsonAtomic } from "../src/json.ts";
+import { normalizeNativeText, type NativeEvent } from "../src/native-events.ts";
 
 export interface DriverArgs {
   specPath: string;
@@ -385,17 +386,8 @@ export function extractResultFromText(text: string, spec: RunSpec): RoleResult |
   return null;
 }
 
-function textFromClaudeAssistantContent(content: unknown): string | null {
-  if (!Array.isArray(content)) return null;
-  const text = content
-    .flatMap((block) => {
-      if (!block || typeof block !== "object") return [];
-      const item = block as { type?: unknown; text?: unknown };
-      return item.type === "text" && typeof item.text === "string" ? [item.text] : [];
-    })
-    .join("\n")
-    .trim();
-  return text.length > 0 ? text : null;
+function candidateTexts(events: NativeEvent[], kind: NativeEvent["kind"], format: NativeEvent["format"]): string[] {
+  return events.filter((event) => event.kind === kind && event.format === format && typeof event.text === "string").map((event) => event.text!);
 }
 
 function collectResultCandidates(runDir: string): string[] {
@@ -406,56 +398,16 @@ function collectResultCandidates(runDir: string): string[] {
 
   const nativePath = `${runDir}/native.jsonl`;
   if (existsSync(nativePath)) {
-    const claudeResultCandidates: string[] = [];
-    const claudeAssistantCandidates: string[] = [];
-    const codexCandidates: string[] = [];
-    const piCandidates: string[] = [];
-    const rawLineCandidates: string[] = [];
     const nativeText = readFileSync(nativePath, "utf8");
-    for (const line of nativeText.split("\n")) {
-      if (!line.trim()) continue;
-      try {
-        const event = JSON.parse(line) as {
-          type?: unknown;
-          result?: unknown;
-          message?: { role?: unknown; content?: unknown };
-          messages?: Array<{ role?: unknown; content?: unknown }>;
-          item?: { type?: string; text?: string };
-        };
-        if (event.type === "result" && typeof event.result === "string") {
-          claudeResultCandidates.push(event.result);
-        }
-        if (event.type === "assistant") {
-          const text = textFromClaudeAssistantContent(event.message?.content);
-          if (text) claudeAssistantCandidates.push(text);
-        }
-        if (event.item?.type === "agent_message" && typeof event.item.text === "string") {
-          codexCandidates.push(event.item.text);
-        }
-        if (
-          (event.type === "message_end" || event.type === "turn_end") &&
-          event.message?.role === "assistant"
-        ) {
-          const text = textFromClaudeAssistantContent(event.message.content);
-          if (text) piCandidates.push(text);
-        }
-        if (event.type === "agent_end" && Array.isArray(event.messages)) {
-          for (const message of event.messages) {
-            if (message.role !== "assistant") continue;
-            const text = textFromClaudeAssistantContent(message.content);
-            if (text) piCandidates.push(text);
-          }
-        }
-      } catch {
-        rawLineCandidates.push(line);
-      }
-    }
+    const events = normalizeNativeText(nativeText);
+    // Final-message-first candidate order per provider format; raw lines are
+    // agy plain text and stream noise, tried after every structured candidate.
     candidates.push(
-      ...claudeResultCandidates,
-      ...claudeAssistantCandidates,
-      ...codexCandidates,
-      ...piCandidates,
-      ...rawLineCandidates,
+      ...candidateTexts(events, "final", "claude"),
+      ...candidateTexts(events, "assistant", "claude"),
+      ...candidateTexts(events, "assistant", "codex"),
+      ...candidateTexts(events, "assistant", "pi"),
+      ...candidateTexts(events, "raw", "unknown"),
       // Plain-text providers (agy) emit a multi-line response; the JSON object
       // may span lines, so try the whole stream as one candidate too.
       nativeText,

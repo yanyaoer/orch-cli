@@ -15,6 +15,7 @@ All notable user-facing changes are recorded here.
 - `orch status` / `orch run list` flag non-terminal runs whose pid is gone as `stale?` (read-only check); the new `orch run reap --mr <id>` persists them as `stale`.
 - Reviewer runs now default to a 3600s timeout (52 of 67 recorded runs overrode the old 4h default); other roles keep 14400s.
 - Unknown top-level commands print `unknown command: …` before the help text, and missing-flag errors print clean messages instead of stack traces.
+- Fixed a flag-parsing bug where a boolean flag directly before `-n` swallowed it as its value (`orch events tail --native -n 20` previously ignored both flags).
 
 ### Safety and Reliability
 
@@ -33,6 +34,7 @@ All notable user-facing changes are recorded here.
 - Added `orch run create --model <ref>` to record provider model overrides in `spec.json` and pass them through to model-aware drivers including pi.
 - Matched provider permissions to the role: the `reviewer` role now launches each provider without worktree write access (claude plan mode, codex `--sandbox read-only`, pi read-only tools, agy `--sandbox`). `verifier` and write roles keep write-capable access.
 - Added `orch cross-review`, `orch fanout`, and `orch investigate`: one-shot fan-out of a single task across several agents. They route through the mail layer, so a `--thread <id>` supplies the mr and workspace context instead of `--mr`.
+- Added `orch events tail --native`: renders the provider-native stream (`native.jsonl`) as normalized progress events (`session` / `assistant` / `tool_use` / `tool_result` / `usage` / `final` / `raw`) across claude/codex/pi/agy. The same normalizer (`src/native-events.ts`) now backs result extraction and provider resume-id detection, replacing the previously scattered per-provider parsing.
 
 ## [0.0.3] - 2026-06-25
 
