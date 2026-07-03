@@ -8,13 +8,13 @@ Daemonless multi-agent orchestration for coding work.
 
 Project page: `docs/index.html` is ready for GitHub Pages and includes a bilingual animated overview.
 
-Latest release: `v0.0.3` ([CHANGELOG.md](CHANGELOG.md)).
+Latest release: `v0.0.4` ([CHANGELOG.md](CHANGELOG.md)).
 
 ## Current Scope
 
 This repository is the v2 MVP described in [docs/orch-mvp-spec.md](docs/orch-mvp-spec.md).
 
-Shipped on `main` (v0.0.3 plus unreleased changes, see [CHANGELOG.md](CHANGELOG.md)):
+Shipped on `main` (v0.0.4, see [CHANGELOG.md](CHANGELOG.md)):
 
 - `orch run create` starts one supervised headless worker run. `--mr` is optional: it resolves from an `MR: <id-or-url>` line in the task's leading header block, a merge-request/pull URL in the task text, or the current branch name (`mr_source` reports which).
 - `orch run list`, `orch status`, `orch events tail`, and `orch result` read local run state; omitting `--mr` aggregates across all MRs in the repo. `orch result --wait` blocks until the run reaches a terminal state; reviewer results render findings, verifier results render commands and acceptance.

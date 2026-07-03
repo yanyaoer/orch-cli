@@ -2,7 +2,7 @@
 
 All notable user-facing changes are recorded here.
 
-## [Unreleased]
+## [0.0.4] - 2026-07-03
 
 ### Usage-driven interface improvements
 
