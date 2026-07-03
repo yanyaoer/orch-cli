@@ -89,8 +89,8 @@ export function buildWorkerEnv(baseEnv: NodeJS.ProcessEnv = process.env): Record
   env.CLAUDE_CODE_AUTO_CONNECT_IDE = "false";
   env.CLAUDE_CODE_MCP_ALLOWLIST_ENV = "1";
   // Workers generate POSIX/bash commands; a fish login shell inherited via
-  // $SHELL breaks providers whose shell tool follows it (agy does; claude
-  // pins zsh, codex rejects fish, pi pins /bin/bash).
+  // $SHELL breaks providers whose shell tooling follows it (codex hooks do;
+  // claude pins zsh, codex exec rejects fish, pi/omp pin /bin/bash).
   if (env.SHELL?.endsWith("fish")) env.SHELL = "/bin/bash";
   // bun prepends node_modules/.bin dirs (walking up from cwd, including
   // ~/node_modules/.bin) to spawned PATH; a stale provider CLI there (e.g. an
@@ -102,12 +102,34 @@ export function buildWorkerEnv(baseEnv: NodeJS.ProcessEnv = process.env): Record
   return env;
 }
 
-export const AGY_MODEL = "Gemini 3.1 Pro (High)";
+// omp = oh-my-pi, model-aware with a quota fallback chain. The primary model
+// rides argv; the rest of the chain rides a per-run --config overlay (merged
+// over the base config) as `retry.fallbackChains.default`. omp's retry
+// recovery consumes it — `retry.modelFallback` (on by default) permits the
+// switch — advancing to the next model when the provider reports
+// quota/rate-limit exhaustion.
+export const OMP_MODEL_CHAIN: readonly string[] = [
+  "google-antigravity/gemini-3.1-pro",
+  "zenmux/anthropic/claude-fable-5",
+  "openai-codex/gpt-5.5",
+];
 
-// agy has no stdin/file prompt channel; the prompt must ride in argv, which is
-// visible in `ps` and bounded by ARG_MAX (~1MB on macOS). Fail early with a
-// clear message instead of an opaque E2BIG from spawn.
-export const AGY_MAX_PROMPT_BYTES = 512 * 1024;
+export function ompModelChain(model: string | null | undefined): { primary: string; fallbacks: string[] } {
+  const primary = model ?? OMP_MODEL_CHAIN[0]!;
+  return { primary, fallbacks: OMP_MODEL_CHAIN.filter((entry) => entry !== primary) };
+}
+
+export function ompPromptPath(runDir: string): string {
+  return `${runDir}/prompt.md`;
+}
+
+export function ompFallbackConfigPath(runDir: string): string {
+  return `${runDir}/omp-fallback.yml`;
+}
+
+export function ompFallbackConfigYaml(fallbacks: readonly string[]): string {
+  return ["retry:", "  fallbackChains:", "    default:", ...fallbacks.map((model) => `      - ${model}`), ""].join("\n");
+}
 
 // Worktree permission posture matched to the role's constraint. `reviewer` is the
 // pure read-only analysis role, so its provider is launched without write access.
@@ -118,8 +140,8 @@ export function isReadOnlyRole(role: RunSpec["role"]): boolean {
 }
 
 // claude model tier by role: reviewer escalates to opus (deep critique, paired
-// with agy as a distinct model family in cross-review); implementer/verifier
-// stay on the claude CLI's default model (sonnet) and only dial --effort.
+// with omp's gemini-3.1-pro as a distinct model family in cross-review);
+// implementer/verifier stay on the claude CLI's default model (sonnet) and only dial --effort.
 const CLAUDE_ROLE_MODEL: Partial<Record<RunSpec["role"], string>> = {
   reviewer: "opus",
 };
@@ -142,23 +164,22 @@ export function buildProviderArgv(
 ): string[] {
   const readOnly = isReadOnlyRole(spec.role);
 
-  if (provider === "agy") {
-    // agy = gemini-3.1-pro, reviewer-only. Second line of defense behind orch's
-    // validateRunAgent: never launch agy with write access, whatever the caller says.
-    if (!readOnly) {
-      throw new Error(`agy is reviewer-only; refusing to launch with write access for role ${spec.role}`);
+  if (provider === "omp") {
+    const { primary, fallbacks } = ompModelChain(spec.model);
+    const argv = ["omp", "--model", primary];
+    // The quota fallback chain rides a per-run config overlay written by
+    // runProviderDriver before spawn (omp native retry.fallbackChains).
+    if (fallbacks.length > 0) argv.push("--config", ompFallbackConfigPath(runDir));
+    argv.push("-p", "--mode", "json");
+    if (readOnly) argv.push("--tools", "read,grep,find,ls");
+    if (spec.provider_session_mode === "ephemeral") {
+      argv.push("--no-session");
+    } else if (spec.provider_session_mode === "resume_exact" && spec.provider_session_id) {
+      argv.push("--resume", spec.provider_session_id);
     }
-    if (Buffer.byteLength(prompt, "utf8") > AGY_MAX_PROMPT_BYTES) {
-      throw new Error(
-        `agy prompt exceeds ${AGY_MAX_PROMPT_BYTES} bytes; agy passes the prompt via argv (ps-visible, ARG_MAX-bound) — trim the task or use another reviewer`,
-      );
-    }
-    // --sandbox keeps it read-only (no worktree edits); the prompt rides in argv
-    // (print mode ignores stdin).
-    const argv = ["agy", "--print=" + prompt, "--model", spec.model ?? AGY_MODEL, "--sandbox"];
-    if (spec.provider_session_mode === "resume_exact" && spec.provider_session_id) {
-      argv.push("--conversation", spec.provider_session_id);
-    }
+    // omp -p ignores stdin; the prompt rides an @file argument written by
+    // runProviderDriver (keeps it out of `ps` and clear of ARG_MAX).
+    argv.push(`@${ompPromptPath(runDir)}`);
     return argv;
   }
 
@@ -343,20 +364,44 @@ const VERDICT_SYNONYMS: Record<string, string> = {
   complete: "completed",
 };
 
+// Models routinely omit arrays that would be empty; restoring them is unambiguous.
+function coerceMissingArrays(obj: Record<string, unknown>, fields: string[]): void {
+  for (const field of fields) {
+    if (obj[field] === undefined || obj[field] === null) obj[field] = [];
+  }
+}
+
 function coerceRoleResult(role: RunSpec["role"], obj: Record<string, unknown>): void {
   if (typeof obj.verdict === "string") {
     const verdict = obj.verdict.trim().toLowerCase();
     obj.verdict = VERDICT_SYNONYMS[verdict] ?? verdict;
   }
   if (role === "reviewer") {
+    // Gemini-family models flatten the two finding arrays into a single
+    // `findings` list. An approving reviewer's findings are by definition
+    // non-blocking (blocking ones would force request_changes); everything
+    // else surfaces as blocking so no finding is dropped.
+    if (!Array.isArray(obj.blocking_findings) && Array.isArray(obj.findings)) {
+      if (obj.verdict === "approve") {
+        obj.non_blocking_findings = Array.isArray(obj.non_blocking_findings)
+          ? [...(obj.non_blocking_findings as unknown[]), ...(obj.findings as unknown[])]
+          : obj.findings;
+      } else {
+        obj.blocking_findings = obj.findings;
+      }
+      delete obj.findings;
+    }
+    coerceMissingArrays(obj, ["blocking_findings", "non_blocking_findings", "suggested_tests"]);
     coerceFindings(obj, "blocking_findings", true);
     coerceFindings(obj, "non_blocking_findings", false);
     coerceStringArray(obj, "suggested_tests");
     if (typeof obj.reviews_run_id !== "string") obj.reviews_run_id = obj.reviews_run_id == null ? "" : String(obj.reviews_run_id);
   } else if (role === "implementer") {
+    coerceMissingArrays(obj, ["changed_files", "tests", "acceptance", "risks"]);
     coerceStringArray(obj, "changed_files");
     coerceStringArray(obj, "risks");
   } else if (role === "verifier") {
+    coerceMissingArrays(obj, ["commands", "acceptance"]);
     if (typeof obj.verifies_run_id !== "string") obj.verifies_run_id = obj.verifies_run_id == null ? "" : String(obj.verifies_run_id);
   }
 }
@@ -401,15 +446,15 @@ function collectResultCandidates(runDir: string): string[] {
     const nativeText = readFileSync(nativePath, "utf8");
     const events = normalizeNativeText(nativeText);
     // Final-message-first candidate order per provider format; raw lines are
-    // agy plain text and stream noise, tried after every structured candidate.
+    // plain text and stream noise, tried after every structured candidate.
     candidates.push(
       ...candidateTexts(events, "final", "claude"),
       ...candidateTexts(events, "assistant", "claude"),
       ...candidateTexts(events, "assistant", "codex"),
       ...candidateTexts(events, "assistant", "pi"),
       ...candidateTexts(events, "raw", "unknown"),
-      // Plain-text providers (agy) emit a multi-line response; the JSON object
-      // may span lines, so try the whole stream as one candidate too.
+      // A plain-text provider response may be a JSON object spanning multiple
+      // lines, so try the whole stream as one candidate too.
       nativeText,
     );
   }
@@ -532,6 +577,15 @@ export async function runProviderDriver(provider: AgentName, argv: string[]): Pr
   if (await maybeWriteFakeResult(args.runDir, spec, provider)) return 0;
 
   const prompt = buildPrompt(spec, provider);
+  if (provider === "omp") {
+    // omp -p ignores stdin: the prompt rides an @file argument, and the quota
+    // fallback chain rides a per-run config overlay (omp retry.fallbackChains).
+    writeFileSync(ompPromptPath(args.runDir), prompt, "utf8");
+    const { fallbacks } = ompModelChain(spec.model);
+    if (fallbacks.length > 0) {
+      writeFileSync(ompFallbackConfigPath(args.runDir), ompFallbackConfigYaml(fallbacks), "utf8");
+    }
+  }
   const proc = Bun.spawn(buildProviderArgv(provider, spec, args.runDir, args.worktree, prompt), {
     cwd: args.worktree,
     stdin: "pipe",
@@ -539,8 +593,7 @@ export async function runProviderDriver(provider: AgentName, argv: string[]): Pr
     stderr: "inherit",
     env: buildWorkerEnv(),
   });
-  // agy reads the prompt from argv (print mode); everyone else gets it on stdin.
-  if (provider !== "agy") proc.stdin.write(prompt);
+  if (provider !== "omp") proc.stdin.write(prompt);
   proc.stdin.end();
 
   await pipeToFile(proc.stdout, `${args.runDir}/native.jsonl`);

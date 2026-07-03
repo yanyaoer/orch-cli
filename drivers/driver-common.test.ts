@@ -3,12 +3,14 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  AGY_MAX_PROMPT_BYTES,
   buildPrompt,
   buildProviderArgv,
   buildWorkerEnv,
   extractResultFromRunDir,
   extractResultFromText,
+  ompFallbackConfigYaml,
+  ompModelChain,
+  OMP_MODEL_CHAIN,
   rawResultText,
 } from "./driver-common.ts";
 import type { RunSpec } from "../src/types.ts";
@@ -259,55 +261,86 @@ test("buildProviderArgv passes explicit model overrides to supporting providers"
   ]);
 });
 
-test("buildProviderArgv runs agy gemini-3.1-pro print mode sandboxed for review", () => {
-  const base = spec("reviewer", "agy-review");
+test("buildProviderArgv runs omp with the default model chain and @file prompt", () => {
+  const base = spec("reviewer", "omp-review");
 
-  expect(buildProviderArgv("agy", { ...base, provider_session_mode: "ephemeral" }, "/run", "/worktree", "do review")).toEqual([
-    "agy",
-    "--print=do review",
+  expect(buildProviderArgv("omp", { ...base, provider_session_mode: "ephemeral" }, "/run", "/worktree", "do review")).toEqual([
+    "omp",
     "--model",
-    "Gemini 3.1 Pro (High)",
-    "--sandbox",
+    "google-antigravity/gemini-3.1-pro",
+    "--config",
+    "/run/omp-fallback.yml",
+    "-p",
+    "--mode",
+    "json",
+    "--tools",
+    "read,grep,find,ls",
+    "--no-session",
+    "@/run/prompt.md",
   ]);
 
   expect(
     buildProviderArgv(
-      "agy",
-      { ...base, provider_session_mode: "resume_exact", provider_session_id: "conv-123" },
+      "omp",
+      { ...base, provider_session_mode: "resume_exact", provider_session_id: "sess-123" },
       "/run",
       "/worktree",
       "do review",
     ),
   ).toEqual([
-    "agy",
-    "--print=do review",
+    "omp",
     "--model",
-    "Gemini 3.1 Pro (High)",
-    "--sandbox",
-    "--conversation",
-    "conv-123",
+    "google-antigravity/gemini-3.1-pro",
+    "--config",
+    "/run/omp-fallback.yml",
+    "-p",
+    "--mode",
+    "json",
+    "--tools",
+    "read,grep,find,ls",
+    "--resume",
+    "sess-123",
+    "@/run/prompt.md",
+  ]);
+
+  // omp is not reviewer-only: write roles launch without the read-only tool set.
+  expect(
+    buildProviderArgv("omp", { ...spec("implementer", "omp-impl"), provider_session_mode: "ephemeral" }, "/run", "/worktree", "build"),
+  ).toEqual([
+    "omp",
+    "--model",
+    "google-antigravity/gemini-3.1-pro",
+    "--config",
+    "/run/omp-fallback.yml",
+    "-p",
+    "--mode",
+    "json",
+    "--no-session",
+    "@/run/prompt.md",
   ]);
 });
 
-test("buildProviderArgv refuses agy outside the read-only reviewer role", () => {
-  // Second line of defense behind orch's validateRunAgent: agy must never be
-  // launched with write access, so the driver layer refuses instead of
-  // falling through to --dangerously-skip-permissions.
-  for (const role of ["implementer", "verifier", "challenger", "rework", "debugger"] as const) {
-    expect(() => buildProviderArgv("agy", spec(role, `agy-${role}`), "/run", "/worktree", "task")).toThrow(
-      "agy is reviewer-only",
-    );
-  }
+test("ompModelChain puts the requested model first and keeps the rest as quota fallbacks", () => {
+  expect(ompModelChain(null)).toEqual({
+    primary: "google-antigravity/gemini-3.1-pro",
+    fallbacks: ["zenmux/anthropic/claude-fable-5", "openai-codex/gpt-5.5"],
+  });
+  expect(ompModelChain("zenmux/anthropic/claude-fable-5")).toEqual({
+    primary: "zenmux/anthropic/claude-fable-5",
+    fallbacks: ["google-antigravity/gemini-3.1-pro", "openai-codex/gpt-5.5"],
+  });
+  // A model outside the chain keeps the full chain as fallbacks.
+  expect(ompModelChain("openai/gpt-5.5-pro")).toEqual({
+    primary: "openai/gpt-5.5-pro",
+    fallbacks: [...OMP_MODEL_CHAIN],
+  });
 });
 
-test("buildProviderArgv rejects agy prompts beyond the argv size cap", () => {
-  const oversized = "x".repeat(AGY_MAX_PROMPT_BYTES + 1);
-  expect(() => buildProviderArgv("agy", spec("reviewer", "agy-big"), "/run", "/worktree", oversized)).toThrow(
-    "agy prompt exceeds",
-  );
-  const atLimit = "x".repeat(AGY_MAX_PROMPT_BYTES);
-  expect(buildProviderArgv("agy", spec("reviewer", "agy-fit"), "/run", "/worktree", atLimit)[1]).toBe(
-    `--print=${atLimit}`,
+test("ompFallbackConfigYaml renders omp's native retry.fallbackChains overlay", () => {
+  expect(ompFallbackConfigYaml(["zenmux/anthropic/claude-fable-5", "openai-codex/gpt-5.5"])).toBe(
+    ["retry:", "  fallbackChains:", "    default:", "      - zenmux/anthropic/claude-fable-5", "      - openai-codex/gpt-5.5", ""].join(
+      "\n",
+    ),
   );
 });
 
@@ -361,7 +394,7 @@ test("buildProviderArgv picks claude model/effort by role", () => {
   const argv = (role: RunSpec["role"], runId: string) =>
     buildProviderArgv("claude", spec(role, runId), "/run", "/worktree");
 
-  // reviewer escalates to opus at high effort (paired with agy as a distinct model family).
+  // reviewer escalates to opus at high effort (paired with omp's gemini as a distinct model family).
   expect(argv("reviewer", "role-reviewer")).toEqual([
     "claude",
     "-p",
@@ -444,21 +477,66 @@ test("rawResultText returns the final-message candidate and null when empty", ()
   expect(rawResultText(empty)).toBeNull();
 });
 
-test("extractResultFromRunDir parses agy multi-line plain-text JSON", () => {
+test("extractResultFromText coerces a flattened findings list and omitted empty arrays", () => {
+  // Observed live from omp/gemini: one `findings` list instead of the two
+  // schema arrays, and empty arrays plus reviews_run_id omitted entirely.
+  const text = JSON.stringify({
+    schema: "orch.result/reviewer/v1",
+    verdict: "approve",
+    findings: [],
+  });
+  expect(extractResultFromText(text, spec("reviewer", "flat-approve"))).toEqual({
+    schema: "orch.result/reviewer/v1",
+    run_id: "flat-approve",
+    verdict: "approve",
+    reviews_run_id: "",
+    blocking_findings: [],
+    non_blocking_findings: [],
+    suggested_tests: [],
+  });
+
+  const withFinding = JSON.stringify({
+    schema: "orch.result/reviewer/v1",
+    verdict: "request_changes",
+    findings: [{ body: "off-by-one in pager" }],
+  });
+  expect(extractResultFromText(withFinding, spec("reviewer", "flat-findings"))).toMatchObject({
+    verdict: "request_changes",
+    // Flattened findings surface as blocking so nothing is dropped.
+    blocking_findings: [{ body: "off-by-one in pager", id: "finding-1", severity: "unspecified", file: "unspecified" }],
+    non_blocking_findings: [],
+  });
+
+  // An approving reviewer's flattened findings are non-blocking nits: routing
+  // them to blocking would flip the downstream suggestion to rework.
+  const approvedNits = JSON.stringify({
+    schema: "orch.result/reviewer/v1",
+    verdict: "approve",
+    findings: [{ body: "naming nit in pager" }],
+  });
+  expect(extractResultFromText(approvedNits, spec("reviewer", "flat-nits"))).toMatchObject({
+    verdict: "approve",
+    blocking_findings: [],
+    non_blocking_findings: [{ body: "naming nit in pager" }],
+  });
+});
+
+test("extractResultFromRunDir parses multi-line plain-text JSON", () => {
   const runDir = tempDir();
   const result = {
     schema: "orch.result/reviewer/v1",
-    run_id: "agy-review",
+    run_id: "plain-review",
     verdict: "approve",
-    reviews_run_id: "agy-review",
+    reviews_run_id: "plain-review",
     blocking_findings: [],
     non_blocking_findings: [],
     suggested_tests: [],
   };
-  // agy prints pretty-printed JSON spanning multiple lines (no native event wrapper).
+  // A plain-text provider may print pretty-printed JSON spanning multiple
+  // lines (no native event wrapper); the whole stream is tried as one candidate.
   writeFileSync(join(runDir, "native.jsonl"), `Here is the review:\n${JSON.stringify(result, null, 2)}\n`);
 
-  expect(extractResultFromRunDir(runDir, spec("reviewer", "agy-review"))).toEqual(result);
+  expect(extractResultFromRunDir(runDir, spec("reviewer", "plain-review"))).toEqual(result);
 });
 
 test("extractResultFromRunDir preserves codex agent_message extraction", () => {

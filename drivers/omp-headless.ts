@@ -1,12 +1,12 @@
 #!/usr/bin/env bun
 import { runProviderDriver } from "./driver-common.ts";
 
-export async function runAgyDriver(argv: string[]): Promise<number> {
-  return runProviderDriver("agy", argv);
+export async function runOmpDriver(argv: string[]): Promise<number> {
+  return runProviderDriver("omp", argv);
 }
 
 if (import.meta.main) {
-  runAgyDriver(process.argv.slice(2))
+  runOmpDriver(process.argv.slice(2))
     .then((code) => process.exit(code))
     .catch((error) => {
       process.stderr.write(`${error instanceof Error ? error.stack : String(error)}\n`);

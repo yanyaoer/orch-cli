@@ -356,7 +356,7 @@ test("cross-review fans one task across reviewer agents via mail, deriving mr fr
   expect(dry).toMatchObject({ exitCode: 0, stderr: "" });
   const dryPayload = JSON.parse(dry.stdout) as { dry_run: boolean; agents: Array<{ agent_id: string }> };
   expect(dryPayload.dry_run).toBe(true);
-  expect(dryPayload.agents.map((agent) => agent.agent_id)).toEqual(["claude-reviewer", "agy-reviewer"]);
+  expect(dryPayload.agents.map((agent) => agent.agent_id)).toEqual(["claude-reviewer", "omp-reviewer"]);
 
   // real fan-out with the fake driver: publish + claim + run each agent.
   const fan = await runOrch(["cross-review", "--thread", thread, "--task", taskPath, "--worktree", worktree], {
@@ -370,7 +370,7 @@ test("cross-review fans one task across reviewer agents via mail, deriving mr fr
     runs: Array<{ agent_id: string; role: string; mr: string; run: { run_id: string } }>;
   };
   expect(payload.mail).toBe("cross-review");
-  expect(payload.assigned.map((item) => item.agent_id)).toEqual(["claude-reviewer", "agy-reviewer"]);
+  expect(payload.assigned.map((item) => item.agent_id)).toEqual(["claude-reviewer", "omp-reviewer"]);
   expect(payload.runs).toHaveLength(2);
   for (const run of payload.runs) {
     expect(run.role).toBe("reviewer");
@@ -392,7 +392,7 @@ test("cross-review fans one task across reviewer agents via mail, deriving mr fr
   };
   expect(againPayload.assigned.map((item) => [item.agent_id, item.idempotent, item.claim_state])).toEqual([
     ["claude-reviewer", true, "acked"],
-    ["agy-reviewer", true, "acked"],
+    ["omp-reviewer", true, "acked"],
   ]);
   expect(againPayload.runs).toEqual([]);
   expect(readdirSync(runsRoot)).toHaveLength(2);
@@ -425,7 +425,7 @@ test("concurrent cross-review fan-outs publish exactly one task per agent", asyn
     .filter(Boolean)
     .map((line) => JSON.parse(line) as { type: string; assigned_agent?: { id: string } })
     .filter((event) => event.type === "task.requested");
-  expect(taskEvents.map((event) => event.assigned_agent?.id).sort()).toEqual(["agy-reviewer", "claude-reviewer"]);
+  expect(taskEvents.map((event) => event.assigned_agent?.id).sort()).toEqual(["claude-reviewer", "omp-reviewer"]);
 
   const runsRoot = join(stateHome, "orch", repoKey, "mrs", thread, "runs");
   expect(readdirSync(runsRoot)).toHaveLength(2);
@@ -478,7 +478,7 @@ test("fanout forwards --model to spawned runs and honors --to-agent override", a
   expect(spec.role).toBe("verifier");
 });
 
-test("investigate defaults to agy+claude reviewers and rejects unknown flags", async () => {
+test("investigate defaults to omp+claude reviewers and rejects unknown flags", async () => {
   const root = mkdtempSync(join(tmpdir(), "orch-investigate-"));
   const stateHome = join(root, "state");
   const configHome = join(root, "config");
@@ -493,7 +493,7 @@ test("investigate defaults to agy+claude reviewers and rejects unknown flags", a
   expect(dry).toMatchObject({ exitCode: 0, stderr: "" });
   const payload = JSON.parse(dry.stdout) as { role: string; agents: Array<{ agent_id: string }> };
   expect(payload.role).toBe("reviewer");
-  expect(payload.agents.map((agent) => agent.agent_id)).toEqual(["agy-reviewer", "claude-reviewer"]);
+  expect(payload.agents.map((agent) => agent.agent_id)).toEqual(["omp-reviewer", "claude-reviewer"]);
 
   // A typo'd flag must fail loudly instead of being silently ignored.
   const typo = await runOrch(["investigate", "--thread", "research-1", "--task", taskPath, "--worktree", worktree, "--modle", "x"], env);
@@ -516,13 +516,13 @@ test("mail submit to router routes default codex claude pi agents", async () => 
   expect(defaults).toMatchObject({ exitCode: 0, stderr: "" });
   const defaultAgents = JSON.parse(defaults.stdout).agents as Array<{ id: string; provider: string; work_mode: string }>;
   expect(defaultAgents.map((agent) => agent.id)).toEqual([
-    "agy-reviewer",
     "claude-reviewer",
     "codex-implementer",
+    "omp-reviewer",
     "orch-router",
     "pi-verifier",
   ]);
-  expect(defaultAgents.map((agent) => [agent.provider, agent.work_mode])).toContainEqual(["agy", "review"]);
+  expect(defaultAgents.map((agent) => [agent.provider, agent.work_mode])).toContainEqual(["omp", "review"]);
   expect(defaultAgents.map((agent) => [agent.provider, agent.work_mode])).toContainEqual(["codex", "implement"]);
   expect(defaultAgents.map((agent) => [agent.provider, agent.work_mode])).toContainEqual(["claude", "review"]);
   expect(defaultAgents.map((agent) => [agent.provider, agent.work_mode])).toContainEqual(["pi", "verify"]);

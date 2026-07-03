@@ -1,6 +1,6 @@
 // Read-side normalizer for provider-native stream output (native.jsonl).
 // Each provider CLI emits its own event vocabulary (claude stream-json, codex
-// exec --json, pi --mode json, agy plain text); this maps those lines onto a
+// exec --json, pi/omp --mode json); this maps those lines onto a
 // small provider-independent progress vocabulary so consumers (events tail,
 // result extraction, resume-id detection) share one parser instead of
 // re-implementing per-provider knowledge. Orch lifecycle events (events.jsonl)
@@ -191,7 +191,7 @@ function usageEvent(event: NativeLine): NativeEvent | null {
 }
 
 // One native.jsonl line -> zero or more normalized events. Unparseable lines
-// surface as kind "raw" (agy plain text and provider stderr noise land here);
+// surface as kind "raw" (plain text and provider stderr noise land here);
 // parseable lines that match no known structure are dropped as stream noise.
 export function normalizeNativeLine(line: string): NativeEvent[] {
   const trimmed = line.trim();

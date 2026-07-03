@@ -621,29 +621,29 @@ test("branch-derived mr keeps its raw value through run list and decision", asyn
   expect(outbox.mr).toBe("feat/slash-branch");
 });
 
-test("run create rejects agy outside the reviewer role with a clean error", async () => {
-  const root = mkdtempSync(join(tmpdir(), "orch-agy-role-test-"));
+test("run create rejects the removed agy agent and accepts omp for any result role", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orch-omp-role-test-"));
   const stateHome = join(root, "state");
   const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
   await initGitWorktree(worktree);
 
-  for (const role of ["implementer", "verifier"]) {
-    const rejected = await runOrch(
-      ["run", "create", "--mr", "agy-role", "--role", role, "--agent", "agy", "--tag", `agy-${role}`, "--worktree", worktree, "--dry-run"],
-      { XDG_STATE_HOME: stateHome },
-    );
-    expect(rejected.exitCode).toBe(1);
-    expect(rejected.stderr).toContain("reviewer analysis only");
-    // CliError prints the message only, not a stack trace.
-    expect(rejected.stderr).not.toContain("    at ");
-  }
-  expect(existsSync(stateHome)).toBe(false);
-
-  const allowed = await runOrch(
-    ["run", "create", "--mr", "agy-role", "--role", "reviewer", "--agent", "agy", "--tag", "agy-review", "--worktree", worktree, "--dry-run"],
+  const rejected = await runOrch(
+    ["run", "create", "--mr", "omp-role", "--role", "reviewer", "--agent", "agy", "--tag", "agy-review", "--worktree", worktree, "--dry-run"],
     { XDG_STATE_HOME: stateHome },
   );
-  expect(allowed).toMatchObject({ exitCode: 0, stderr: "" });
+  expect(rejected.exitCode).toBe(1);
+  expect(rejected.stderr).toContain("unsupported agent: agy");
+  // CliError prints the message only, not a stack trace.
+  expect(rejected.stderr).not.toContain("    at ");
+  expect(existsSync(stateHome)).toBe(false);
+
+  for (const role of ["implementer", "reviewer", "verifier"]) {
+    const allowed = await runOrch(
+      ["run", "create", "--mr", "omp-role", "--role", role, "--agent", "omp", "--tag", `omp-${role}`, "--worktree", worktree, "--dry-run"],
+      { XDG_STATE_HOME: stateHome },
+    );
+    expect(allowed).toMatchObject({ exitCode: 0, stderr: "" });
+  }
 });
 
 test("run create rejects unsafe provider session combinations", async () => {

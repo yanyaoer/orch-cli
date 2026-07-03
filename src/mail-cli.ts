@@ -94,9 +94,9 @@ function defaultMailAgents(now: string): MailAgentDefinition[] {
       updated_at: now,
     },
     {
-      id: "agy-reviewer",
-      address: "orch+agy.reviewer@local.orch",
-      provider: "agy",
+      id: "omp-reviewer",
+      address: "orch+omp.reviewer@local.orch",
+      provider: "omp",
       roles: ["reviewer"],
       capabilities: ["code-review", "research", "long-context"],
       max_concurrency: 1,
@@ -402,7 +402,7 @@ function mailAgentProvider(agent: MailAgentDefinition): AgentName {
     agent.provider === "codex" ||
     agent.provider === "claude" ||
     agent.provider === "pi" ||
-    agent.provider === "agy"
+    agent.provider === "omp"
   ) {
     return agent.provider;
   }

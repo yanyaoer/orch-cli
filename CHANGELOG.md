@@ -2,6 +2,21 @@
 
 All notable user-facing changes are recorded here.
 
+## [Unreleased]
+
+### Features
+
+- Replaced the `agy` driver with `omp` (oh-my-pi). `omp` is model-aware and not role-restricted: it defaults to `google-antigravity/gemini-3.1-pro` and automatically falls back to `zenmux/anthropic/claude-fable-5`, then `openai-codex/gpt-5.5` when the active model's quota/rate limit is exhausted (via omp's native `retry.fallbackChains`, configured per run through a `--config` overlay in the run dir). An explicit `--model <ref>` becomes the primary and the remaining chain models stay as fallbacks. The reviewer role runs with read-only tools; the prompt is passed as an `@file` argument (omp print mode ignores stdin). The default mail roster and `cross-review`/`investigate` now use `omp-reviewer` instead of `agy-reviewer` (run `orch mail agent defaults` to upsert).
+
+- Bare `orch` now prints the global overview: active runs plus every pending action (undecided terminal runs, stale runs, pending outbox comments) expressed as a runnable orch command line. Text and `--json` are projections of the same aggregation, so the command a human copies and the argv an agent spawns are identical. `--all` scans every repo under the state root. (`orch --help` still prints the command reference.)
+- Added `orch verdict --thread <id> [--wait]`: aggregates a fan-out thread's run verdicts into one suggestion (accept / rework / inspect / pending / reap) with runnable decision commands per undecided run.
+- Added `orch wait --thread <id>`: wait-any primitive that blocks until the next run in a thread needs attention, returning one JSON event (`run_terminal` / `stale` / `settled`). A recorded decision acts as the ack, so handled runs are never returned again — a controller loops `orch wait` → handle → `orch wait` until settled.
+
+### Safety and Reliability
+
+- `orch decision` is now an atomic ack: `decision.json` is created with `O_EXCL`, so two controllers racing on the same run get one winner and one clear `already decided` error instead of a silent overwrite plus a second queued mirror comment. This makes the `orch wait` → decision loop safe with multiple controllers.
+- Serialized concurrent `orch mirror sync --execute` per MR outbox with a pidfile lock; previously two parallel executes could both send the same pending comment before either renamed it into `sent/`.
+
 ## [0.0.4] - 2026-07-03
 
 ### Usage-driven interface improvements

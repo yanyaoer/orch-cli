@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark light">
-  <meta name="description" content="orch runs headless coding agents (codex, claude, pi, agy) as supervised, auditable local jobs — no daemon, signed local mail bus, schema-validated results.">
+  <meta name="description" content="orch runs headless coding agents (codex, claude, pi, omp) as supervised, auditable local jobs — no daemon, signed local mail bus, schema-validated results.">
   <title>orch-cli — daemonless multi-agent orchestration</title>
   <style>
     :root {
@@ -350,12 +350,12 @@
       <h1 data-lang="en">Coding agents as supervised, auditable local jobs.</h1>
       <h1 data-lang="zh">把编码 Agent 跑成可监督、可审计的本地任务。</h1>
       <p class="lead" data-lang="en">
-        orch dispatches headless <strong>codex / claude / pi / agy</strong> workers through a signed
+        orch dispatches headless <strong>codex / claude / pi / omp</strong> workers through a signed
         local mail bus, claims work atomically, and validates every result against a role schema.
         <strong>No daemon</strong> — each command reads local files, advances one step, and exits.
       </p>
       <p class="lead" data-lang="zh">
-        orch 通过签名的本地 mail bus 派发 headless 的 <strong>codex / claude / pi / agy</strong> worker，
+        orch 通过签名的本地 mail bus 派发 headless 的 <strong>codex / claude / pi / omp</strong> worker，
         原子 claim 任务，并按角色 schema 校验每一个结果。<strong>没有 daemon</strong>——每个命令读本地文件、
         推进一步、退出。
       </p>
@@ -419,7 +419,7 @@
           <g transform="translate(796 46)">
             <rect class="n-box" width="196" height="64" rx="10"/>
             <text class="n-name" x="18" y="28">driver</text>
-            <text class="n-sub" x="18" y="48">codex · claude · pi · agy</text>
+            <text class="n-sub" x="18" y="48">codex · claude · pi · omp</text>
           </g>
 
           <!-- nodes: bottom row -->
@@ -526,10 +526,10 @@
                 <td><span class="yes">✓</span></td>
               </tr>
               <tr>
-                <td>agy · gemini 3.1 pro</td>
-                <td><span class="no">✗</span> rejected</td>
-                <td><span class="ro">✓</span> --sandbox · ephemeral</td>
-                <td><span class="no">✗</span> rejected</td>
+                <td>omp · gemini 3.1 pro → fable 5 → gpt-5.5</td>
+                <td><span class="yes">✓</span> default write</td>
+                <td><span class="ro">✓</span> tools: read · grep · find · ls</td>
+                <td><span class="yes">✓</span></td>
               </tr>
             </tbody>
           </table>
@@ -635,6 +635,7 @@
             <h3 data-lang="en">Commands</h3>
             <h3 data-lang="zh">命令</h3>
             <ul>
+              <li>bare <code>orch</code> (overview) · <code>verdict --wait</code> · <code>wait</code></li>
               <li><code>run create</code> · <code>run list</code> · <code>run reap</code> · <code>status</code></li>
               <li><code>cross-review</code> · <code>fanout</code> · <code>investigate</code></li>
               <li><code>mail submit</code> · <code>mail route</code> · <code>mail claim</code> · <code>mail reply result</code></li>

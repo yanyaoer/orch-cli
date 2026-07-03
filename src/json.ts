@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
 export function jsonBytes(value: unknown): string {
@@ -15,6 +15,19 @@ export function readJsonFile<T>(path: string, fallback: T): T {
 
 export function writeJsonAtomic(path: string, value: unknown): void {
   writeTextAtomic(path, jsonBytes(value));
+}
+
+// O_EXCL create-or-fail: for files whose existence is itself the protocol
+// (e.g. decision.json as a run's atomic ack). Throws the raw EEXIST error;
+// callers translate it into their own "already done" message.
+export function writeJsonExclusive(path: string, value: unknown): void {
+  mkdirSync(dirname(path), { recursive: true });
+  const fd = openSync(path, "wx", 0o644);
+  try {
+    writeFileSync(fd, jsonBytes(value), "utf8");
+  } finally {
+    closeSync(fd);
+  }
 }
 
 export function writeTextAtomic(path: string, value: string): void {

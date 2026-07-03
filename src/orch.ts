@@ -18,17 +18,29 @@ import { isResultRole, writeRoles } from "./types.ts";
 import { acquirePidfileLock, acquirePidfileLockWait, isPidAlive, LockHeldError } from "./locks.ts";
 import { randomHex, sha256 } from "./hash.ts";
 import { ensureStateLayout, getRepoIdentity, lockPathForWorktree, mrStateDir, orchStateRoot, type RepoIdentity } from "./paths.ts";
-import { appendJsonLine, countLines, jsonBytes, readJsonFile, writeJsonAtomic, writeTextAtomic } from "./json.ts";
+import { appendJsonLine, countLines, jsonBytes, readJsonFile, writeJsonAtomic, writeJsonExclusive, writeTextAtomic } from "./json.ts";
 import { argvForDisplay, createForgeAdapter, detectForge } from "./forge.ts";
 import { findPrivateLeak, privateLeakAllowed, privateLeakErrorMessage } from "./leak.ts";
 import { runSupervisor, writeInitialRunFiles } from "./supervisor.ts";
 import { normalizeNativeText } from "./native-events.ts";
+import {
+  buildOverview,
+  collectMrRuns,
+  collectRepoKeys,
+  isGoodVerdict,
+  isTerminal,
+  renderArgv,
+  renderOverview,
+  suggestedRunAction,
+} from "./overview.ts";
 import {
   HELP_TOPICS,
   chatgptBridgeHelp,
   handoffProHelp,
   decisionHelp,
   eventsTailHelp,
+  verdictHelp,
+  waitHelp,
   fanoutHelp,
   mirrorHelp,
   mirrorSyncHelp,
@@ -48,7 +60,7 @@ import { runCodexDriver } from "../drivers/codex-headless.ts";
 import { runClaudeDriver } from "../drivers/claude-headless.ts";
 import { deployWorker, locateBridgeDir, runChatgptBridge } from "../drivers/chatgpt-bridge.ts";
 import { runPiDriver } from "../drivers/pi-headless.ts";
-import { runAgyDriver } from "../drivers/agy-headless.ts";
+import { runOmpDriver } from "../drivers/omp-headless.ts";
 import { addWorkspace, chatgptBridgeConfigPath, readBridgeConfig, writeBridgeConfig } from "./config.ts";
 import { buildBundle, type BundleOptions } from "./handoff-pro.ts";
 import { mail, mailFanout, type MailCliContext } from "./mail-cli.ts";
@@ -128,7 +140,7 @@ function isProviderSessionMode(value: string): value is ProviderSessionMode {
 }
 
 function defaultProviderSessionMode(agent: AgentName): ProviderSessionMode {
-  return agent === "pi" || agent === "agy" ? "ephemeral" : "fresh_persistent";
+  return agent === "pi" || agent === "omp" ? "ephemeral" : "fresh_persistent";
 }
 
 function isUuid(value: string): boolean {
@@ -157,6 +169,9 @@ function providerSessionConfig(args: ParsedArgs, agent: AgentName): ProviderSess
   if (agent === "pi" && modeValue === "ephemeral" && name) {
     throw new CliError("pi --session-name requires --session-mode fresh_persistent or resume_exact");
   }
+  if (agent === "omp" && name) {
+    throw new CliError("omp does not support --session-name; use --session-id with --session-mode resume_exact");
+  }
   if (agent === "codex" && name) {
     throw new CliError("codex does not support --session-name in headless exec; use --session-id with --session-mode resume_exact");
   }
@@ -176,7 +191,7 @@ function providerSessionFingerprint(session: ProviderSessionConfig): string {
 function providerSessionFromValue(value: unknown, fallbackAgent: AgentName): ProviderSessionConfig {
   const obj = value && typeof value === "object" && !Array.isArray(value) ? (value as Partial<RunSpec>) : {};
   const agent =
-    obj.agent === "codex" || obj.agent === "claude" || obj.agent === "pi" || obj.agent === "agy"
+    obj.agent === "codex" || obj.agent === "claude" || obj.agent === "pi" || obj.agent === "omp"
       ? obj.agent
       : fallbackAgent;
   const mode =
@@ -580,15 +595,10 @@ function decisionBody(
   ].join("\n");
 }
 
-const VALID_AGENTS: readonly AgentName[] = ["codex", "claude", "pi", "agy"];
+const VALID_AGENTS: readonly AgentName[] = ["codex", "claude", "pi", "omp"];
 
-function validateRunAgent(agent: AgentName, role: RunRole): void {
+function validateRunAgent(agent: AgentName, _role: RunRole): void {
   if (!VALID_AGENTS.includes(agent)) throw new CliError(`unsupported agent: ${agent}`);
-  // agy = gemini-3.1-pro runs read-only (sandboxed), so it only fits the pure
-  // analysis role; verifier needs to execute and write roles edit the worktree.
-  if (agent === "agy" && role !== "reviewer") {
-    throw new CliError(`agy (gemini-3.1-pro) is read-only; use it for reviewer analysis only, not ${role}`);
-  }
 }
 
 const RUN_CREATE_FLAGS = [
@@ -932,7 +942,7 @@ async function crossReview(args: ParsedArgs): Promise<number> {
   return mailFanout(args, mailFanoutContext(), {
     command: "cross-review",
     role: "reviewer",
-    defaultAgentIds: ["claude-reviewer", "agy-reviewer"],
+    defaultAgentIds: ["claude-reviewer", "omp-reviewer"],
   });
 }
 
@@ -946,7 +956,7 @@ async function investigate(args: ParsedArgs): Promise<number> {
   return mailFanout(args, mailFanoutContext(), {
     command: "investigate",
     role: "reviewer",
-    defaultAgentIds: ["agy-reviewer", "claude-reviewer"],
+    defaultAgentIds: ["omp-reviewer", "claude-reviewer"],
   });
 }
 
@@ -1036,6 +1046,140 @@ async function runList(args: ParsedArgs): Promise<number> {
     process.stdout.write(formatTable(rows));
   }
   return 0;
+}
+
+// Bare `orch`: the shared status + pending-actions view. Text and --json are
+// projections of the same aggregation, and every suggested action is a
+// runnable orch command line — humans copy it, agents spawn it.
+async function overviewCommand(args: ParsedArgs): Promise<number> {
+  const worktree = resolve(flagString(args, "worktree", process.cwd()));
+  const all = flagBool(args, "all");
+  const repoKeys = all ? collectRepoKeys() : [(await getRepoIdentity(worktree)).repo_key];
+  // Cross-repo suggestions need --worktree to resolve the right repo_key when
+  // they are executed from elsewhere; same-repo suggestions stay short.
+  const overview = buildOverview(repoKeys, all);
+  if (flagBool(args, "json")) {
+    printJson(overview);
+  } else {
+    process.stdout.write(renderOverview(overview));
+  }
+  return 0;
+}
+
+function threadMr(args: ParsedArgs): string {
+  if (args.flags.has("thread")) return flagString(args, "thread");
+  if (args.flags.has("mr")) return flagString(args, "mr");
+  throw new CliError("missing --thread (or --mr)");
+}
+
+async function verdictCommand(args: ParsedArgs): Promise<number> {
+  const mr = threadMr(args);
+  const worktree = resolve(flagString(args, "worktree", process.cwd()));
+  const repo = await getRepoIdentity(worktree);
+  const waitSec = flagNumber(args, "wait-sec") ?? 900;
+  const deadline = Date.now() + waitSec * 1000;
+
+  let runs = collectMrRuns(repo.repo_key, mr);
+  if (flagBool(args, "wait")) {
+    for (;;) {
+      runs = collectMrRuns(repo.repo_key, mr);
+      if (runs.length > 0 && runs.every((run) => isTerminal(run.state) || run.stale)) break;
+      if (Date.now() >= deadline) {
+        throw new CliError(`thread ${mr} did not settle within ${waitSec}s (${runs.filter((r) => isTerminal(r.state)).length}/${runs.length} terminal)`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+    }
+  }
+  if (runs.length === 0) throw new CliError(`no runs found for thread: ${mr}`);
+
+  const staleRuns = runs.filter((run) => run.stale);
+  const allTerminal = runs.every((run) => isTerminal(run.state));
+  const suggestion = staleRuns.length > 0
+    ? "reap"
+    : !allTerminal
+      ? "pending"
+      : runs.some((run) => run.state === "failed" || run.state === "timeout")
+        ? "inspect"
+        : runs.some((run) => (run.blocking ?? 0) > 0 || (run.verdict !== null && !isGoodVerdict(run.verdict)))
+          ? "rework"
+          : "accept";
+
+  const actions = runs.map((run) => suggestedRunAction(run, false)).filter((action) => action !== null);
+  if (staleRuns.length > 0) {
+    actions.unshift({
+      kind: "reap",
+      reason: `${staleRuns.length} stale run${staleRuns.length > 1 ? "s" : ""}`,
+      argv: ["orch", "run", "reap", "--mr", mr],
+      repo_key: repo.repo_key,
+      mr,
+    });
+  }
+
+  if (flagBool(args, "json")) {
+    printJson({ thread: mr, all_terminal: allTerminal, suggestion, runs, actions });
+    return 0;
+  }
+
+  const lines: string[] = [];
+  lines.push(`thread ${mr}: ${runs.filter((run) => isTerminal(run.state)).length}/${runs.length} terminal`);
+  for (const run of runs) {
+    const verdict = run.verdict ?? "-";
+    const blocking = run.blocking !== null ? `blocking ${run.blocking}` : "";
+    const marks = [run.stale ? "stale?" : "", run.decided ? "decided" : ""].filter(Boolean).join(" ");
+    lines.push(`  ${run.run_id}  ${run.role}/${run.agent}  ${run.state}  ${verdict}  ${[blocking, marks].filter(Boolean).join("  ")}`.trimEnd());
+  }
+  lines.push(`suggestion: ${suggestion}`);
+  actions.forEach((action, index) => {
+    lines.push(`  ${index + 1}. ${renderArgv(action.argv)}`);
+  });
+  if (actions.length === 0) lines.push("  nothing left to do — all runs decided");
+  process.stdout.write(`${lines.join("\n")}\n`);
+  return 0;
+}
+
+// Wait-any: block until some run in the thread needs attention. A decision is
+// the natural ack — decided runs are never returned again, so the agent loop
+// is `orch wait` -> handle -> `orch wait` until it reports settled.
+async function waitCommand(args: ParsedArgs): Promise<number> {
+  const mr = threadMr(args);
+  const worktree = resolve(flagString(args, "worktree", process.cwd()));
+  const repo = await getRepoIdentity(worktree);
+  const timeoutSec = flagNumber(args, "timeout-sec") ?? 900;
+  const deadline = Date.now() + timeoutSec * 1000;
+
+  for (;;) {
+    const runs = collectMrRuns(repo.repo_key, mr);
+    if (runs.length === 0) throw new CliError(`no runs found for thread: ${mr}`);
+
+    const stale = runs.find((run) => run.stale);
+    if (stale) {
+      printJson({
+        kind: "stale",
+        thread: mr,
+        run_id: stale.run_id,
+        suggested_argv: ["orch", "run", "reap", "--mr", mr],
+      });
+      return 0;
+    }
+
+    for (const run of runs) {
+      const action = suggestedRunAction(run, false);
+      if (action) {
+        printJson({ kind: "run_terminal", thread: mr, run, reason: action.reason, suggested_argv: action.argv });
+        return 0;
+      }
+    }
+
+    if (runs.every((run) => isTerminal(run.state))) {
+      printJson({ kind: "settled", thread: mr, runs: runs.length });
+      return 0;
+    }
+
+    if (Date.now() >= deadline) {
+      throw new CliError(`no run reached a terminal state within ${timeoutSec}s (thread: ${mr})`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+  }
 }
 
 async function eventsTail(args: ParsedArgs): Promise<number> {
@@ -1171,7 +1315,20 @@ async function decision(args: ParsedArgs): Promise<number> {
   const body = decisionBody(mr, runId, record, result, status);
   assertMirrorBodySafe(body);
   const runDir = `${runsRoot}/${runId}`;
-  writeJsonAtomic(`${runDir}/decision.json`, record);
+  // decision.json is the run's atomic ack: O_EXCL create-or-fail, so two
+  // controllers racing on the same run get one winner and one clear error —
+  // never a silent overwrite plus a second queued mirror comment.
+  try {
+    writeJsonExclusive(`${runDir}/decision.json`, record);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      const prior = readJsonFile<DecisionRecord | null>(`${runDir}/decision.json`, null);
+      throw new CliError(
+        `run ${runId} already decided (${prior?.verdict ?? "unknown"}${prior?.ts ? ` at ${prior.ts}` : ""}); not queueing another mirror comment`,
+      );
+    }
+    throw error;
+  }
 
   const outboxPath = enqueueComment(mrDir, {
     kind: "comment",
@@ -1219,6 +1376,24 @@ async function mirrorSync(args: ParsedArgs): Promise<number> {
 
   const mrDir = mrStateDir(repo.repo_key, mr);
   ensureStateLayout(mrDir);
+  // Concurrent --execute runs would each send the same pending comment before
+  // either renames it into sent/; serialize senders per MR outbox. Dry-run
+  // stays lock-free read-only.
+  const outboxLock = execute ? await acquirePidfileLockWait(`${mrDir}/locks/outbox.lock`, 10_000) : null;
+  try {
+    return await mirrorSyncPending(mrDir, adapter, forge, mr, execute);
+  } finally {
+    outboxLock?.release();
+  }
+}
+
+async function mirrorSyncPending(
+  mrDir: string,
+  adapter: NonNullable<ReturnType<typeof createForgeAdapter>>,
+  forge: string,
+  mr: string,
+  execute: boolean,
+): Promise<number> {
   const pending = pendingOutboxFiles(mrDir);
   let failed = 0;
   for (const file of pending) {
@@ -1425,11 +1600,23 @@ async function main(): Promise<number> {
   if (first === "__driver-codex") return runCodexDriver(process.argv.slice(3));
   if (first === "__driver-claude") return runClaudeDriver(process.argv.slice(3));
   if (first === "__driver-pi") return runPiDriver(process.argv.slice(3));
-  if (first === "__driver-agy") return runAgyDriver(process.argv.slice(3));
+  if (first === "__driver-omp") return runOmpDriver(process.argv.slice(3));
+
+  // Bare `orch` is the overview: current state + runnable pending actions.
+  // `orch --help` keeps printing the command reference.
+  if (!first && !hasHelp(args)) return overviewCommand(args);
 
   if (!first || hasHelp(args)) {
     if (!first) {
       process.stdout.write(topLevelHelp());
+      return 0;
+    }
+    if (first === "verdict") {
+      process.stdout.write(verdictHelp());
+      return 0;
+    }
+    if (first === "wait") {
+      process.stdout.write(waitHelp());
       return 0;
     }
     if (first === "run" && second === "create") {
@@ -1509,6 +1696,8 @@ async function main(): Promise<number> {
     return 2;
   }
 
+  if (first === "verdict") return verdictCommand(args);
+  if (first === "wait") return waitCommand(args);
   if (first === "run" && second === "create") return createRun(args);
   if (first === "run" && second === "list") return runList(args);
   if (first === "run" && second === "reap") return runReap(args);

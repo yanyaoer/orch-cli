@@ -17,6 +17,8 @@ This repository is the v2 MVP described in [docs/orch-mvp-spec.md](docs/orch-mvp
 Shipped on `main` (v0.0.4, see [CHANGELOG.md](CHANGELOG.md)):
 
 - `orch run create` starts one supervised headless worker run. `--mr` is optional: it resolves from an `MR: <id-or-url>` line in the task's leading header block, a merge-request/pull URL in the task text, or the current branch name (`mr_source` reports which).
+- Bare `orch` prints the overview: active runs plus every pending action (undecided terminal runs, stale runs, pending outbox) expressed as a runnable orch command line — the same contract humans copy and agents execute from `--json`. `--all` scans every repo under the state root.
+- `orch verdict --thread <id>` aggregates a fan-out thread's verdicts into one suggestion (accept / rework / inspect / pending / reap); `--wait` blocks until the thread settles. `orch wait --thread <id>` is the wait-any primitive: it blocks until the next run needs attention, and a recorded decision acts as the ack so handled runs are never returned again.
 - `orch run list`, `orch status`, `orch events tail`, and `orch result` read local run state; omitting `--mr` aggregates across all MRs in the repo. `orch result --wait` blocks until the run reaches a terminal state; reviewer results render findings, verifier results render commands and acceptance.
 - `orch events tail --native` renders the provider-native stream (`native.jsonl`) as normalized progress events — `session`, `assistant`, `tool_use`, `tool_result`, `usage`, `final`, `raw` — so a controller can see what a worker is doing without parsing per-provider formats. The same normalizer (`src/native-events.ts`) backs result extraction and resume-id detection.
 - Non-terminal runs whose supervisor pid is gone show as `stale?`; `orch run reap` persists them as `stale`. A provider that exits 0 without any output fails its run instead of quietly reporting done.
@@ -24,11 +26,11 @@ Shipped on `main` (v0.0.4, see [CHANGELOG.md](CHANGELOG.md)):
 - `orch mail` provides the local message bus: signed mail events, Maildir delivery, router dispatch, atomic task claim, and result-driven review/verify follow-ups.
 - `orch cross-review`, `orch fanout`, and `orch investigate` fan one task across several agents in a single command. They route through the mail layer, so a `--thread <id>` supplies the mr and workspace context (no `--mr` needed).
 - `orch mirror` and `orch mirror sync` dry-run by default, then use `gh` or `glab` only with `--execute`.
-- Drivers exist for `codex`, `claude`, `pi`, and `agy`.
-- Permissions match the role: the read-only `reviewer` role launches each provider without write access (claude plan mode, codex `--sandbox read-only`, pi read-only tools, agy `--sandbox`). `verifier` and write roles keep write-capable access.
+- Drivers exist for `codex`, `claude`, `pi`, and `omp`.
+- Permissions match the role: the read-only `reviewer` role launches each provider without write access (claude plan mode, codex `--sandbox read-only`, pi and omp read-only tools). `verifier` and write roles keep write-capable access.
 - claude model/effort match the role too: `reviewer` runs `--model opus --effort high`; `implementer` stays on the default model at `--effort medium`; `verifier` stays on the default model at `--effort low`.
-- `orch run create --model <ref>` records a provider model override in `spec.json` and passes it through to model-aware drivers such as pi, codex, and claude.
-- `agy` (Gemini 3.1 Pro) is restricted to the `reviewer` role and runs sandboxed read-only; orch rejects it for any other role.
+- `orch run create --model <ref>` records a provider model override in `spec.json` and passes it through to model-aware drivers such as pi, omp, codex, and claude.
+- `omp` (oh-my-pi) defaults to `google-antigravity/gemini-3.1-pro` and falls back to `zenmux/anthropic/claude-fable-5`, then `openai-codex/gpt-5.5` when the active model's quota/rate limit is exhausted; an explicit `--model <ref>` becomes the primary and the rest of the chain stays as fallbacks.
 - `orch chatgpt-bridge` deploys a Cloudflare Worker (no tunnel) and connects ChatGPT (Developer Mode, e.g. `gpt-5.5-pro`) to a read-only view of the worktree.
 - Role result schemas exist for `implementer`, `reviewer`, and `verifier`.
 - Provider session/model controls are explicit: defaults avoid latest-session resume, exact resume requires `--session-mode resume_exact --session-id <id>`, `--model <ref>` selects a provider model when supported, and idempotency keys include session/model settings.
@@ -46,7 +48,7 @@ Prerequisites:
 
 - Bun
 - Git
-- `codex`, `claude`, `pi`, and/or `agy` authenticated locally if you want real worker runs
+- `codex`, `claude`, `pi`, and/or `omp` authenticated locally if you want real worker runs
 - Optional: `gh` for GitHub mirroring or `glab` for GitLab mirroring
 - Optional: `wrangler` and a Cloudflare account for `orch chatgpt-bridge`
 
@@ -190,9 +192,9 @@ $ orch investigate --thread research-1 --task question.md
 $ orch status --mr review-123                     # follow the runs (mr == thread)
 ```
 
-- `cross-review`: reviewer role; default agents `claude-reviewer` (opus, high effort) + `agy-reviewer` (distinct model families).
+- `cross-review`: reviewer role; default agents `claude-reviewer` (opus, high effort) + `omp-reviewer` (distinct model families).
 - `fanout`: any result role via `--role`; default agents are the auto-invited agents for that role.
-- `investigate`: reviewer role for read-only research; default agents `agy-reviewer` + `claude-reviewer`.
+- `investigate`: reviewer role for read-only research; default agents `omp-reviewer` + `claude-reviewer`.
 - `--to-agent <mail-agent-id>` (repeatable) overrides the default roster; `--dry-run` prints the resolved agents without publishing; `--model <ref>` forwards a provider model override to every spawned run.
 - Re-running the same thread with the same task is idempotent: already-acked assignments are reused and not run again; nacked or expired assignments can be claimed without publishing duplicates.
 
@@ -206,7 +208,7 @@ controller / human
   -> MaildirBus signed event log
   -> orch mail route / claim
   -> per-run supervisor
-  -> codex, claude, pi, or agy headless driver
+  -> codex, claude, pi, or omp headless driver
   -> result.submitted mail
   -> reviewer / verifier follow-up tasks
   -> optional PR/MR mirror through outbox
@@ -257,7 +259,8 @@ Important mail files:
 - Native stream isolation: provider output is stored in `native.jsonl`; controllers should read normalized `events.jsonl`, `status.json`, and `result.json`. For progress observability, `orch events tail --native` gives a read-side normalized view of the native stream without promoting it to run-state authority.
 - Provider sessions: default runs do not resume the latest provider session. Claude/Codex start fresh headless sessions, Pi stays ephemeral; exact resume requires explicit `--session-mode resume_exact --session-id <id>`.
 - Schema gate: the supervisor validates `result.json` before marking a run `done`.
-- Local-first mirroring: PR/MR comments go to `outbox/pending/` first. Network sends are opt-in with `--execute`.
+- Local-first mirroring: PR/MR comments go to `outbox/pending/` first. Network sends are opt-in with `--execute`, and concurrent executes are serialized per MR outbox.
+- Atomic decisions: `decision.json` is created with `O_EXCL`, so concurrent controllers racing on the same run get one winner and one clear `already decided` error — the `orch wait` → decision loop stays safe with multiple controllers.
 - Mail bus claims: `claimTasks` creates a per-event lease with atomic `O_EXCL`; `ackTask` is written only after `orch run create` succeeds, and `nackTask` records failed starts for retry.
 - Result-driven review: reviewer and verifier mail tasks are routed from `result.submitted` implementer events, not from the original router task.
 - Honest terminal states: a provider that exits 0 with no output fails its run, and `orch run reap` persists `stale` for runs whose supervisor died.
@@ -278,6 +281,9 @@ The driver prompt asks the provider to return exactly one JSON object. The drive
 ## Commands
 
 ```text
+orch               Overview: active runs + pending actions as runnable commands
+orch verdict       Aggregate one thread's verdicts and suggest a decision (--wait)
+orch wait          Block until the next run in a thread needs attention (wait-any)
 orch run create    Start one headless worker run for an MR task
 orch run list      List local runs for an MR (dead-pid runs show as stale?)
 orch run reap      Persist stale for non-terminal runs whose supervisor died
@@ -339,7 +345,7 @@ $ XDG_STATE_HOME=/tmp/orch-demo-state orch status --mr demo --json
 The current MVP intentionally avoids a daemon. Natural next steps are:
 
 - `orch doctor`: preflight checks for provider binaries, versions, flags, and roster consistency
-- `orch verdict`: aggregate cross-review verdicts per thread for one-glance decisions
+- policy-driven reconcile: auto-execute low-risk suggested actions (`--apply` behind an explicit policy file)
 - reviewer runs against an immutable artifact (temporary worktree at `base_sha`) instead of the live worktree
 - better provider resume support; `attach` as log tailing and `debug shell` as human takeover helpers
 - daemon or queue service only when unattended multi-machine orchestration becomes real
