@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { resolve } from "node:path";
 import { MaildirBus, type BusTaskLease } from "./bus.ts";
-import { CliError, collectFlags, flagBool, flagNumber, flagString, printJson, type ParsedArgs } from "./cli.ts";
+import { assertKnownFlags, CliError, collectFlags, flagBool, flagNumber, flagString, printJson, type ParsedArgs } from "./cli.ts";
 import {
   mailAgentsConfigPath,
   readMailAgentsConfig,
@@ -29,7 +29,7 @@ import {
 import { getRepoIdentity, mrStateDir, orchStateRoot } from "./paths.ts";
 import type { AgentName, RoleResult, RunRole, RunStatus } from "./types.ts";
 import { isResultRole } from "./types.ts";
-import { acquirePidfileLock, LockHeldError, type PidfileLock } from "./locks.ts";
+import { acquirePidfileLockWait, type PidfileLock } from "./locks.ts";
 
 interface LocatedRun {
   mr: string;
@@ -322,17 +322,12 @@ function routedRouteKeys(threadDir: string, events: OrchMailEvent[]): Set<string
   return keys;
 }
 
+async function acquireThreadLock(threadDir: string, name: string, holder: string): Promise<PidfileLock> {
+  return acquirePidfileLockWait(`${threadDir}/${name}`, 5000, process.pid, holder);
+}
+
 async function acquireRouteLock(threadDir: string): Promise<PidfileLock> {
-  const lockPath = `${threadDir}/router-route.lock`;
-  const deadline = Date.now() + 5000;
-  for (;;) {
-    try {
-      return acquirePidfileLock(lockPath, process.pid, "mail-route");
-    } catch (error) {
-      if (!(error instanceof LockHeldError) || Date.now() >= deadline) throw error;
-      await new Promise((resolve) => setTimeout(resolve, 25));
-    }
-  }
+  return acquireThreadLock(threadDir, "router-route.lock", "mail-route");
 }
 
 async function routeRouterTasks(threadDir: string, thread: string, repoKey: string): Promise<RouteAssignment[]> {
@@ -492,6 +487,7 @@ async function claimMailTasks(
         "--json",
       ];
       if (args.flags.has("timeout-sec")) argv.push("--timeout-sec", flagString(args, "timeout-sec"));
+      if (args.flags.has("model")) argv.push("--model", flagString(args, "model"));
       if (dryRun) argv.push("--dry-run");
       if (flagBool(args, "allow-dirty")) argv.push("--allow-dirty");
       const run = await runCreateFromMail(argv, worktree);
@@ -523,6 +519,8 @@ function withAgentFlag(args: ParsedArgs, agentId: string): ParsedArgs {
   return { positionals: args.positionals, flags, flagValues: args.flagValues };
 }
 
+type FanoutAssignment = Record<string, unknown> & { agent_id: string; event_id: string };
+
 function fanoutAssignment(
   bus: MaildirBus,
   args: {
@@ -535,7 +533,7 @@ function fanoutAssignment(
     mr: string | null;
     workspace: { id: string; path: string } | null;
   },
-): Record<string, unknown> & { agent_id: string; event_id: string } {
+): FanoutAssignment {
   const existing = bus.findTask({
     agent_id: args.agent.id,
     role: args.role,
@@ -579,9 +577,29 @@ export interface MailFanoutOptions {
   defaultAgentIds?: string[];
 }
 
+const FANOUT_FLAGS = [
+  "thread",
+  "role",
+  "to-agent",
+  "task",
+  "workspace",
+  "worktree",
+  "mr",
+  "model",
+  "from",
+  "parent-event",
+  "timeout-sec",
+  "allow-dirty",
+  "limit",
+  "dry-run",
+  // Harmless no-op: fan-out always prints JSON, but scripts habitually append it.
+  "json",
+] as const;
+
 // Mail-native fan-out: derive mr/worktree from the thread, publish one task per
 // target agent, then claim+run each. Replaces the need for explicit --mr.
 export async function mailFanout(args: ParsedArgs, context: MailCliContext, opts: MailFanoutOptions): Promise<number> {
+  assertKnownFlags(args, opts.command, FANOUT_FLAGS);
   const thread = flagString(args, "thread");
   const worktree = mailWorktree(args);
   const repo = await getRepoIdentity(worktree);
@@ -633,13 +651,27 @@ export async function mailFanout(args: ParsedArgs, context: MailCliContext, opts
   const parentEventId = args.flags.has("parent-event") ? flagString(args, "parent-event") : null;
   const mr = args.flags.has("mr") ? flagString(args, "mr") : null;
 
-  const assigned = agents.map((agent) =>
-    fanoutAssignment(bus, { agent, from, taskText, taskSha, role, parentEventId, mr, workspace }),
-  );
+  // Serialize the dedup-check → publish → deliver → import window: two concurrent
+  // fan-outs would otherwise both miss findTask (events still in outbox) and
+  // publish duplicate tasks with distinct event ids. Claiming has per-event locks.
+  const fanoutLock = await acquireThreadLock(threadDir, "fanout.lock", `mail-${opts.command}`);
+  let assigned: FanoutAssignment[];
+  try {
+    assigned = agents.map((agent) =>
+      fanoutAssignment(bus, { agent, from, taskText, taskSha, role, parentEventId, mr, workspace }),
+    );
 
-  // Deliver + import so the freshly published task.requested events are claimable.
-  const delivered = deliverLocalMail(threadDir);
-  for (const item of delivered) bus.importRaw(readFileSync(item.to, "utf8"), thread, repo.repo_key);
+    // Deliver + import so the freshly published task.requested events are claimable.
+    const delivered = deliverLocalMail(threadDir);
+    for (const item of delivered) {
+      const imported = bus.importRaw(readFileSync(item.to, "utf8"), thread, repo.repo_key);
+      if (!imported.imported && imported.reason) {
+        throw new CliError(`fan-out mail quarantined (${imported.reason}): ${imported.quarantine_path ?? item.to}`);
+      }
+    }
+  } finally {
+    fanoutLock.release();
+  }
 
   const runs: unknown[] = [];
   for (const agent of agents) {

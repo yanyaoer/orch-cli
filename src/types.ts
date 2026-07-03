@@ -36,6 +36,7 @@ export interface RunSpec {
   mr: string;
   role: RunRole;
   agent: AgentName;
+  model: string | null;
   tag: string;
   provider_session_name: string | null;
   provider_session_id: string | null;
@@ -76,7 +77,7 @@ export interface RunStatus {
 }
 
 export interface OrchEvent {
-  type: "created" | "starting" | "running" | "heartbeat" | "done" | "failed" | "timeout";
+  type: "created" | "starting" | "running" | "heartbeat" | "done" | "failed" | "timeout" | "stale";
   seq: number;
   ts: string;
   message?: string;

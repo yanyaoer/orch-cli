@@ -56,7 +56,7 @@ export function flagString(args: ParsedArgs, name: string, fallback?: string): s
   const value = args.flags.get(name);
   if (typeof value === "string") return value;
   if (fallback !== undefined) return fallback;
-  throw new Error(`missing --${name}`);
+  throw new CliError(`missing --${name}`);
 }
 
 export function flagBool(args: ParsedArgs, name: string): boolean {
@@ -69,6 +69,19 @@ export function hasHelp(args: ParsedArgs): boolean {
 
 export function collectFlags(args: ParsedArgs, name: string): string[] {
   return args.flagValues.get(name) ?? [];
+}
+
+// parseArgs accepts any --flag; commands that opt in reject unknown ones so a
+// typo (or an unsupported flag like a stray --model) fails loudly instead of
+// being silently ignored.
+export function assertKnownFlags(args: ParsedArgs, command: string, allowed: Iterable<string>): void {
+  const allowedSet = new Set(allowed);
+  allowedSet.add("help");
+  for (const key of args.flags.keys()) {
+    if (!allowedSet.has(key)) {
+      throw new CliError(`unknown flag --${key} for ${command}; see: orch ${command} --help`);
+    }
+  }
 }
 
 export function flagNumber(args: ParsedArgs, name: string): number | undefined {

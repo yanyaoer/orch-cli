@@ -2,7 +2,15 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildPrompt, buildProviderArgv, buildWorkerEnv, extractResultFromRunDir, extractResultFromText } from "./driver-common.ts";
+import {
+  AGY_MAX_PROMPT_BYTES,
+  buildPrompt,
+  buildProviderArgv,
+  buildWorkerEnv,
+  extractResultFromRunDir,
+  extractResultFromText,
+  rawResultText,
+} from "./driver-common.ts";
 import type { RunSpec } from "../src/types.ts";
 
 const tempDirs: string[] = [];
@@ -24,6 +32,7 @@ function spec(role: RunSpec["role"], runId: string): RunSpec {
     mr: "123",
     role,
     agent: "claude",
+    model: null,
     tag: role,
     provider_session_name: null,
     provider_session_id: null,
@@ -83,6 +92,19 @@ test("buildWorkerEnv preserves normal env and removes recursive tool settings", 
   expect(buildWorkerEnv(env)).toEqual(env);
 });
 
+test("buildWorkerEnv replaces a fish SHELL with bash and keeps POSIX shells", () => {
+  expect(buildWorkerEnv({ PATH: "/usr/bin", SHELL: "/opt/homebrew/bin/fish" }).SHELL).toBe("/bin/bash");
+  expect(buildWorkerEnv({ PATH: "/usr/bin", SHELL: "/bin/zsh" }).SHELL).toBe("/bin/zsh");
+  expect(buildWorkerEnv({ PATH: "/usr/bin" }).SHELL).toBeUndefined();
+});
+
+test("buildWorkerEnv strips node_modules/.bin entries from PATH", () => {
+  const env = buildWorkerEnv({
+    PATH: "/Users/u/node_modules/.bin:/Users/u/repo/node_modules/.bin:/usr/local/bin:/usr/bin",
+  });
+  expect(env.PATH).toBe("/usr/local/bin:/usr/bin");
+});
+
 test("buildPrompt names schema property and forbids worktree result files", () => {
   const prompt = buildPrompt(spec("reviewer", "review-prompt"), "pi");
   expect(prompt).toContain('"schema": "orch.result/reviewer/v1"');
@@ -101,6 +123,8 @@ test("buildProviderArgv keeps defaults fresh and only resumes exact sessions", (
     "stream-json",
     "--input-format",
     "text",
+    "--effort",
+    "medium",
   ]);
   expect(buildProviderArgv("codex", base, "/run", "/worktree")).toEqual([
     "codex",
@@ -140,6 +164,8 @@ test("buildProviderArgv keeps defaults fresh and only resumes exact sessions", (
     "stream-json",
     "--input-format",
     "text",
+    "--effort",
+    "medium",
     "--name",
     "mr123-review",
     "--resume",
@@ -161,6 +187,76 @@ test("buildProviderArgv keeps defaults fresh and only resumes exact sessions", (
       "/worktree",
     ),
   ).toEqual(["pi", "-p", "--mode", "json", "--session-id", "pi-session"]);
+});
+
+test("buildProviderArgv passes explicit model overrides to supporting providers", () => {
+  const base = spec("reviewer", "model-override");
+  const model = "zenmux-anthropic/anthropic/claude-fable-5";
+
+  expect(buildProviderArgv("pi", { ...base, model, provider_session_mode: "ephemeral" }, "/run", "/worktree")).toEqual([
+    "pi",
+    "--model",
+    model,
+    "-p",
+    "--mode",
+    "json",
+    "--tools",
+    "read,grep,find,ls",
+    "--no-session",
+  ]);
+
+  expect(buildProviderArgv("claude", { ...base, model }, "/run", "/worktree")).toEqual([
+    "claude",
+    "-p",
+    "--verbose",
+    "--output-format",
+    "stream-json",
+    "--input-format",
+    "text",
+    "--model",
+    model,
+    "--effort",
+    "high",
+    "--permission-mode",
+    "plan",
+  ]);
+
+  expect(buildProviderArgv("codex", { ...base, model }, "/run", "/worktree")).toEqual([
+    "codex",
+    "exec",
+    "--json",
+    "--cd",
+    "/worktree",
+    "--output-last-message",
+    "/run/last_message.txt",
+    "--model",
+    model,
+    "--sandbox",
+    "read-only",
+    "-",
+  ]);
+
+  expect(
+    buildProviderArgv(
+      "codex",
+      { ...base, model, provider_session_mode: "resume_exact", provider_session_id: "thread-123" },
+      "/run",
+      "/worktree",
+    ),
+  ).toEqual([
+    "codex",
+    "exec",
+    "resume",
+    "--json",
+    "--output-last-message",
+    "/run/last_message.txt",
+    "--model",
+    model,
+    "--sandbox",
+    "read-only",
+    "thread-123",
+    "-",
+  ]);
 });
 
 test("buildProviderArgv runs agy gemini-3.1-pro print mode sandboxed for review", () => {
@@ -193,10 +289,32 @@ test("buildProviderArgv runs agy gemini-3.1-pro print mode sandboxed for review"
   ]);
 });
 
+test("buildProviderArgv refuses agy outside the read-only reviewer role", () => {
+  // Second line of defense behind orch's validateRunAgent: agy must never be
+  // launched with write access, so the driver layer refuses instead of
+  // falling through to --dangerously-skip-permissions.
+  for (const role of ["implementer", "verifier", "challenger", "rework", "debugger"] as const) {
+    expect(() => buildProviderArgv("agy", spec(role, `agy-${role}`), "/run", "/worktree", "task")).toThrow(
+      "agy is reviewer-only",
+    );
+  }
+});
+
+test("buildProviderArgv rejects agy prompts beyond the argv size cap", () => {
+  const oversized = "x".repeat(AGY_MAX_PROMPT_BYTES + 1);
+  expect(() => buildProviderArgv("agy", spec("reviewer", "agy-big"), "/run", "/worktree", oversized)).toThrow(
+    "agy prompt exceeds",
+  );
+  const atLimit = "x".repeat(AGY_MAX_PROMPT_BYTES);
+  expect(buildProviderArgv("agy", spec("reviewer", "agy-fit"), "/run", "/worktree", atLimit)[1]).toBe(
+    `--print=${atLimit}`,
+  );
+});
+
 test("buildProviderArgv matches read-only posture to the reviewer role per provider", () => {
   const base = spec("reviewer", "review-posture");
 
-  // claude reviewer runs in plan mode (read-only, no edits).
+  // claude reviewer runs in plan mode (read-only, no edits), escalated to opus/high effort.
   expect(buildProviderArgv("claude", base, "/run", "/worktree")).toEqual([
     "claude",
     "-p",
@@ -205,6 +323,10 @@ test("buildProviderArgv matches read-only posture to the reviewer role per provi
     "stream-json",
     "--input-format",
     "text",
+    "--model",
+    "opus",
+    "--effort",
+    "high",
     "--permission-mode",
     "plan",
   ]);
@@ -233,6 +355,93 @@ test("buildProviderArgv matches read-only posture to the reviewer role per provi
     "read,grep,find,ls",
     "--no-session",
   ]);
+});
+
+test("buildProviderArgv picks claude model/effort by role", () => {
+  const argv = (role: RunSpec["role"], runId: string) =>
+    buildProviderArgv("claude", spec(role, runId), "/run", "/worktree");
+
+  // reviewer escalates to opus at high effort (paired with agy as a distinct model family).
+  expect(argv("reviewer", "role-reviewer")).toEqual([
+    "claude",
+    "-p",
+    "--verbose",
+    "--output-format",
+    "stream-json",
+    "--input-format",
+    "text",
+    "--model",
+    "opus",
+    "--effort",
+    "high",
+    "--permission-mode",
+    "plan",
+  ]);
+
+  // implementer stays on the CLI default model (sonnet), medium effort.
+  expect(argv("implementer", "role-implementer")).toEqual([
+    "claude",
+    "-p",
+    "--verbose",
+    "--output-format",
+    "stream-json",
+    "--input-format",
+    "text",
+    "--effort",
+    "medium",
+  ]);
+
+  // verifier stays on the CLI default model (sonnet), low effort (mechanical checks).
+  expect(argv("verifier", "role-verifier")).toEqual([
+    "claude",
+    "-p",
+    "--verbose",
+    "--output-format",
+    "stream-json",
+    "--input-format",
+    "text",
+    "--effort",
+    "low",
+  ]);
+});
+
+test("extractResultFromText coerces benign schema deviations instead of discarding", () => {
+  const reviewSpec = spec("reviewer", "review-coerce");
+  const deviant = JSON.stringify({
+    schema: "orch.result/reviewer/v1",
+    run_id: "model-invented-id",
+    verdict: "Approved",
+    reviews_run_id: 42,
+    blocking_findings: ["plain string finding"],
+    non_blocking_findings: [{ id: "nb-1", severity: "low", file: "a.ts", description: "body under wrong key" }],
+    suggested_tests: [{ id: "st-1", body: "object instead of string" }, "already a string"],
+  });
+  const result = extractResultFromText(deviant, reviewSpec);
+  expect(result).not.toBeNull();
+  expect(result).toMatchObject({ run_id: "review-coerce", verdict: "approve", reviews_run_id: "42" });
+  const reviewer = result as import("../src/types.ts").ReviewerResult;
+  expect(reviewer.blocking_findings[0]).toMatchObject({
+    body: "plain string finding",
+    id: "finding-1",
+    severity: "unspecified",
+    file: "unspecified",
+  });
+  expect(reviewer.non_blocking_findings[0]?.body).toBe("body under wrong key");
+  expect(reviewer.suggested_tests).toEqual(["st-1: object instead of string", "already a string"]);
+});
+
+test("rawResultText returns the final-message candidate and null when empty", () => {
+  const dir = tempDir();
+  writeFileSync(
+    join(dir, "native.jsonl"),
+    `${JSON.stringify({ type: "result", result: "final prose answer without JSON" })}\n`,
+    "utf8",
+  );
+  expect(rawResultText(dir)).toBe("final prose answer without JSON");
+
+  const empty = tempDir();
+  writeFileSync(join(empty, "native.jsonl"), "", "utf8");
+  expect(rawResultText(empty)).toBeNull();
 });
 
 test("extractResultFromRunDir parses agy multi-line plain-text JSON", () => {
@@ -422,7 +631,11 @@ test("extractResultFromRunDir accepts schema-key and partial reviewer wrappers",
   expect(extractResultFromText(JSON.stringify({ result: reviewer }), spec("reviewer", "review-codex"))).toEqual(expected);
   expect(extractResultFromText(JSON.stringify({ schema: "orch.result/reviewer/v1", run_id: "review-codex", ...reviewer }), spec("reviewer", "review-codex"))).toEqual(expected);
   expect(extractResultFromText(JSON.stringify({ metadata: reviewer }), spec("reviewer", "review-codex"))).toBeNull();
-  expect(extractResultFromText(JSON.stringify({ schema: "orch.result/reviewer/v1", run_id: "old-run", ...reviewer }), spec("reviewer", "review-codex"))).toBeNull();
+  // A model-invented run_id no longer rejects the result: candidates only come
+  // from this run's own stream, so the spec's run_id is authoritative.
+  expect(
+    extractResultFromText(JSON.stringify({ schema: "orch.result/reviewer/v1", run_id: "old-run", ...reviewer }), spec("reviewer", "review-codex")),
+  ).toEqual(expected);
 });
 
 test("extractResultFromRunDir accepts claude final text with prose before result JSON", () => {

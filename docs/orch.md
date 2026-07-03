@@ -14,11 +14,18 @@ Full usage lives in the CLI itself: `orch --help`, `orch <cmd> --help`,
   the PR/MR comment.
 - **agy = gemini-3.1-pro, `reviewer` role only** → review, research, read-only
   analysis. orch rejects agy for every other role; it runs sandboxed (`--sandbox`),
-  ephemeral (one-shot), model fixed to Gemini 3.1 Pro.
+  ephemeral (one-shot), and defaults to Gemini 3.1 Pro.
 - **Permissions match the role** → the `reviewer` role launches every provider
   read-only (claude plan mode / codex `--sandbox read-only` / pi read-only tools /
   agy `--sandbox`). `verifier` and write roles keep write-capable access (verifier
   must run tests; write roles edit the worktree).
+- **claude model/effort match the role** → `reviewer` escalates the claude driver
+  to `--model opus --effort high` (deep critique, a stronger second opinion
+  alongside agy's Gemini 3.1 Pro in `cross-review`); `implementer` stays on the
+  CLI's default model (sonnet) at `--effort medium`; `verifier` stays on sonnet at
+  `--effort low` (mechanical test/acceptance checks, cheapest tier). An explicit
+  `orch run create --model <ref>` is recorded in `spec.json` and overrides the
+  provider model for model-aware drivers such as pi, codex, and claude.
 - **Fan one task across agents (mail-native)** → `orch cross-review`
   (claude+agy review one diff), `orch fanout --role <r>` (generic, any result
   role), `orch investigate` (read-only research, defaults to agy+claude). These

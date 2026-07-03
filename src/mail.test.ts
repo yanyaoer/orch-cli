@@ -398,6 +398,109 @@ test("cross-review fans one task across reviewer agents via mail, deriving mr fr
   expect(readdirSync(runsRoot)).toHaveLength(2);
 });
 
+test("concurrent cross-review fan-outs publish exactly one task per agent", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orch-cross-review-race-"));
+  const stateHome = join(root, "state");
+  const configHome = join(root, "config");
+  const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
+  const remote = "git@github.com:example/repo.git";
+  await initRepo(worktree, remote);
+  const env = { XDG_STATE_HOME: stateHome, XDG_CONFIG_HOME: configHome, ORCH_DRIVER_FAKE_RESULT: "1" };
+  const thread = "review-race-1";
+  const taskPath = join(root, "review.md");
+  writeFileSync(taskPath, "Review the pending diff.\n", "utf8");
+  await runOrch(["mail", "agent", "defaults"], env);
+
+  // Without the fanout thread lock both invocations miss findTask (events still
+  // in outbox) and publish duplicate tasks with distinct event ids.
+  const args = ["cross-review", "--thread", thread, "--task", taskPath, "--worktree", worktree];
+  const [first, second] = await Promise.all([runOrch(args, env), runOrch(args, env)]);
+  expect(first.exitCode).toBe(0);
+  expect(second.exitCode).toBe(0);
+
+  const repoKey = repoKeyFromRemote(remote, worktree);
+  const eventsPath = join(stateHome, "orch", repoKey, "mail", "threads", thread, "inbox", "events", "mail-events.jsonl");
+  const taskEvents = readFileSync(eventsPath, "utf8")
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as { type: string; assigned_agent?: { id: string } })
+    .filter((event) => event.type === "task.requested");
+  expect(taskEvents.map((event) => event.assigned_agent?.id).sort()).toEqual(["agy-reviewer", "claude-reviewer"]);
+
+  const runsRoot = join(stateHome, "orch", repoKey, "mrs", thread, "runs");
+  expect(readdirSync(runsRoot)).toHaveLength(2);
+});
+
+test("fanout forwards --model to spawned runs and honors --to-agent override", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orch-fanout-model-"));
+  const stateHome = join(root, "state");
+  const configHome = join(root, "config");
+  const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
+  const remote = "git@github.com:example/repo.git";
+  await initRepo(worktree, remote);
+  const env = { XDG_STATE_HOME: stateHome, XDG_CONFIG_HOME: configHome, ORCH_DRIVER_FAKE_RESULT: "1" };
+  const thread = "verify-model-1";
+  const taskPath = join(root, "verify.md");
+  writeFileSync(taskPath, "Verify the change.\n", "utf8");
+  await runOrch(["mail", "agent", "defaults"], env);
+
+  const fan = await runOrch(
+    [
+      "fanout",
+      "--thread",
+      thread,
+      "--role",
+      "verifier",
+      "--to-agent",
+      "pi-verifier",
+      "--model",
+      "zenmux/test-model",
+      "--task",
+      taskPath,
+      "--worktree",
+      worktree,
+    ],
+    env,
+  );
+  expect(fan).toMatchObject({ exitCode: 0, stderr: "" });
+  const payload = JSON.parse(fan.stdout) as {
+    runs: Array<{ agent_id: string; role: string; run: { run_id: string } }>;
+  };
+  expect(payload.runs).toHaveLength(1);
+  expect(payload.runs[0]).toMatchObject({ agent_id: "pi-verifier", role: "verifier" });
+
+  const runsRoot = join(stateHome, "orch", repoKeyFromRemote(remote, worktree), "mrs", thread, "runs");
+  const spec = JSON.parse(readFileSync(join(runsRoot, payload.runs[0]!.run.run_id, "spec.json"), "utf8")) as {
+    model: string | null;
+    role: string;
+  };
+  expect(spec.model).toBe("zenmux/test-model");
+  expect(spec.role).toBe("verifier");
+});
+
+test("investigate defaults to agy+claude reviewers and rejects unknown flags", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orch-investigate-"));
+  const stateHome = join(root, "state");
+  const configHome = join(root, "config");
+  const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
+  await initRepo(worktree, "git@github.com:example/repo.git");
+  const env = { XDG_STATE_HOME: stateHome, XDG_CONFIG_HOME: configHome };
+  const taskPath = join(root, "question.md");
+  writeFileSync(taskPath, "Investigate the flaky test.\n", "utf8");
+  await runOrch(["mail", "agent", "defaults"], env);
+
+  const dry = await runOrch(["investigate", "--thread", "research-1", "--task", taskPath, "--worktree", worktree, "--dry-run"], env);
+  expect(dry).toMatchObject({ exitCode: 0, stderr: "" });
+  const payload = JSON.parse(dry.stdout) as { role: string; agents: Array<{ agent_id: string }> };
+  expect(payload.role).toBe("reviewer");
+  expect(payload.agents.map((agent) => agent.agent_id)).toEqual(["agy-reviewer", "claude-reviewer"]);
+
+  // A typo'd flag must fail loudly instead of being silently ignored.
+  const typo = await runOrch(["investigate", "--thread", "research-1", "--task", taskPath, "--worktree", worktree, "--modle", "x"], env);
+  expect(typo.exitCode).toBe(1);
+  expect(typo.stderr).toContain("unknown flag --modle");
+});
+
 test("mail submit to router routes default codex claude pi agents", async () => {
   const root = mkdtempSync(join(tmpdir(), "orch-mail-router-test-"));
   const stateHome = join(root, "state");

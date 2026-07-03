@@ -35,7 +35,9 @@ function hostFromRemote(remoteUrl: string): string | null {
 export function detectForge(remoteUrl: string): ForgeKind {
   const host = hostFromRemote(remoteUrl);
   if (!host) return "none";
-  if (host.includes("github.com")) return "github";
+  // Exact-host match: a substring check would classify github.com.attacker.net
+  // as github. GitHub Enterprise (github.mycorp.com) stays gitlab for now.
+  if (host === "github.com" || host.endsWith(".github.com")) return "github";
   return "gitlab";
 }
 

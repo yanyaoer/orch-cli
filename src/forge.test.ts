@@ -20,3 +20,18 @@ test("detectForge classifies self-hosted git remotes as gitlab", () => {
 test("detectForge returns none for local paths", () => {
   expect(detectForge("/Users/example/repo")).toBe("none");
 });
+
+test("detectForge matches the github host exactly, not as a substring", () => {
+  const cases: Array<[string, "github" | "gitlab" | "none"]> = [
+    ["git@github.com:o/r.git", "github"],
+    ["https://gist.github.com/o/r.git", "github"],
+    // Substring lookalikes must not classify as github.
+    ["https://github.com.attacker.net/o/r.git", "gitlab"],
+    ["git@notgithub.com:o/r.git", "gitlab"],
+    // GitHub Enterprise stays gitlab until an explicit forge override exists.
+    ["git@github.mycorp.com:o/r.git", "gitlab"],
+  ];
+  for (const [remote, expected] of cases) {
+    expect(detectForge(remote)).toBe(expected);
+  }
+});

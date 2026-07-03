@@ -24,10 +24,12 @@ Shipped in `v0.0.3`:
 - `orch mirror` and `orch mirror sync` dry-run by default, then use `gh` or `glab` only with `--execute`.
 - Drivers exist for `codex`, `claude`, `pi`, and `agy`.
 - Permissions match the role: the read-only `reviewer` role launches each provider without write access (claude plan mode, codex `--sandbox read-only`, pi read-only tools, agy `--sandbox`). `verifier` and write roles keep write-capable access.
+- claude model/effort match the role too: `reviewer` runs `--model opus --effort high`; `implementer` stays on the default model at `--effort medium`; `verifier` stays on the default model at `--effort low`.
+- `orch run create --model <ref>` records a provider model override in `spec.json` and passes it through to model-aware drivers such as pi, codex, and claude.
 - `agy` (Gemini 3.1 Pro) is restricted to the `reviewer` role and runs sandboxed read-only; orch rejects it for any other role.
 - `orch chatgpt-bridge` deploys a Cloudflare Worker (no tunnel) and connects ChatGPT (Developer Mode, e.g. `gpt-5.5-pro`) to a read-only view of the worktree.
 - Role result schemas exist for `implementer`, `reviewer`, and `verifier`.
-- Provider session controls are explicit: defaults avoid latest-session resume, exact resume requires `--session-mode resume_exact --session-id <id>`, and idempotency keys include session settings.
+- Provider session/model controls are explicit: defaults avoid latest-session resume, exact resume requires `--session-mode resume_exact --session-id <id>`, `--model <ref>` selects a provider model when supported, and idempotency keys include session/model settings.
 
 Not shipped yet:
 
@@ -114,6 +116,15 @@ $ orch run create \
   --timeout-sec 3600
 ```
 
+Preview a pi run with a non-default registered model:
+
+```sh
+$ orch run create --mr demo --role reviewer --agent pi --tag pi-fable \
+  --worktree . --task task.md \
+  --model zenmux-anthropic/anthropic/claude-fable-5 \
+  --dry-run
+```
+
 Observe it:
 
 ```sh
@@ -177,7 +188,7 @@ $ orch investigate --thread research-1 --task question.md
 $ orch status --mr review-123                     # follow the runs (mr == thread)
 ```
 
-- `cross-review`: reviewer role; default agents `claude-reviewer` + `agy-reviewer` (distinct model families).
+- `cross-review`: reviewer role; default agents `claude-reviewer` (opus, high effort) + `agy-reviewer` (distinct model families).
 - `fanout`: any result role via `--role`; default agents are the auto-invited agents for that role.
 - `investigate`: reviewer role for read-only research; default agents `agy-reviewer` + `claude-reviewer`.
 - `--to-agent <mail-agent-id>` (repeatable) overrides the default roster; `--dry-run` prints the resolved agents without publishing.
@@ -239,7 +250,7 @@ Important mail files:
 
 `orch` is deliberately file-first and conservative:
 
-- Idempotency: the default key includes `mr`, `tag`, `task_sha`, and provider session settings, so repeated equivalent `run create` calls reuse an existing run unless `--retry` is passed.
+- Idempotency: the default key includes `mr`, `tag`, `task_sha`, and provider session/model settings, so repeated equivalent `run create` calls reuse an existing run unless `--retry` is passed.
 - Worktree locking: write roles take a worktree lock. Reviewer and verifier roles inspect artifacts and do not take the write lock.
 - Native stream isolation: provider output is stored in `native.jsonl`; controllers should read normalized `events.jsonl`, `status.json`, and `result.json`.
 - Provider sessions: default runs do not resume the latest provider session. Claude/Codex start fresh headless sessions, Pi stays ephemeral; exact resume requires explicit `--session-mode resume_exact --session-id <id>`.
@@ -258,13 +269,14 @@ Implemented schemas:
 - `orch.result/reviewer/v1`: `verdict`, `reviews_run_id`, `blocking_findings`, `non_blocking_findings`, `suggested_tests`
 - `orch.result/verifier/v1`: `verdict`, `verifies_run_id`, `commands`, `acceptance`
 
-The driver prompt asks the provider to return exactly one JSON object. The driver then extracts that object, writes `result.json`, and the supervisor validates it.
+The driver prompt asks the provider to return exactly one JSON object. The driver then extracts that object (coercing benign schema deviations such as verdict synonyms and object-vs-string array items), writes `result.json`, and the supervisor validates it. When extraction fails, the worker's raw final message is preserved as `result.raw.md` in the run dir and excerpted in the fallback summary; a provider that exits 0 with no output at all fails the run.
 
 ## Commands
 
 ```text
 orch run create    Start one headless worker run for an MR task
-orch run list      List local runs for an MR
+orch run list      List local runs for an MR (dead-pid runs show as stale?)
+orch run reap      Persist stale for non-terminal runs whose supervisor died
 orch cross-review  Review one diff in parallel with several agents (via mail thread)
 orch fanout        Run one task across several agents, any result role (via mail thread)
 orch investigate   Read-only research/analysis, defaults to gemini-3.1-pro (via mail thread)

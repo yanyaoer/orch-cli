@@ -321,6 +321,7 @@ test("observability commands read local run state", async () => {
       state: "done",
       started_at: "2026-06-19T12:00:00.000Z",
       exit_code: 0,
+      stale: false,
     },
   ]);
 
@@ -387,6 +388,7 @@ test("run create dry-run resolves plans without writing state", async () => {
     run_id: string;
     run_id_preview: string;
     run_dir: string;
+    model: string | null;
     provider_session_name: string | null;
     provider_session_id: string | null;
     provider_session_mode: string;
@@ -410,6 +412,7 @@ test("run create dry-run resolves plans without writing state", async () => {
   expect(payload.worktree_lock.startsWith(join(stateHome, "orch", "worktree-locks"))).toBe(true);
   expect(payload.dirty).toBe(false);
   expect(payload.base_sha).toHaveLength(40);
+  expect(payload.model).toBeNull();
   expect(payload.provider_session_name).toBeNull();
   expect(payload.provider_session_id).toBeNull();
   expect(payload.provider_session_mode).toBe("fresh_persistent");
@@ -455,6 +458,87 @@ test("run create dry-run resolves plans without writing state", async () => {
   expect(human.stdout).toContain("provider:");
   expect(human.stdout).toContain("--name review-dry-session");
   expect(existsSync(stateHome)).toBe(false);
+});
+
+test("run create dry-run passes explicit model to the pi provider plan", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orch-pi-model-dry-run-test-"));
+  const stateHome = join(root, "state");
+  const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
+  await initGitWorktree(worktree);
+  const taskPath = join(root, "task.md");
+  writeFileSync(taskPath, "review with selected pi model\n", "utf8");
+  const model = "zenmux-anthropic/anthropic/claude-fable-5";
+
+  const result = await runOrch(
+    [
+      "run",
+      "create",
+      "--mr",
+      "pi-model",
+      "--role",
+      "reviewer",
+      "--agent",
+      "pi",
+      "--model",
+      model,
+      "--tag",
+      "pi-model",
+      "--worktree",
+      worktree,
+      "--task",
+      taskPath,
+      "--dry-run",
+      "--json",
+    ],
+    { XDG_STATE_HOME: stateHome },
+  );
+
+  expect(result).toMatchObject({ exitCode: 0, stderr: "" });
+  const payload = JSON.parse(result.stdout) as {
+    model: string | null;
+    provider_session_mode: string;
+    provider_plan: { argv: string[]; spawn: boolean };
+  };
+  expect(payload.model).toBe(model);
+  expect(payload.provider_session_mode).toBe("ephemeral");
+  expect(payload.provider_plan).toMatchObject({ spawn: false });
+  expect(payload.provider_plan.argv).toEqual([
+    "pi",
+    "--model",
+    model,
+    "-p",
+    "--mode",
+    "json",
+    "--tools",
+    "read,grep,find,ls",
+    "--no-session",
+  ]);
+  expect(existsSync(stateHome)).toBe(false);
+});
+
+test("run create rejects agy outside the reviewer role with a clean error", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orch-agy-role-test-"));
+  const stateHome = join(root, "state");
+  const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
+  await initGitWorktree(worktree);
+
+  for (const role of ["implementer", "verifier"]) {
+    const rejected = await runOrch(
+      ["run", "create", "--mr", "agy-role", "--role", role, "--agent", "agy", "--tag", `agy-${role}`, "--worktree", worktree, "--dry-run"],
+      { XDG_STATE_HOME: stateHome },
+    );
+    expect(rejected.exitCode).toBe(1);
+    expect(rejected.stderr).toContain("reviewer analysis only");
+    // CliError prints the message only, not a stack trace.
+    expect(rejected.stderr).not.toContain("    at ");
+  }
+  expect(existsSync(stateHome)).toBe(false);
+
+  const allowed = await runOrch(
+    ["run", "create", "--mr", "agy-role", "--role", "reviewer", "--agent", "agy", "--tag", "agy-review", "--worktree", worktree, "--dry-run"],
+    { XDG_STATE_HOME: stateHome },
+  );
+  expect(allowed).toMatchObject({ exitCode: 0, stderr: "" });
 });
 
 test("run create rejects unsafe provider session combinations", async () => {
@@ -699,7 +783,7 @@ test("run create dry-run previews idempotent reuse without spawn plan", async ()
   expect(readdirSync(join(stateHome, "orch", repoKeyFromRemote(worktree, worktree), "mrs", "791", "runs"))).toHaveLength(1);
 });
 
-test("run create rejects idempotent reuse with different provider session settings", async () => {
+test("run create rejects idempotent reuse with different provider session/model settings", async () => {
   const root = mkdtempSync(join(tmpdir(), "orch-session-idem-test-"));
   const stateHome = join(root, "state");
   const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
@@ -763,7 +847,35 @@ test("run create rejects idempotent reuse with different provider session settin
     env,
   );
   expect(mismatch.exitCode).toBe(1);
-  expect(mismatch.stderr).toContain("idempotent run already exists with different provider session settings");
+  expect(mismatch.stderr).toContain("idempotent run already exists with different provider session/model settings");
+
+  const modelMismatch = await runOrch(
+    [
+      "run",
+      "create",
+      "--mr",
+      "session-idem",
+      "--role",
+      "reviewer",
+      "--agent",
+      "claude",
+      "--tag",
+      "review-session",
+      "--worktree",
+      worktree,
+      "--task",
+      taskPath,
+      "--idempotency-key",
+      "same-key",
+      "--model",
+      "claude-fable-5",
+      "--dry-run",
+      "--json",
+    ],
+    env,
+  );
+  expect(modelMismatch.exitCode).toBe(1);
+  expect(modelMismatch.stderr).toContain("idempotent run already exists with different provider session/model settings");
 
   const retry = await runOrch(
     [
@@ -827,6 +939,8 @@ test("run create writes spec.json, hashes landed bytes, warns on dirty write-rol
       worktree,
       "--task",
       taskPath,
+      "--model",
+      "codex-test-model",
       "--idempotency-key",
       "idem-create-test",
       "--timeout-sec",
@@ -842,8 +956,14 @@ test("run create writes spec.json, hashes landed bytes, warns on dirty write-rol
   expect(existsSync(join(firstPayload.run_dir, "spec.json"))).toBe(true);
   expect(existsSync(join(firstPayload.run_dir, "spec.yml"))).toBe(false);
   const specBytes = readFileSync(join(firstPayload.run_dir, "spec.json"), "utf8");
-  const storedSpec = JSON.parse(specBytes) as { provider_session_name: string | null; provider_session_id: string | null; provider_session_mode: string };
+  const storedSpec = JSON.parse(specBytes) as {
+    model: string | null;
+    provider_session_name: string | null;
+    provider_session_id: string | null;
+    provider_session_mode: string;
+  };
   expect(storedSpec).toMatchObject({
+    model: "codex-test-model",
     provider_session_name: null,
     provider_session_id: null,
     provider_session_mode: "fresh_persistent",
@@ -1157,6 +1277,120 @@ test("mirror sync dry-run refuses unsafe queued payload before posting", async (
 test("write-role worktree lock is shared within an MR and across MRs", async () => {
   await expectOneDoneOneLockHeld({ firstMr: "same-mr", secondMr: "same-mr" });
   await expectOneDoneOneLockHeld({ firstMr: "mr-a", secondMr: "mr-b" });
+});
+
+test("stale runs are flagged and reaped, result --wait returns, reviewer findings render", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orch-lifecycle-test-"));
+  const stateHome = join(root, "state");
+  const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
+  const repoKey = repoKeyFromRemote(worktree, worktree);
+  const mr = "lifecycle";
+  const env = { XDG_STATE_HOME: stateHome };
+  const baseStatus = (runId: string): RunStatus => ({
+    run_id: runId,
+    mr,
+    role: "reviewer",
+    agent: "claude",
+    tag: "review",
+    provider_session_name: null,
+    provider_session_id: null,
+    provider_session_mode: "fresh_persistent",
+    state: "done",
+    pid: null,
+    pgid: null,
+    started_at: "2026-07-03T12:00:00.000Z",
+    updated_at: "2026-07-03T12:01:00.000Z",
+    exit_code: 0,
+    timeout_sec: 3600,
+    last_event_seq: 1,
+    native_event_count: 0,
+    provider_resume_id: null,
+    worktree,
+    base_sha: "base",
+    head_sha: "head",
+  });
+
+  // A run stuck in `running` whose pid is dead: flagged on read, persisted by reap.
+  const deadProc = Bun.spawn(["true"], { stdout: "ignore" });
+  await deadProc.exited;
+  const staleId = "review-stale-20260703T120000-aaaaaa";
+  const staleDir = join(stateHome, "orch", repoKey, "mrs", mr, "runs", staleId);
+  mkdirSync(staleDir, { recursive: true });
+  writeFileSync(
+    join(staleDir, "status.json"),
+    `${JSON.stringify({ ...baseStatus(staleId), state: "running", pid: deadProc.pid, pgid: deadProc.pid, exit_code: null })}\n`,
+    "utf8",
+  );
+  writeFileSync(join(staleDir, "events.jsonl"), '{"type":"running","seq":0,"ts":"2026-07-03T12:00:00.000Z"}\n', "utf8");
+
+  const list = await runOrch(["run", "list", "--mr", mr, "--worktree", worktree], env);
+  expect(list.stdout).toContain("running (stale?)");
+
+  const reap = await runOrch(["run", "reap", "--mr", mr, "--worktree", worktree], env);
+  expect(reap).toMatchObject({ exitCode: 0, stderr: "" });
+  expect(JSON.parse(reap.stdout)).toMatchObject({ mr, reaped: [staleId], still_running: [] });
+  const reapedStatus = JSON.parse(readFileSync(join(staleDir, "status.json"), "utf8")) as RunStatus;
+  expect(reapedStatus.state).toBe("stale");
+  expect(readFileSync(join(staleDir, "events.jsonl"), "utf8")).toContain('"type":"stale"');
+  const reapAgain = await runOrch(["run", "reap", "--mr", mr, "--worktree", worktree], env);
+  expect(JSON.parse(reapAgain.stdout)).toMatchObject({ reaped: [] });
+
+  // A finished reviewer run: --wait returns immediately and findings render.
+  const doneId = "review-done-20260703T120000-bbbbbb";
+  const doneDir = join(stateHome, "orch", repoKey, "mrs", mr, "runs", doneId);
+  mkdirSync(doneDir, { recursive: true });
+  writeFileSync(join(doneDir, "status.json"), `${JSON.stringify(baseStatus(doneId))}\n`, "utf8");
+  writeFileSync(
+    join(doneDir, "result.json"),
+    `${JSON.stringify({
+      schema: "orch.result/reviewer/v1",
+      run_id: doneId,
+      verdict: "request_changes",
+      reviews_run_id: "impl-a",
+      blocking_findings: [{ id: "b1", severity: "major", file: "src/a.ts", body: "race in claim path" }],
+      non_blocking_findings: [{ id: "nb1", body: "naming nit" }],
+      suggested_tests: ["bun test claims"],
+    })}\n`,
+    "utf8",
+  );
+  const rendered = await runOrch(["result", "--run", doneId, "--mr", mr, "--worktree", worktree, "--wait"], env);
+  expect(rendered).toMatchObject({ exitCode: 0, stderr: "" });
+  expect(rendered.stdout).toContain("blocking_findings:");
+  expect(rendered.stdout).toContain("major | b1 | src/a.ts");
+  expect(rendered.stdout).toContain("race in claim path");
+  expect(rendered.stdout).toContain("naming nit");
+  expect(rendered.stdout).toContain("bun test claims");
+
+  // --wait on the reaped run does not hang: stale is terminal, and the missing
+  // result.json surfaces as a clean CliError.
+  const waitStale = await runOrch(["result", "--run", staleId, "--mr", mr, "--worktree", worktree, "--wait"], env);
+  expect(waitStale.exitCode).toBe(1);
+  expect(waitStale.stderr).toContain("result.json not found");
+  expect(waitStale.stderr).not.toContain("    at ");
+});
+
+test("a provider that exits 0 with no output fails the run instead of quietly succeeding", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orch-silent-provider-"));
+  const stateHome = join(root, "state");
+  const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
+  await initGitWorktree(worktree);
+  const taskPath = join(root, "task.md");
+  writeFileSync(taskPath, "review something\n", "utf8");
+  const binDir = join(root, "bin");
+  mkdirSync(binDir, { recursive: true });
+  writeFileSync(join(binDir, "claude"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  const env = { XDG_STATE_HOME: stateHome, PATH: `${binDir}:${process.env.PATH ?? ""}` };
+
+  const created = await runOrch(
+    ["run", "create", "--mr", "silent", "--role", "reviewer", "--agent", "claude", "--tag", "silent", "--worktree", worktree, "--task", taskPath, "--timeout-sec", "10"],
+    env,
+  );
+  expect(created).toMatchObject({ exitCode: 0, stderr: "" });
+  const payload = JSON.parse(created.stdout) as { run_dir: string; status_path: string };
+  const finalStatus = await waitForRunFinal(payload.status_path);
+  expect(finalStatus.state).toBe("failed");
+  const result = readResult(join(payload.run_dir, "result.json"));
+  expect(JSON.stringify(result)).toContain("produced no output");
 });
 
 test("codex, claude, and pi drivers can complete from provider-native output without fallback", async () => {

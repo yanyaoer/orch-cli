@@ -148,15 +148,45 @@ function killProcessGroup(pgid: number, signal: NodeJS.Signals): void {
   }
 }
 
+// Minimal stand-in when spec.json is missing or corrupt, so the run can still
+// be driven to a failed terminal state instead of hanging in `created` forever.
+function fallbackSpec(runDir: string): RunSpec {
+  return {
+    version: 1,
+    run_id: runDir.split("/").filter(Boolean).pop() ?? "unknown",
+    mr: "unknown",
+    role: "reviewer",
+    agent: "codex",
+    model: null,
+    tag: "unknown",
+    provider_session_name: null,
+    provider_session_id: null,
+    provider_session_mode: "fresh_persistent",
+    idempotency_key: "unknown",
+    repo_key: "unknown",
+    // The run dir is not a git worktree, so gitHead resolves to null instead of
+    // picking up whatever repo the supervisor process happens to run in.
+    worktree: runDir,
+    task_path: null,
+    task_text: "",
+    task_sha: "",
+    base_sha: "",
+    timeout_sec: 0,
+    created_at: now(),
+  };
+}
+
 export async function runSupervisor(runDir: string, orchCommand: string[]): Promise<number> {
   const specPath = runDirFile(runDir, "spec.json");
-  const spec = JSON.parse(readFileSync(specPath, "utf8")) as RunSpec;
+  let loadedSpec: RunSpec | null = null;
   let worktreeLock: PidfileLock | null = null;
   let timeout: ReturnType<typeof setTimeout> | null = null;
   let heartbeat: ReturnType<typeof setInterval> | null = null;
   let pgid: number | null = null;
 
   try {
+    const spec = JSON.parse(readFileSync(specPath, "utf8")) as RunSpec;
+    loadedSpec = spec;
     if (writeRoles.has(spec.role)) {
       worktreeLock = acquirePidfileLock(lockPathForWorktree(spec.worktree), process.pid, spec.run_id);
     }
@@ -251,6 +281,7 @@ export async function runSupervisor(runDir: string, orchCommand: string[]): Prom
     const exitCode = error instanceof LockHeldError ? 75 : 1;
     const message = error instanceof Error ? error.message : String(error);
     if (pgid !== null) killProcessGroup(pgid, "SIGTERM");
+    const spec = loadedSpec ?? fallbackSpec(runDir);
     ensureResult(runDir, spec, message);
     appendEvent(runDir, { type: "failed", seq: nextSeq(runDir), ts: now(), message });
     updateStatus(runDir, spec, {

@@ -105,3 +105,23 @@ export function acquirePidfileLock(path: string, pid = process.pid, runId?: stri
   }
   throw new Error(`failed to acquire lock: ${path}`);
 }
+
+// Bounded-wait variant for locks that guard short critical sections (mr lock,
+// mail route/fanout locks): a live contender is expected to release within
+// milliseconds, so waiting briefly beats failing the whole command.
+export async function acquirePidfileLockWait(
+  path: string,
+  waitMs: number,
+  pid = process.pid,
+  runId?: string,
+): Promise<PidfileLock> {
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    try {
+      return acquirePidfileLock(path, pid, runId);
+    } catch (error) {
+      if (!(error instanceof LockHeldError) || Date.now() >= deadline) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+}

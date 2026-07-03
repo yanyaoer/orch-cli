@@ -87,10 +87,26 @@ export function buildWorkerEnv(baseEnv: NodeJS.ProcessEnv = process.env): Record
   // restrict any child-started Claude MCP servers to their own explicit allowlist.
   env.CLAUDE_CODE_AUTO_CONNECT_IDE = "false";
   env.CLAUDE_CODE_MCP_ALLOWLIST_ENV = "1";
+  // Workers generate POSIX/bash commands; a fish login shell inherited via
+  // $SHELL breaks providers whose shell tool follows it (agy does; claude
+  // pins zsh, codex rejects fish, pi pins /bin/bash).
+  if (env.SHELL?.endsWith("fish")) env.SHELL = "/bin/bash";
+  // bun prepends node_modules/.bin dirs (walking up from cwd, including
+  // ~/node_modules/.bin) to spawned PATH; a stale provider CLI there (e.g. an
+  // accidental old claude in $HOME) then shadows the real one. Provider
+  // binaries must resolve from the real PATH.
+  if (env.PATH) {
+    env.PATH = env.PATH.split(":").filter((entry) => !entry.endsWith("/node_modules/.bin")).join(":");
+  }
   return env;
 }
 
 export const AGY_MODEL = "Gemini 3.1 Pro (High)";
+
+// agy has no stdin/file prompt channel; the prompt must ride in argv, which is
+// visible in `ps` and bounded by ARG_MAX (~1MB on macOS). Fail early with a
+// clear message instead of an opaque E2BIG from spawn.
+export const AGY_MAX_PROMPT_BYTES = 512 * 1024;
 
 // Worktree permission posture matched to the role's constraint. `reviewer` is the
 // pure read-only analysis role, so its provider is launched without write access.
@@ -99,6 +115,22 @@ export const AGY_MODEL = "Gemini 3.1 Pro (High)";
 export function isReadOnlyRole(role: RunSpec["role"]): boolean {
   return role === "reviewer";
 }
+
+// claude model tier by role: reviewer escalates to opus (deep critique, paired
+// with agy as a distinct model family in cross-review); implementer/verifier
+// stay on the claude CLI's default model (sonnet) and only dial --effort.
+const CLAUDE_ROLE_MODEL: Partial<Record<RunSpec["role"], string>> = {
+  reviewer: "opus",
+};
+
+// claude reasoning effort by role: reviewer needs the deepest pass, verifier is
+// mechanical (tests/acceptance checks) so it stays cheap, implementer sits in
+// between and can be bumped manually per-task via provider_session_name/task text.
+const CLAUDE_ROLE_EFFORT: Partial<Record<RunSpec["role"], string>> = {
+  implementer: "medium",
+  verifier: "low",
+  reviewer: "high",
+};
 
 export function buildProviderArgv(
   provider: AgentName,
@@ -110,15 +142,19 @@ export function buildProviderArgv(
   const readOnly = isReadOnlyRole(spec.role);
 
   if (provider === "agy") {
-    // agy = gemini-3.1-pro, reviewer-only. --sandbox keeps it read-only (no
-    // worktree edits); the prompt rides in argv (print mode ignores stdin).
-    const argv = [
-      "agy",
-      "--print=" + prompt,
-      "--model",
-      AGY_MODEL,
-      readOnly ? "--sandbox" : "--dangerously-skip-permissions",
-    ];
+    // agy = gemini-3.1-pro, reviewer-only. Second line of defense behind orch's
+    // validateRunAgent: never launch agy with write access, whatever the caller says.
+    if (!readOnly) {
+      throw new Error(`agy is reviewer-only; refusing to launch with write access for role ${spec.role}`);
+    }
+    if (Buffer.byteLength(prompt, "utf8") > AGY_MAX_PROMPT_BYTES) {
+      throw new Error(
+        `agy prompt exceeds ${AGY_MAX_PROMPT_BYTES} bytes; agy passes the prompt via argv (ps-visible, ARG_MAX-bound) — trim the task or use another reviewer`,
+      );
+    }
+    // --sandbox keeps it read-only (no worktree edits); the prompt rides in argv
+    // (print mode ignores stdin).
+    const argv = ["agy", "--print=" + prompt, "--model", spec.model ?? AGY_MODEL, "--sandbox"];
     if (spec.provider_session_mode === "resume_exact" && spec.provider_session_id) {
       argv.push("--conversation", spec.provider_session_id);
     }
@@ -127,6 +163,10 @@ export function buildProviderArgv(
 
   if (provider === "claude") {
     const argv = ["claude", "-p", "--verbose", "--output-format", "stream-json", "--input-format", "text"];
+    const model = spec.model ?? CLAUDE_ROLE_MODEL[spec.role];
+    if (model) argv.push("--model", model);
+    const effort = CLAUDE_ROLE_EFFORT[spec.role];
+    if (effort) argv.push("--effort", effort);
     if (readOnly) argv.push("--permission-mode", "plan");
     if (spec.provider_session_name) argv.push("--name", spec.provider_session_name);
     if (spec.provider_session_mode === "ephemeral") {
@@ -141,18 +181,22 @@ export function buildProviderArgv(
     const lastMessagePath = `${runDir}/last_message.txt`;
     if (spec.provider_session_mode === "resume_exact" && spec.provider_session_id) {
       const resume = ["codex", "exec", "resume", "--json", "--output-last-message", lastMessagePath];
+      if (spec.model) resume.push("--model", spec.model);
       if (readOnly) resume.push("--sandbox", "read-only");
       resume.push(spec.provider_session_id, "-");
       return resume;
     }
     const argv = ["codex", "exec", "--json", "--cd", worktree, "--output-last-message", lastMessagePath];
+    if (spec.model) argv.push("--model", spec.model);
     if (readOnly) argv.push("--sandbox", "read-only");
     if (spec.provider_session_mode === "ephemeral") argv.push("--ephemeral");
     argv.push("-");
     return argv;
   }
 
-  const argv = ["pi", "-p", "--mode", "json"];
+  const argv = ["pi"];
+  if (spec.model) argv.push("--model", spec.model);
+  argv.push("-p", "--mode", "json");
   if (readOnly) argv.push("--tools", "read,grep,find,ls");
   if (spec.provider_session_mode === "ephemeral") {
     argv.push("--no-session");
@@ -250,18 +294,85 @@ function roleResultFromCandidate(value: unknown, spec: RunSpec): RoleResult | nu
   return null;
 }
 
+// Providers often deviate from the schema in benign ways (string items where
+// objects are expected and vice versa, invented run ids, verdict synonyms).
+// Real usage showed ~2/3 of runs losing their result to strict validation, so
+// coerce the unambiguous deviations instead of discarding the whole result.
+function coercedString(item: unknown): string {
+  if (typeof item === "string") return item;
+  if (item && typeof item === "object" && !Array.isArray(item)) {
+    const obj = item as Record<string, unknown>;
+    const body = [obj.body, obj.description, obj.text, obj.cmd, obj.summary].find(
+      (v) => typeof v === "string" && v.trim(),
+    ) as string | undefined;
+    if (body) return typeof obj.id === "string" && obj.id.trim() ? `${obj.id}: ${body}` : body;
+  }
+  return JSON.stringify(item);
+}
+
+function coerceStringArray(obj: Record<string, unknown>, field: string): void {
+  if (Array.isArray(obj[field])) obj[field] = (obj[field] as unknown[]).map(coercedString);
+}
+
+function coerceFindings(obj: Record<string, unknown>, field: string, blocking: boolean): void {
+  if (!Array.isArray(obj[field])) return;
+  obj[field] = (obj[field] as unknown[]).map((item, index) => {
+    const finding: Record<string, unknown> =
+      item && typeof item === "object" && !Array.isArray(item) ? { ...(item as Record<string, unknown>) } : { body: String(item) };
+    if (typeof finding.body !== "string" || !finding.body.trim()) {
+      const body = [finding.description, finding.message, finding.detail, finding.text].find(
+        (v) => typeof v === "string" && v.trim(),
+      );
+      if (body) finding.body = body;
+    }
+    if (blocking) {
+      if (typeof finding.id !== "string" || !finding.id.trim()) finding.id = `finding-${index + 1}`;
+      if (typeof finding.severity !== "string" || !finding.severity.trim()) finding.severity = "unspecified";
+      if (typeof finding.file !== "string" || !finding.file.trim()) finding.file = "unspecified";
+    }
+    return finding;
+  });
+}
+
+const VERDICT_SYNONYMS: Record<string, string> = {
+  approved: "approve",
+  changes_requested: "request_changes",
+  "request-changes": "request_changes",
+  passed: "pass",
+  complete: "completed",
+};
+
+function coerceRoleResult(role: RunSpec["role"], obj: Record<string, unknown>): void {
+  if (typeof obj.verdict === "string") {
+    const verdict = obj.verdict.trim().toLowerCase();
+    obj.verdict = VERDICT_SYNONYMS[verdict] ?? verdict;
+  }
+  if (role === "reviewer") {
+    coerceFindings(obj, "blocking_findings", true);
+    coerceFindings(obj, "non_blocking_findings", false);
+    coerceStringArray(obj, "suggested_tests");
+    if (typeof obj.reviews_run_id !== "string") obj.reviews_run_id = obj.reviews_run_id == null ? "" : String(obj.reviews_run_id);
+  } else if (role === "implementer") {
+    coerceStringArray(obj, "changed_files");
+    coerceStringArray(obj, "risks");
+  } else if (role === "verifier") {
+    if (typeof obj.verifies_run_id !== "string") obj.verifies_run_id = obj.verifies_run_id == null ? "" : String(obj.verifies_run_id);
+  }
+}
+
 function normalizedRoleResult(value: unknown, spec: RunSpec): RoleResult | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   if (!isResultRole(spec.role)) return null;
 
   const schemaName = resultSchemaName(spec.role);
   const obj = { ...(value as Record<string, unknown>) };
-  if (obj.run_id !== undefined && obj.run_id !== spec.run_id) return null;
+  // Candidates only come from this run's own stream, so the spec is the
+  // authority on run_id — models frequently invent one, which used to reject
+  // the entire result.
+  obj.run_id = spec.run_id;
   if (validateRoleResult(spec.role, obj).ok) return obj as unknown as RoleResult;
   if (obj.schema === undefined) obj.schema = schemaName;
-  if (obj.run_id === undefined) obj.run_id = spec.run_id;
-  if (spec.role === "reviewer" && obj.reviews_run_id === undefined) obj.reviews_run_id = "";
-  if (spec.role === "verifier" && obj.verifies_run_id === undefined) obj.verifies_run_id = "";
+  coerceRoleResult(spec.role, obj);
 
   return validateRoleResult(spec.role, obj).ok ? (obj as unknown as RoleResult) : null;
 }
@@ -287,7 +398,7 @@ function textFromClaudeAssistantContent(content: unknown): string | null {
   return text.length > 0 ? text : null;
 }
 
-export function extractResultFromRunDir(runDir: string, spec: RunSpec): RoleResult | null {
+function collectResultCandidates(runDir: string): string[] {
   const candidates: string[] = [];
   for (const path of [`${runDir}/last_message.txt`, `${runDir}/stdout.log`]) {
     if (existsSync(path)) candidates.push(readFileSync(path, "utf8"));
@@ -351,9 +462,24 @@ export function extractResultFromRunDir(runDir: string, spec: RunSpec): RoleResu
     );
   }
 
-  for (const candidate of candidates) {
+  return candidates;
+}
+
+export function extractResultFromRunDir(runDir: string, spec: RunSpec): RoleResult | null {
+  for (const candidate of collectResultCandidates(runDir)) {
     const result = extractResultFromText(candidate, spec);
     if (result) return result;
+  }
+  return null;
+}
+
+// Best human-readable stand-in for the worker's final answer, used to preserve
+// the raw output when schema extraction fails: candidates are ordered
+// final-message-first, so the first non-empty one is the closest thing to the
+// provider's answer.
+export function rawResultText(runDir: string): string | null {
+  for (const candidate of collectResultCandidates(runDir)) {
+    if (candidate.trim().length > 0) return candidate;
   }
   return null;
 }
@@ -470,14 +596,24 @@ export async function runProviderDriver(provider: AgentName, argv: string[]): Pr
   writeExitCode(args.runDir, code);
 
   const extracted = extractResultFromRunDir(args.runDir, spec);
-  writeResult(
-    args.runDir,
-    spec,
-    extracted ??
-      synthesizeResult(
-        spec,
-        code === 0 ? `${provider} did not return a valid orch result JSON` : `${provider} exited ${code}`,
-      ),
-  );
-  return code;
+  if (extracted) {
+    writeResult(args.runDir, spec, extracted);
+    return code;
+  }
+
+  // Preserve the worker's real answer even when it doesn't fit the schema —
+  // in practice most runs produce a usable review that must stay reachable.
+  const raw = rawResultText(args.runDir);
+  if (raw) writeFileSync(`${args.runDir}/result.raw.md`, raw, "utf8");
+
+  // A provider that exits 0 with no output at all did no work (broken auth,
+  // silent CLI failure); report that as a failed run, not a quiet `done`.
+  const silent = code === 0 && !raw;
+  const summary = silent
+    ? `${provider} exited 0 but produced no output; check the provider CLI auth/session (run \`${provider}\` interactively once)`
+    : code === 0
+      ? `${provider} did not return a valid orch result JSON; raw output saved to result.raw.md. Excerpt: ${raw!.slice(0, 400)}`
+      : `${provider} exited ${code}${raw ? "; raw output saved to result.raw.md" : ""}`;
+  writeResult(args.runDir, spec, synthesizeResult(spec, summary));
+  return silent ? 1 : code;
 }

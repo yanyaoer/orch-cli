@@ -79,6 +79,9 @@ interface ClaimRecord {
   updated_at: string;
 }
 
+// A run longer than the lease lets another process re-claim the event; the
+// run-layer idempotency key (mail:<thread>:<event_id>:<agent>) then returns the
+// existing run instead of double-dispatching, so an expired lease is benign.
 const DEFAULT_LEASE_MS = 30 * 60 * 1000;
 
 function claimRecordPath(threadDir: string, eventId: string): string {

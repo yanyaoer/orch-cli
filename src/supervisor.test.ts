@@ -15,6 +15,7 @@ test("supervisor records terminal failure when driver spawn throws", async () =>
     mr: "spawn-failure",
     role: "reviewer",
     agent: "codex",
+    model: null,
     tag: "review",
     provider_session_name: null,
     provider_session_id: null,
@@ -39,5 +40,20 @@ test("supervisor records terminal failure when driver spawn throws", async () =>
   expect(status).toMatchObject({ state: "failed", exit_code: 1, head_sha: null });
   const result = JSON.parse(readFileSync(join(runDir, "result.json"), "utf8")) as ReviewerResult;
   expect(result).toMatchObject({ schema: "orch.result/reviewer/v1", verdict: "request_changes" });
+  expect(readFileSync(join(runDir, "events.jsonl"), "utf8")).toContain("\"type\":\"failed\"");
+});
+
+test("supervisor records terminal failure when spec.json is corrupt", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orch-supervisor-"));
+  const runDir = join(root, "run");
+  mkdirSync(runDir, { recursive: true });
+  writeFileSync(join(runDir, "spec.json"), "{not json", "utf8");
+
+  const exitCode = await runSupervisor(runDir, [process.execPath, "src/orch.ts"]);
+  expect(exitCode).toBe(1);
+  const status = JSON.parse(readFileSync(join(runDir, "status.json"), "utf8")) as RunStatus;
+  expect(status).toMatchObject({ state: "failed", exit_code: 1 });
+  const result = JSON.parse(readFileSync(join(runDir, "result.json"), "utf8")) as ReviewerResult;
+  expect(result.schema).toBe("orch.result/reviewer/v1");
   expect(readFileSync(join(runDir, "events.jsonl"), "utf8")).toContain("\"type\":\"failed\"");
 });

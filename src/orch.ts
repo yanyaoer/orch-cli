@@ -2,12 +2,23 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { $ } from "bun";
-import type { AgentName, ImplementerResult, ProviderSessionMode, RoleResult, RunRole, RunSpec, RunState, RunStatus } from "./types.ts";
+import type {
+  AgentName,
+  ImplementerResult,
+  ProviderSessionMode,
+  ReviewerResult,
+  RoleResult,
+  RunRole,
+  RunSpec,
+  RunState,
+  RunStatus,
+  VerifierResult,
+} from "./types.ts";
 import { isResultRole, writeRoles } from "./types.ts";
-import { acquirePidfileLock, LockHeldError } from "./locks.ts";
+import { acquirePidfileLock, acquirePidfileLockWait, isPidAlive, LockHeldError } from "./locks.ts";
 import { randomHex, sha256 } from "./hash.ts";
 import { ensureStateLayout, getRepoIdentity, lockPathForWorktree, mrStateDir, orchStateRoot, type RepoIdentity } from "./paths.ts";
-import { jsonBytes, readJsonFile, writeJsonAtomic, writeTextAtomic } from "./json.ts";
+import { appendJsonLine, countLines, jsonBytes, readJsonFile, writeJsonAtomic, writeTextAtomic } from "./json.ts";
 import { argvForDisplay, createForgeAdapter, detectForge } from "./forge.ts";
 import { findPrivateLeak, privateLeakAllowed, privateLeakErrorMessage } from "./leak.ts";
 import { runSupervisor, writeInitialRunFiles } from "./supervisor.ts";
@@ -41,7 +52,7 @@ import { addWorkspace, chatgptBridgeConfigPath, readBridgeConfig, writeBridgeCon
 import { buildBundle, type BundleOptions } from "./handoff-pro.ts";
 import { mail, mailFanout, type MailCliContext } from "./mail-cli.ts";
 import { workspace } from "./workspace-cli.ts";
-import { CliError, collectFlags, flagBool, flagNumber, flagString, hasHelp, parseArgs, printJson, type ParsedArgs } from "./cli.ts";
+import { assertKnownFlags, CliError, collectFlags, flagBool, flagNumber, flagString, hasHelp, parseArgs, printJson, type ParsedArgs } from "./cli.ts";
 import { buildPrompt, buildProviderArgv } from "../drivers/driver-common.ts";
 
 type IdempotencyRecord = {
@@ -53,7 +64,9 @@ type IdempotencyRecord = {
   previous?: IdempotencyRecord[];
 };
 
-type RunListRow = Pick<RunStatus, "run_id" | "role" | "agent" | "tag" | "state" | "started_at" | "exit_code">;
+type RunListRow = Pick<RunStatus, "run_id" | "role" | "agent" | "tag" | "state" | "started_at" | "exit_code"> & {
+  stale: boolean;
+};
 
 type LocatedRun = {
   mr: string;
@@ -121,38 +134,42 @@ function isUuid(value: string): boolean {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }
 
-type ProviderSessionConfig = Pick<RunSpec, "provider_session_name" | "provider_session_id" | "provider_session_mode">;
+type ProviderSessionConfig = Pick<
+  RunSpec,
+  "provider_session_name" | "provider_session_id" | "provider_session_mode" | "model"
+>;
 
 function providerSessionConfig(args: ParsedArgs, agent: AgentName): ProviderSessionConfig {
   const modeValue = flagString(args, "session-mode", defaultProviderSessionMode(agent));
   if (!isProviderSessionMode(modeValue)) {
-    throw new Error("--session-mode must be ephemeral|fresh_persistent|resume_exact");
+    throw new CliError("--session-mode must be ephemeral|fresh_persistent|resume_exact");
   }
   const name = args.flags.has("session-name") ? flagString(args, "session-name").trim() : null;
   const id = args.flags.has("session-id") ? flagString(args, "session-id").trim() : null;
+  const model = args.flags.has("model") ? flagString(args, "model").trim() : null;
 
-  if (name === "") throw new Error("--session-name must not be empty");
-  if (id === "") throw new Error("--session-id must not be empty");
-  if (modeValue === "resume_exact" && !id) throw new Error("--session-mode resume_exact requires --session-id");
-  if (id && modeValue !== "resume_exact") throw new Error("--session-id requires --session-mode resume_exact");
+  if (name === "") throw new CliError("--session-name must not be empty");
+  if (id === "") throw new CliError("--session-id must not be empty");
+  if (model === "") throw new CliError("--model must not be empty");
+  if (modeValue === "resume_exact" && !id) throw new CliError("--session-mode resume_exact requires --session-id");
+  if (id && modeValue !== "resume_exact") throw new CliError("--session-id requires --session-mode resume_exact");
   if (agent === "pi" && modeValue === "ephemeral" && name) {
-    throw new Error("pi --session-name requires --session-mode fresh_persistent or resume_exact");
+    throw new CliError("pi --session-name requires --session-mode fresh_persistent or resume_exact");
   }
   if (agent === "codex" && name) {
-    throw new Error("codex does not support --session-name in headless exec; use --session-id with --session-mode resume_exact");
+    throw new CliError("codex does not support --session-name in headless exec; use --session-id with --session-mode resume_exact");
   }
   if (agent === "claude" && id && !isUuid(id)) {
-    throw new Error("claude --session-id/--resume requires a UUID");
+    throw new CliError("claude --session-id/--resume requires a UUID");
   }
 
-  return { provider_session_name: name, provider_session_id: id, provider_session_mode: modeValue };
+  return { provider_session_name: name, provider_session_id: id, provider_session_mode: modeValue, model };
 }
 
 function providerSessionFingerprint(session: ProviderSessionConfig): string {
-  return sha256(`${session.provider_session_mode}:${session.provider_session_name ?? ""}:${session.provider_session_id ?? ""}`).slice(
-    0,
-    12,
-  );
+  const sessionKey = `${session.provider_session_mode}:${session.provider_session_name ?? ""}:${session.provider_session_id ?? ""}`;
+  const modelKey = session.model ? `${sessionKey}:model:${session.model}` : sessionKey;
+  return sha256(modelKey).slice(0, 12);
 }
 
 function providerSessionFromValue(value: unknown, fallbackAgent: AgentName): ProviderSessionConfig {
@@ -169,6 +186,7 @@ function providerSessionFromValue(value: unknown, fallbackAgent: AgentName): Pro
     provider_session_name: typeof obj.provider_session_name === "string" ? obj.provider_session_name : null,
     provider_session_id: typeof obj.provider_session_id === "string" ? obj.provider_session_id : null,
     provider_session_mode: mode,
+    model: typeof obj.model === "string" ? obj.model : null,
   };
 }
 
@@ -188,14 +206,15 @@ function assertProviderSessionCompatible(
   if (
     stored.provider_session_name !== requested.provider_session_name ||
     stored.provider_session_id !== requested.provider_session_id ||
-    stored.provider_session_mode !== requested.provider_session_mode
+    stored.provider_session_mode !== requested.provider_session_mode ||
+    stored.model !== requested.model
   ) {
     throw new CliError(
       [
-        "idempotent run already exists with different provider session settings",
-        `existing: ${stored.provider_session_mode}/${stored.provider_session_name ?? "none"}/${stored.provider_session_id ?? "none"}`,
-        `requested: ${requested.provider_session_mode}/${requested.provider_session_name ?? "none"}/${requested.provider_session_id ?? "none"}`,
-        "Pass --retry to create a new run with different provider session settings.",
+        "idempotent run already exists with different provider session/model settings",
+        `existing: ${stored.provider_session_mode}/${stored.provider_session_name ?? "none"}/${stored.provider_session_id ?? "none"}/model-${stored.model ?? "default"}`,
+        `requested: ${requested.provider_session_mode}/${requested.provider_session_name ?? "none"}/${requested.provider_session_id ?? "none"}/model-${requested.model ?? "default"}`,
+        "Pass --retry to create a new run with different provider session/model settings.",
       ].join("\n"),
     );
   }
@@ -230,6 +249,10 @@ function sentOutboxDir(mrDir: string): string {
   return `${mrDir}/outbox/sent`;
 }
 
+function invalidOutboxDir(mrDir: string): string {
+  return `${mrDir}/outbox/invalid`;
+}
+
 function pendingOutboxFiles(mrDir: string): string[] {
   const pendingDir = pendingOutboxDir(mrDir);
   if (!existsSync(pendingDir)) return [];
@@ -247,6 +270,15 @@ function enqueueComment(mrDir: string, payload: OutboxCommentPayload): string {
   return path;
 }
 
+const nonTerminalStates = new Set<RunState>(["created", "starting", "running"]);
+
+// Read-side reconcile (A7: display-only, never writes): a run whose recorded
+// pid is gone but whose state never reached a terminal one is flagged stale.
+// `orch run reap` persists the verdict.
+function looksStale(status: RunStatus): boolean {
+  return nonTerminalStates.has(status.state) && status.pid !== null && !isPidAlive(status.pid);
+}
+
 function runListRows(runsRoot: string): RunListRow[] {
   if (!existsSync(runsRoot)) return [];
   return readdirSync(runsRoot, { withFileTypes: true })
@@ -262,6 +294,7 @@ function runListRows(runsRoot: string): RunListRow[] {
       state: status.state,
       started_at: status.started_at,
       exit_code: status.exit_code,
+      stale: looksStale(status),
     }));
 }
 
@@ -272,7 +305,7 @@ function formatTable(rows: RunListRow[]): string {
     row.role,
     row.agent,
     row.tag,
-    row.state,
+    row.stale ? `${row.state} (stale?)` : row.state,
     row.started_at ?? "-",
     row.exit_code === null ? "-" : String(row.exit_code),
   ]);
@@ -332,12 +365,55 @@ function tailText(text: string, lines: number | null): string {
   return selected.length ? `${selected.join("\n")}\n` : "";
 }
 
+function printFindings(label: string, findings: ReviewerResult["non_blocking_findings"]): void {
+  process.stdout.write(`\n${label}:\n`);
+  if (findings.length === 0) {
+    process.stdout.write("  - none\n");
+    return;
+  }
+  for (const finding of findings) {
+    const head = [finding.severity, finding.id, finding.file].filter(Boolean).join(" | ");
+    process.stdout.write(`  - [${head || "finding"}]\n    ${finding.body.replaceAll("\n", "\n    ")}\n`);
+  }
+}
+
 function printResultSummary(result: RoleResult): void {
   process.stdout.write(`schema: ${result.schema}\n`);
   process.stdout.write(`verdict: ${resultVerdict(result)}\n`);
   process.stdout.write(`summary: ${resultSummary(result)}\n`);
 
-  if (result.schema !== "orch.result/implementer/v1") return;
+  if (result.schema === "orch.result/reviewer/v1") {
+    const reviewer = result as ReviewerResult;
+    printFindings("blocking_findings", reviewer.blocking_findings);
+    printFindings("non_blocking_findings", reviewer.non_blocking_findings);
+    process.stdout.write("\nsuggested_tests:\n");
+    if (reviewer.suggested_tests.length === 0) {
+      process.stdout.write("  - none\n");
+    } else {
+      for (const test of reviewer.suggested_tests) process.stdout.write(`  - ${test}\n`);
+    }
+    return;
+  }
+
+  if (result.schema === "orch.result/verifier/v1") {
+    const verifier = result as VerifierResult;
+    process.stdout.write("\ncommands:\n");
+    if (verifier.commands.length === 0) {
+      process.stdout.write("  - none\n");
+    } else {
+      for (const command of verifier.commands) {
+        process.stdout.write(`  - ${command.cmd} (exit ${command.exit_code}): ${command.summary}\n`);
+      }
+    }
+    process.stdout.write("\nacceptance:\n");
+    if (verifier.acceptance.length === 0) {
+      process.stdout.write("  - none\n");
+    } else {
+      for (const item of verifier.acceptance) process.stdout.write(`  - ${item.id}: ${item.status}\n`);
+    }
+    return;
+  }
+
   const implementer = result as ImplementerResult;
   process.stdout.write("\nchanged_files:\n");
   if (implementer.changed_files.length === 0) {
@@ -405,9 +481,9 @@ function latestRunId(runsRoot: string): string | null {
 
 function readMirrorResult(runsRoot: string, runId: string): { result: RoleResult; status: RunStatus | null } {
   const runDir = `${runsRoot}/${runId}`;
-  if (!existsSync(runDir)) throw new Error(`run not found: ${runId}`);
+  if (!existsSync(runDir)) throw new CliError(`run not found: ${runId}`);
   const result = readJsonFile<RoleResult | null>(`${runDir}/result.json`, null);
-  if (!result) throw new Error(`result.json not found for run: ${runId}`);
+  if (!result) throw new CliError(`result.json not found for run: ${runId}`);
   const status = readJsonFile<RunStatus | null>(`${runDir}/status.json`, null);
   return { result, status };
 }
@@ -450,15 +526,35 @@ function decisionBody(
 const VALID_AGENTS: readonly AgentName[] = ["codex", "claude", "pi", "agy"];
 
 function validateRunAgent(agent: AgentName, role: RunRole): void {
-  if (!VALID_AGENTS.includes(agent)) throw new Error(`unsupported agent: ${agent}`);
+  if (!VALID_AGENTS.includes(agent)) throw new CliError(`unsupported agent: ${agent}`);
   // agy = gemini-3.1-pro runs read-only (sandboxed), so it only fits the pure
   // analysis role; verifier needs to execute and write roles edit the worktree.
   if (agent === "agy" && role !== "reviewer") {
-    throw new Error(`agy (gemini-3.1-pro) is read-only; use it for reviewer analysis only, not ${role}`);
+    throw new CliError(`agy (gemini-3.1-pro) is read-only; use it for reviewer analysis only, not ${role}`);
   }
 }
 
+const RUN_CREATE_FLAGS = [
+  "mr",
+  "role",
+  "agent",
+  "tag",
+  "model",
+  "worktree",
+  "task",
+  "idempotency-key",
+  "retry",
+  "allow-dirty",
+  "timeout-sec",
+  "session-mode",
+  "session-name",
+  "session-id",
+  "dry-run",
+  "json",
+] as const;
+
 async function createRun(args: ParsedArgs): Promise<number> {
+  assertKnownFlags(args, "run create", RUN_CREATE_FLAGS);
   const mr = flagString(args, "mr");
   const role = flagString(args, "role") as RunRole;
   const agent = flagString(args, "agent") as AgentName;
@@ -466,13 +562,15 @@ async function createRun(args: ParsedArgs): Promise<number> {
   const worktree = resolve(flagString(args, "worktree", process.cwd()));
   const taskPath = args.flags.has("task") ? resolve(flagString(args, "task")) : null;
   const taskText = taskPath ? readFileSync(taskPath, "utf8") : "";
-  const timeoutSec = Number(flagString(args, "timeout-sec", "14400"));
+  // Reviewer runs finish in minutes in practice (52/67 recorded runs override
+  // the old 4h default); keep the long default only for roles that build/test.
+  const timeoutSec = Number(flagString(args, "timeout-sec", role === "reviewer" ? "3600" : "14400"));
 
   if (!isResultRole(role)) {
-    throw new Error(`P1 only supports result-schema roles: implementer, reviewer, verifier (got ${role})`);
+    throw new CliError(`P1 only supports result-schema roles: implementer, reviewer, verifier (got ${role})`);
   }
   validateRunAgent(agent, role);
-  if (!Number.isFinite(timeoutSec) || timeoutSec <= 0) throw new Error("--timeout-sec must be positive");
+  if (!Number.isFinite(timeoutSec) || timeoutSec <= 0) throw new CliError("--timeout-sec must be positive");
   const providerSession = providerSessionConfig(args, agent);
 
   const repo = await getRepoIdentity(worktree);
@@ -516,6 +614,7 @@ async function createRun(args: ParsedArgs): Promise<number> {
       mr,
       role,
       agent,
+      model: effectiveSession.model,
       tag,
       provider_session_name: effectiveSession.provider_session_name,
       provider_session_id: effectiveSession.provider_session_id,
@@ -572,6 +671,7 @@ async function createRun(args: ParsedArgs): Promise<number> {
         `idempotency_key: ${idempotencyKey}`,
         `idempotent: ${payload.idempotent}`,
         `state: ${payload.state}`,
+        `model: ${payload.model ?? "default"}`,
         `provider_session_mode: ${payload.provider_session_mode}`,
         `provider_session_name: ${payload.provider_session_name ?? "none"}`,
         `provider_session_id: ${payload.provider_session_id ?? "none"}`,
@@ -638,16 +738,26 @@ async function startRun(input: StartRunInput): Promise<Record<string, unknown>> 
   } catch (error) {
     throw stateDirectoryHint(mrDir, error);
   }
-  const mrLock = acquirePidfileLock(`${mrDir}/locks/mr.lock`);
+  // Concurrent same-MR creates are routine (fan-out claims one run per agent);
+  // the lock only guards the idempotency read-modify-write + spawn, so wait
+  // briefly instead of failing the whole create on contention.
+  const mrLock = await acquirePidfileLockWait(`${mrDir}/locks/mr.lock`, 10_000);
   try {
     const idempotency = readIdempotency(idempotencyPath);
     const existing = idempotency[idempotencyKey];
     if (existing && !flagBool(args, "retry")) {
       const existingSession = assertProviderSessionCompatible(existing, providerSession, agent);
+      const existingState = statusState(existing);
+      if (existingState === "failed" || existingState === "timeout") {
+        process.stderr.write(
+          `warn: idempotent run ${existing.run_id} is ${existingState}; pass --retry to dispatch a new run\n`,
+        );
+      }
       return {
         run_id: existing.run_id,
-        state: statusState(existing),
+        state: existingState,
         idempotent: true,
+        model: existingSession.model,
         provider_session_name: existingSession.provider_session_name,
         provider_session_id: existingSession.provider_session_id,
         provider_session_mode: existingSession.provider_session_mode,
@@ -712,11 +822,26 @@ async function startRun(input: StartRunInput): Promise<Record<string, unknown>> 
       created_at: createdAt,
       previous: existing ? [...(existing.previous ?? []), archivedIdempotency(existing)] : undefined,
     };
-    writeJsonAtomic(idempotencyPath, idempotency);
+    try {
+      writeJsonAtomic(idempotencyPath, idempotency);
+    } catch (error) {
+      // Without the idempotency record a same-key retry would double-dispatch;
+      // reap the just-spawned supervisor's process group before surfacing.
+      // Residual risk (accepted): the driver is spawned detached in its own
+      // group, so if the supervisor already reached its driver-spawn in this
+      // sub-millisecond window, the driver survives as an orphan.
+      try {
+        process.kill(-proc.pid, "SIGTERM");
+      } catch {
+        // already exited
+      }
+      throw error;
+    }
 
     return {
       run_id: id,
       state: "starting",
+      model: providerSession.model,
       provider_session_name: providerSession.provider_session_name,
       provider_session_id: providerSession.provider_session_id,
       provider_session_mode: providerSession.provider_session_mode,
@@ -775,14 +900,46 @@ async function status(args: ParsedArgs): Promise<number> {
         .map((id) => readJsonFile<RunStatus | null>(`${runsRoot}/${id}/status.json`, null))
         .filter((item): item is RunStatus => item !== null)
     : [];
-  const payload = { repo_key: repo.repo_key, mr, state_dir: root, runs };
+  const annotated = runs.map((run) => ({ ...run, stale: looksStale(run) }));
+  const payload = { repo_key: repo.repo_key, mr, state_dir: root, runs: annotated };
   if (flagBool(args, "json")) printJson(payload);
   else {
     process.stdout.write(`MR ${mr} (${repo.repo_key})\n`);
-    for (const run of runs) {
-      process.stdout.write(`${run.run_id}\t${run.state}\t${run.role}\t${run.agent}\t${run.updated_at}\n`);
+    for (const run of annotated) {
+      const state = run.stale ? `${run.state} (stale?)` : run.state;
+      process.stdout.write(`${run.run_id}\t${state}\t${run.role}\t${run.agent}\t${run.updated_at}\n`);
     }
   }
+  return 0;
+}
+
+// Persist the read-side stale verdict: non-terminal runs whose pid is dead (or
+// that never got a pid and stopped updating an hour ago) are moved to `stale`.
+async function runReap(args: ParsedArgs): Promise<number> {
+  const mr = flagString(args, "mr");
+  const worktree = resolve(flagString(args, "worktree", process.cwd()));
+  const repo = await getRepoIdentity(worktree);
+  const runsRoot = `${mrStateDir(repo.repo_key, mr)}/runs`;
+  const reaped: string[] = [];
+  const running: string[] = [];
+  if (existsSync(runsRoot)) {
+    for (const id of readdirSync(runsRoot).sort()) {
+      const statusPath = `${runsRoot}/${id}/status.json`;
+      const status = readJsonFile<RunStatus | null>(statusPath, null);
+      if (!status || !nonTerminalStates.has(status.state)) continue;
+      const ageMs = Date.now() - Date.parse(status.updated_at ?? "");
+      const orphanedBeforeSpawn = status.pid === null && Number.isFinite(ageMs) && ageMs > 60 * 60 * 1000;
+      if (!looksStale(status) && !orphanedBeforeSpawn) {
+        running.push(id);
+        continue;
+      }
+      writeJsonAtomic(statusPath, { ...status, state: "stale", updated_at: new Date().toISOString() });
+      const eventsPath = `${runsRoot}/${id}/events.jsonl`;
+      appendJsonLine(eventsPath, { type: "stale", seq: countLines(eventsPath), ts: new Date().toISOString() });
+      reaped.push(id);
+    }
+  }
+  printJson({ mr, reaped, still_running: running });
   return 0;
 }
 
@@ -820,6 +977,25 @@ async function result(args: ParsedArgs): Promise<number> {
   const worktree = resolve(flagString(args, "worktree", process.cwd()));
   const repo = await getRepoIdentity(worktree);
   const located = locateRun(repo.repo_key, runId, mr);
+
+  // --wait blocks until the run reaches a terminal state, so agent controllers
+  // don't have to hand-roll a polling loop between create and result.
+  if (flagBool(args, "wait")) {
+    const waitSec = flagNumber(args, "wait-sec") ?? 900;
+    const deadline = Date.now() + waitSec * 1000;
+    for (;;) {
+      const status = readJsonFile<RunStatus | null>(`${located.run_dir}/status.json`, null);
+      if (status && !nonTerminalStates.has(status.state)) break;
+      if (status && looksStale(status)) {
+        throw new CliError(`run ${runId} looks stale (pid ${status.pid} is gone); run: orch run reap --mr ${located.mr}`);
+      }
+      if (Date.now() >= deadline) {
+        throw new CliError(`run ${runId} did not reach a terminal state within ${waitSec}s (state: ${status?.state ?? "unknown"})`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+    }
+  }
+
   const resultPath = `${located.run_dir}/result.json`;
   const raw = readTextFile(resultPath);
   if (raw === null) throw new CliError(`result.json not found for run: ${runId}`);
@@ -851,12 +1027,12 @@ async function mirror(args: ParsedArgs): Promise<number> {
   }
 
   const adapter = createForgeAdapter(forge, execute, worktree);
-  if (!adapter) throw new Error(`unsupported forge: ${forge}`);
+  if (!adapter) throw new CliError(`unsupported forge: ${forge}`);
 
   const root = mrStateDir(repo.repo_key, mr);
   const runsRoot = `${root}/runs`;
   const runId = args.flags.has("run") ? flagString(args, "run") : latestRunId(runsRoot);
-  if (!runId) throw new Error(`no local runs found for MR ${mr}`);
+  if (!runId) throw new CliError(`no local runs found for MR ${mr}`);
 
   const { result, status } = readMirrorResult(runsRoot, runId);
   const body = mirrorBody(mr, runId, result, status);
@@ -941,7 +1117,7 @@ async function mirrorSync(args: ParsedArgs): Promise<number> {
   }
 
   const adapter = createForgeAdapter(forge, execute, worktree);
-  if (!adapter) throw new Error(`unsupported forge: ${forge}`);
+  if (!adapter) throw new CliError(`unsupported forge: ${forge}`);
 
   const mrDir = mrStateDir(repo.repo_key, mr);
   ensureStateLayout(mrDir);
@@ -951,12 +1127,21 @@ async function mirrorSync(args: ParsedArgs): Promise<number> {
     const pendingPath = `${pendingOutboxDir(mrDir)}/${file}`;
     const payload = readOutboxComment(pendingPath);
     if (!payload) {
+      // Quarantine poison payloads on execute: leaving them pending would make
+      // every future mirror sync fail without ever reaching all-clear. Dry-run
+      // stays read-only and only reports.
+      let outboxPath = pendingPath;
+      if (execute) {
+        mkdirSync(invalidOutboxDir(mrDir), { recursive: true });
+        outboxPath = `${invalidOutboxDir(mrDir)}/${file}`;
+        renameSync(pendingPath, outboxPath);
+      }
       printJson({
-        mirror: execute ? "failed" : "dry-run",
+        mirror: execute ? "invalid" : "dry-run",
         forge,
         mr,
-        outbox_path: pendingPath,
-        error: "invalid outbox payload",
+        outbox_path: outboxPath,
+        error: execute ? "invalid outbox payload; moved to outbox/invalid" : "invalid outbox payload",
       });
       failed += 1;
       continue;
@@ -1228,6 +1413,7 @@ async function main(): Promise<number> {
 
   if (first === "run" && second === "create") return createRun(args);
   if (first === "run" && second === "list") return runList(args);
+  if (first === "run" && second === "reap") return runReap(args);
   if (first === "cross-review") return crossReview(args);
   if (first === "fanout") return fanout(args);
   if (first === "investigate") return investigate(args);
@@ -1240,6 +1426,7 @@ async function main(): Promise<number> {
   if (first === "workspace") return workspace(args);
   if (first === "chatgpt-bridge") return chatgptBridge(args);
   if (first === "handoff-pro") return handoffPro(args);
+  process.stderr.write(`unknown command: ${[first, second].filter(Boolean).join(" ")}\n\n`);
   process.stderr.write(topLevelHelp());
   return 2;
 }

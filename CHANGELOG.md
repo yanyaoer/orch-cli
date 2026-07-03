@@ -4,9 +4,31 @@ All notable user-facing changes are recorded here.
 
 ## [Unreleased]
 
+### Usage-driven interface improvements
+
+- Result extraction now coerces benign schema deviations (verdict synonyms, object items in string arrays, string items in finding arrays, model-invented run ids) instead of discarding the whole result; replaying 49 real fallback runs recovered 5 outright.
+- When extraction still fails, the worker's raw final message is preserved as `result.raw.md` in the run dir and excerpted in the fallback summary, so `orch result` always has readable content (36 of 49 historical fallbacks).
+- A provider that exits 0 without producing any output now fails the run with an auth/session hint instead of quietly reporting `done`.
+- `orch result` renders reviewer findings and verifier commands/acceptance (previously only implementer results were expanded), and gained `--wait`/`--wait-sec` to block until the run reaches a terminal state.
+- `orch status` / `orch run list` flag non-terminal runs whose pid is gone as `stale?` (read-only check); the new `orch run reap --mr <id>` persists them as `stale`.
+- Reviewer runs now default to a 3600s timeout (52 of 67 recorded runs overrode the old 4h default); other roles keep 14400s.
+- Unknown top-level commands print `unknown command: …` before the help text, and missing-flag errors print clean messages instead of stack traces.
+
+### Safety and Reliability
+
+- Hardened the agy driver as a second line of defense: the driver layer now refuses any non-reviewer role outright (the `--dangerously-skip-permissions` fallback is gone) and rejects prompts over 512KB with a clear error instead of an opaque argv-size failure.
+- Serialized fan-out publishing with a per-thread lock so concurrent `cross-review`/`fanout`/`investigate` invocations no longer publish duplicate tasks and duplicate runs.
+- Made the MR lock wait briefly on contention instead of failing `run create`, so fan-out claims that start runs on the same MR concurrently succeed.
+- Forwarded `--model` from the fan-out commands to each spawned run; previously it was silently ignored on that path.
+- `run create` and the fan-out commands now reject unknown flags instead of silently ignoring typos.
+- The supervisor now records a failed terminal state when `spec.json` is missing or corrupt instead of leaving the run stuck in `created`.
+- Forge detection matches the GitHub host exactly; lookalike hosts such as `github.com.attacker.net` no longer classify as GitHub.
+- Invalid outbox payloads are quarantined to `outbox/invalid/` so `mirror sync` can reach all-clear; idempotent hits on failed runs now print a `--retry` hint; quarantined fan-out mail fails loudly; CLI validation errors print clean messages instead of stack traces.
+
 ### Features
 
 - Added the `agy` provider driver (Gemini 3.1 Pro), restricted to the read-only `reviewer` role and launched sandboxed (`--sandbox`); orch rejects it for every other role.
+- Added `orch run create --model <ref>` to record provider model overrides in `spec.json` and pass them through to model-aware drivers including pi.
 - Matched provider permissions to the role: the `reviewer` role now launches each provider without worktree write access (claude plan mode, codex `--sandbox read-only`, pi read-only tools, agy `--sandbox`). `verifier` and write roles keep write-capable access.
 - Added `orch cross-review`, `orch fanout`, and `orch investigate`: one-shot fan-out of a single task across several agents. They route through the mail layer, so a `--thread <id>` supplies the mr and workspace context instead of `--mr`.
 

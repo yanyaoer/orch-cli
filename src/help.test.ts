@@ -56,6 +56,7 @@ test("command help exposes flags and runnable examples", () => {
     "--role",
     "--agent",
     "--tag",
+    "--model",
     "--worktree",
     "--task",
     "--idempotency-key",
