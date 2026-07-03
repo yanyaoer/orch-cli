@@ -7,11 +7,19 @@ Repo: `github.com/yanyaoer/orch-cli`.
 Full usage lives in the CLI itself: `orch --help`, `orch <cmd> --help`,
 `orch help <task-spec|result|events|concepts|forge>`.
 
+Install: `curl -fsSL https://raw.githubusercontent.com/yanyaoer/orch-cli/main/install.sh | sh`
+(latest release binary → `~/.local/bin`); upgrade with `orch update` (`--check` to compare only).
+
 ## When to use what
 - **Not sure what needs attention? Run bare `orch`** → the overview: active runs +
   every pending action (undecided runs, stale runs, pending outbox) as runnable
   command lines; add `--json` when a controller consumes it, `--all` for every
-  repo. Controller loop for fan-out threads: `orch wait --thread <id>` blocks
+  repo. It is a notification center, not a debt ledger: items idle beyond
+  `--attention-days` (default 14, 0 disables) age out, and mrs whose name is a
+  local branch already merged into HEAD auto-archive. Clear backlog in one go
+  with `orch decision sweep --execute` (accept/rework/close per the overview's
+  rubric, no mirror comments); `orch decision close` acks a single run quietly.
+  Controller loop for fan-out threads: `orch wait --thread <id>` blocks
   until the next run needs attention (decision = ack; returns `settled` when
   done); `orch verdict --thread <id> --wait` waits for the whole thread and
   suggests accept / rework / inspect.

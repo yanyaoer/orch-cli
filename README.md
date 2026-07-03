@@ -17,7 +17,7 @@ This repository is the v2 MVP described in [docs/orch-mvp-spec.md](docs/orch-mvp
 Shipped on `main` (v0.0.4, see [CHANGELOG.md](CHANGELOG.md)):
 
 - `orch run create` starts one supervised headless worker run. `--mr` is optional: it resolves from an `MR: <id-or-url>` line in the task's leading header block, a merge-request/pull URL in the task text, or the current branch name (`mr_source` reports which).
-- Bare `orch` prints the overview: active runs plus every pending action (undecided terminal runs, stale runs, pending outbox) expressed as a runnable orch command line — the same contract humans copy and agents execute from `--json`. `--all` scans every repo under the state root.
+- Bare `orch` prints the overview: active runs plus every pending action (undecided terminal runs, stale runs, pending outbox) expressed as a runnable orch command line — the same contract humans copy and agents execute from `--json`. `--all` scans every repo under the state root. The overview is a notification center, not a debt ledger: items idle beyond `--attention-days` (default 14, `0` disables) age out, and mrs matching a local branch already merged into HEAD are archived wholesale. `orch decision close` acks a run without queueing a comment; `orch decision sweep --execute` batch-acks the whole backlog by the overview's own rubric.
 - `orch verdict --thread <id>` aggregates a fan-out thread's verdicts into one suggestion (accept / rework / inspect / pending / reap); `--wait` blocks until the thread settles. `orch wait --thread <id>` is the wait-any primitive: it blocks until the next run needs attention, and a recorded decision acts as the ack so handled runs are never returned again.
 - `orch run list`, `orch status`, `orch events tail`, and `orch result` read local run state; omitting `--mr` aggregates across all MRs in the repo. `orch result --wait` blocks until the run reaches a terminal state; reviewer results render findings, verifier results render commands and acceptance.
 - `orch events tail --native` renders the provider-native stream (`native.jsonl`) as normalized progress events — `session`, `assistant`, `tool_use`, `tool_result`, `usage`, `final`, `raw` — so a controller can see what a worker is doing without parsing per-provider formats. The same normalizer (`src/native-events.ts`) backs result extraction and resume-id detection.
@@ -44,10 +44,21 @@ Not shipped yet:
 
 ## Install
 
+One line (downloads the latest release binary for your platform into `~/.local/bin`):
+
+```sh
+$ curl -fsSL https://raw.githubusercontent.com/yanyaoer/orch-cli/main/install.sh | sh
+```
+
+Override the target with `ORCH_INSTALL_DIR=/somewhere` or pin a tag with `ORCH_VERSION=v0.0.4`. Upgrade later with:
+
+```sh
+$ orch update          # self-replace with the latest release (--check to only compare)
+```
+
 Prerequisites:
 
-- Bun
-- Git
+- Bun and Git for source builds (the release binary needs neither)
 - `codex`, `claude`, `pi`, and/or `omp` authenticated locally if you want real worker runs
 - Optional: `gh` for GitHub mirroring or `glab` for GitLab mirroring
 - Optional: `wrangler` and a Cloudflare account for `orch chatgpt-bridge`
@@ -76,7 +87,7 @@ $ orch --help
 
 `dist/` is intentionally ignored by Git. Treat the compiled binary as a local or release artifact.
 
-Release binaries are published from GitHub Actions when a `v*` tag is pushed:
+Release binaries are published from GitHub Actions when a `v*` tag is pushed; `install.sh` and `orch update` consume them. Manual download:
 
 ```sh
 $ curl -L https://github.com/yanyaoer/orch-cli/releases/latest/download/orch-darwin-arm64 -o ~/.local/bin/orch

@@ -2,9 +2,13 @@
 
 All notable user-facing changes are recorded here.
 
-## [Unreleased]
+## [0.0.5] - 2026-07-04
 
 ### Features
+
+- One-line install and self-update: `curl -fsSL https://raw.githubusercontent.com/yanyaoer/orch-cli/main/install.sh | sh` downloads the latest release binary for the current platform into `~/.local/bin` (override with `ORCH_INSTALL_DIR` / pin with `ORCH_VERSION`). The new `orch update` queries the latest GitHub release, downloads the matching asset, probes it with `--version`, and atomically replaces the running executable (`--check` only compares versions; source checkouts are told to `git pull && bun run install:local`). `orch --version` prints the CLI version.
+
+- The overview is now a notification center, not a permanent debt ledger: terminal-but-undecided runs, stale runs, and pending outbox comments idle for more than `--attention-days` (default 14, `0` disables) sink into an `aged out` counter instead of NEEDS ACTION, and mrs whose name matches a local branch already merged into HEAD (and not pointing at HEAD) are archived wholesale — still-running workers stay visible. Added `orch decision close` (a pure ack that queues no mirror comment, for runs that are neither accepted nor sent to rework) and `orch decision sweep [--execute]`, which batch-acks every undecided terminal run using the overview's own rubric (good verdict → accept, bad verdict → rework, failed/missing result → close) without queueing mirror comments.
 
 - Replaced the `agy` driver with `omp` (oh-my-pi). `omp` is model-aware and not role-restricted: it defaults to `google-antigravity/gemini-3.1-pro` and automatically falls back to `zenmux/anthropic/claude-fable-5`, then `openai-codex/gpt-5.5` when the active model's quota/rate limit is exhausted (via omp's native `retry.fallbackChains`, configured per run through a `--config` overlay in the run dir). An explicit `--model <ref>` becomes the primary and the remaining chain models stay as fallbacks. The reviewer role runs with read-only tools; the prompt is passed as an `@file` argument (omp print mode ignores stdin). The default mail roster and `cross-review`/`investigate` now use `omp-reviewer` instead of `agy-reviewer` (run `orch mail agent defaults` to upsert).
 

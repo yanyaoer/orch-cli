@@ -4,10 +4,10 @@
 // overview and the command an agent spawns from --json are the same audited
 // line. Read-only: this module never writes state.
 
-import { existsSync, readdirSync } from "node:fs";
+import { existsSync, readdirSync, statSync } from "node:fs";
 import type { RunState, RunStatus } from "./types.ts";
 import { readJsonFile } from "./json.ts";
-import { mrStateDir, orchStateRoot } from "./paths.ts";
+import { mrStateDir, orchStateRoot, statePathSegment } from "./paths.ts";
 import { isPidAlive } from "./locks.ts";
 
 export interface OverviewRun {
@@ -42,7 +42,24 @@ export interface Overview {
   active: OverviewRun[];
   actions: OverviewAction[];
   settled: number;
+  // Undecided-but-old items that fell out of the attention window: the
+  // overview is a notification center, not a permanent debt ledger.
+  aged_out: number;
+  // Items skipped because their mr matches a branch already merged into HEAD.
+  archived: number;
 }
+
+export interface OverviewOptions {
+  // Terminal-but-undecided runs, stale runs, and pending outbox comments
+  // older than this many days sink into `aged_out` instead of NEEDS ACTION.
+  // 0 disables the window (everything surfaces forever).
+  attentionDays?: number;
+  // MRs considered closed because their branch merged: raw or sanitized mr
+  // names, applied only to the repo they were computed for.
+  archived?: { repoKey: string; mrs: Set<string> } | null;
+}
+
+export const DEFAULT_ATTENTION_DAYS = 14;
 
 const nonTerminal = new Set<RunState>(["created", "starting", "running"]);
 
@@ -97,7 +114,7 @@ export function collectMrRuns(repoKey: string, mr: string): OverviewRun[] {
 
 // Directory names under <repo>/mrs are sanitized at write time; the raw mr id
 // is recovered from each run's status.json by collectMrRuns.
-function mrDirsForRepo(repoKey: string): string[] {
+export function mrDirsForRepo(repoKey: string): string[] {
   const root = `${orchStateRoot()}/${repoKey}/mrs`;
   if (!existsSync(root)) return [];
   return readdirSync(root, { withFileTypes: true })
@@ -166,32 +183,76 @@ export function suggestedRunAction(run: OverviewRun, withWorktree: boolean): Ove
   };
 }
 
-function pendingOutboxCount(repoKey: string, mrDirName: string): number {
+function pendingOutbox(repoKey: string, mrDirName: string, agedBefore: number | null): { fresh: number; aged: number } {
   const pendingDir = `${orchStateRoot()}/${repoKey}/mrs/${mrDirName}/outbox/pending`;
-  if (!existsSync(pendingDir)) return 0;
-  return readdirSync(pendingDir, { withFileTypes: true }).filter((entry) => entry.isFile() && entry.name.endsWith(".json")).length;
+  if (!existsSync(pendingDir)) return { fresh: 0, aged: 0 };
+  let fresh = 0;
+  let aged = 0;
+  for (const entry of readdirSync(pendingDir, { withFileTypes: true })) {
+    if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+    let mtime = Number.POSITIVE_INFINITY;
+    try {
+      mtime = statSync(`${pendingDir}/${entry.name}`).mtimeMs;
+    } catch {
+      // Raced away between readdir and stat: it no longer needs attention.
+      continue;
+    }
+    if (agedBefore !== null && mtime < agedBefore) aged += 1;
+    else fresh += 1;
+  }
+  return { fresh, aged };
 }
 
-export function buildOverview(repoKeys: string[], withWorktree: boolean): Overview {
+export function buildOverview(repoKeys: string[], withWorktree: boolean, options: OverviewOptions = {}): Overview {
+  const attentionDays = options.attentionDays ?? DEFAULT_ATTENTION_DAYS;
+  // Cutoff in epoch ms: anything last touched before it has aged out.
+  const agedBefore = attentionDays > 0 ? Date.now() - attentionDays * 24 * 60 * 60 * 1000 : null;
+  const isAged = (iso: string | null): boolean => {
+    if (agedBefore === null) return false;
+    const ts = Date.parse(iso ?? "");
+    return Number.isFinite(ts) && ts < agedBefore;
+  };
+  const archivedMrs = options.archived ?? null;
+  const isArchivedMr = (repoKey: string, ...names: string[]): boolean =>
+    archivedMrs !== null && archivedMrs.repoKey === repoKey && names.some((name) => archivedMrs.mrs.has(name));
+
   const active: OverviewRun[] = [];
   const decisions: OverviewAction[] = [];
   const tail: OverviewAction[] = [];
   let settled = 0;
+  let agedOut = 0;
+  let archived = 0;
 
   for (const repoKey of repoKeys) {
     for (const mrDirName of mrDirsForRepo(repoKey)) {
       const runs = collectMrRuns(repoKey, mrDirName);
-      let mr = mrDirName;
+      const mr = runs[0]?.mr ?? mrDirName;
+      // A merged branch means the mr's work shipped: retire the whole group
+      // (still-running workers stay visible; nothing else needs attention).
+      const mrArchived = isArchivedMr(repoKey, mr, mrDirName);
       let staleCount = 0;
       let sampleWorktree: string | null = null;
       for (const run of runs) {
-        mr = run.mr;
         sampleWorktree = run.worktree;
-        if (run.stale) staleCount += 1;
-        else if (!isTerminal(run.state)) active.push(run);
+        if (!run.stale && !isTerminal(run.state)) {
+          active.push(run);
+          continue;
+        }
+        if (mrArchived) {
+          archived += 1;
+          continue;
+        }
+        if (run.stale) {
+          if (isAged(run.updated_at)) agedOut += 1;
+          else staleCount += 1;
+        }
         const action = suggestedRunAction(run, withWorktree);
-        if (action) decisions.push(action);
-        else if (isTerminal(run.state)) settled += 1;
+        if (action) {
+          if (isAged(run.updated_at)) agedOut += 1;
+          else decisions.push(action);
+        } else if (isTerminal(run.state)) {
+          settled += 1;
+        }
       }
       const worktreeFlags = withWorktree && sampleWorktree ? ["--worktree", sampleWorktree] : [];
       if (staleCount > 0) {
@@ -203,21 +264,55 @@ export function buildOverview(repoKeys: string[], withWorktree: boolean): Overvi
           mr,
         });
       }
-      const pending = pendingOutboxCount(repoKey, mrDirName);
-      if (pending > 0) {
-        tail.push({
-          kind: "mirror_sync",
-          reason: `outbox: ${pending} pending comment${pending > 1 ? "s" : ""}`,
-          argv: ["orch", "mirror", "sync", "--mr", mr, "--execute", ...worktreeFlags],
-          repo_key: repoKey,
-          mr,
-        });
+      const pending = pendingOutbox(repoKey, mrDirName, agedBefore);
+      if (mrArchived) {
+        archived += pending.fresh + pending.aged;
+      } else {
+        agedOut += pending.aged;
+        if (pending.fresh > 0) {
+          tail.push({
+            kind: "mirror_sync",
+            reason: `outbox: ${pending.fresh} pending comment${pending.fresh > 1 ? "s" : ""}`,
+            argv: ["orch", "mirror", "sync", "--mr", mr, "--execute", ...worktreeFlags],
+            repo_key: repoKey,
+            mr,
+          });
+        }
       }
     }
   }
 
   decisions.sort((a, b) => a.mr.localeCompare(b.mr) || (a.run_id ?? "").localeCompare(b.run_id ?? ""));
-  return { scanned_repos: repoKeys, active, actions: [...decisions, ...tail], settled };
+  return { scanned_repos: repoKeys, active, actions: [...decisions, ...tail], settled, aged_out: agedOut, archived };
+}
+
+// The set of mr names retired by branch lifecycle: local branches fully merged
+// into HEAD (their work shipped). Excluded: the current branch (always an
+// ancestor of HEAD, but its thread may still be live) and branches pointing at
+// HEAD itself (a just-created branch with no commits yet is indistinguishable
+// from a merged one by ancestry alone). Sanitized forms are included so
+// outbox-only mr dirs (no runs to recover the raw name from) match too.
+// Returns null outside a git repo.
+export async function mergedBranchMrs(worktree: string): Promise<Set<string> | null> {
+  const git = (...args: string[]) =>
+    Bun.spawn(["git", "-C", worktree, ...args], { stdout: "pipe", stderr: "ignore" });
+  try {
+    const current = (await new Response(git("branch", "--show-current").stdout).text()).trim();
+    const head = (await new Response(git("rev-parse", "HEAD").stdout).text()).trim();
+    const proc = git("branch", "--format=%(refname:short) %(objectname)", "--merged", "HEAD");
+    const out = await new Response(proc.stdout).text();
+    if ((await proc.exited) !== 0) return null;
+    const mrs = new Set<string>();
+    for (const line of out.split("\n")) {
+      const [branch, sha] = line.trim().split(" ");
+      if (!branch || branch === current || sha === head) continue;
+      mrs.add(branch);
+      mrs.add(statePathSegment(branch, "mr"));
+    }
+    return mrs;
+  } catch {
+    return null;
+  }
 }
 
 export function formatAge(iso: string | null): string {
@@ -266,6 +361,9 @@ export function renderOverview(overview: Overview): string {
     });
   }
 
-  lines.push("", `settled: ${overview.settled} run${overview.settled === 1 ? "" : "s"} decided or closed`);
+  const trailer = [`settled: ${overview.settled} run${overview.settled === 1 ? "" : "s"} decided or closed`];
+  if (overview.aged_out > 0) trailer.push(`${overview.aged_out} aged out (--attention-days 0 to resurface)`);
+  if (overview.archived > 0) trailer.push(`${overview.archived} archived (merged branches)`);
+  lines.push("", trailer.join(" · "));
   return `${lines.join("\n")}\n`;
 }

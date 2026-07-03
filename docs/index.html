@@ -589,17 +589,21 @@
           <h2 data-lang="en">One command fans a task across agents.</h2>
           <h2 data-lang="zh">一条命令把任务分发给多个 agent。</h2>
           <p class="sec-lead" data-lang="en">
-            Install with Bun or a release binary, register default mail agents once, then publish,
-            claim, and run ride the local mail bus in one shot. The manual submit / route / claim
-            pipeline stays available for fine control.
+            Install with one curl line (release binary; upgrade later with <code>orch update</code>),
+            register default mail agents once, then publish, claim, and run ride the local mail bus
+            in one shot. The manual submit / route / claim pipeline stays available for fine control.
           </p>
           <p class="sec-lead" data-lang="zh">
-            用 Bun 或 release binary 安装，注册一次默认 mail agents，之后发布、claim、运行一条命令
-            走完本地 mail bus。手动 submit / route / claim 流水线仍然可用。
+            一条 curl 命令安装 release binary（之后用 <code>orch update</code> 升级），注册一次默认
+            mail agents，之后发布、claim、运行一条命令走完本地 mail bus。手动 submit / route / claim
+            流水线仍然可用。
           </p>
         </div>
         <div class="code-block">
-          <pre><span class="p">$</span> <span class="c">bun install</span> <span class="cm">&amp;&amp; bun run install:local</span>
+          <pre><span class="cm"># install the latest release binary into ~/.local/bin</span>
+<span class="p">$</span> <span class="c">curl -fsSL https://raw.githubusercontent.com/yanyaoer/orch-cli/main/install.sh | sh</span>
+<span class="p">$</span> <span class="c">orch update</span>                                 <span class="cm"># later: self-update to the latest release</span>
+
 <span class="p">$</span> <span class="c">orch mail agent defaults</span>                    <span class="cm"># once</span>
 <span class="p">$</span> <span class="c">orch workspace add</span> <span class="f">--id</span> my-repo <span class="f">--path</span> .
 

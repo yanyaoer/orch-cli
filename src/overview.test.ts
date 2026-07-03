@@ -1,9 +1,9 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RunState, RunStatus } from "./types.ts";
-import { buildOverview, collectMrRuns, collectRepoKeys, renderArgv, renderOverview } from "./overview.ts";
+import { buildOverview, collectMrRuns, collectRepoKeys, mergedBranchMrs, renderArgv, renderOverview } from "./overview.ts";
 
 const cleanups: Array<() => void> = [];
 
@@ -190,6 +190,132 @@ test("bare orch, verdict, and wait read the same aggregation end to end", async 
   writeFileSync(join(runDir, "decision.json"), JSON.stringify({ verdict: "accept", run_id: "rv-a", reason: "ok", ts: "t" }), "utf8");
   const settled = await runOrch(["wait", "--thread", "th-1", "--worktree", worktree], env);
   expect(JSON.parse(settled.stdout)).toEqual({ kind: "settled", thread: "th-1", runs: 2 });
+});
+
+test("attention window ages out old undecided runs, stale runs, and outbox comments", () => {
+  const stateHome = makeStateHome();
+  const oldIso = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+  // Old undecided done run and old stale run: both sink into aged_out.
+  writeRun(stateHome, REPO, "old", status({ run_id: "r-old", mr: "old", state: "done", exit_code: 0, updated_at: oldIso }), { verdict: "approve" });
+  writeRun(stateHome, REPO, "old", status({ run_id: "r-old-stale", mr: "old", state: "running", pid: 999999999, pgid: 999999999, updated_at: oldIso }));
+  // Fresh undecided run stays actionable.
+  writeRun(stateHome, REPO, "new", status({ run_id: "r-new", mr: "new", state: "done", exit_code: 0 }), { verdict: "approve" });
+  // Old pending outbox comment ages out too.
+  const pendingDir = join(stateHome, "orch", REPO, "mrs", "old", "outbox", "pending");
+  mkdirSync(pendingDir, { recursive: true });
+  writeFileSync(join(pendingDir, "c1.json"), "{}", "utf8");
+  const oldDate = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+  utimesSync(join(pendingDir, "c1.json"), oldDate, oldDate);
+
+  const overview = buildOverview([REPO], false);
+  expect(overview.actions.map((action) => action.run_id ?? action.kind)).toEqual(["r-new"]);
+  expect(overview.aged_out).toBe(3);
+  expect(renderOverview(overview)).toContain("3 aged out (--attention-days 0 to resurface)");
+
+  // Window disabled: everything resurfaces.
+  const everything = buildOverview([REPO], false, { attentionDays: 0 });
+  expect(everything.aged_out).toBe(0);
+  expect(everything.actions.map((action) => action.kind).sort()).toEqual(["decision", "decision", "mirror_sync", "reap"]);
+});
+
+test("merged-branch mrs are archived wholesale; live runs stay visible", () => {
+  const stateHome = makeStateHome();
+  writeRun(stateHome, REPO, "feat-x", status({ run_id: "r-done", mr: "feat-x", state: "done", exit_code: 0 }), { verdict: "approve" });
+  writeRun(stateHome, REPO, "feat-x", status({ run_id: "r-live", mr: "feat-x", state: "running", pid: process.pid, pgid: process.pid }));
+  const pendingDir = join(stateHome, "orch", REPO, "mrs", "feat-x", "outbox", "pending");
+  mkdirSync(pendingDir, { recursive: true });
+  writeFileSync(join(pendingDir, "c1.json"), "{}", "utf8");
+  writeRun(stateHome, REPO, "feat-y", status({ run_id: "r-other", mr: "feat-y", state: "done", exit_code: 0 }), { verdict: "approve" });
+
+  const overview = buildOverview([REPO], false, { archived: { repoKey: REPO, mrs: new Set(["feat-x"]) } });
+  // The archived mr contributes no actions; its still-running worker stays active.
+  expect(overview.active.map((run) => run.run_id)).toEqual(["r-live"]);
+  expect(overview.actions.map((action) => action.run_id ?? action.kind)).toEqual(["r-other"]);
+  expect(overview.archived).toBe(2); // r-done + 1 pending comment
+  expect(renderOverview(overview)).toContain("2 archived (merged branches)");
+
+  // The archive set only applies to its own repo.
+  const otherRepo = buildOverview([REPO], false, { archived: { repoKey: "other/repo-1234", mrs: new Set(["feat-x"]) } });
+  expect(otherRepo.archived).toBe(0);
+});
+
+test("mergedBranchMrs lists merged branches, excluding the current one", async () => {
+  const worktree = realpathSync(mkdtempSync(join(tmpdir(), "orch-overview-git-")));
+  cleanups.push(() => rmSync(worktree, { recursive: true, force: true }));
+  const git = async (...args: string[]) => {
+    const proc = Bun.spawn(["git", "-C", worktree, ...args], { stdout: "ignore", stderr: "ignore" });
+    expect(await proc.exited).toBe(0);
+  };
+  await git("init", "-q", "-b", "main");
+  await git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "init");
+  await git("branch", "feat/merged");
+  await git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "ahead");
+  await git("branch", "just-created"); // points at HEAD: not yet distinguishable from live work
+
+  const mrs = await mergedBranchMrs(worktree);
+  expect(mrs).not.toBeNull();
+  // feat/merged points at an older commit that is an ancestor of HEAD -> merged.
+  expect(mrs!.has("feat/merged")).toBe(true);
+  expect(mrs!.has("feat_merged")).toBe(true); // sanitized form for outbox-only dirs
+  expect(mrs!.has("just-created")).toBe(false); // at HEAD -> presumed live, never archived
+  expect(mrs!.has("main")).toBe(false); // current branch never archives itself
+
+  // Not a git repo -> null (feature disabled, no error).
+  const plain = realpathSync(mkdtempSync(join(tmpdir(), "orch-overview-plain-")));
+  cleanups.push(() => rmSync(plain, { recursive: true, force: true }));
+  expect(await mergedBranchMrs(plain)).toBeNull();
+});
+
+test("decision close acks without queueing a mirror comment; sweep batch-acks the backlog", async () => {
+  const stateHome = makeStateHome();
+  const worktree = realpathSync(mkdtempSync(join(tmpdir(), "orch-overview-wt-")));
+  cleanups.push(() => rmSync(worktree, { recursive: true, force: true }));
+  const { repoKeyFromRemote } = await import("./paths.ts");
+  const repoKey = repoKeyFromRemote(worktree, worktree);
+  const env = { XDG_STATE_HOME: stateHome };
+
+  writeRun(stateHome, repoKey, "bk", status({ run_id: "bk-approve", mr: "bk", state: "done", exit_code: 0 }), { verdict: "approve" });
+  writeRun(stateHome, repoKey, "bk", status({ run_id: "bk-changes", mr: "bk", state: "done", exit_code: 0 }), { verdict: "request_changes", blocking: 2 });
+  writeRun(stateHome, repoKey, "bk", status({ run_id: "bk-failed", mr: "bk", state: "failed", exit_code: 1 }));
+  writeRun(stateHome, repoKey, "bk", status({ run_id: "bk-decided", mr: "bk", state: "done", exit_code: 0 }), { verdict: "approve", decided: true });
+
+  // close: records the ack, queues nothing.
+  const closed = await runOrch(["decision", "close", "--run", "bk-failed", "--mr", "bk", "--reason", "obsolete", "--worktree", worktree], env);
+  expect(closed).toMatchObject({ exitCode: 0, stderr: "" });
+  expect(JSON.parse(closed.stdout)).toMatchObject({ decision: "close", outbox_path: null });
+  const pendingDir = join(stateHome, "orch", repoKey, "mrs", "bk", "outbox", "pending");
+  expect(!existsSync(pendingDir) || readdirSync(pendingDir).filter((file) => file.endsWith(".json")).length === 0).toBe(true);
+
+  // sweep dry-run plans the two remaining undecided runs and writes nothing.
+  const dry = await runOrch(["decision", "sweep", "--mr", "bk", "--worktree", worktree], env);
+  expect(dry).toMatchObject({ exitCode: 0, stderr: "" });
+  const dryPayload = JSON.parse(dry.stdout) as { sweep: string; planned: Array<{ run_id: string; verdict: string }> };
+  expect(dryPayload.sweep).toBe("dry-run");
+  expect(dryPayload.planned.map((plan) => [plan.run_id, plan.verdict])).toEqual([
+    ["bk-approve", "accept"],
+    ["bk-changes", "rework"],
+  ]);
+  expect(existsSync(join(stateHome, "orch", repoKey, "mrs", "bk", "runs", "bk-approve", "decision.json"))).toBe(false);
+
+  // sweep --execute records them; no mirror comments are queued.
+  const swept = await runOrch(["decision", "sweep", "--mr", "bk", "--execute", "--worktree", worktree], env);
+  expect(swept).toMatchObject({ exitCode: 0, stderr: "" });
+  const sweptPayload = JSON.parse(swept.stdout) as { sweep: string; decided: unknown[]; skipped: unknown[] };
+  expect(sweptPayload.decided).toHaveLength(2);
+  expect(sweptPayload.skipped).toHaveLength(0);
+  const accept = JSON.parse(readFileSync(join(stateHome, "orch", repoKey, "mrs", "bk", "runs", "bk-approve", "decision.json"), "utf8")) as { verdict: string; reason: string };
+  expect(accept).toMatchObject({ verdict: "accept", reason: "sweep: reviewer approve" });
+  expect(!existsSync(pendingDir) || readdirSync(pendingDir).filter((file) => file.endsWith(".json")).length === 0).toBe(true);
+
+  // Idempotent: a second sweep finds nothing left.
+  const again = await runOrch(["decision", "sweep", "--mr", "bk", "--worktree", worktree], env);
+  expect((JSON.parse(again.stdout) as { planned: unknown[] }).planned).toEqual([]);
+});
+
+test("orch --version prints the CLI version", async () => {
+  const out = await runOrch(["--version"], {});
+  expect(out).toMatchObject({ exitCode: 0, stderr: "" });
+  expect(out.stdout.trim()).toMatch(/^orch v\d+\.\d+\.\d+$/);
 });
 
 test("decision is an atomic ack: a second decision fails and queues nothing", async () => {

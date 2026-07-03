@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync } from "node:fs";
+import pkg from "../package.json";
+import { basename, dirname, resolve } from "node:path";
 import { $ } from "bun";
 import type {
   AgentName,
@@ -27,8 +28,11 @@ import {
   buildOverview,
   collectMrRuns,
   collectRepoKeys,
+  DEFAULT_ATTENTION_DAYS,
   isGoodVerdict,
   isTerminal,
+  mergedBranchMrs,
+  mrDirsForRepo,
   renderArgv,
   renderOverview,
   suggestedRunAction,
@@ -37,6 +41,7 @@ import {
   HELP_TOPICS,
   chatgptBridgeHelp,
   handoffProHelp,
+  updateHelp,
   decisionHelp,
   eventsTailHelp,
   verdictHelp,
@@ -87,7 +92,10 @@ type LocatedRun = {
   run_dir: string;
 };
 
-type DecisionVerdict = "accept" | "rework";
+// close = "stop tracking this run" — an ack that queues no mirror comment.
+// It exists so historical or abandoned runs can leave the overview without
+// pretending they were reviewed (accept) or need work (rework).
+type DecisionVerdict = "accept" | "rework" | "close";
 
 interface DecisionRecord {
   verdict: DecisionVerdict;
@@ -1054,10 +1062,19 @@ async function runList(args: ParsedArgs): Promise<number> {
 async function overviewCommand(args: ParsedArgs): Promise<number> {
   const worktree = resolve(flagString(args, "worktree", process.cwd()));
   const all = flagBool(args, "all");
-  const repoKeys = all ? collectRepoKeys() : [(await getRepoIdentity(worktree)).repo_key];
+  const attentionDays = flagNumber(args, "attention-days") ?? DEFAULT_ATTENTION_DAYS;
+  if (!Number.isFinite(attentionDays) || attentionDays < 0) {
+    throw new CliError("--attention-days must be a non-negative number (0 disables the window)");
+  }
+  const repoIdentity = await getRepoIdentity(worktree);
+  const repoKeys = all ? collectRepoKeys() : [repoIdentity.repo_key];
+  // Branch lifecycle only applies to the repo we have a worktree for; other
+  // repos in --all mode have no local branch context to consult.
+  const mergedMrs = await mergedBranchMrs(worktree);
+  const archived = mergedMrs ? { repoKey: repoIdentity.repo_key, mrs: mergedMrs } : null;
   // Cross-repo suggestions need --worktree to resolve the right repo_key when
   // they are executed from elsewhere; same-repo suggestions stay short.
-  const overview = buildOverview(repoKeys, all);
+  const overview = buildOverview(repoKeys, all, { attentionDays, archived });
   if (flagBool(args, "json")) {
     printJson(overview);
   } else {
@@ -1296,8 +1313,9 @@ async function mirror(args: ParsedArgs): Promise<number> {
 
 async function decision(args: ParsedArgs): Promise<number> {
   const verdict = args.positionals[1];
-  if (verdict !== "accept" && verdict !== "rework") {
-    throw new CliError("usage: orch decision accept|rework --run <run_id> [--mr <id>] [--reason <text>] [--worktree <path>]");
+  if (verdict === "sweep") return decisionSweep(args);
+  if (verdict !== "accept" && verdict !== "rework" && verdict !== "close") {
+    throw new CliError("usage: orch decision accept|rework|close --run <run_id> [--mr <id>] [--reason <text>] [--worktree <path>], or orch decision sweep [--mr <id>] [--execute]");
   }
   const runId = flagString(args, "run");
   const reason = args.flags.has("reason") ? flagString(args, "reason") : null;
@@ -1309,33 +1327,27 @@ async function decision(args: ParsedArgs): Promise<number> {
   ensureStateLayout(mrDir);
 
   const runsRoot = `${mrDir}/runs`;
-  const { result, status } = readMirrorResult(runsRoot, runId);
   const ts = new Date().toISOString();
   const record: DecisionRecord = { verdict, run_id: runId, reason, ts };
-  const body = decisionBody(mr, runId, record, result, status);
-  assertMirrorBodySafe(body);
-  const runDir = `${runsRoot}/${runId}`;
-  // decision.json is the run's atomic ack: O_EXCL create-or-fail, so two
-  // controllers racing on the same run get one winner and one clear error —
-  // never a silent overwrite plus a second queued mirror comment.
-  try {
-    writeJsonExclusive(`${runDir}/decision.json`, record);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-      const prior = readJsonFile<DecisionRecord | null>(`${runDir}/decision.json`, null);
-      throw new CliError(
-        `run ${runId} already decided (${prior?.verdict ?? "unknown"}${prior?.ts ? ` at ${prior.ts}` : ""}); not queueing another mirror comment`,
-      );
-    }
-    throw error;
+  // close is a pure ack: no PR/MR comment rides on it, so no body is built.
+  let body: string | null = null;
+  if (verdict !== "close") {
+    const { result, status } = readMirrorResult(runsRoot, runId);
+    body = decisionBody(mr, runId, record, result, status);
+    assertMirrorBodySafe(body);
   }
+  const runDir = `${runsRoot}/${runId}`;
+  writeDecisionExclusive(runDir, record);
 
-  const outboxPath = enqueueComment(mrDir, {
-    kind: "comment",
-    mr,
-    body,
-    created_at: ts,
-  });
+  const outboxPath =
+    body === null
+      ? null
+      : enqueueComment(mrDir, {
+          kind: "comment",
+          mr,
+          body,
+          created_at: ts,
+        });
 
   printJson({
     decision: verdict,
@@ -1345,6 +1357,78 @@ async function decision(args: ParsedArgs): Promise<number> {
     outbox_path: outboxPath,
   });
   return 0;
+}
+
+// decision.json is the run's atomic ack: O_EXCL create-or-fail, so two
+// controllers racing on the same run get one winner and one clear error —
+// never a silent overwrite plus a second queued mirror comment.
+function writeDecisionExclusive(runDir: string, record: DecisionRecord): void {
+  try {
+    writeJsonExclusive(`${runDir}/decision.json`, record);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      const prior = readJsonFile<DecisionRecord | null>(`${runDir}/decision.json`, null);
+      throw new CliError(
+        `run ${record.run_id} already decided (${prior?.verdict ?? "unknown"}${prior?.ts ? ` at ${prior.ts}` : ""}); not queueing another mirror comment`,
+      );
+    }
+    throw error;
+  }
+}
+
+// Batch-ack the backlog: record the obvious decision for every undecided
+// terminal run, following the same rubric the overview suggests. Sweep never
+// queues mirror comments — it clears attention debt; runs that deserve a PR
+// comment should go through a single `orch decision accept|rework`.
+async function decisionSweep(args: ParsedArgs): Promise<number> {
+  const worktree = resolve(flagString(args, "worktree", process.cwd()));
+  const execute = flagBool(args, "execute");
+  const repo = await getRepoIdentity(worktree);
+  const mrFilter = args.flags.has("mr") ? flagString(args, "mr") : null;
+  const mrDirNames = mrFilter ? [basename(mrStateDir(repo.repo_key, mrFilter))] : mrDirsForRepo(repo.repo_key);
+
+  const planned: Array<{ mr: string; run_id: string; verdict: DecisionVerdict; reason: string }> = [];
+  for (const mrDirName of mrDirNames) {
+    for (const run of collectMrRuns(repo.repo_key, mrDirName)) {
+      if (!isTerminal(run.state) || run.decided) continue;
+      // stale/cancelled runs are already retired by reap/cancel; leave them out
+      // of the decision ledger, mirroring suggestedRunAction.
+      if (run.state === "stale" || run.state === "cancelled") continue;
+      const plan =
+        run.state === "done"
+          ? run.verdict === null
+            ? { verdict: "close" as const, reason: "sweep: done without result" }
+            : isGoodVerdict(run.verdict) && (run.blocking ?? 0) === 0
+              ? { verdict: "accept" as const, reason: `sweep: ${run.role} ${run.verdict}` }
+              : { verdict: "rework" as const, reason: `sweep: ${run.role} ${run.verdict}${run.blocking ? ` · blocking ${run.blocking}` : ""}` }
+          : { verdict: "close" as const, reason: `sweep: run ${run.state}` };
+      planned.push({ mr: run.mr, run_id: run.run_id, ...plan });
+    }
+  }
+
+  if (!execute) {
+    printJson({ sweep: "dry-run", repo_key: repo.repo_key, planned, hint: "re-run with --execute to record these decisions (no mirror comments are queued)" });
+    return 0;
+  }
+
+  const decided: typeof planned = [];
+  const skipped: Array<{ mr: string; run_id: string; error: string }> = [];
+  const ts = new Date().toISOString();
+  for (const plan of planned) {
+    const runDir = `${mrStateDir(repo.repo_key, plan.mr)}/runs/${plan.run_id}`;
+    try {
+      writeJsonExclusive(`${runDir}/decision.json`, { verdict: plan.verdict, run_id: plan.run_id, reason: plan.reason, ts });
+      decided.push(plan);
+    } catch (error) {
+      skipped.push({
+        mr: plan.mr,
+        run_id: plan.run_id,
+        error: (error as NodeJS.ErrnoException).code === "EEXIST" ? "already decided" : String(error),
+      });
+    }
+  }
+  printJson({ sweep: "executed", repo_key: repo.repo_key, decided, skipped });
+  return skipped.length > 0 ? 1 : 0;
 }
 
 function readOutboxComment(path: string): OutboxCommentPayload | null {
@@ -1593,9 +1677,76 @@ async function handoffPro(args: ParsedArgs): Promise<number> {
   return 0;
 }
 
+const GITHUB_REPO = "yanyaoer/orch-cli";
+
+// The compiled single-file binary runs its entry module from bun's virtual
+// filesystem; a source checkout (bun run src/orch.ts) does not.
+function isCompiledBinary(): boolean {
+  return Bun.main.startsWith("/$bunfs/");
+}
+
+const UPDATE_FLAGS = ["check", "json"] as const;
+
+// Self-update from the latest GitHub release. `--check` only reports versions.
+async function updateCommand(args: ParsedArgs): Promise<number> {
+  assertKnownFlags(args, "update", UPDATE_FLAGS);
+  const current = `v${pkg.version}`;
+  const headers: Record<string, string> = { "user-agent": `orch-cli/${pkg.version}`, accept: "application/vnd.github+json" };
+  // Unauthenticated GitHub API calls are rate-limited to 60/hour per IP; use
+  // ambient credentials when present.
+  const token = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN;
+  if (token) headers.authorization = `Bearer ${token}`;
+  const api = await fetch(`https://api.github.com/repos/${GITHUB_REPO}/releases/latest`, { headers });
+  if (!api.ok) throw new CliError(`failed to query the latest release: HTTP ${api.status} from api.github.com${api.status === 403 ? " (rate limit? set GH_TOKEN)" : ""}`);
+  const release = (await api.json()) as { tag_name?: string };
+  const latest = release.tag_name;
+  if (!latest) throw new CliError("latest release carries no tag_name");
+
+  if (flagBool(args, "check") || latest === current) {
+    printJson({ current, latest, up_to_date: latest === current });
+    return 0;
+  }
+  if (!isCompiledBinary()) {
+    throw new CliError("orch update self-replaces the compiled binary; in a source checkout run: git pull && bun run install:local");
+  }
+  const platform = process.platform;
+  const arch = process.arch;
+  if ((platform !== "darwin" && platform !== "linux") || (arch !== "arm64" && arch !== "x64")) {
+    throw new CliError(`no prebuilt release asset for ${platform}-${arch}; build from source: bun run install:local`);
+  }
+  const asset = `orch-${platform}-${arch}`;
+  const url = `https://github.com/${GITHUB_REPO}/releases/download/${latest}/${asset}`;
+  const download = await fetch(url, { headers: { "user-agent": `orch-cli/${pkg.version}` } });
+  if (!download.ok) throw new CliError(`failed to download ${url}: HTTP ${download.status}`);
+  // Buffer the body explicitly: Bun.write(path, response) can hang on these
+  // release downloads, and a starved event loop then exits 0 silently.
+  const binary = await download.arrayBuffer();
+
+  // Write next to the real binary so the final rename is atomic on one fs.
+  const targetPath = realpathSync(process.execPath);
+  const stagedPath = `${targetPath}.update-${process.pid}`;
+  try {
+    await Bun.write(stagedPath, binary);
+    chmodSync(stagedPath, 0o755);
+    // The new binary must at least run before it replaces this one.
+    const probe = Bun.spawn([stagedPath, "--version"], { stdout: "ignore", stderr: "ignore" });
+    if ((await probe.exited) !== 0) throw new CliError(`downloaded ${asset} failed its --version probe; keeping ${current}`);
+    renameSync(stagedPath, targetPath);
+  } catch (error) {
+    rmSync(stagedPath, { force: true });
+    throw error;
+  }
+  printJson({ updated: true, from: current, to: latest, path: targetPath });
+  return 0;
+}
+
 async function main(): Promise<number> {
   const args = parseArgs(process.argv.slice(2));
   const [first, second] = args.positionals;
+  if (!first && flagBool(args, "version")) {
+    process.stdout.write(`orch v${pkg.version}\n`);
+    return 0;
+  }
   if (first === "__supervisor") return runSupervisor(flagString(args, "run-dir"), orchCommand());
   if (first === "__driver-codex") return runCodexDriver(process.argv.slice(3));
   if (first === "__driver-claude") return runClaudeDriver(process.argv.slice(3));
@@ -1675,6 +1826,10 @@ async function main(): Promise<number> {
       process.stdout.write(handoffProHelp());
       return 0;
     }
+    if (first === "update") {
+      process.stdout.write(updateHelp());
+      return 0;
+    }
     if (first === "help") {
       process.stdout.write(second && isHelpTopic(second) ? topicHelp(second) : topLevelHelp());
       return 0;
@@ -1713,6 +1868,7 @@ async function main(): Promise<number> {
   if (first === "workspace") return workspace(args);
   if (first === "chatgpt-bridge") return chatgptBridge(args);
   if (first === "handoff-pro") return handoffPro(args);
+  if (first === "update") return updateCommand(args);
   process.stderr.write(`unknown command: ${[first, second].filter(Boolean).join(" ")}\n\n`);
   process.stderr.write(topLevelHelp());
   return 2;
