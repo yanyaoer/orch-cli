@@ -64,7 +64,7 @@ type IdempotencyRecord = {
   previous?: IdempotencyRecord[];
 };
 
-type RunListRow = Pick<RunStatus, "run_id" | "role" | "agent" | "tag" | "state" | "started_at" | "exit_code"> & {
+type RunListRow = Pick<RunStatus, "run_id" | "mr" | "role" | "agent" | "tag" | "state" | "started_at" | "exit_code"> & {
   stale: boolean;
 };
 
@@ -233,6 +233,41 @@ async function gitDirty(worktree: string): Promise<string> {
   }
 }
 
+async function gitBranch(worktree: string): Promise<string | null> {
+  try {
+    const branch = (await $`git -C ${worktree} rev-parse --abbrev-ref HEAD`.quiet().text()).trim();
+    return branch && branch !== "HEAD" ? branch : null;
+  } catch {
+    return null;
+  }
+}
+
+function mrFromForgeUrl(text: string): string | null {
+  return text.match(/\/-\/merge_requests\/(\d+)/)?.[1] ?? text.match(/github\.com\/[^\s/]+\/[^\s/]+\/pull\/(\d+)/)?.[1] ?? null;
+}
+
+// Resolution sources for an omitted --mr, strongest first: an explicit
+// "MR: <id-or-url>" header line in the task spec, then any GitLab
+// merge-request / GitHub pull URL in the task text.
+function mrFromTask(taskText: string): string | null {
+  const header = taskText.match(/^\s*MR\s*:\s*(\S+)\s*$/im)?.[1];
+  if (header) return mrFromForgeUrl(header) ?? header;
+  return mrFromForgeUrl(taskText);
+}
+
+type MrSource = "flag" | "task" | "branch";
+
+async function resolveMr(args: ParsedArgs, taskText: string, worktree: string): Promise<{ mr: string; source: MrSource }> {
+  if (args.flags.has("mr")) return { mr: flagString(args, "mr"), source: "flag" };
+  const fromTask = mrFromTask(taskText);
+  if (fromTask) return { mr: fromTask, source: "task" };
+  const branch = await gitBranch(worktree);
+  if (branch) return { mr: branch, source: "branch" };
+  throw new CliError(
+    "--mr is required: no MR/PR reference found in the task text and the worktree is not on a branch (detached HEAD or not a git repo)",
+  );
+}
+
 function readTextFile(path: string): string | null {
   try {
     return readFileSync(path, "utf8");
@@ -288,6 +323,7 @@ function runListRows(runsRoot: string): RunListRow[] {
     .sort((a, b) => (a.started_at ?? "").localeCompare(b.started_at ?? "") || a.run_id.localeCompare(b.run_id))
     .map((status) => ({
       run_id: status.run_id,
+      mr: status.mr,
       role: status.role,
       agent: status.agent,
       tag: status.tag,
@@ -298,10 +334,22 @@ function runListRows(runsRoot: string): RunListRow[] {
     }));
 }
 
+// Directory names under mrs/ (already sanitized at write time); used by the
+// aggregate views when --mr is omitted.
+function mrIdsForRepo(repoKey: string): string[] {
+  const root = repoMrsRoot(repoKey);
+  if (!existsSync(root)) return [];
+  return readdirSync(root, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name)
+    .sort();
+}
+
 function formatTable(rows: RunListRow[]): string {
-  const headers = ["run_id", "role", "agent", "tag", "state", "started_at", "exit_code"];
+  const headers = ["run_id", "mr", "role", "agent", "tag", "state", "started_at", "exit_code"];
   const body = rows.map((row) => [
     row.run_id,
+    row.mr,
     row.role,
     row.agent,
     row.tag,
@@ -555,13 +603,13 @@ const RUN_CREATE_FLAGS = [
 
 async function createRun(args: ParsedArgs): Promise<number> {
   assertKnownFlags(args, "run create", RUN_CREATE_FLAGS);
-  const mr = flagString(args, "mr");
   const role = flagString(args, "role") as RunRole;
   const agent = flagString(args, "agent") as AgentName;
   const tag = flagString(args, "tag", role);
   const worktree = resolve(flagString(args, "worktree", process.cwd()));
   const taskPath = args.flags.has("task") ? resolve(flagString(args, "task")) : null;
   const taskText = taskPath ? readFileSync(taskPath, "utf8") : "";
+  const { mr, source: mrSource } = await resolveMr(args, taskText, worktree);
   // Reviewer runs finish in minutes in practice (52/67 recorded runs override
   // the old 4h default); keep the long default only for roles that build/test.
   const timeoutSec = Number(flagString(args, "timeout-sec", role === "reviewer" ? "3600" : "14400"));
@@ -612,6 +660,7 @@ async function createRun(args: ParsedArgs): Promise<number> {
     const payload = {
       dry_run: true,
       mr,
+      mr_source: mrSource,
       role,
       agent,
       model: effectiveSession.model,
@@ -666,6 +715,7 @@ async function createRun(args: ParsedArgs): Promise<number> {
       const lines = [
         `dry-run: orch run create ${payload.run_id_preview ?? payload.run_id}`,
         `repo: ${repo.repo_key}`,
+        `mr: ${mr} (${mrSource})`,
         `mr_dir: ${mrDir}`,
         `task_sha: ${taskSha}`,
         `idempotency_key: ${idempotencyKey}`,
@@ -687,8 +737,10 @@ async function createRun(args: ParsedArgs): Promise<number> {
     }
     return 0;
   }
-  printJson(
-    await startRun({
+  printJson({
+    mr,
+    mr_source: mrSource,
+    ...(await startRun({
       args,
       mr,
       role,
@@ -704,8 +756,8 @@ async function createRun(args: ParsedArgs): Promise<number> {
       mrDir,
       idempotencyKey,
       idempotencyPath,
-    }),
-  );
+    })),
+  });
   return 0;
 }
 
@@ -889,23 +941,37 @@ async function investigate(args: ParsedArgs): Promise<number> {
   });
 }
 
-async function status(args: ParsedArgs): Promise<number> {
-  const mr = flagString(args, "mr");
-  const worktree = resolve(flagString(args, "worktree", process.cwd()));
-  const repo = await getRepoIdentity(worktree);
-  const root = mrStateDir(repo.repo_key, mr);
+function mrStatusSection(repoKey: string, mr: string): { mr: string; state_dir: string; runs: Array<RunStatus & { stale: boolean }> } {
+  const root = mrStateDir(repoKey, mr);
   const runsRoot = `${root}/runs`;
   const runs = existsSync(runsRoot)
     ? readdirSync(runsRoot)
         .map((id) => readJsonFile<RunStatus | null>(`${runsRoot}/${id}/status.json`, null))
         .filter((item): item is RunStatus => item !== null)
+        .map((run) => ({ ...run, stale: looksStale(run) }))
     : [];
-  const annotated = runs.map((run) => ({ ...run, stale: looksStale(run) }));
-  const payload = { repo_key: repo.repo_key, mr, state_dir: root, runs: annotated };
-  if (flagBool(args, "json")) printJson(payload);
-  else {
-    process.stdout.write(`MR ${mr} (${repo.repo_key})\n`);
-    for (const run of annotated) {
+  return { mr, state_dir: root, runs };
+}
+
+async function status(args: ParsedArgs): Promise<number> {
+  const worktree = resolve(flagString(args, "worktree", process.cwd()));
+  const repo = await getRepoIdentity(worktree);
+  const explicitMr = args.flags.has("mr") ? flagString(args, "mr") : null;
+  const sections = (explicitMr ? [explicitMr] : mrIdsForRepo(repo.repo_key)).map((mr) => mrStatusSection(repo.repo_key, mr));
+
+  if (flagBool(args, "json")) {
+    if (explicitMr) {
+      const section = sections[0]!;
+      printJson({ repo_key: repo.repo_key, mr: section.mr, state_dir: section.state_dir, runs: section.runs });
+    } else {
+      printJson({ repo_key: repo.repo_key, mrs: sections });
+    }
+    return 0;
+  }
+  for (const section of sections) {
+    if (section.runs.length === 0 && !explicitMr) continue;
+    process.stdout.write(`MR ${section.mr} (${repo.repo_key})\n`);
+    for (const run of section.runs) {
       const state = run.stale ? `${run.state} (stale?)` : run.state;
       process.stdout.write(`${run.run_id}\t${state}\t${run.role}\t${run.agent}\t${run.updated_at}\n`);
     }
@@ -916,13 +982,14 @@ async function status(args: ParsedArgs): Promise<number> {
 // Persist the read-side stale verdict: non-terminal runs whose pid is dead (or
 // that never got a pid and stopped updating an hour ago) are moved to `stale`.
 async function runReap(args: ParsedArgs): Promise<number> {
-  const mr = flagString(args, "mr");
   const worktree = resolve(flagString(args, "worktree", process.cwd()));
   const repo = await getRepoIdentity(worktree);
-  const runsRoot = `${mrStateDir(repo.repo_key, mr)}/runs`;
-  const reaped: string[] = [];
-  const running: string[] = [];
-  if (existsSync(runsRoot)) {
+  const mrIds = args.flags.has("mr") ? [flagString(args, "mr")] : mrIdsForRepo(repo.repo_key);
+  const reaped: Array<{ mr: string; run_id: string }> = [];
+  const running: Array<{ mr: string; run_id: string }> = [];
+  for (const mr of mrIds) {
+    const runsRoot = `${mrStateDir(repo.repo_key, mr)}/runs`;
+    if (!existsSync(runsRoot)) continue;
     for (const id of readdirSync(runsRoot).sort()) {
       const statusPath = `${runsRoot}/${id}/status.json`;
       const status = readJsonFile<RunStatus | null>(statusPath, null);
@@ -930,25 +997,26 @@ async function runReap(args: ParsedArgs): Promise<number> {
       const ageMs = Date.now() - Date.parse(status.updated_at ?? "");
       const orphanedBeforeSpawn = status.pid === null && Number.isFinite(ageMs) && ageMs > 60 * 60 * 1000;
       if (!looksStale(status) && !orphanedBeforeSpawn) {
-        running.push(id);
+        running.push({ mr, run_id: id });
         continue;
       }
       writeJsonAtomic(statusPath, { ...status, state: "stale", updated_at: new Date().toISOString() });
       const eventsPath = `${runsRoot}/${id}/events.jsonl`;
       appendJsonLine(eventsPath, { type: "stale", seq: countLines(eventsPath), ts: new Date().toISOString() });
-      reaped.push(id);
+      reaped.push({ mr, run_id: id });
     }
   }
-  printJson({ mr, reaped, still_running: running });
+  printJson({ reaped, still_running: running });
   return 0;
 }
 
 async function runList(args: ParsedArgs): Promise<number> {
-  const mr = flagString(args, "mr");
   const worktree = resolve(flagString(args, "worktree", process.cwd()));
   const repo = await getRepoIdentity(worktree);
-  const root = mrStateDir(repo.repo_key, mr);
-  const rows = runListRows(`${root}/runs`);
+  const mrIds = args.flags.has("mr") ? [flagString(args, "mr")] : mrIdsForRepo(repo.repo_key);
+  const rows = mrIds
+    .flatMap((mr) => runListRows(`${mrStateDir(repo.repo_key, mr)}/runs`))
+    .sort((a, b) => (a.started_at ?? "").localeCompare(b.started_at ?? "") || a.run_id.localeCompare(b.run_id));
   if (flagBool(args, "json")) {
     printJson(rows);
   } else {
@@ -1056,13 +1124,14 @@ async function mirror(args: ParsedArgs): Promise<number> {
 async function decision(args: ParsedArgs): Promise<number> {
   const verdict = args.positionals[1];
   if (verdict !== "accept" && verdict !== "rework") {
-    throw new CliError("usage: orch decision accept|rework --mr <id> --run <run_id> [--reason <text>] [--worktree <path>]");
+    throw new CliError("usage: orch decision accept|rework --run <run_id> [--mr <id>] [--reason <text>] [--worktree <path>]");
   }
-  const mr = flagString(args, "mr");
   const runId = flagString(args, "run");
   const reason = args.flags.has("reason") ? flagString(args, "reason") : null;
   const worktree = resolve(flagString(args, "worktree", process.cwd()));
   const repo = await getRepoIdentity(worktree);
+  // --mr optional: the run id is unique enough to locate its MR by scanning.
+  const mr = locateRun(repo.repo_key, runId, args.flags.has("mr") ? flagString(args, "mr") : undefined).mr;
   const mrDir = mrStateDir(repo.repo_key, mr);
   ensureStateLayout(mrDir);
 

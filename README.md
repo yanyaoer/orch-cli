@@ -16,8 +16,8 @@ This repository is the v2 MVP described in [docs/orch-mvp-spec.md](docs/orch-mvp
 
 Shipped in `v0.0.3`:
 
-- `orch run create` starts one supervised headless worker run.
-- `orch run list`, `orch status`, `orch events tail`, and `orch result` read local run state.
+- `orch run create` starts one supervised headless worker run. `--mr` is optional: it resolves from an `MR: <id-or-url>` task header, a merge-request/pull URL in the task text, or the current branch name.
+- `orch run list`, `orch status`, `orch events tail`, and `orch result` read local run state; omitting `--mr` aggregates across all MRs in the repo.
 - `orch decision` records `accept` or `rework` locally and queues a mirror comment.
 - `orch mail` provides the local message bus: signed mail events, Maildir delivery, router dispatch, atomic task claim, and result-driven review/verify follow-ups.
 - `orch cross-review`, `orch fanout`, and `orch investigate` fan one task across several agents in a single command. They route through the mail layer, so a `--thread <id>` supplies the mr and workspace context (no `--mr` needed).

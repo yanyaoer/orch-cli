@@ -315,6 +315,7 @@ test("observability commands read local run state", async () => {
   expect(JSON.parse(list.stdout)).toEqual([
     {
       run_id: runId,
+      mr,
       role: "implementer",
       agent: "codex",
       tag: "impl-a",
@@ -514,6 +515,40 @@ test("run create dry-run passes explicit model to the pi provider plan", async (
     "--no-session",
   ]);
   expect(existsSync(stateHome)).toBe(false);
+});
+
+test("run create resolves an omitted --mr from the task text, then the branch", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orch-mr-resolve-test-"));
+  const stateHome = join(root, "state");
+  const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
+  await initGitWorktree(worktree);
+  const env = { XDG_STATE_HOME: stateHome };
+  const base = ["run", "create", "--role", "reviewer", "--agent", "codex", "--worktree", worktree, "--dry-run", "--json"];
+
+  // 1. A GitLab merge-request URL anywhere in the task text wins over the branch.
+  const urlTask = join(root, "url-task.md");
+  writeFileSync(urlTask, "Review https://git.example.com/group/repo/-/merge_requests/3358 for races.\n", "utf8");
+  const fromUrl = await runOrch([...base, "--task", urlTask], env);
+  expect(fromUrl).toMatchObject({ exitCode: 0, stderr: "" });
+  expect(JSON.parse(fromUrl.stdout)).toMatchObject({ mr: "3358", mr_source: "task" });
+
+  // 2. An explicit "MR:" header line wins, including URL values.
+  const headerTask = join(root, "header-task.md");
+  writeFileSync(headerTask, "MR: https://github.com/o/r/pull/77\nGoal: review\n", "utf8");
+  const fromHeader = await runOrch([...base, "--task", headerTask], env);
+  expect(JSON.parse(fromHeader.stdout)).toMatchObject({ mr: "77", mr_source: "task" });
+
+  // 3. No reference in the task → current branch name.
+  const branchProc = Bun.spawn(["git", "-C", worktree, "rev-parse", "--abbrev-ref", "HEAD"], { stdout: "pipe" });
+  const branch = (await new Response(branchProc.stdout).text()).trim();
+  const plainTask = join(root, "plain-task.md");
+  writeFileSync(plainTask, "Review the pending diff.\n", "utf8");
+  const fromBranch = await runOrch([...base, "--task", plainTask], env);
+  expect(JSON.parse(fromBranch.stdout)).toMatchObject({ mr: branch, mr_source: "branch" });
+
+  // 4. Explicit --mr still wins over everything.
+  const explicit = await runOrch([...base, "--task", urlTask, "--mr", "manual"], env);
+  expect(JSON.parse(explicit.stdout)).toMatchObject({ mr: "manual", mr_source: "flag" });
 });
 
 test("run create rejects agy outside the reviewer role with a clean error", async () => {
@@ -1328,7 +1363,7 @@ test("stale runs are flagged and reaped, result --wait returns, reviewer finding
 
   const reap = await runOrch(["run", "reap", "--mr", mr, "--worktree", worktree], env);
   expect(reap).toMatchObject({ exitCode: 0, stderr: "" });
-  expect(JSON.parse(reap.stdout)).toMatchObject({ mr, reaped: [staleId], still_running: [] });
+  expect(JSON.parse(reap.stdout)).toMatchObject({ reaped: [{ mr, run_id: staleId }], still_running: [] });
   const reapedStatus = JSON.parse(readFileSync(join(staleDir, "status.json"), "utf8")) as RunStatus;
   expect(reapedStatus.state).toBe("stale");
   expect(readFileSync(join(staleDir, "events.jsonl"), "utf8")).toContain('"type":"stale"');
