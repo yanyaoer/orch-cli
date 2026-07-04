@@ -182,10 +182,12 @@
 
     .n-box { fill: var(--panel); stroke: var(--line-strong); stroke-width: 1.25; }
     .n-box.hot { stroke: var(--accent); fill: color-mix(in srgb, var(--accent-dim) 60%, var(--panel)); }
+    .n-box.opt { fill: var(--panel-2); stroke: var(--accent); stroke-dasharray: 5 4; }
     .n-name { font: 600 15px var(--sans); fill: var(--text); }
     .n-sub { font: 500 11.5px var(--mono); fill: var(--faint); }
     .edge { stroke: var(--line-strong); stroke-width: 1.4; fill: none; }
     .edge.back { stroke: color-mix(in srgb, var(--amber) 44%, var(--line-strong)); }
+    .edge.opt { stroke: color-mix(in srgb, var(--accent) 55%, var(--line-strong)); stroke-dasharray: 5 4; }
     .e-label { font: 600 11px var(--mono); fill: var(--amber); }
     .e-label.t { fill: var(--accent); }
     .arrowhead { fill: var(--line-strong); }
@@ -372,7 +374,7 @@
       <figure class="flow-figure" aria-label="orch information flow">
         <svg viewBox="0 0 1020 330" role="img" aria-labelledby="flowTitle flowDesc" xmlns="http://www.w3.org/2000/svg">
           <title id="flowTitle">orch information flow</title>
-          <desc id="flowDesc">A controller publishes a signed task to the mail bus; the task is claimed atomically and executed by a driver; the run writes local state; the submitted result flows back through the bus as review and verify follow-up tasks.</desc>
+          <desc id="flowDesc">A controller publishes a signed task to the mail bus; the task is claimed atomically and executed by a driver; the run writes local state; the submitted result flows back through the bus as review and verify follow-up tasks. Optionally, an external mailbox such as Gmail feeds tasks in and receives replies through orch mailctl over IMAP and SMTP.</desc>
 
           <defs>
             <marker id="ah" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -436,6 +438,18 @@
             <text class="n-sub" x="18" y="48" data-lang="zh">结果驱动评审</text>
           </g>
 
+          <!-- optional external component: email (Gmail) via orch mailctl (IMAP in / SMTP out) -->
+          <path class="edge opt" d="M100 116 V200" marker-start="url(#ah)" marker-end="url(#ah)"/>
+          <text class="e-label t" x="112" y="150" data-lang="en">mailctl</text>
+          <text class="e-label t" x="112" y="150" data-lang="zh">mailctl</text>
+          <text class="n-sub" x="112" y="166">IMAP · SMTP</text>
+          <g transform="translate(28 204)">
+            <rect class="n-box opt" width="144" height="64" rx="10"/>
+            <text class="n-name" x="18" y="27">email</text>
+            <text class="n-sub" x="18" y="47" data-lang="en">Gmail · optional</text>
+            <text class="n-sub" x="18" y="47" data-lang="zh">Gmail · 可选</text>
+          </g>
+
           <!-- flowing particles (CSS offset-path; hidden without support / reduced motion) -->
           <circle class="particle p1" cx="172" cy="78"/>
           <circle class="particle p2" cx="436" cy="78"/>
@@ -448,10 +462,14 @@
       <figcaption class="flow-caption" data-lang="en">
         Review and verify tasks are routed from <span class="rs">result.submitted</span> —
         cross-review audits the implementer's actual output, never the original prompt.
+        The dashed <span class="rs">email · Gmail</span> box is optional: <code>orch mailctl</code>
+        drives orch from a real inbox over IMAP (in) / SMTP (reply out).
       </figcaption>
       <figcaption class="flow-caption" data-lang="zh">
         review / verify 任务由 <span class="rs">result.submitted</span> 驱动——
         交叉评审审的是 implementer 的真实产物，而不是原始 prompt。
+        虚线的 <span class="rs">email · Gmail</span> 框是可选的：<code>orch mailctl</code>
+        用真实邮箱经 IMAP（收）/ SMTP（回信）驱动 orch。
       </figcaption>
     </div>
 
@@ -591,12 +609,13 @@
           <p class="sec-lead" data-lang="en">
             Install with one curl line (release binary; upgrade later with <code>orch update</code>),
             register default mail agents once, then publish, claim, and run ride the local mail bus
-            in one shot. The manual submit / route / claim pipeline stays available for fine control.
+            in one shot. Or hand orch a real inbox with <code>orch mailctl</code>: an allowlisted,
+            authenticated sender emails a task and a claude controller drives it end to end.
           </p>
           <p class="sec-lead" data-lang="zh">
             一条 curl 命令安装 release binary（之后用 <code>orch update</code> 升级），注册一次默认
-            mail agents，之后发布、claim、运行一条命令走完本地 mail bus。手动 submit / route / claim
-            流水线仍然可用。
+            mail agents，之后发布、claim、运行一条命令走完本地 mail bus。或用 <code>orch mailctl</code>
+            把真实邮箱交给 orch：白名单内、已认证的发件人发一封任务邮件，一个 claude 主控就端到端把它跑完。
           </p>
         </div>
         <div class="code-block">
@@ -622,7 +641,14 @@
 
 <span class="cm"># record the verdict; mirror to PR/MR only with --execute</span>
 <span class="p">$</span> <span class="c">orch decision</span> accept <span class="f">--run</span> &lt;run_id&gt; <span class="f">--reason</span> "reviewed"
-<span class="p">$</span> <span class="c">orch mirror sync</span> <span class="f">--mr</span> 123 <span class="f">--execute</span></pre>
+<span class="p">$</span> <span class="c">orch mirror sync</span> <span class="f">--mr</span> 123 <span class="f">--execute</span>
+
+<span class="cm"># — or drive orch by email — an allowlisted sender mails a task; poll ingests it (IMAP)</span>
+<span class="cm">#   and auto-spawns a claude controller that fans work out and replies in-thread (SMTP)</span>
+<span class="p">$</span> <span class="c">orch mailctl init</span> <span class="f">--user</span> you@example.com <span class="f">--allow</span> boss@example.com <span class="f">--workspace</span> my-repo \
+      <span class="f">--imap-host</span> imap.gmail.com <span class="f">--smtp-host</span> smtp.gmail.com
+<span class="p">$</span> <span class="c">orch mailctl poll</span> <span class="f">--json</span>                      <span class="cm"># cron/launchd: one bounded ingest + reconcile cycle</span>
+<span class="p">$</span> <span class="c">orch mailctl status</span>                            <span class="cm"># cursor · threads · controller generations · outbound</span></pre>
         </div>
       </div>
     </section>
@@ -643,6 +669,7 @@
               <li><code>run create</code> · <code>run list</code> · <code>run reap</code> · <code>status</code></li>
               <li><code>cross-review</code> · <code>fanout</code> · <code>investigate</code></li>
               <li><code>mail submit</code> · <code>mail route</code> · <code>mail claim</code> · <code>mail reply result</code></li>
+              <li><code>mailctl init</code> · <code>poll</code> · <code>watch</code> · <code>status</code> · <code>reply</code> · <code>ack</code> · <code>guidance</code></li>
               <li><code>events tail [--native]</code> · <code>result --wait</code></li>
               <li><code>decision</code> · <code>mirror</code> · <code>mirror sync</code> · <code>workspace</code></li>
               <li><code>chatgpt-bridge</code> · <code>handoff-pro</code></li>
@@ -652,14 +679,16 @@
             <h3 data-lang="en">Boundaries</h3>
             <h3 data-lang="zh">边界</h3>
             <ul data-lang="en">
-              <li>No long-running daemon; stale runs are flagged on read and reaped explicitly.</li>
+              <li>No background daemon (no <code>orchd</code>); stale runs are flagged on read and reaped explicitly.</li>
+              <li><code>mailctl poll</code> keeps that contract (cron/launchd, one bounded cycle); <code>mailctl watch</code> is a foreground IMAP-IDLE loop you run yourself — a long-running process, not a background service.</li>
               <li>The shipped message bus is local Maildir state, not a multi-machine database.</li>
               <li>Mirroring is outbox-first: nothing touches the network without <code>--execute</code>.</li>
               <li>Provider sessions never auto-resume "latest"; exact resume needs an explicit session id.</li>
               <li><code>chatgpt-bridge</code> is a read-only Cloudflare Worker MCP bridge.</li>
             </ul>
             <ul data-lang="zh">
-              <li>没有常驻 daemon；僵尸 run 读取时标记 stale，需显式 reap。</li>
+              <li>没有后台 daemon（无 <code>orchd</code>）；僵尸 run 读取时标记 stale，需显式 reap。</li>
+              <li><code>mailctl poll</code> 守住这个契约（cron/launchd，一次有界周期）；<code>mailctl watch</code> 是你自己在前台跑的 IMAP-IDLE 循环——是常驻进程，但不是后台服务。</li>
               <li>当前消息总线是本地 Maildir 状态，不是多机数据库。</li>
               <li>PR/MR 镜像 outbox 先行：没有 <code>--execute</code> 不碰网络。</li>
               <li>provider 会话从不自动续"最近一次"；精确恢复必须显式给 session id。</li>

@@ -29,6 +29,7 @@ Shipped on `main` (v0.0.4, see [CHANGELOG.md](CHANGELOG.md)):
 - `orch decision` records `accept` or `rework` locally and queues a mirror comment.
 - `orch mail` provides the local message bus: signed mail events, Maildir delivery, router dispatch, atomic task claim, and result-driven review/verify follow-ups.
 - `orch cross-review`, `orch fanout`, and `orch investigate` fan one task across several agents in a single command. They route through the mail layer, so a `--thread <id>` supplies the mr and workspace context (no `--mr` needed).
+- `orch mailctl` drives orch by real email over IMAP/SMTP: an allowlisted, authenticated sender emails a task, `orch mailctl poll` ingests it, auto-spawns a claude **controller** run that decomposes/dispatches the work and replies progress in the same thread. Daemonless (`poll` is the cron/launchd contract; `watch` is a foreground IMAP-IDLE convenience), zero npm deps, any IMAP/SMTP provider (Gmail via app password). Inbound email is treated as an authentication boundary (allowlist + trusted-authserv-id Authentication-Results, fail-closed; text/plain-only task body). The controller result schema is `orch.result/controller/v1`.
 - `orch mirror` and `orch mirror sync` dry-run by default, then use `gh` or `glab` only with `--execute`.
 - Drivers exist for `codex`, `claude`, `pi`, and `omp`.
 - Permissions match the role: the read-only `reviewer` role launches each provider without write access (claude plan mode, codex `--sandbox read-only`, pi and omp read-only tools). `verifier` and write roles keep write-capable access.
@@ -36,7 +37,7 @@ Shipped on `main` (v0.0.4, see [CHANGELOG.md](CHANGELOG.md)):
 - `orch run create --model <ref>` records a provider model override in `spec.json` and passes it through to model-aware drivers such as pi, omp, codex, and claude.
 - `omp` (oh-my-pi) defaults to `google-antigravity/gemini-3.1-pro` and falls back to `zenmux/anthropic/claude-fable-5`, then `openai-codex/gpt-5.5` when the active model's quota/rate limit is exhausted; an explicit `--model <ref>` becomes the primary and the rest of the chain stays as fallbacks.
 - `orch chatgpt-bridge` deploys a Cloudflare Worker (no tunnel) and connects ChatGPT (Developer Mode, e.g. `gpt-5.5-pro`) to a read-only view of the worktree.
-- Role result schemas exist for `implementer`, `reviewer`, and `verifier`.
+- Role result schemas exist for `implementer`, `reviewer`, `verifier`, and `controller` (the `orch mailctl` mail controller; claude-only, orchestrate-not-edit).
 - Provider session/model controls are explicit: defaults avoid latest-session resume, exact resume requires `--session-mode resume_exact --session-id <id>`, `--model <ref>` selects a provider model when supported, and idempotency keys include session/model settings.
 
 Not shipped yet:
@@ -213,6 +214,37 @@ $ orch status --mr review-123                     # follow the runs (mr == threa
 - `--to-agent <mail-agent-id>` (repeatable) overrides the default roster; `--dry-run` prints the resolved agents without publishing; `--model <ref>` forwards a provider model override to every spawned run.
 - Re-running the same thread with the same task is idempotent: already-acked assignments are reused and not run again; nacked or expired assignments can be claimed without publishing duplicates.
 
+## Mail Controller (`orch mailctl`)
+
+`orch mailctl` drives orch by real email. An allowlisted, authenticated sender emails a task; `orch mailctl poll` ingests it over a zero-dependency IMAP client, publishes a router task, and — with no controller already running for the thread — auto-spawns a headless claude **controller** run. The controller decomposes the work, dispatches implementer/reviewer runs with `orch fanout`/`cross-review`, records `orch decision`s, and replies progress over SMTP in the same email thread. Works with any IMAP/SMTP provider (Gmail via an app password).
+
+```sh
+$ orch mailctl init --user you@example.com \
+    --imap-host imap.gmail.com --smtp-host smtp.gmail.com --smtp-mode implicit \
+    --allow boss@example.com --workspace my-repo \
+    --password-cmd '["security","find-generic-password","-w","-s","orch-mail"]' \
+    --trusted-authserv-id mx.google.com
+$ orch mailctl poll --json      # main contract: one bounded ingest + reconcile cycle (cron/launchd)
+$ orch mailctl watch            # foreground convenience: IMAP IDLE + periodic reconcile
+$ orch mailctl status           # cursor, active threads, controller generations, outbound queue
+$ orch mailctl reply   --thread em-<id> --report-key <k> --body "…"   # (used by the controller)
+$ orch mailctl ack     --thread em-<id> --attention <id>              # (used by the controller)
+$ orch mailctl guidance --thread em-<id>                             # unacked instructions for the controller
+```
+
+**Daemonless, precisely.** `poll` is the primary contract — a bounded one-shot ingest + reconcile you drive from `cron` or `launchd`, exactly the stateless-reconciler model, with no orch-owned background service. `watch` is a **foreground** convenience: it is honestly a long-running process (an IMAP-IDLE loop), but it is *not a daemon* — it never forks or detaches, owns no global scheduler, holds no persistent model session, and does one bounded reconcile per wake before returning to IDLE (`Ctrl-C` exits). So the "daemonless" claim means *no background service / no `orchd`*, not "no long-running process ever". **For unattended operation, drive `poll` from cron/launchd — do not keep `watch` alive under a restart supervisor.**
+
+State lives under `${XDG_STATE_HOME:-$HOME/.local/state}/orch/mail-control/` (a single `ingest.lock`, exactly-once `messages/<sha>` markers, per-thread mappings, outbound queue) plus per-thread controller runs under the usual run tree with mr `mailctl-em-<id>`.
+
+Inbound email is treated as an **authentication boundary**:
+
+- `From` must be on the `allowed_senders` allowlist (weak by itself), and must not be the account itself.
+- By default (`require_auth_results`) the message must carry an `Authentication-Results` header from the configured `trusted_authserv_id` with dkim/dmarc `pass` and domain alignment — evaluated on the single top-most trusted instance only, fail-closed. A forged lower A-R can't override it. An optional `subject_token` adds a second factor.
+- Task text comes only from a real `text/plain` part; **HTML-only mail is refused** (`rejected_html`) so HTML/CSS hidden text can never become task instructions. Quoted/forwarded tails and attachments are stripped.
+- Rejections leave a `rejected_*` marker (never silent); `messages/<sha>` markers make ingestion exactly-once across crashes.
+- The controller runs with `Bash(orch *)` + read-only tools (no Edit/Write): it **orchestrates, it does not edit code** — code changes are dispatched to write-role workers holding the worktree lock.
+- Outbound replies run a mail-specific leak scan (local paths / secret shapes / size cap) and `ORCH_MIRROR_ALLOW_PRIVATE` does not open the mail channel.
+
 ## How It Works
 
 `orch` is a stateless reconciler. Every command reads local state, performs one action, and exits.
@@ -290,6 +322,7 @@ Implemented schemas:
 - `orch.result/implementer/v1`: `verdict`, `summary`, `base_sha`, `head_sha`, `changed_files`, `tests`, `acceptance`, `risks`, `rollback`
 - `orch.result/reviewer/v1`: `verdict`, `reviews_run_id`, `blocking_findings`, `non_blocking_findings`, `suggested_tests`
 - `orch.result/verifier/v1`: `verdict`, `verifies_run_id`, `commands`, `acceptance`
+- `orch.result/controller/v1`: `verdict`, `summary`, `actions` (the `orch mailctl` controller; claude-only, not in `writeRoles`, launched with a `Bash(orch *)` + read-only allowed-tools whitelist)
 
 The driver prompt asks the provider to return exactly one JSON object. The driver then extracts that object (coercing benign schema deviations such as verdict synonyms and object-vs-string array items), writes `result.json`, and the supervisor validates it. When extraction fails, the worker's raw final message is preserved as `result.raw.md` in the run dir and excerpted in the fallback summary; a provider that exits 0 with no output at all fails the run.
 
@@ -310,6 +343,7 @@ orch result        Print a run's local result.json
 orch status        Read local run status for an MR
 orch decision      Record accept/rework and queue a PR/MR mirror comment
 orch mail          Local signed-mail bus: submit, route, claim, reply, import
+orch mailctl       Email-driven orchestration over IMAP/SMTP (init/poll/watch/status/reply/ack/guidance)
 orch workspace     Register local workspaces for mail routing
 orch mirror        Mirror one local run result summary to a PR/MR comment
 orch mirror sync   Send queued outbox comments to a PR/MR

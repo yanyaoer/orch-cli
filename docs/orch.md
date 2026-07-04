@@ -53,6 +53,12 @@ Install: `curl -fsSL https://raw.githubusercontent.com/yanyaoer/orch-cli/main/in
   publishes one task per agent then claims+runs it; re-running a thread skips
   acked tasks. Needs `orch mail agent defaults` once. `--dry-run` shows the
   resolved agents without publishing. Follow with `orch status` / `orch result`.
+- **Drive orch by email** → `orch mailctl` (init/poll/watch/status/reply/ack/guidance):
+  an allowlisted, authenticated sender emails a task; `poll` ingests it (IMAP) and
+  auto-spawns a claude **controller** run that fans work out and replies in-thread
+  (SMTP). The controller itself only has `Bash(orch *)` + read-only tools — it
+  orchestrates via the same orch commands, never edits code. Setup + auth/security
+  detail live in the README; run `orch mailctl --help`.
 - **Watch what a worker is doing** → `orch events tail --run <id> --native`:
   renders the provider-native stream (`native.jsonl`) as normalized progress
   events (`session` / `assistant` / `tool_use` / `tool_result` / `usage` /
