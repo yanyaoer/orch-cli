@@ -601,12 +601,20 @@ describe("buildControllerTask", () => {
       sentReportSummary: "none yet",
     });
 
+    expect(task.toLowerCase()).toContain("headless");
+    expect(task.toLowerCase()).toContain("non-interactive");
+    expect(task).toContain("Do NOT enter plan mode");
+    expect(task).toContain("Do NOT call ExitPlanMode");
+    expect(task).toContain("If a step would need a tool you do not have, SKIP it");
     expect(task).toContain("You have no Edit/Write; dispatch a worker to change code");
+    expect(task).toContain("Your only tools are Bash for `orch ...` commands plus read-only Read/Grep/Glob/LS");
     expect(task).toContain("orch fanout/cross-review --thread em-abc123 --task <file>");
     expect(task).toContain("orch decision accept|rework");
     expect(task).toContain("orch mailctl ack --thread em-abc123");
     expect(task).toContain("orch mailctl reply --report-key");
+    expect(task).toContain("summary field");
     expect(task).toContain("Please implement the parser");
+    expect(task).not.toContain("notes.md");
     expect(task).not.toContain("/Users/example/project");
     expect(task).not.toContain("ABCDEFGHIJKLMNOPQRST");
   });
@@ -794,6 +802,54 @@ describe("mailctlPoll stateful cycle", () => {
     const afterRetry = readJsonFile<any>(mailctlThreadStatePath(state.thread), null);
     expect(afterRetry.controller.generations).toHaveLength(2);
     expect(afterRetry.controller.generations[1].idempotency_key).toBe(`ctrl:${state.thread}:1`);
+  });
+
+  it("feeds second-generation controller tasks from the prior controller result summary", async () => {
+    const { root, cfg } = setupMailctl();
+    const baseOrch = writeFakeOrch(root);
+    const priorSummary = "handoff: ack attention before sending the final report";
+    const locatedRuns: string[] = [];
+    const readRuns: string[] = [];
+    const orch: MailCliContext = {
+      ...baseOrch,
+      locateRun: (repoKey, runId, mr) => {
+        locatedRuns.push(`${repoKey}:${runId}:${mr ?? ""}`);
+        return { mr: mr ?? "mailctl-unknown", run_id: runId, run_dir: join(process.env.FAKE_ORCH_STATE!, runId) };
+      },
+      readMirrorResult: (runsRoot, runId) => {
+        readRuns.push(`${runsRoot}:${runId}`);
+        return {
+          result: {
+            schema: "orch.result/controller/v1",
+            run_id: runId,
+            verdict: "completed",
+            summary: priorSummary,
+            actions: ["orch mailctl ack --thread em-x --attention msg"],
+          },
+          status: null,
+        };
+      },
+    };
+    const transport = new FakeTransport([message(1, "<controller-summary@example.com>")]);
+    const ctx = fakeContext({ cfg, transport, orch });
+
+    await mailctlPoll(ctx);
+    const state = firstThreadState();
+    const gen0 = state.controller.generations[0];
+    const status = readJsonFile<any>(gen0.status_path, null);
+    writeJsonAtomic(gen0.status_path, { ...status, state: "failed", exit_code: 1, updated_at: "2026-07-04T08:56:29.000Z" });
+
+    const retry = await mailctlReconcile(ctx);
+    expect(retry.spawned).toHaveLength(1);
+    const afterRetry = readJsonFile<any>(mailctlThreadStatePath(state.thread), null);
+    const gen1 = afterRetry.controller.generations[1];
+    const task = readFileSync(gen1.task_path, "utf8");
+
+    expect(task).toContain("## Previous Controller Summary");
+    expect(task).toContain(priorSummary);
+    expect(task).not.toContain("notes.md");
+    expect(locatedRuns).toEqual([`${state.repo_key}:${gen0.run_id}:mailctl-${state.thread}`]);
+    expect(readRuns).toHaveLength(1);
   });
 
   it("sleeps instead of tight-looping when watch.lock is held", async () => {

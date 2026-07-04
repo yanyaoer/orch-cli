@@ -453,6 +453,8 @@ test("buildProviderArgv picks claude model/effort by role", () => {
     "medium",
     "--allowedTools",
     CLAUDE_CONTROLLER_ALLOWED_TOOLS,
+    "--permission-mode",
+    "dontAsk",
   ]);
   expect(CLAUDE_CONTROLLER_ALLOWED_TOOLS).toContain("Bash(orch *)");
   expect(CLAUDE_CONTROLLER_ALLOWED_TOOLS).toContain("Read");

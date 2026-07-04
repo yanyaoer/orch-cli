@@ -29,7 +29,7 @@ import {
 } from "./mime.ts";
 import { ImapClient, filterNewUids, planUidScan } from "./imap.ts";
 import { isTerminal, looksStale, collectMrRuns } from "./overview.ts";
-import { getRepoIdentity, mailControlStateDir, statePathSegment } from "./paths.ts";
+import { getRepoIdentity, mailControlStateDir, mrStateDir, statePathSegment } from "./paths.ts";
 import { assertNoPrivateLeak } from "./leak.ts";
 import { buildReplyMessage, submitSmtpMessage } from "./smtp.ts";
 import type { RunStatus } from "./types.ts";
@@ -354,10 +354,6 @@ export function attentionDonePath(msgSha: string): string {
   return `${mailControlStateDir()}/controller/attention/done/${msgSha}.json`;
 }
 
-export function controllerNotesPath(thread: string): string {
-  return `${mailControlStateDir()}/controller/notes/${statePathSegment(thread, "thread")}.md`;
-}
-
 export function outboxEmailPendingDir(): string {
   return `${mailControlStateDir()}/outbox-email/pending`;
 }
@@ -566,6 +562,13 @@ export function buildControllerTask(input: BuildControllerTaskInput): string {
   return [
     "# Mail Controller Task",
     "",
+    "## Execution Mode",
+    "- You are running HEADLESS and NON-INTERACTIVE. No human will approve anything, and there is no plan-mode approval step.",
+    "- Do NOT enter plan mode. Do NOT write a plan and wait. Do NOT call ExitPlanMode.",
+    "- Execute your batch of `orch ...` commands directly and immediately, then output the orch.result/controller/v1 JSON.",
+    "- Your only tools are Bash for `orch ...` commands plus read-only Read/Grep/Glob/LS.",
+    "- You have no Edit/Write. If a step would need a tool you do not have, SKIP it; do not stall or ask.",
+    "",
     "## Context",
     `- Thread: ${thread}`,
     `- Workspace: ${input.workspace}`,
@@ -574,7 +577,7 @@ export function buildControllerTask(input: BuildControllerTaskInput): string {
     "## Unacked Mail",
     unackedMailText || "(empty)",
     "",
-    "## Controller Notes Tail",
+    "## Previous Controller Summary",
     notesTail,
     "",
     "## Sent Report Summary",
@@ -588,7 +591,7 @@ export function buildControllerTask(input: BuildControllerTaskInput): string {
     `- After consuming an instruction, acknowledge it with orch mailctl ack --thread ${thread} --attention <id>.`,
     "- Report only for milestones, blockers, and final results via orch mailctl reply --report-key <progress:<run_id>|settled:<gen>|reply:<msg_sha>>.",
     "- Each meaningful state change gets at most one report. Reply bodies must not contain local paths or secrets.",
-    "- Append any durable handoff notes to notes.md before exit.",
+    "- Put any durable cross-batch handoff notes into the summary field of your orch.result/controller/v1 output (you cannot write files).",
     "- Final output must be orch.result/controller/v1 JSON.",
     "",
   ].join("\n");
@@ -640,7 +643,6 @@ function ensureMailctlStateDirs(): void {
     `${mailControlStateDir()}/threads`,
     `${mailControlStateDir()}/tasks`,
     `${mailControlStateDir()}/controller/attention/done`,
-    `${mailControlStateDir()}/controller/notes`,
     outboxEmailPendingDir(),
     outboxEmailSentDir(),
     outboxEmailDroppedDir(),
@@ -1631,11 +1633,18 @@ function recentControllerGenerations(state: MailctlThreadState, nowMs: number): 
   return state.controller.generations.filter((gen) => Date.parse(gen.spawned_at) >= cutoff).length;
 }
 
-function notesTail(thread: string): string {
-  const path = controllerNotesPath(thread);
-  if (!existsSync(path)) return "";
-  const text = readFileSync(path, "utf8");
-  return text.slice(-4000);
+function previousControllerSummary(ctx: MailctlContext, state: MailctlThreadState): string {
+  const previous = state.controller.generations.at(-1);
+  if (!previous) return "(none)";
+  try {
+    const mr = `mailctl-${state.thread}`;
+    const located = ctx.orch.locateRun(state.repo_key, previous.run_id, mr);
+    const { result } = ctx.orch.readMirrorResult(`${mrStateDir(state.repo_key, located.mr)}/runs`, located.run_id);
+    const summary = result.schema === "orch.result/controller/v1" ? result.summary.trim() : "";
+    return summary ? summary.slice(-4000) : "(none)";
+  } catch {
+    return "(none)";
+  }
 }
 
 function sentReportSummary(thread: string): string {
@@ -1667,7 +1676,7 @@ async function spawnController(
       workspace: state.workspace_id,
       triggerReason: trigger.summary,
       unackedMailText: trigger.unackedText || trigger.summary,
-      notesTail: notesTail(state.thread),
+      notesTail: previousControllerSummary(ctx, state),
       sentReportSummary: sentReportSummary(state.thread),
     }),
   );
