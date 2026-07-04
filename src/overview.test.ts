@@ -73,6 +73,18 @@ function writeRun(stateHome: string, repoKey: string, mr: string, runStatus: Run
 
 const REPO = "local/demo-abcd1234";
 
+function writeMailctlCursor(stateHome: string, value: unknown): void {
+  const dir = join(stateHome, "orch", "mail-control");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "cursor.json"), typeof value === "string" ? value : JSON.stringify(value), "utf8");
+}
+
+function writeDroppedMailctlReply(stateHome: string, name = "reply-1.json"): void {
+  const dir = join(stateHome, "orch", "mail-control", "outbox-email", "dropped");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, name), JSON.stringify({ schema: "orch.mailctl/outbox-email/v1" }), "utf8");
+}
+
 function seedMixedMr(stateHome: string): void {
   // done+approve, no decision -> decision accept action
   writeRun(stateHome, REPO, "42", status({ run_id: "r-approve", mr: "42", state: "done", exit_code: 0 }), { verdict: "approve" });
@@ -134,6 +146,63 @@ test("renderArgv quotes only what the shell needs", () => {
     "orch decision accept --reason 'reviewer approve'",
   );
   expect(renderArgv(["orch", "status", "--mr", "42"])).toBe("orch status --mr 42");
+});
+
+test("healthy mailctl state emits no overview action", () => {
+  const stateHome = makeStateHome();
+
+  expect(buildOverview([REPO], false).actions.filter((action) => action.kind === "mailctl")).toEqual([]);
+
+  writeMailctlCursor(stateHome, { consecutive_failures: 2 });
+  expect(buildOverview([REPO], false).actions.filter((action) => action.kind === "mailctl")).toEqual([]);
+});
+
+test("mailctl poll failures emit one safe runnable status action", () => {
+  const stateHome = makeStateHome();
+  writeMailctlCursor(stateHome, { consecutive_failures: 3, last_error: `/token/${stateHome}` });
+
+  const overview = buildOverview([REPO], false);
+  expect(overview.actions).toHaveLength(1);
+  expect(overview.actions[0]).toMatchObject({
+    kind: "mailctl",
+    reason: "mailctl: 3 poll failures",
+    argv: ["orch", "mailctl", "status"],
+  });
+  expect(overview.actions[0]!.reason).not.toContain(stateHome);
+  expect(renderOverview(overview)).toContain("orch mailctl status");
+});
+
+test("dropped mailctl reply emits one status action", () => {
+  const stateHome = makeStateHome();
+  writeDroppedMailctlReply(stateHome);
+
+  const overview = buildOverview([REPO], false);
+  expect(overview.actions).toHaveLength(1);
+  expect(overview.actions[0]).toMatchObject({
+    kind: "mailctl",
+    reason: "mailctl: 1 dropped reply",
+    argv: ["orch", "mailctl", "status"],
+  });
+});
+
+test("mailctl overview action is emitted once when failures and dropped replies both exist", () => {
+  const stateHome = makeStateHome();
+  writeMailctlCursor(stateHome, { consecutive_failures: 4 });
+  writeDroppedMailctlReply(stateHome);
+
+  const overview = buildOverview([REPO], false);
+  expect(overview.actions).toHaveLength(1);
+  expect(overview.actions.filter((action) => action.kind === "mailctl")).toHaveLength(1);
+  expect(overview.actions[0]!.argv).toEqual(["orch", "mailctl", "status"]);
+});
+
+test("missing or corrupt mailctl cursor is ignored without throwing", () => {
+  const stateHome = makeStateHome();
+  expect(buildOverview([REPO], false).actions).toEqual([]);
+
+  writeMailctlCursor(stateHome, "{not json");
+  const overview = buildOverview([REPO], false);
+  expect(overview.actions).toEqual([]);
 });
 
 async function runOrch(args: string[], env: Record<string, string>): Promise<{ stdout: string; stderr: string; exitCode: number }> {

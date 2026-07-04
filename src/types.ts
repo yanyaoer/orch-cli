@@ -2,11 +2,12 @@ export type RunRole =
   | "implementer"
   | "reviewer"
   | "verifier"
+  | "controller"
   | "challenger"
   | "rework"
   | "debugger";
 
-export type ResultRole = "implementer" | "reviewer" | "verifier";
+export type ResultRole = "implementer" | "reviewer" | "verifier" | "controller";
 
 export type AgentName = "codex" | "claude" | "pi" | "omp";
 
@@ -128,7 +129,15 @@ export interface VerifierResult {
   acceptance: Array<{ id: string; status: string }>;
 }
 
-export type RoleResult = ImplementerResult | ReviewerResult | VerifierResult;
+export interface ControllerResult {
+  schema: "orch.result/controller/v1";
+  run_id: string;
+  verdict: "completed" | "failed";
+  summary: string;
+  actions: string[];
+}
+
+export type RoleResult = ImplementerResult | ReviewerResult | VerifierResult | ControllerResult;
 
 export const writeRoles = new Set<RunRole>([
   "implementer",
@@ -138,5 +147,5 @@ export const writeRoles = new Set<RunRole>([
 ]);
 
 export function isResultRole(role: RunRole): role is ResultRole {
-  return role === "implementer" || role === "reviewer" || role === "verifier";
+  return role === "implementer" || role === "reviewer" || role === "verifier" || role === "controller";
 }

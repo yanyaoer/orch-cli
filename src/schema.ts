@@ -1,4 +1,5 @@
 import type {
+  ControllerResult,
   ImplementerResult,
   ResultRole,
   RoleResult,
@@ -105,6 +106,7 @@ function validateFindings(obj: Record<string, unknown>, field: string, errors: s
 export function resultSchemaName(role: ResultRole): RoleResult["schema"] {
   if (role === "implementer") return "orch.result/implementer/v1";
   if (role === "reviewer") return "orch.result/reviewer/v1";
+  if (role === "controller") return "orch.result/controller/v1";
   return "orch.result/verifier/v1";
 }
 
@@ -138,6 +140,11 @@ export function validateRoleResult(role: RunRole, value: unknown): ValidationRes
     validateFindings(obj, "blocking_findings", errors, true);
     validateFindings(obj, "non_blocking_findings", errors, false);
     validateStringArray(obj, "suggested_tests", errors);
+  } else if (role === "controller") {
+    const missing = requireFields(obj, ["verdict", "summary"]);
+    errors.push(...missing.map((field) => `${field} is required`));
+    if (obj.verdict !== "completed" && obj.verdict !== "failed") errors.push("verdict must be completed|failed");
+    validateStringArray(obj, "actions", errors);
   } else {
     const missing = requireFields(obj, ["verdict"]);
     errors.push(...missing.map((field) => `${field} is required`));
@@ -179,6 +186,15 @@ export function fallbackResult(args: {
       commands: [],
       acceptance: [],
     } satisfies VerifierResult;
+  }
+  if (args.role === "controller") {
+    return {
+      schema: "orch.result/controller/v1",
+      run_id: args.run_id,
+      verdict: "failed",
+      summary: args.summary,
+      actions: [],
+    } satisfies ControllerResult;
   }
   return {
     schema: "orch.result/implementer/v1",

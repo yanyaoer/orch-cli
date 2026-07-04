@@ -5,6 +5,7 @@ import {
   fanoutHelp,
   mirrorHelp,
   mirrorSyncHelp,
+  mailctlHelp,
   resultCommandHelp,
   runCreateHelp,
   runHelp,
@@ -30,6 +31,7 @@ test("top-level help exposes positioning, commands, quickstart, and topics", () 
   expect(text).toContain("orch decision");
   expect(text).toContain("orch mirror");
   expect(text).toContain("orch mirror sync");
+  expect(text).toContain("orch mailctl");
   expect(text).toContain("Quickstart:");
   expect(text).toContain("orch <command> --help");
   expect(text).toContain("task-spec | result | events | concepts | forge");
@@ -72,6 +74,9 @@ test("command help exposes flags and runnable examples", () => {
     expect(runCreate).toContain(flag);
   }
   expect(runCreate).toContain("Example:");
+  expect(runCreate).toContain("controller");
+  expect(runCreate).toContain("Claude-only");
+  expect(runCreate).toContain("allowed-tool whitelist");
   expect(runCreate).toContain("orch run create --mr 123");
 
   const runList = runListHelp();
@@ -123,6 +128,17 @@ test("command help exposes flags and runnable examples", () => {
   }
   expect(mirrorSync).toContain("outbox/pending");
   expect(mirrorSync).toContain("outbox/sent");
+
+  const mailctl = mailctlHelp();
+  for (const command of ["init", "poll", "watch", "status", "reply", "ack", "guidance"]) {
+    expect(mailctl).toContain(`mailctl ${command}`);
+  }
+  expect(mailctl).toContain("Authentication-Results");
+  expect(mailctl).toContain("trusted authserv-id");
+  expect(mailctl).toContain("DKIM and DMARC pass");
+  expect(mailctl).toContain("rejected_* marker");
+  expect(mailctl).toContain("--subject-token");
+  expect(mailctl).toContain("selects INBOX only");
 });
 
 test("topic help covers task specs, results, events, and concepts", () => {

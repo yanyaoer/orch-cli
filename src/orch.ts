@@ -5,6 +5,7 @@ import { basename, dirname, resolve } from "node:path";
 import { $ } from "bun";
 import type {
   AgentName,
+  ControllerResult,
   ImplementerResult,
   ProviderSessionMode,
   ReviewerResult,
@@ -50,6 +51,7 @@ import {
   mirrorHelp,
   mirrorSyncHelp,
   mailHelp,
+  mailctlHelp,
   workspaceHelp,
   resultCommandHelp,
   runCreateHelp,
@@ -66,9 +68,25 @@ import { runClaudeDriver } from "../drivers/claude-headless.ts";
 import { deployWorker, locateBridgeDir, runChatgptBridge } from "../drivers/chatgpt-bridge.ts";
 import { runPiDriver } from "../drivers/pi-headless.ts";
 import { runOmpDriver } from "../drivers/omp-headless.ts";
-import { addWorkspace, chatgptBridgeConfigPath, readBridgeConfig, writeBridgeConfig } from "./config.ts";
+import { addWorkspace, chatgptBridgeConfigPath, readBridgeConfig, readMailControlConfig, validateMailControlConfig, writeBridgeConfig } from "./config.ts";
 import { buildBundle, type BundleOptions } from "./handoff-pro.ts";
 import { mail, mailFanout, type MailCliContext } from "./mail-cli.ts";
+import {
+  createMailTransport,
+  mailctlAck,
+  mailctlGuidance,
+  mailctlInit,
+  mailctlPoll,
+  mailctlReply,
+  mailctlStatus,
+  mailctlWatch,
+  renderMailctlGuidance,
+  renderMailctlStatus,
+  type MailCursor,
+  type MailMessageRef,
+  type MailTransport,
+  type MailctlContext,
+} from "./mailctl.ts";
 import { workspace } from "./workspace-cli.ts";
 import { assertKnownFlags, CliError, collectFlags, flagBool, flagNumber, flagString, hasHelp, parseArgs, printJson, type ParsedArgs } from "./cli.ts";
 import { buildPrompt, buildProviderArgv } from "../drivers/driver-common.ts";
@@ -494,6 +512,17 @@ function printResultSummary(result: RoleResult): void {
     return;
   }
 
+  if (result.schema === "orch.result/controller/v1") {
+    const controller = result as ControllerResult;
+    process.stdout.write("\nactions:\n");
+    if (controller.actions.length === 0) {
+      process.stdout.write("  - none\n");
+    } else {
+      for (const action of controller.actions) process.stdout.write(`  - ${action}\n`);
+    }
+    return;
+  }
+
   const implementer = result as ImplementerResult;
   process.stdout.write("\nchanged_files:\n");
   if (implementer.changed_files.length === 0) {
@@ -607,6 +636,9 @@ const VALID_AGENTS: readonly AgentName[] = ["codex", "claude", "pi", "omp"];
 
 function validateRunAgent(agent: AgentName, _role: RunRole): void {
   if (!VALID_AGENTS.includes(agent)) throw new CliError(`unsupported agent: ${agent}`);
+  if (_role === "controller" && agent !== "claude") {
+    throw new CliError("controller role only supports the claude agent");
+  }
 }
 
 const RUN_CREATE_FLAGS = [
@@ -642,7 +674,7 @@ async function createRun(args: ParsedArgs): Promise<number> {
   const timeoutSec = Number(flagString(args, "timeout-sec", role === "reviewer" ? "3600" : "14400"));
 
   if (!isResultRole(role)) {
-    throw new CliError(`P1 only supports result-schema roles: implementer, reviewer, verifier (got ${role})`);
+    throw new CliError(`P1 only supports result-schema roles: implementer, reviewer, verifier, controller (got ${role})`);
   }
   validateRunAgent(agent, role);
   if (!Number.isFinite(timeoutSec) || timeoutSec <= 0) throw new CliError("--timeout-sec must be positive");
@@ -943,6 +975,140 @@ async function startRun(input: StartRunInput): Promise<Record<string, unknown>> 
 // delegates to mailFanout (publish one task per agent → claim+run).
 function mailFanoutContext(): MailCliContext {
   return { orchCommand, locateRun, readMirrorResult };
+}
+
+function dryRunMailTransport(): MailTransport {
+  return {
+    async listNew(_sinceDays: number, _cursor: MailCursor | null): Promise<MailMessageRef[]> {
+      return [];
+    },
+    async fetchRaw(ref: MailMessageRef): Promise<string> {
+      throw new Error(`dry-run transport cannot fetch UID ${ref.uid}`);
+    },
+    async markProcessed(_ref: MailMessageRef): Promise<void> {},
+    async sendReply(_rfc822: string): Promise<void> {},
+    async idleOnce(_timeoutMs: number, _cursor: MailCursor | null): Promise<void> {},
+  };
+}
+
+function mailctlContext(context: MailCliContext, transport?: MailTransport): MailctlContext {
+  const config = readMailControlConfig();
+  try {
+    validateMailControlConfig(config);
+  } catch (error) {
+    throw new CliError(error instanceof Error ? error.message : String(error));
+  }
+  return {
+    config,
+    transport: transport ?? createMailTransport(config),
+    now: () => Date.now(),
+    orch: context,
+  };
+}
+
+function mailctlBody(args: ParsedArgs): string {
+  const hasBody = args.flags.has("body");
+  const hasBodyFile = args.flags.has("body-file");
+  if (hasBody === hasBodyFile) throw new CliError("mailctl reply requires exactly one of --body or --body-file");
+  return hasBody ? flagString(args, "body") : readFileSync(resolve(flagString(args, "body-file")), "utf8");
+}
+
+function pollSummary(result: Awaited<ReturnType<typeof mailctlPoll>>, dryRun: boolean): string {
+  const reconcile = result.reconciled
+    ? ` reconciled_spawned=${result.reconciled.spawned.length} reconciled_live=${result.reconciled.live.length} retried_reports=${result.reconciled.retried_reports}`
+    : "";
+  return `mailctl poll${dryRun ? " dry-run" : ""}: listed=${result.listed} fetched=${result.fetched} accepted=${result.accepted} rejected=${result.rejected} duplicate=${result.duplicate} errors=${result.errors} skipped=${result.skipped}${reconcile}\n`;
+}
+
+export async function mailctl(args: ParsedArgs, context: MailCliContext): Promise<number> {
+  const mode = args.positionals[1];
+  try {
+    if (mode === "init") {
+      const result = mailctlInit(args);
+      if (flagBool(args, "json")) printJson({ mailctl: "init", ...result });
+      else {
+        process.stdout.write(`${result.config_path}\n`);
+        process.stdout.write(`trusted_authserv_id=${result.trusted_authserv_id} (confirm with your mail provider)\n`);
+      }
+      return 0;
+    }
+
+    if (mode === "poll") {
+      assertKnownFlags(args, "mailctl poll", ["json", "dry-run"]);
+      const dryRun = flagBool(args, "dry-run");
+      const ctx = mailctlContext(context, dryRun ? dryRunMailTransport() : undefined);
+      const result = await mailctlPoll(ctx, { reconcile: !dryRun });
+      if (flagBool(args, "json")) printJson(result);
+      else process.stdout.write(pollSummary(result, dryRun));
+      return 0;
+    }
+
+    if (mode === "watch") {
+      assertKnownFlags(args, "mailctl watch", ["iterations", "json"]);
+      const iterations = flagNumber(args, "iterations");
+      if (iterations !== undefined && (!Number.isInteger(iterations) || iterations < 0)) {
+        throw new CliError("--iterations must be a non-negative integer");
+      }
+      const result = await mailctlWatch(mailctlContext(context), { iterations });
+      if (flagBool(args, "json")) printJson({ mailctl: "watch", ...result });
+      else process.stdout.write(`mailctl watch: iterations=${result.iterations} stopped=${result.stopped}\n`);
+      return 0;
+    }
+
+    if (mode === "status") {
+      assertKnownFlags(args, "mailctl status", ["json"]);
+      const result = mailctlStatus(mailctlContext(context), { json: flagBool(args, "json") });
+      if (flagBool(args, "json")) printJson(result);
+      else process.stdout.write(renderMailctlStatus(result));
+      return 0;
+    }
+
+    if (mode === "reply") {
+      assertKnownFlags(args, "mailctl reply", ["thread", "report-key", "body", "body-file", "dry-run"]);
+      const dryRun = flagBool(args, "dry-run");
+      const result = await mailctlReply(mailctlContext(context), {
+        thread: flagString(args, "thread"),
+        reportKey: flagString(args, "report-key"),
+        body: mailctlBody(args),
+        dryRun,
+      });
+      if (dryRun) {
+        process.stdout.write(result.rawMessage ?? "");
+        return 0;
+      }
+      printJson({
+        mailctl: "reply",
+        duplicate: result.duplicate,
+        sent: result.sent,
+        pending: result.pending,
+        message_id: result.messageId ?? null,
+        next_attempt_at: result.nextAttemptAt ?? null,
+      });
+      return 0;
+    }
+
+    if (mode === "ack") {
+      assertKnownFlags(args, "mailctl ack", ["thread", "attention", "json"]);
+      const result = mailctlAck(mailctlContext(context), { thread: flagString(args, "thread"), attention: flagString(args, "attention") });
+      if (flagBool(args, "json")) printJson({ mailctl: "ack", ...result });
+      else process.stdout.write(`mailctl ack: thread=${result.thread} attention=${result.attention} done=${result.done} acknowledged=${result.acknowledged}\n`);
+      return 0;
+    }
+
+    if (mode === "guidance") {
+      assertKnownFlags(args, "mailctl guidance", ["thread", "json"]);
+      const result = mailctlGuidance(mailctlContext(context), { thread: flagString(args, "thread"), json: flagBool(args, "json") });
+      if (flagBool(args, "json")) printJson(result);
+      else process.stdout.write(renderMailctlGuidance(result));
+      return 0;
+    }
+  } catch (error) {
+    if (error instanceof CliError) throw error;
+    throw new CliError(error instanceof Error ? error.message : String(error));
+  }
+
+  process.stderr.write("usage: orch mailctl init|poll|watch|status|reply|ack|guidance [flags]\n");
+  return 2;
 }
 
 // cross-review: one diff reviewed in parallel by distinct model families.
@@ -1806,6 +1972,10 @@ async function main(): Promise<number> {
       process.stdout.write(mailHelp());
       return 0;
     }
+    if (first === "mailctl") {
+      process.stdout.write(mailctlHelp());
+      return 0;
+    }
     if (first === "workspace") {
       process.stdout.write(workspaceHelp());
       return 0;
@@ -1865,6 +2035,7 @@ async function main(): Promise<number> {
   if (first === "decision") return decision(args);
   if (first === "mirror") return mirror(args);
   if (first === "mail") return mail(args, { orchCommand, locateRun, readMirrorResult });
+  if (first === "mailctl") return mailctl(args, { orchCommand, locateRun, readMirrorResult });
   if (first === "workspace") return workspace(args);
   if (first === "chatgpt-bridge") return chatgptBridge(args);
   if (first === "handoff-pro") return handoffPro(args);
