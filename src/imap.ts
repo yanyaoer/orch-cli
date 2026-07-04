@@ -216,7 +216,19 @@ export class ImapClient {
   constructor(private readonly connection: ImapConnection) {}
 
   static async connect(options: ImapConnectOptions, connector: ImapConnector = createBunImapConnection): Promise<ImapClient> {
-    return new ImapClient(await connector(options));
+    const client = new ImapClient(await connector(options));
+    await client.readGreeting();
+    return client;
+  }
+
+  // The server sends a mandatory untagged greeting ("* OK" / "* PREAUTH") the
+  // moment the connection is ready. Consume it here, before any command, so it
+  // never interleaves with a command's tagged-response loop. A "* BYE"/"* NO"/
+  // "* BAD" greeting means the server refused the connection.
+  private async readGreeting(): Promise<void> {
+    const greeting = await readImapResponse(this.connection);
+    if (greeting.kind === "tagged") throw new Error(`IMAP unexpected tagged greeting: ${greeting.text}`);
+    if (/^\*\s+(BYE|NO|BAD)\b/i.test(greeting.text)) throw new Error(`IMAP server refused connection: ${greeting.text}`);
   }
 
   private nextTag(): string {
@@ -296,6 +308,8 @@ class BunImapConnection implements ImapConnection {
   private buffer = "";
   private waiters: Array<() => void> = [];
   private error: Error | null = null;
+  private opened = false;
+  private openWaiters: Array<() => void> = [];
 
   static async connect(options: ImapConnectOptions): Promise<BunImapConnection> {
     const connection = new BunImapConnection();
@@ -305,11 +319,19 @@ class BunImapConnection implements ImapConnection {
       tls: options.tls === false ? false : { serverName: options.host },
       socket: connection.socketHandler(),
     });
+    // Wait for the socket (and TLS handshake) to be open before the caller writes
+    // the first command or reads the greeting — writing before `open` can be
+    // dropped, which strands the login and Gmail eventually closes the socket.
+    await connection.waitUntilOpen();
     return connection;
   }
 
   private socketHandler(): Bun.SocketHandler<undefined> {
     return {
+      open: () => {
+        this.opened = true;
+        this.flushOpen();
+      },
       data: (_socket, data) => {
         this.buffer += Buffer.from(data).toString("latin1");
         this.wake();
@@ -317,12 +339,26 @@ class BunImapConnection implements ImapConnection {
       close: (_socket, error) => {
         this.error = error ?? new Error("IMAP socket closed");
         this.wake();
+        this.flushOpen();
       },
       error: (_socket, error) => {
         this.error = error;
         this.wake();
+        this.flushOpen();
       },
     };
+  }
+
+  private async waitUntilOpen(): Promise<void> {
+    if (!this.opened && !this.error) {
+      await new Promise<void>((resolve) => this.openWaiters.push(resolve));
+    }
+    if (this.error) throw this.error;
+  }
+
+  private flushOpen(): void {
+    const waiters = this.openWaiters.splice(0);
+    for (const waiter of waiters) waiter();
   }
 
   async readLine(): Promise<string> {
@@ -352,7 +388,9 @@ class BunImapConnection implements ImapConnection {
 
   write(data: string): void {
     if (!this.socket) throw new Error("IMAP socket is not connected");
-    this.socket.write(data);
+    // `data` is a latin1 (1 char == 1 byte) string; write the exact octets so a
+    // non-ASCII byte is not silently re-encoded as UTF-8.
+    this.socket.write(Buffer.from(data, "latin1"));
   }
 
   close(): void {

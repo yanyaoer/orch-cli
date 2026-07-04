@@ -167,4 +167,22 @@ describe("ImapClient", () => {
       "A0007 LOGOUT\r\n",
     ]);
   });
+
+  it("consumes the untagged server greeting on connect before the first command", async () => {
+    const connection = new FakeImapConnection(
+      ["* OK Gimap ready for requests", "A0001 OK logged in", ""].join("\r\n"),
+    );
+    const client = await ImapClient.connect({ host: "imap.example.com", port: 993 }, async () => connection);
+    await client.login("user@example.com", "pw");
+    // The greeting was read by connect(), so LOGIN is the very first client write
+    // and its tagged response is read directly (not offset by the greeting).
+    expect(connection.writes).toEqual(["A0001 LOGIN \"user@example.com\" \"pw\"\r\n"]);
+  });
+
+  it("rejects a * BYE greeting on connect", async () => {
+    const connection = new FakeImapConnection("* BYE server unavailable\r\n");
+    await expect(
+      ImapClient.connect({ host: "imap.example.com", port: 993 }, async () => connection),
+    ).rejects.toThrow(/refused/i);
+  });
 });
