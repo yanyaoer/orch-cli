@@ -1,23 +1,39 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { MailControlConfig } from "./config.ts";
+import { writeOrchConfig, type MailControlConfig } from "./config.ts";
+import { readJsonFile, writeJsonAtomic } from "./json.ts";
+import { acquirePidfileLock } from "./locks.ts";
+import { mailEventsPath } from "./mail.ts";
 import {
   auditPath,
   buildControllerTask,
   cursorPath,
   evaluateGate,
   ingestLockPath,
+  mailctlPoll,
+  mailctlReconcile,
+  mailctlReply,
+  mailctlThreadStatePath,
+  mailctlWatch,
   mergeThread,
   messageMarkerPath,
   normalizeMessageId,
+  outboxEmailPendingDir,
+  outboxEmailSentDir,
   resolveWorkspace,
   sha12,
   taskFilePath,
   threadMapPath,
   watchLockPath,
+  type MailCursor,
+  type MailMessageRef,
+  type MailTransport,
+  type MailctlContext,
+  type PollFault,
 } from "./mailctl.ts";
+import type { MailCliContext } from "./mail-cli.ts";
 
 type ConfigOverrides = Partial<MailControlConfig> & {
   account?: Partial<MailControlConfig["account"]>;
@@ -28,10 +44,25 @@ type ConfigOverrides = Partial<MailControlConfig> & {
 };
 
 const previousStateHome = process.env.XDG_STATE_HOME;
+const previousConfigHome = process.env.XDG_CONFIG_HOME;
+const previousMirrorAllow = process.env.ORCH_MIRROR_ALLOW_PRIVATE;
+const previousFakeResult = process.env.ORCH_DRIVER_FAKE_RESULT;
+const previousFakeOrchState = process.env.FAKE_ORCH_STATE;
+const previousFakeOrchStatus = process.env.FAKE_ORCH_STATUS;
 
 afterEach(() => {
   if (previousStateHome === undefined) delete process.env.XDG_STATE_HOME;
   else process.env.XDG_STATE_HOME = previousStateHome;
+  if (previousConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
+  else process.env.XDG_CONFIG_HOME = previousConfigHome;
+  if (previousMirrorAllow === undefined) delete process.env.ORCH_MIRROR_ALLOW_PRIVATE;
+  else process.env.ORCH_MIRROR_ALLOW_PRIVATE = previousMirrorAllow;
+  if (previousFakeResult === undefined) delete process.env.ORCH_DRIVER_FAKE_RESULT;
+  else process.env.ORCH_DRIVER_FAKE_RESULT = previousFakeResult;
+  if (previousFakeOrchState === undefined) delete process.env.FAKE_ORCH_STATE;
+  else process.env.FAKE_ORCH_STATE = previousFakeOrchState;
+  if (previousFakeOrchStatus === undefined) delete process.env.FAKE_ORCH_STATUS;
+  else process.env.FAKE_ORCH_STATUS = previousFakeOrchStatus;
 });
 
 function config(overrides: ConfigOverrides = {}): MailControlConfig {
@@ -80,6 +111,214 @@ function textMail(options: {
     `Content-Type: ${options.contentType ?? "text/plain; charset=utf-8"}`,
   ];
   return [...headers, "", options.body ?? "Do the work"].join("\r\n");
+}
+
+class FakeTransport implements MailTransport {
+  marks: number[] = [];
+  sent: string[] = [];
+  failSend = false;
+  idleCalls = 0;
+  listCalls = 0;
+
+  constructor(public messages: Array<{ ref: MailMessageRef; raw: string }> = []) {}
+
+  async listNew(_sinceDays: number, _cursor: MailCursor | null): Promise<MailMessageRef[]> {
+    this.listCalls += 1;
+    return this.messages.map((message) => message.ref);
+  }
+
+  async fetchRaw(ref: MailMessageRef): Promise<string> {
+    const message = this.messages.find((item) => item.ref.uid === ref.uid);
+    if (!message) throw new Error(`missing fake message ${ref.uid}`);
+    return message.raw;
+  }
+
+  async markProcessed(ref: MailMessageRef): Promise<void> {
+    this.marks.push(ref.uid);
+  }
+
+  async sendReply(rfc822: string): Promise<void> {
+    if (this.failSend) throw new Error("fake smtp failure");
+    this.sent.push(rfc822);
+  }
+
+  async idleOnce(): Promise<void> {
+    this.idleCalls += 1;
+  }
+}
+
+function setupMailctl(overrides: ConfigOverrides = {}) {
+  const root = mkdtempSync(join(tmpdir(), "orch-mailctl-state-"));
+  const workspace = join(root, "workspace");
+  mkdirSync(workspace, { recursive: true });
+  process.env.XDG_STATE_HOME = join(root, "state");
+  process.env.XDG_CONFIG_HOME = join(root, "config");
+  writeOrchConfig({
+    version: 1,
+    workspaces: {
+      "default-ws": { id: "default-ws", path: workspace, added_at: "2026-07-04T00:00:00.000Z" },
+      "other-ws": { id: "other-ws", path: workspace, added_at: "2026-07-04T00:00:00.000Z" },
+    },
+  });
+  return { root, workspace, cfg: config({ require_auth_results: false, ...overrides }) };
+}
+
+function fakeContext(args: {
+  cfg?: MailControlConfig;
+  transport: FakeTransport;
+  now?: number;
+  orch?: MailCliContext;
+}): MailctlContext {
+  return {
+    config: args.cfg ?? config({ require_auth_results: false }),
+    transport: args.transport,
+    now: () => args.now ?? Date.parse("2026-07-04T08:56:28.000Z"),
+    orch:
+      args.orch ??
+      ({
+        orchCommand: () => [process.execPath, join(process.cwd(), "src/orch.ts")],
+        locateRun: () => {
+          throw new Error("unused");
+        },
+        readMirrorResult: () => {
+          throw new Error("unused");
+        },
+      } satisfies MailCliContext),
+  };
+}
+
+function message(uid: number, messageId: string, body = `Do task ${uid}`, headers: string[] = []): { ref: MailMessageRef; raw: string } {
+  return {
+    ref: { uid },
+    raw: textMail({ messageId, body, headers }),
+  };
+}
+
+function stateFiles(): string[] {
+  const dir = join(process.env.XDG_STATE_HOME!, "orch", "mail-control", "threads");
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir).filter((name) => name.endsWith(".json")).map((name) => join(dir, name)).sort();
+}
+
+function firstThreadState(): any {
+  const file = stateFiles()[0];
+  if (!file) throw new Error("missing thread state");
+  return JSON.parse(readFileSync(file, "utf8"));
+}
+
+function markerFiles(): string[] {
+  const dir = join(process.env.XDG_STATE_HOME!, "orch", "mail-control", "messages");
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir).filter((name) => name.endsWith(".json")).map((name) => join(dir, name)).sort();
+}
+
+function attentionFiles(): string[] {
+  const dir = join(process.env.XDG_STATE_HOME!, "orch", "mail-control", "controller", "attention");
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir).filter((name) => name.endsWith(".json")).map((name) => join(dir, name)).sort();
+}
+
+function jsonFiles(dir: string): string[] {
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir).filter((name) => name.endsWith(".json")).map((name) => join(dir, name)).sort();
+}
+
+function auditRows(): any[] {
+  if (!existsSync(auditPath())) return [];
+  return readFileSync(auditPath(), "utf8")
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+}
+
+function busEvents(state = firstThreadState()): any[] {
+  return readFileSync(mailEventsPath(state.thread_dir), "utf8")
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+}
+
+function writeFakeOrch(root: string): MailCliContext {
+  const script = join(root, "fake-orch.ts");
+  writeFileSync(
+    script,
+    `
+import { existsSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+
+const args = process.argv.slice(2);
+const stateRoot = process.env.FAKE_ORCH_STATE!;
+function flag(name: string): string {
+  const index = args.indexOf(name);
+  if (index < 0 || args[index + 1] === undefined) throw new Error("missing " + name);
+  return args[index + 1]!;
+}
+function safe(value: string): string {
+  return value.replace(/[^A-Za-z0-9._-]+/g, "_");
+}
+
+if (args[0] === "run" && args[1] === "create") {
+  const key = flag("--idempotency-key");
+  const runId = "run-" + safe(key);
+  const runDir = join(stateRoot, runId);
+  mkdirSync(runDir, { recursive: true });
+  const status = {
+    run_id: runId,
+    mr: flag("--mr"),
+    role: flag("--role"),
+    agent: flag("--agent"),
+    tag: flag("--tag"),
+    provider_session_name: null,
+    provider_session_id: null,
+    provider_session_mode: "fresh_persistent",
+    state: process.env.FAKE_ORCH_STATUS ?? "created",
+    pid: null,
+    pgid: null,
+    started_at: null,
+    updated_at: new Date().toISOString(),
+    exit_code: null,
+    timeout_sec: Number(flag("--timeout-sec")),
+    last_event_seq: 0,
+    native_event_count: 0,
+    provider_resume_id: null,
+    worktree: flag("--worktree"),
+    base_sha: "base",
+    head_sha: null
+  };
+  writeFileSync(join(runDir, "status.json"), JSON.stringify(status, null, 2) + "\\n");
+  console.log(JSON.stringify({ run_id: runId, run_dir: runDir, status_path: join(runDir, "status.json"), state: status.state }));
+  process.exit(0);
+}
+
+if (args[0] === "decision" && args[1] === "close") {
+  const runId = flag("--run");
+  for (const entry of readdirSync(stateRoot, { withFileTypes: true })) {
+    if (!entry.isDirectory() || entry.name !== runId) continue;
+    writeFileSync(join(stateRoot, entry.name, "decision.json"), JSON.stringify({ verdict: "close", run_id: runId, reason: "fake", ts: new Date().toISOString() }, null, 2) + "\\n");
+    console.log(JSON.stringify({ decision: "close", run_id: runId }));
+    process.exit(0);
+  }
+  console.error("run not found");
+  process.exit(1);
+}
+
+console.error("unexpected fake orch argv " + args.join(" "));
+process.exit(1);
+`,
+    "utf8",
+  );
+  const fakeState = join(root, "fake-orch-state");
+  mkdirSync(fakeState, { recursive: true });
+  process.env.FAKE_ORCH_STATE = fakeState;
+  return {
+    orchCommand: () => [process.execPath, script],
+    locateRun: () => {
+      throw new Error("unused");
+    },
+    readMirrorResult: () => {
+      throw new Error("unused");
+    },
+  };
 }
 
 describe("mailctl state layout", () => {
@@ -275,5 +514,265 @@ describe("buildControllerTask", () => {
     expect(task).toContain("Please implement the parser");
     expect(task).not.toContain("/Users/example/project");
     expect(task).not.toContain("ABCDEFGHIJKLMNOPQRST");
+  });
+});
+
+describe("mailctlPoll stateful cycle", () => {
+  it("closes poll crash windows without duplicating router tasks", async () => {
+    const faults: PollFault[] = ["publish-before-marker", "attention-before-marker", "marker-before-STORE", "before-cursor"];
+    for (const fault of faults) {
+      const { cfg } = setupMailctl();
+      const transport = new FakeTransport([message(1, `<${fault}@example.com>`)]);
+      const ctx = fakeContext({ cfg, transport });
+
+      await expect(mailctlPoll(ctx, { fault, reconcile: false })).rejects.toThrow("injected mailctl poll fault");
+      const second = await mailctlPoll(ctx, { reconcile: false });
+      const third = await mailctlPoll(ctx, { reconcile: false });
+
+      expect(second.errors).toBe(0);
+      expect(third.fetched).toBe(0);
+      expect(markerFiles()).toHaveLength(1);
+      expect(attentionFiles()).toHaveLength(1);
+      const events = busEvents();
+      expect(events.filter((event) => event.type === "task.requested" && event.role === "router")).toHaveLength(1);
+      expect(events.filter((event) => event.type === "task.requested" && event.role === "implementer")).toHaveLength(0);
+      const state = firstThreadState();
+      expect(state.last_instruction_event_id).toBe(events[0].event_id);
+      expect(state.status).toBe("active");
+      expect(transport.marks).toContain(1);
+    }
+  });
+
+  it("silently skips when ingest.lock is held and then processes once", async () => {
+    const { cfg } = setupMailctl();
+    const transport = new FakeTransport([message(1, "<locked@example.com>")]);
+    const ctx = fakeContext({ cfg, transport });
+    const lock = acquirePidfileLock(ingestLockPath(), process.pid, "test-lock");
+    try {
+      const skipped = await mailctlPoll(ctx, { reconcile: false });
+      expect(skipped.skipped).toBe(true);
+      expect(markerFiles()).toHaveLength(0);
+    } finally {
+      lock.release();
+    }
+
+    const processed = await mailctlPoll(ctx, { reconcile: false });
+    expect(processed.accepted).toBe(1);
+    expect(markerFiles()).toHaveLength(1);
+    expect(attentionFiles()).toHaveLength(1);
+    expect(busEvents().filter((event) => event.type === "task.requested")).toHaveLength(1);
+  });
+
+  it("rejects a reused Message-ID when raw_sha differs", async () => {
+    const { cfg } = setupMailctl();
+    const transport = new FakeTransport([
+      message(1, "<conflict@example.com>", "First task"),
+      message(2, "<conflict@example.com>", "Different task under reused Message-ID"),
+    ]);
+    const ctx = fakeContext({ cfg, transport });
+
+    const result = await mailctlPoll(ctx, { reconcile: false });
+    const markers = markerFiles().map((path) => readJsonFile<any>(path, null));
+    const conflict = markers.find((marker) => marker.status === "rejected_conflict");
+
+    expect(result.accepted).toBe(1);
+    expect(result.rejected).toBe(1);
+    expect(result.duplicate).toBe(0);
+    expect(markers.map((marker) => marker.status).sort()).toEqual(["accepted", "rejected_conflict"]);
+    expect(conflict).toMatchObject({ message_id: "<conflict@example.com>", uid: 2, thread_synced: true, flag_synced: true });
+    expect(transport.marks).toEqual([1, 2]);
+    expect(busEvents().filter((event) => event.type === "task.requested" && event.role === "router")).toHaveLength(1);
+    expect(auditRows().some((row) => row.type === "rejected_conflict" && row.message_id === "<conflict@example.com>")).toBe(true);
+  });
+
+  it("terminally rejects accepted mail whose workspace cannot resolve", async () => {
+    const { cfg } = setupMailctl();
+    const transport = new FakeTransport([
+      {
+        ref: { uid: 1 },
+        raw: textMail({ subject: "[ws:missing-ws] Task", messageId: "<missing-ws@example.com>", body: "Do task" }),
+      },
+    ]);
+    const ctx = fakeContext({ cfg, transport });
+
+    const result = await mailctlPoll(ctx, { reconcile: false });
+    const markers = markerFiles().map((path) => readJsonFile<any>(path, null));
+    const cursor = readJsonFile<any>(cursorPath(), null);
+    const retry = await mailctlPoll(ctx, { reconcile: false });
+
+    expect(result.accepted).toBe(0);
+    expect(result.rejected).toBe(1);
+    expect(result.errors).toBe(0);
+    expect(markers).toHaveLength(1);
+    expect(markers[0]).toMatchObject({ status: "rejected_error", message_id: "<missing-ws@example.com>", uid: 1, flag_synced: true });
+    expect(cursor.last_uid).toBe(1);
+    expect(transport.marks).toEqual([1]);
+    expect(retry.fetched).toBe(0);
+    expect(retry.duplicate).toBe(1);
+    expect(auditRows().some((row) => row.type === "rejected_error" && String(row.error).includes("missing-ws"))).toBe(true);
+  });
+
+  it("rejects self-loop and automated mail before task publication", async () => {
+    const { cfg } = setupMailctl({ allowed_senders: ["owner@example.com", "bot@example.com"] });
+    const transport = new FakeTransport([
+      { ref: { uid: 1 }, raw: textMail({ from: "Bot <bot@example.com>", headers: [], messageId: "<self-from@example.com>" }) },
+      { ref: { uid: 2 }, raw: textMail({ headers: ["Auto-Submitted: auto-replied"], messageId: "<auto@example.com>" }) },
+      { ref: { uid: 3 }, raw: textMail({ headers: ["Precedence: list"], messageId: "<list@example.com>" }) },
+      { ref: { uid: 4 }, raw: textMail({ headers: [], body: "[orch:reply]\nbody", messageId: "<sentinel@example.com>" }) },
+      { ref: { uid: 5 }, raw: textMail({ headers: [], messageId: "<orch-generated@localhost>" }) },
+    ]);
+    const result = await mailctlPoll(fakeContext({ cfg, transport }), { reconcile: false });
+
+    expect(result.accepted).toBe(0);
+    expect(result.rejected).toBe(5);
+    expect(stateFiles()).toHaveLength(0);
+    expect(attentionFiles()).toHaveLength(0);
+    expect(markerFiles()).toHaveLength(5);
+  });
+
+  it("reopens a settled thread and preserves decision bytes", async () => {
+    const { cfg } = setupMailctl();
+    const rootMail = message(1, "<root-reopen@example.com>", "First task");
+    const transport = new FakeTransport([rootMail]);
+    const ctx = fakeContext({ cfg, transport });
+    await mailctlPoll(ctx, { reconcile: false });
+    const state = firstThreadState();
+    const decision = { verdict: "completed", note: "keep me byte-identical" };
+    writeJsonAtomic(mailctlThreadStatePath(state.thread), { ...state, status: "settled", decision });
+    const before = JSON.stringify(readJsonFile<any>(mailctlThreadStatePath(state.thread), null).decision);
+
+    transport.messages = [
+      rootMail,
+      {
+        ref: { uid: 2 },
+        raw: textMail({
+          subject: "Re: Task",
+          messageId: "<reply-reopen@example.com>",
+          headers: [`References: <root-reopen@example.com>`],
+          body: "Follow up",
+        }),
+      },
+    ];
+    await mailctlPoll(ctx, { reconcile: false });
+    const reopened = readJsonFile<any>(mailctlThreadStatePath(state.thread), null);
+    const events = busEvents(reopened);
+
+    expect(reopened.status).toBe("active");
+    expect(JSON.stringify(reopened.decision)).toBe(before);
+    expect(events.filter((event) => event.type === "task.requested" && event.role === "router")).toHaveLength(2);
+    expect(events[1].parent_event_id).toBe(events[0].event_id);
+    expect(reopened.last_instruction_event_id).toBe(events[1].event_id);
+  });
+
+  it("publishes only a router event and spawns generation-keyed controllers with liveness checks", async () => {
+    const { root, cfg } = setupMailctl();
+    process.env.ORCH_DRIVER_FAKE_RESULT = "1";
+    const orch = writeFakeOrch(root);
+    const transport = new FakeTransport([message(1, "<controller@example.com>")]);
+    const ctx = fakeContext({ cfg, transport, orch });
+
+    const polled = await mailctlPoll(ctx);
+    const state = firstThreadState();
+    const events = busEvents(state);
+    expect(events.filter((event) => event.type === "task.requested" && event.role === "router")).toHaveLength(1);
+    expect(events.filter((event) => event.type === "task.requested" && event.role === "implementer")).toHaveLength(0);
+    expect(polled.reconciled?.spawned).toHaveLength(1);
+    const firstSpawn = polled.reconciled?.spawned[0];
+    expect(firstSpawn).toBeDefined();
+    expect(firstSpawn!.gen).toBe(0);
+
+    const live = await mailctlReconcile(ctx);
+    expect(live.spawned).toHaveLength(0);
+    expect(live.live).toHaveLength(1);
+
+    const afterLive = readJsonFile<any>(mailctlThreadStatePath(state.thread), null);
+    const gen0 = afterLive.controller.generations[0];
+    const status = readJsonFile<any>(gen0.status_path, null);
+    writeJsonAtomic(gen0.status_path, { ...status, state: "failed", updated_at: new Date(Date.now() - 2_000).toISOString() });
+
+    const retry = await mailctlReconcile(ctx);
+    expect(retry.closed.map((item) => item.run_id)).toContain(gen0.run_id);
+    expect(retry.spawned).toHaveLength(1);
+    const retrySpawn = retry.spawned[0];
+    expect(retrySpawn).toBeDefined();
+    expect(retrySpawn!.gen).toBe(1);
+    const afterRetry = readJsonFile<any>(mailctlThreadStatePath(state.thread), null);
+    expect(afterRetry.controller.generations).toHaveLength(2);
+    expect(afterRetry.controller.generations[1].idempotency_key).toBe(`ctrl:${state.thread}:1`);
+  });
+
+  it("sleeps instead of tight-looping when watch.lock is held", async () => {
+    const { cfg } = setupMailctl({ reconcile_interval_sec: 1 });
+    const transport = new FakeTransport([]);
+    const ctx = fakeContext({ cfg, transport });
+    const lock = acquirePidfileLock(watchLockPath(), process.pid, "test-watch-lock");
+    const originalSetTimeout = globalThis.setTimeout;
+    const sleeps: number[] = [];
+    globalThis.setTimeout = ((handler: (...args: any[]) => void, timeout?: number, ...args: any[]) => {
+      sleeps.push(Number(timeout ?? 0));
+      queueMicrotask(() => handler(...args));
+      return 0 as unknown as ReturnType<typeof setTimeout>;
+    }) as typeof setTimeout;
+    try {
+      const result = await mailctlWatch(ctx, { iterations: 2 });
+      expect(result).toEqual({ iterations: 2, stopped: false });
+    } finally {
+      globalThis.setTimeout = originalSetTimeout;
+      lock.release();
+    }
+
+    expect(sleeps).toEqual([1000, 1000]);
+    expect(transport.listCalls).toBe(2);
+    expect(transport.idleCalls).toBe(0);
+  });
+});
+
+describe("mailctlReply outbound policy", () => {
+  it("dedupes report keys, enforces mail-only leak checks, and queues failed sends", async () => {
+    const { cfg } = setupMailctl({ reports: { policy: "auto", max_per_hour: 10, max_body_bytes: 64 } });
+    const transport = new FakeTransport([message(1, "<reply-policy@example.com>")]);
+    const ctx = fakeContext({ cfg, transport });
+    await mailctlPoll(ctx, { reconcile: false });
+    const thread = firstThreadState().thread;
+
+    process.env.ORCH_MIRROR_ALLOW_PRIVATE = "1";
+    await expect(mailctlReply(ctx, { thread, reportKey: "progress:leak", body: "see /Users/me/project" })).rejects.toThrow("private local path");
+    await expect(mailctlReply(ctx, { thread, reportKey: "reply:secret", body: "token=abcdefghijklmnop" })).rejects.toThrow("secret assignment");
+    await expect(mailctlReply(ctx, { thread, reportKey: "progress:long", body: "x".repeat(65) })).rejects.toThrow("max_body_bytes");
+
+    const dryRun = await mailctlReply(ctx, { thread, reportKey: "progress:dry", body: "dry body", dryRun: true });
+    expect(dryRun.rawMessage).toContain("[orch:progress:dry]");
+    expect(transport.sent).toHaveLength(0);
+
+    const sent = await mailctlReply(ctx, { thread, reportKey: "settled:1", body: "safe body" });
+    expect(sent.sent).toBe(true);
+    expect(transport.sent).toHaveLength(1);
+    const duplicate = await mailctlReply(ctx, { thread, reportKey: "settled:1", body: "safe body" });
+    expect(duplicate.duplicate).toBe(true);
+
+    transport.failSend = true;
+    const pending = await mailctlReply(ctx, { thread, reportKey: "reply:pending", body: "safe later" });
+    expect(pending.pending).toBe(true);
+    expect(existsSync(pending.pendingPath!)).toBe(true);
+    const pendingFiles = jsonFiles(outboxEmailPendingDir());
+    expect(pendingFiles.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("rejects unsafe report keys before sending or touching outbox state", async () => {
+    const { cfg } = setupMailctl();
+    const transport = new FakeTransport([message(1, "<reply-key-policy@example.com>")]);
+    const ctx = fakeContext({ cfg, transport });
+    await mailctlPoll(ctx, { reconcile: false });
+    const thread = firstThreadState().thread;
+    const beforePending = jsonFiles(outboxEmailPendingDir());
+    const beforeSent = jsonFiles(outboxEmailSentDir());
+
+    await expect(mailctlReply(ctx, { thread, reportKey: "progress:/Users/me/.ssh/id_rsa", body: "safe body" })).rejects.toThrow("report key");
+    await expect(mailctlReply(ctx, { thread, reportKey: "reply:token=abcdefghijklmnop", body: "safe body" })).rejects.toThrow("report key");
+    await expect(mailctlReply(ctx, { thread, reportKey: "reply:token:abcdefghijklmnop", body: "safe body" })).rejects.toThrow("secret assignment");
+
+    expect(transport.sent).toHaveLength(0);
+    expect(jsonFiles(outboxEmailPendingDir())).toEqual(beforePending);
+    expect(jsonFiles(outboxEmailSentDir())).toEqual(beforeSent);
   });
 });
