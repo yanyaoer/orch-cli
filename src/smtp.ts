@@ -257,6 +257,8 @@ class BunSmtpConnection implements SmtpConnection {
   private buffer = "";
   private waiters: Array<() => void> = [];
   private error: Error | null = null;
+  private opened = false;
+  private openWaiters: Array<() => void> = [];
 
   private constructor(private readonly host: string) {}
 
@@ -268,11 +270,19 @@ class BunSmtpConnection implements SmtpConnection {
       tls: options.mode === "implicit" ? { serverName: options.host } : false,
       socket: connection.socketHandler(),
     });
+    // Wait for the socket (and, for implicit TLS, the handshake) to be open before
+    // reading the greeting or writing — a write before `open` can be dropped, which
+    // strands submission and the server closes the connection ("SMTP socket closed").
+    await connection.waitUntilOpen();
     return connection;
   }
 
   private socketHandler(): Bun.SocketHandler<undefined> {
     return {
+      open: () => {
+        this.opened = true;
+        this.flushOpen();
+      },
       data: (_socket, data) => {
         this.buffer += Buffer.from(data).toString("utf8");
         this.wake();
@@ -280,12 +290,26 @@ class BunSmtpConnection implements SmtpConnection {
       close: (_socket, error) => {
         this.error = error ?? new Error("SMTP socket closed");
         this.wake();
+        this.flushOpen();
       },
       error: (_socket, error) => {
         this.error = error;
         this.wake();
+        this.flushOpen();
       },
     };
+  }
+
+  private async waitUntilOpen(): Promise<void> {
+    if (!this.opened && !this.error) {
+      await new Promise<void>((resolve) => this.openWaiters.push(resolve));
+    }
+    if (this.error) throw this.error;
+  }
+
+  private flushOpen(): void {
+    const waiters = this.openWaiters.splice(0);
+    for (const waiter of waiters) waiter();
   }
 
   async readLine(): Promise<string> {
@@ -308,11 +332,15 @@ class BunSmtpConnection implements SmtpConnection {
 
   async startTls(): Promise<void> {
     if (!this.socket) throw new Error("SMTP socket is not connected");
+    // The upgraded TLS socket fires `open` when its handshake completes; wait for it
+    // before the re-EHLO so the first post-STARTTLS write is not dropped.
+    this.opened = false;
     const [, tls] = this.socket.upgradeTLS({
       tls: { serverName: this.host },
       socket: this.socketHandler(),
     });
     this.socket = tls;
+    await this.waitUntilOpen();
   }
 
   close(): void {
