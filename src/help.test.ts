@@ -72,6 +72,9 @@ test("command help exposes flags and runnable examples", () => {
     expect(runCreate).toContain(flag);
   }
   expect(runCreate).toContain("Example:");
+  expect(runCreate).toContain("controller");
+  expect(runCreate).toContain("Claude-only");
+  expect(runCreate).toContain("allowed-tool whitelist");
   expect(runCreate).toContain("orch run create --mr 123");
 
   const runList = runListHelp();

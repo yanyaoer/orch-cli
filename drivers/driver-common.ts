@@ -28,12 +28,7 @@ export function readSpec(path: string): RunSpec {
 }
 
 export function buildPrompt(spec: RunSpec, provider: string): string {
-  const schemaName =
-    spec.role === "reviewer"
-      ? "orch.result/reviewer/v1"
-      : spec.role === "verifier"
-        ? "orch.result/verifier/v1"
-        : "orch.result/implementer/v1";
+  const schemaName = isResultRole(spec.role) ? resultSchemaName(spec.role) : "orch.result/implementer/v1";
   return [
     `You are running under orch provider driver: ${provider}.`,
     `Run id: ${spec.run_id}`,
@@ -139,6 +134,8 @@ export function isReadOnlyRole(role: RunSpec["role"]): boolean {
   return role === "reviewer";
 }
 
+export const CLAUDE_CONTROLLER_ALLOWED_TOOLS = "Bash(orch *),Read,Grep,Glob,LS";
+
 // claude model tier by role: reviewer escalates to opus (deep critique, paired
 // with omp's gemini-3.1-pro as a distinct model family in cross-review);
 // implementer/verifier stay on the claude CLI's default model (sonnet) and only dial --effort.
@@ -153,6 +150,7 @@ const CLAUDE_ROLE_EFFORT: Partial<Record<RunSpec["role"], string>> = {
   implementer: "medium",
   verifier: "low",
   reviewer: "high",
+  controller: "medium",
 };
 
 export function buildProviderArgv(
@@ -163,6 +161,10 @@ export function buildProviderArgv(
   prompt = "",
 ): string[] {
   const readOnly = isReadOnlyRole(spec.role);
+
+  if (spec.role === "controller" && provider !== "claude") {
+    throw new Error("controller role only supports claude provider");
+  }
 
   if (provider === "omp") {
     const { primary, fallbacks } = ompModelChain(spec.model);
@@ -189,6 +191,10 @@ export function buildProviderArgv(
     if (model) argv.push("--model", model);
     const effort = CLAUDE_ROLE_EFFORT[spec.role];
     if (effort) argv.push("--effort", effort);
+    // Controller intentionally stays out of reviewer plan mode so dispatched
+    // workers hold the worktree lock. Keep this whitelist narrow: no Edit/Write,
+    // and Bash stays constrained to `orch *` to prevent controller-side writes.
+    if (spec.role === "controller") argv.push("--allowedTools", CLAUDE_CONTROLLER_ALLOWED_TOOLS);
     if (readOnly) argv.push("--permission-mode", "plan");
     if (spec.provider_session_name) argv.push("--name", spec.provider_session_name);
     if (spec.provider_session_mode === "ephemeral") {
@@ -400,6 +406,9 @@ function coerceRoleResult(role: RunSpec["role"], obj: Record<string, unknown>): 
     coerceMissingArrays(obj, ["changed_files", "tests", "acceptance", "risks"]);
     coerceStringArray(obj, "changed_files");
     coerceStringArray(obj, "risks");
+  } else if (role === "controller") {
+    coerceMissingArrays(obj, ["actions"]);
+    coerceStringArray(obj, "actions");
   } else if (role === "verifier") {
     coerceMissingArrays(obj, ["commands", "acceptance"]);
     if (typeof obj.verifies_run_id !== "string") obj.verifies_run_id = obj.verifies_run_id == null ? "" : String(obj.verifies_run_id);
@@ -529,6 +538,14 @@ export async function maybeWriteFakeResult(runDir: string, spec: RunSpec, provid
           non_blocking_findings: [],
           suggested_tests: [],
         }
+      : spec.role === "controller"
+        ? {
+            schema: "orch.result/controller/v1",
+            run_id: spec.run_id,
+            verdict: "completed",
+            summary: `fake ${provider} controller completed`,
+            actions: [],
+          }
       : spec.role === "verifier"
         ? {
             schema: "orch.result/verifier/v1",

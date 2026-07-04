@@ -1,7 +1,8 @@
 import { expect, test } from "bun:test";
 import { fallbackResult, validateRoleResult } from "./schema.ts";
+import { writeRoles } from "./types.ts";
 
-test("reviewer and verifier fallback results pass their role validators", () => {
+test("reviewer, verifier, and controller fallback results pass their role validators", () => {
   const reviewer = fallbackResult({
     role: "reviewer",
     run_id: "review-a",
@@ -16,9 +17,17 @@ test("reviewer and verifier fallback results pass their role validators", () => 
     head_sha: "head",
     summary: "missing provider result",
   });
+  const controller = fallbackResult({
+    role: "controller",
+    run_id: "control-a",
+    base_sha: "base",
+    head_sha: "head",
+    summary: "missing provider result",
+  });
 
   expect(validateRoleResult("reviewer", reviewer)).toEqual({ ok: true, errors: [] });
   expect(validateRoleResult("verifier", verifier)).toEqual({ ok: true, errors: [] });
+  expect(validateRoleResult("controller", controller)).toEqual({ ok: true, errors: [] });
 });
 
 test("result validators reject malformed collection items", () => {
@@ -60,4 +69,18 @@ test("result validators reject malformed collection items", () => {
       acceptance: [{}],
     }).ok,
   ).toBe(false);
+
+  expect(
+    validateRoleResult("controller", {
+      schema: "orch.result/controller/v1",
+      run_id: "control-a",
+      verdict: "completed",
+      summary: "done",
+      actions: [123],
+    }).ok,
+  ).toBe(false);
+});
+
+test("controller is not a write role", () => {
+  expect(writeRoles.has("controller")).toBe(false);
 });

@@ -5,6 +5,7 @@ import { basename, dirname, resolve } from "node:path";
 import { $ } from "bun";
 import type {
   AgentName,
+  ControllerResult,
   ImplementerResult,
   ProviderSessionMode,
   ReviewerResult,
@@ -494,6 +495,17 @@ function printResultSummary(result: RoleResult): void {
     return;
   }
 
+  if (result.schema === "orch.result/controller/v1") {
+    const controller = result as ControllerResult;
+    process.stdout.write("\nactions:\n");
+    if (controller.actions.length === 0) {
+      process.stdout.write("  - none\n");
+    } else {
+      for (const action of controller.actions) process.stdout.write(`  - ${action}\n`);
+    }
+    return;
+  }
+
   const implementer = result as ImplementerResult;
   process.stdout.write("\nchanged_files:\n");
   if (implementer.changed_files.length === 0) {
@@ -607,6 +619,9 @@ const VALID_AGENTS: readonly AgentName[] = ["codex", "claude", "pi", "omp"];
 
 function validateRunAgent(agent: AgentName, _role: RunRole): void {
   if (!VALID_AGENTS.includes(agent)) throw new CliError(`unsupported agent: ${agent}`);
+  if (_role === "controller" && agent !== "claude") {
+    throw new CliError("controller role only supports the claude agent");
+  }
 }
 
 const RUN_CREATE_FLAGS = [
@@ -642,7 +657,7 @@ async function createRun(args: ParsedArgs): Promise<number> {
   const timeoutSec = Number(flagString(args, "timeout-sec", role === "reviewer" ? "3600" : "14400"));
 
   if (!isResultRole(role)) {
-    throw new CliError(`P1 only supports result-schema roles: implementer, reviewer, verifier (got ${role})`);
+    throw new CliError(`P1 only supports result-schema roles: implementer, reviewer, verifier, controller (got ${role})`);
   }
   validateRunAgent(agent, role);
   if (!Number.isFinite(timeoutSec) || timeoutSec <= 0) throw new CliError("--timeout-sec must be positive");

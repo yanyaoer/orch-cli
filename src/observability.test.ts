@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { sha256 } from "./hash.ts";
 import { repoKeyFromRemote } from "./paths.ts";
-import type { ImplementerResult, RoleResult, RunStatus } from "./types.ts";
+import type { ControllerResult, ImplementerResult, RoleResult, RunStatus } from "./types.ts";
 
 async function runOrch(args: string[], env: Record<string, string>): Promise<{ stdout: string; stderr: string; exitCode: number }> {
   const proc = Bun.spawn([process.execPath, "src/orch.ts", ...args], {
@@ -375,6 +375,60 @@ test("observability commands read local run state", async () => {
   expect(humanResult.stdout).toContain("bun test (exit 0): passed");
 });
 
+test("result text renderer handles controller results", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orch-controller-result-test-"));
+  const stateHome = join(root, "state");
+  const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
+  const repoKey = repoKeyFromRemote(worktree, worktree);
+  const mr = "controller-result";
+  const runId = "control-a-20260704T061044-05c5c9";
+  const runDir = join(stateHome, "orch", repoKey, "mrs", mr, "runs", runId);
+  mkdirSync(runDir, { recursive: true });
+
+  const status: RunStatus = {
+    run_id: runId,
+    mr,
+    role: "controller",
+    agent: "claude",
+    tag: "mailctl",
+    provider_session_name: null,
+    provider_session_id: null,
+    provider_session_mode: "fresh_persistent",
+    state: "done",
+    pid: null,
+    pgid: null,
+    started_at: "2026-07-04T06:10:44.000Z",
+    updated_at: "2026-07-04T06:11:44.000Z",
+    exit_code: 0,
+    timeout_sec: 1800,
+    last_event_seq: 1,
+    native_event_count: 0,
+    provider_resume_id: null,
+    worktree,
+    base_sha: "base",
+    head_sha: "head",
+  };
+  const result: ControllerResult = {
+    schema: "orch.result/controller/v1",
+    run_id: runId,
+    verdict: "completed",
+    summary: "dispatched and settled worker runs",
+    actions: ["spawned implementer run", "recorded decision accept"],
+  };
+  writeFileSync(join(runDir, "status.json"), `${JSON.stringify(status, null, 2)}\n`, "utf8");
+  writeFileSync(join(runDir, "result.json"), `${JSON.stringify(result, null, 2)}\n`, "utf8");
+
+  const rendered = await runOrch(["result", "--run", runId, "--mr", mr, "--worktree", worktree], { XDG_STATE_HOME: stateHome });
+  expect(rendered).toMatchObject({ exitCode: 0, stderr: "" });
+  expect(rendered.stdout).toContain("schema: orch.result/controller/v1");
+  expect(rendered.stdout).toContain("verdict: completed");
+  expect(rendered.stdout).toContain("summary: dispatched and settled worker runs");
+  expect(rendered.stdout).toContain("actions:");
+  expect(rendered.stdout).toContain("spawned implementer run");
+  expect(rendered.stdout).toContain("recorded decision accept");
+  expect(rendered.stdout).not.toContain("changed_files:");
+});
+
 test("run create dry-run resolves plans without writing state", async () => {
   const root = mkdtempSync(join(tmpdir(), "orch-dry-run-test-"));
   const stateHome = join(root, "state");
@@ -644,6 +698,119 @@ test("run create rejects the removed agy agent and accepts omp for any result ro
     );
     expect(allowed).toMatchObject({ exitCode: 0, stderr: "" });
   }
+});
+
+test("run create supports claude controller runs and rejects other controller providers", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orch-controller-role-test-"));
+  const stateHome = join(root, "state");
+  const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
+  await initGitWorktree(worktree);
+  writeFileSync(join(worktree, "dirty-controller.txt"), "dirty\n", "utf8");
+  const taskPath = join(root, "task.md");
+  writeFileSync(taskPath, "orchestrate mail thread\n", "utf8");
+
+  const rejected = await runOrch(
+    ["run", "create", "--mr", "controller-role", "--role", "controller", "--agent", "codex", "--tag", "ctrl", "--worktree", worktree, "--dry-run"],
+    { XDG_STATE_HOME: stateHome },
+  );
+  expect(rejected.exitCode).toBe(1);
+  expect(rejected.stderr).toContain("controller role only supports the claude agent");
+
+  const dryRun = await runOrch(
+    [
+      "run",
+      "create",
+      "--mr",
+      "controller-role",
+      "--role",
+      "controller",
+      "--agent",
+      "claude",
+      "--tag",
+      "ctrl",
+      "--worktree",
+      worktree,
+      "--task",
+      taskPath,
+      "--dry-run",
+      "--json",
+    ],
+    { XDG_STATE_HOME: stateHome },
+  );
+  expect(dryRun).toMatchObject({ exitCode: 0, stderr: "" });
+  const dryRunPayload = JSON.parse(dryRun.stdout) as {
+    provider_plan: { argv: string[] };
+  };
+  expect(dryRunPayload.provider_plan.argv).toContain("--allowedTools");
+  const allowedTools = dryRunPayload.provider_plan.argv[dryRunPayload.provider_plan.argv.indexOf("--allowedTools") + 1];
+  expect(allowedTools).toContain("Bash(orch *)");
+  expect(allowedTools).not.toMatch(/\b(?:Edit|Write|MultiEdit)\b/);
+
+  const created = await runOrch(
+    [
+      "run",
+      "create",
+      "--mr",
+      "controller-role",
+      "--role",
+      "controller",
+      "--agent",
+      "claude",
+      "--tag",
+      "ctrl",
+      "--worktree",
+      worktree,
+      "--task",
+      taskPath,
+      "--idempotency-key",
+      "controller-role-test",
+      "--timeout-sec",
+      "10",
+    ],
+    { XDG_STATE_HOME: stateHome, ORCH_DRIVER_FAKE_RESULT: "1", ORCH_DRIVER_FAKE_SLEEP_MS: "1000" },
+  );
+  expect(created).toMatchObject({ exitCode: 0, stderr: "" });
+  const payload = JSON.parse(created.stdout) as { run_id: string; run_dir: string; status_path: string };
+  const running = await waitForRunState(payload.status_path, ["running"]);
+  expect(running.role).toBe("controller");
+
+  const implementer = await runOrch(
+    [
+      "run",
+      "create",
+      "--mr",
+      "controller-role",
+      "--role",
+      "implementer",
+      "--agent",
+      "codex",
+      "--tag",
+      "impl-during-ctrl",
+      "--worktree",
+      worktree,
+      "--task",
+      taskPath,
+      "--idempotency-key",
+      "controller-role-implementer-test",
+      "--timeout-sec",
+      "10",
+      "--allow-dirty",
+    ],
+    { XDG_STATE_HOME: stateHome, ORCH_DRIVER_FAKE_RESULT: "1" },
+  );
+  expect(implementer).toMatchObject({ exitCode: 0, stderr: "" });
+  const implementerPayload = JSON.parse(implementer.stdout) as { status_path: string };
+  const implementerStatus = await waitForRunDone(implementerPayload.status_path);
+  expect(implementerStatus.role).toBe("implementer");
+
+  await waitForRunDone(payload.status_path);
+  const result = readResult(join(payload.run_dir, "result.json"));
+  expect(result).toMatchObject({
+    schema: "orch.result/controller/v1",
+    run_id: payload.run_id,
+    verdict: "completed",
+    actions: [],
+  });
 });
 
 test("run create rejects unsafe provider session combinations", async () => {

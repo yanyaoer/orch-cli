@@ -6,6 +6,7 @@ import {
   buildPrompt,
   buildProviderArgv,
   buildWorkerEnv,
+  CLAUDE_CONTROLLER_ALLOWED_TOOLS,
   extractResultFromRunDir,
   extractResultFromText,
   ompFallbackConfigYaml,
@@ -112,6 +113,9 @@ test("buildPrompt names schema property and forbids worktree result files", () =
   expect(prompt).toContain('"schema": "orch.result/reviewer/v1"');
   expect(prompt).toContain("Do not create or edit result files in the worktree");
   expect(prompt).not.toContain("Required schema field");
+
+  const controllerPrompt = buildPrompt(spec("controller", "control-prompt"), "claude");
+  expect(controllerPrompt).toContain('"schema": "orch.result/controller/v1"');
 });
 
 test("buildProviderArgv keeps defaults fresh and only resumes exact sessions", () => {
@@ -436,6 +440,26 @@ test("buildProviderArgv picks claude model/effort by role", () => {
     "--effort",
     "low",
   ]);
+
+  expect(argv("controller", "role-controller")).toEqual([
+    "claude",
+    "-p",
+    "--verbose",
+    "--output-format",
+    "stream-json",
+    "--input-format",
+    "text",
+    "--effort",
+    "medium",
+    "--allowedTools",
+    CLAUDE_CONTROLLER_ALLOWED_TOOLS,
+  ]);
+  expect(CLAUDE_CONTROLLER_ALLOWED_TOOLS).toContain("Bash(orch *)");
+  expect(CLAUDE_CONTROLLER_ALLOWED_TOOLS).toContain("Read");
+  expect(CLAUDE_CONTROLLER_ALLOWED_TOOLS).not.toMatch(/\b(?:Edit|Write|MultiEdit)\b/);
+  expect(() => buildProviderArgv("codex", spec("controller", "role-controller-codex"), "/run", "/worktree")).toThrow(
+    "controller role only supports claude provider",
+  );
 });
 
 test("extractResultFromText coerces benign schema deviations instead of discarding", () => {
@@ -461,6 +485,25 @@ test("extractResultFromText coerces benign schema deviations instead of discardi
   });
   expect(reviewer.non_blocking_findings[0]?.body).toBe("body under wrong key");
   expect(reviewer.suggested_tests).toEqual(["st-1: object instead of string", "already a string"]);
+
+  const controlSpec = spec("controller", "control-coerce");
+  const controller = extractResultFromText(
+    JSON.stringify({
+      schema: "orch.result/controller/v1",
+      run_id: "model-invented-id",
+      verdict: "Complete",
+      summary: "coordinated one batch",
+      actions: [{ id: "ack", summary: "acked inbound message" }, "queued worker"],
+    }),
+    controlSpec,
+  );
+  expect(controller).toMatchObject({
+    schema: "orch.result/controller/v1",
+    run_id: "control-coerce",
+    verdict: "completed",
+    summary: "coordinated one batch",
+    actions: ["ack: acked inbound message", "queued worker"],
+  });
 });
 
 test("rawResultText returns the final-message candidate and null when empty", () => {
