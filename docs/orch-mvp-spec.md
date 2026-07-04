@@ -86,6 +86,7 @@ ${XDG_STATE_HOME:-$HOME/.local/state}/orch/<repo_key>/mrs/<mr_iid>/
 - **implementer/v1**：`verdict, summary, base_sha, head_sha, changed_files[], tests[{cmd,exit_code,summary}], acceptance[{id,status,evidence}], risks[], rollback`
 - **reviewer/v1**：`verdict(approve|request_changes), reviews_run_id, blocking_findings[{id,severity,file,body}], non_blocking_findings[], suggested_tests[]`
 - **verifier/v1**：`verdict(pass|fail), verifies_run_id, commands[{cmd,exit_code,summary}], acceptance[{id,status}]`
+- **controller/v1**：`verdict(completed|failed), summary, actions[]`（`orch mailctl` 邮件主控;仅 claude,不入 writeRoles,启动带 `Bash(orch *)`+只读 allowed-tools 白名单,只编排不改码）
 
 implementer 示例：
 ```json
