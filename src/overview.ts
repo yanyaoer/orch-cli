@@ -7,7 +7,7 @@
 import { existsSync, readdirSync, statSync } from "node:fs";
 import type { RunState, RunStatus } from "./types.ts";
 import { readJsonFile } from "./json.ts";
-import { mrStateDir, orchStateRoot, statePathSegment } from "./paths.ts";
+import { mailControlStateDir, mrStateDir, orchStateRoot, statePathSegment } from "./paths.ts";
 import { isPidAlive } from "./locks.ts";
 
 export interface OverviewRun {
@@ -26,7 +26,7 @@ export interface OverviewRun {
   worktree: string;
 }
 
-export type ActionKind = "decision" | "inspect" | "reap" | "mirror_sync";
+export type ActionKind = "decision" | "inspect" | "reap" | "mirror_sync" | "mailctl";
 
 export interface OverviewAction {
   kind: ActionKind;
@@ -203,6 +203,49 @@ function pendingOutbox(repoKey: string, mrDirName: string, agedBefore: number | 
   return { fresh, aged };
 }
 
+function mailctlConsecutiveFailures(): number {
+  const cursor = readJsonFile<{ consecutive_failures?: unknown } | null>(`${mailControlStateDir()}/cursor.json`, null);
+  return typeof cursor?.consecutive_failures === "number" && Number.isFinite(cursor.consecutive_failures) ? cursor.consecutive_failures : 0;
+}
+
+function droppedMailctlReplies(): number {
+  const droppedDir = `${mailControlStateDir()}/outbox-email/dropped`;
+  if (!existsSync(droppedDir)) return 0;
+  try {
+    return readdirSync(droppedDir, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
+      .length;
+  } catch {
+    return 0;
+  }
+}
+
+function mailctlHealthAction(): OverviewAction | null {
+  const failures = mailctlConsecutiveFailures();
+  if (failures >= 3) {
+    return {
+      kind: "mailctl",
+      reason: `mailctl: ${failures} poll failure${failures === 1 ? "" : "s"}`,
+      argv: ["orch", "mailctl", "status"],
+      repo_key: "",
+      mr: "mailctl",
+    };
+  }
+
+  const dropped = droppedMailctlReplies();
+  if (dropped > 0) {
+    return {
+      kind: "mailctl",
+      reason: `mailctl: ${dropped} dropped ${dropped === 1 ? "reply" : "replies"}`,
+      argv: ["orch", "mailctl", "status"],
+      repo_key: "",
+      mr: "mailctl",
+    };
+  }
+
+  return null;
+}
+
 export function buildOverview(repoKeys: string[], withWorktree: boolean, options: OverviewOptions = {}): Overview {
   const attentionDays = options.attentionDays ?? DEFAULT_ATTENTION_DAYS;
   // Cutoff in epoch ms: anything last touched before it has aged out.
@@ -283,7 +326,8 @@ export function buildOverview(repoKeys: string[], withWorktree: boolean, options
   }
 
   decisions.sort((a, b) => a.mr.localeCompare(b.mr) || (a.run_id ?? "").localeCompare(b.run_id ?? ""));
-  return { scanned_repos: repoKeys, active, actions: [...decisions, ...tail], settled, aged_out: agedOut, archived };
+  const mailctl = mailctlHealthAction();
+  return { scanned_repos: repoKeys, active, actions: [...decisions, ...tail, ...(mailctl ? [mailctl] : [])], settled, aged_out: agedOut, archived };
 }
 
 // The set of mr names retired by branch lifecycle: local branches fully merged
@@ -340,7 +384,11 @@ export function renderOverview(overview: Overview): string {
   const lines: string[] = [];
   const multiRepo = overview.scanned_repos.length > 1;
   const runPrefix = (run: OverviewRun): string => (multiRepo ? `${run.repo_key}  ` : "");
-  const actionPrefix = (action: OverviewAction): string => (multiRepo ? `${action.repo_key} · ` : "");
+  const actionHeading = (action: OverviewAction): string => {
+    const prefix = multiRepo && action.repo_key ? `${action.repo_key} · ` : "";
+    if (action.kind === "mailctl") return `${prefix}${action.reason}`;
+    return `${prefix}${action.mr} · ${action.reason}`;
+  };
 
   lines.push(`ACTIVE (${overview.active.length})`);
   if (overview.active.length === 0) {
@@ -356,7 +404,7 @@ export function renderOverview(overview: Overview): string {
     lines.push("  none");
   } else {
     overview.actions.forEach((action, index) => {
-      lines.push(`  ${index + 1}. ${actionPrefix(action)}${action.mr} · ${action.reason}`);
+      lines.push(`  ${index + 1}. ${actionHeading(action)}`);
       lines.push(`     ${renderArgv(action.argv)}`);
     });
   }
