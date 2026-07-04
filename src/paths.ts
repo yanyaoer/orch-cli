@@ -17,6 +17,10 @@ export function orchStateRoot(): string {
   return `${stateHome()}/orch`;
 }
 
+export function mailControlStateDir(): string {
+  return `${orchStateRoot()}/mail-control`;
+}
+
 export function statePathSegment(value: string, fallback: string): string {
   const cleaned = value.trim().replace(/[^A-Za-z0-9._-]+/g, "_").replace(/^_+|_+$/g, "");
   if (!cleaned || cleaned === "." || cleaned === "..") return `${fallback}-${shortHash(value || fallback)}`;

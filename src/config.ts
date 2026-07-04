@@ -51,6 +51,36 @@ export interface MailAgentsConfig {
   agents: Record<string, MailAgentDefinition>;
 }
 
+export interface MailControlConfig {
+  version: 1;
+  account: { user: string; password?: string; password_cmd?: string[] };
+  imap: { host: string; port: number };
+  smtp: { host: string; port: number; mode: "implicit" | "starttls"; from?: string };
+  allowed_senders: string[];
+  trusted_authserv_id: string;
+  workspace: string;
+  reconcile_interval_sec: number;
+  subject_token: string | null;
+  require_auth_results: boolean;
+  controller: { agent: "claude"; model: string | null; timeout_sec: number; max_spawns_per_hour: number };
+  reports: { policy: "auto" | "always" | "never"; max_per_hour: number; max_body_bytes: number };
+}
+
+const DEFAULT_MAIL_CONTROL_CONFIG: MailControlConfig = {
+  version: 1,
+  account: { user: "" },
+  imap: { host: "", port: 993 },
+  smtp: { host: "", port: 465, mode: "implicit" },
+  allowed_senders: [],
+  trusted_authserv_id: "",
+  workspace: "",
+  reconcile_interval_sec: 60,
+  subject_token: null,
+  require_auth_results: true,
+  controller: { agent: "claude", model: null, timeout_sec: 1800, max_spawns_per_hour: 6 },
+  reports: { policy: "auto", max_per_hour: 4, max_body_bytes: 16384 },
+};
+
 export function configHome(): string {
   return process.env.XDG_CONFIG_HOME ?? `${process.env.HOME}/.config`;
 }
@@ -65,6 +95,10 @@ export function chatgptBridgeConfigPath(): string {
 
 export function mailAgentsConfigPath(): string {
   return `${orchConfigDir()}/mail-agents.json`;
+}
+
+export function mailControlConfigPath(): string {
+  return `${orchConfigDir()}/mail-control.json`;
 }
 
 export function orchConfigPath(): string {
@@ -92,6 +126,96 @@ export function writeMailAgentsConfig(cfg: MailAgentsConfig): void {
   mkdirSync(orchConfigDir(), { recursive: true });
   writeJsonAtomic(path, cfg);
   chmodSync(path, 0o600);
+}
+
+export function readMailControlConfig(): MailControlConfig {
+  return readJsonFile<MailControlConfig>(mailControlConfigPath(), DEFAULT_MAIL_CONTROL_CONFIG);
+}
+
+export function writeMailControlConfig(cfg: MailControlConfig): void {
+  const path = mailControlConfigPath();
+  mkdirSync(orchConfigDir(), { recursive: true });
+  writeJsonAtomic(path, cfg);
+  chmodSync(path, 0o600);
+}
+
+export function validateMailControlConfig(cfg: MailControlConfig): void {
+  assertObject(cfg, "config");
+  if (cfg.version !== 1) throw new Error("mail control config version must be 1");
+  assertObject(cfg.account, "account");
+  assertNonEmptyString(cfg.account.user, "account.user");
+  if (cfg.account.password !== undefined && typeof cfg.account.password !== "string") {
+    throw new Error("mail control account.password must be a string when set");
+  }
+  if (cfg.account.password_cmd !== undefined) assertStringArray(cfg.account.password_cmd, "account.password_cmd");
+
+  assertObject(cfg.imap, "imap");
+  assertNonEmptyString(cfg.imap.host, "imap.host");
+  assertTcpPort(cfg.imap.port, "imap.port");
+
+  assertObject(cfg.smtp, "smtp");
+  assertNonEmptyString(cfg.smtp.host, "smtp.host");
+  assertTcpPort(cfg.smtp.port, "smtp.port");
+  if (cfg.smtp.mode !== "implicit" && cfg.smtp.mode !== "starttls") {
+    throw new Error("mail control smtp.mode must be implicit or starttls");
+  }
+  if (cfg.smtp.from !== undefined && typeof cfg.smtp.from !== "string") {
+    throw new Error("mail control smtp.from must be a string when set");
+  }
+
+  assertStringArray(cfg.allowed_senders, "allowed_senders");
+  if (cfg.allowed_senders.length === 0) throw new Error("mail control allowed_senders must be non-empty");
+  for (const sender of cfg.allowed_senders) {
+    if (!sender || sender !== sender.toLowerCase() || /[<>\s]/.test(sender)) {
+      throw new Error("mail control allowed_senders entries must be lower-cased bare addresses");
+    }
+  }
+
+  assertNonEmptyString(cfg.trusted_authserv_id, "trusted_authserv_id");
+  assertNonEmptyString(cfg.workspace, "workspace");
+  assertPositiveFiniteNumber(cfg.reconcile_interval_sec, "reconcile_interval_sec");
+  if (cfg.subject_token !== null && typeof cfg.subject_token !== "string") {
+    throw new Error("mail control subject_token must be a string or null");
+  }
+  if (typeof cfg.require_auth_results !== "boolean") {
+    throw new Error("mail control require_auth_results must be a boolean");
+  }
+
+  assertObject(cfg.controller, "controller");
+  if (cfg.controller.agent !== "claude") throw new Error("mail control controller.agent must be claude");
+  if (cfg.controller.model !== null && typeof cfg.controller.model !== "string") {
+    throw new Error("mail control controller.model must be a string or null");
+  }
+  assertPositiveFiniteNumber(cfg.controller.timeout_sec, "controller.timeout_sec");
+  assertPositiveFiniteNumber(cfg.controller.max_spawns_per_hour, "controller.max_spawns_per_hour");
+
+  assertObject(cfg.reports, "reports");
+  if (cfg.reports.policy !== "auto" && cfg.reports.policy !== "always" && cfg.reports.policy !== "never") {
+    throw new Error("mail control reports.policy must be auto, always, or never");
+  }
+  assertPositiveFiniteNumber(cfg.reports.max_per_hour, "reports.max_per_hour");
+  assertPositiveFiniteNumber(cfg.reports.max_body_bytes, "reports.max_body_bytes");
+}
+
+export async function resolveMailPassword(cfg: MailControlConfig): Promise<string> {
+  const passwordCmd = cfg.account.password_cmd;
+  if (passwordCmd !== undefined) {
+    assertStringArray(passwordCmd, "account.password_cmd");
+    if (passwordCmd.length === 0) throw new Error("mail control account.password_cmd must be a non-empty argv array");
+    const proc = Bun.spawn(passwordCmd, { stdout: "pipe", stderr: "pipe" });
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    if (exitCode !== 0) {
+      const message = stderr.trim();
+      throw new Error(`mail control account.password_cmd failed with exit code ${exitCode}${message ? `: ${message}` : ""}`);
+    }
+    return stdout.replace(/[\r\n]+$/, "");
+  }
+  if (cfg.account.password !== undefined) return cfg.account.password;
+  throw new Error("mail control account.password or account.password_cmd is required");
 }
 
 export function readOrchConfig(): OrchConfig {
@@ -155,4 +279,34 @@ export function buildBridgeUrls(baseHttpsUrl: string, token: string): { mcp_url:
   ws.protocol = base.protocol === "http:" ? "ws:" : "wss:";
   ws.pathname = "/ws";
   return { mcp_url: mcp.toString(), ws_url: ws.toString() };
+}
+
+function assertObject(value: unknown, field: string): asserts value is Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`mail control ${field} must be an object`);
+  }
+}
+
+function assertNonEmptyString(value: unknown, field: string): asserts value is string {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error(`mail control ${field} is required`);
+  }
+}
+
+function assertPositiveFiniteNumber(value: unknown, field: string): asserts value is number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    throw new Error(`mail control ${field} must be a finite positive number`);
+  }
+}
+
+function assertTcpPort(value: unknown, field: string): asserts value is number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1 || value > 65535) {
+    throw new Error(`mail control ${field} must be an integer TCP port in range 1..65535`);
+  }
+}
+
+function assertStringArray(value: unknown, field: string): asserts value is string[] {
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
+    throw new Error(`mail control ${field} must be a string argv array`);
+  }
 }

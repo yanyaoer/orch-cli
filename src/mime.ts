@@ -173,7 +173,7 @@ function decodeBytes(bytes: Uint8Array, declaredCharset: string | null | undefin
     const label = declaredCharset?.trim().toLowerCase();
     if (label && label !== "utf-8" && label !== "utf8") {
       try {
-        return new TextDecoder(label, { fatal: false }).decode(bytes);
+        return new TextDecoder(label as ConstructorParameters<typeof TextDecoder>[0], { fatal: false }).decode(bytes);
       } catch {
         // Fall through to replacement UTF-8 below.
       }

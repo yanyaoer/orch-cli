@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { canonicalWorktreeRoot, getRepoIdentity, lockPathForWorktree, mrStateDir, repoKeyFromRemote } from "./paths.ts";
+import { canonicalWorktreeRoot, getRepoIdentity, lockPathForWorktree, mailControlStateDir, mrStateDir, orchStateRoot, repoKeyFromRemote } from "./paths.ts";
 
 const tempDirs: string[] = [];
 
@@ -62,6 +62,19 @@ test("state path components reject traversal segments", () => {
     expect(mrDir.startsWith(join(root, "state", "orch"))).toBe(true);
     expect(mrDir).not.toContain("/../");
     expect(mrDir).not.toContain("/./");
+  } finally {
+    if (prev === undefined) delete process.env.XDG_STATE_HOME;
+    else process.env.XDG_STATE_HOME = prev;
+  }
+});
+
+test("mail control state dir lives under orch state root and respects XDG_STATE_HOME", () => {
+  const root = tempDir();
+  const prev = process.env.XDG_STATE_HOME;
+  process.env.XDG_STATE_HOME = join(root, "state");
+  try {
+    expect(mailControlStateDir()).toBe(join(root, "state", "orch", "mail-control"));
+    expect(mailControlStateDir().startsWith(`${orchStateRoot()}/`)).toBe(true);
   } finally {
     if (prev === undefined) delete process.env.XDG_STATE_HOME;
     else process.env.XDG_STATE_HOME = prev;

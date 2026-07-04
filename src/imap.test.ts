@@ -19,7 +19,7 @@ function binaryString(bytes: Uint8Array): string {
 class FakeImapConnection implements ImapConnection {
   readonly writes: string[] = [];
 
-  constructor(private readonly transcript: string) {}
+  constructor(private transcript: string) {}
 
   async readLine(): Promise<string> {
     const lf = this.transcript.indexOf("\n");

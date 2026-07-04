@@ -1,8 +1,25 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { addWorkspace, buildBridgeUrls, parseWorkersUrl, readBridgeConfig, readOrchConfig, readMailAgentsConfig, upsertMailAgent, upsertWorkspace, type BridgeConfig, type MailAgentsConfig } from "./config.ts";
+import {
+  addWorkspace,
+  buildBridgeUrls,
+  mailControlConfigPath,
+  parseWorkersUrl,
+  readBridgeConfig,
+  readMailControlConfig,
+  readOrchConfig,
+  readMailAgentsConfig,
+  resolveMailPassword,
+  upsertMailAgent,
+  upsertWorkspace,
+  validateMailControlConfig,
+  writeMailControlConfig,
+  type BridgeConfig,
+  type MailAgentsConfig,
+  type MailControlConfig,
+} from "./config.ts";
 
 const tempDirs: string[] = [];
 
@@ -14,6 +31,23 @@ function tempDir(): string {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), "orch-config-")));
   tempDirs.push(dir);
   return dir;
+}
+
+function validMailControlConfig(): MailControlConfig {
+  return {
+    version: 1,
+    account: { user: "bot@example.com", password: "secret" },
+    imap: { host: "imap.example.com", port: 993 },
+    smtp: { host: "smtp.example.com", port: 465, mode: "implicit", from: "bot@example.com" },
+    allowed_senders: ["alice@example.com"],
+    trusted_authserv_id: "mx.example.com",
+    workspace: "orch-cli",
+    reconcile_interval_sec: 60,
+    subject_token: null,
+    require_auth_results: true,
+    controller: { agent: "claude", model: null, timeout_sec: 1800, max_spawns_per_hour: 6 },
+    reports: { policy: "auto", max_per_hour: 4, max_body_bytes: 16384 },
+  };
 }
 
 test("parseWorkersUrl extracts the workers.dev URL from wrangler deploy output", () => {
@@ -94,6 +128,70 @@ test("mail agent config records mailbox and capabilities by id", () => {
     if (prev === undefined) delete process.env.XDG_CONFIG_HOME;
     else process.env.XDG_CONFIG_HOME = prev;
   }
+});
+
+test("mail control config round-trips with 0600 permissions", () => {
+  const prev = process.env.XDG_CONFIG_HOME;
+  process.env.XDG_CONFIG_HOME = tempDir();
+  try {
+    const cfg = validMailControlConfig();
+    writeMailControlConfig(cfg);
+    expect(readMailControlConfig()).toEqual(cfg);
+    expect(statSync(mailControlConfigPath()).mode & 0o777).toBe(0o600);
+  } finally {
+    if (prev === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = prev;
+  }
+});
+
+test("mail control config validation rejects invalid required fields", () => {
+  const missing = validMailControlConfig() as Partial<MailControlConfig>;
+  delete missing.workspace;
+  expect(() => validateMailControlConfig(missing as MailControlConfig)).toThrow(/workspace/);
+  expect(() => validateMailControlConfig({ ...validMailControlConfig(), imap: { host: "imap.example.com", port: 0 } })).toThrow(/imap\.port/);
+  expect(() => validateMailControlConfig({ ...validMailControlConfig(), imap: { host: "imap.example.com", port: 65536 } })).toThrow(/imap\.port/);
+  expect(() =>
+    validateMailControlConfig({
+      ...validMailControlConfig(),
+      smtp: { host: "smtp.example.com", port: 65536, mode: "implicit" },
+    }),
+  ).toThrow(/smtp\.port/);
+  expect(() =>
+    validateMailControlConfig({
+      ...validMailControlConfig(),
+      smtp: { host: "smtp.example.com", port: 1.5, mode: "implicit" },
+    }),
+  ).toThrow(/smtp\.port/);
+  expect(() =>
+    validateMailControlConfig({
+      ...validMailControlConfig(),
+      smtp: { host: "smtp.example.com", port: 587, mode: "plain" as MailControlConfig["smtp"]["mode"] },
+    }),
+  ).toThrow(/smtp\.mode/);
+  expect(() =>
+    validateMailControlConfig({
+      ...validMailControlConfig(),
+      controller: { agent: "codex" as MailControlConfig["controller"]["agent"], model: null, timeout_sec: 1800, max_spawns_per_hour: 6 },
+    }),
+  ).toThrow(/controller\.agent/);
+  expect(() => validateMailControlConfig({ ...validMailControlConfig(), allowed_senders: [] })).toThrow(/allowed_senders/);
+  expect(() => validateMailControlConfig({ ...validMailControlConfig(), allowed_senders: ["Alice@example.com"] })).toThrow(/allowed_senders/);
+  expect(() => validateMailControlConfig({ ...validMailControlConfig(), allowed_senders: ["<a@b.com>"] })).toThrow(/allowed_senders/);
+  expect(() =>
+    validateMailControlConfig({
+      ...validMailControlConfig(),
+      reports: { policy: "sometimes" as MailControlConfig["reports"]["policy"], max_per_hour: 4, max_body_bytes: 16384 },
+    }),
+  ).toThrow(/reports\.policy/);
+});
+
+test("resolveMailPassword prefers password_cmd argv without shell evaluation", async () => {
+  await expect(resolveMailPassword({ ...validMailControlConfig(), account: { user: "bot@example.com", password: "fallback", password_cmd: ["printf", "secret"] } })).resolves.toBe("secret");
+  await expect(resolveMailPassword({ ...validMailControlConfig(), account: { user: "bot@example.com", password_cmd: ["printf", "$(printf owned);secret"] } })).resolves.toBe("$(printf owned);secret");
+  await expect(resolveMailPassword({ ...validMailControlConfig(), account: { user: "bot@example.com", password: "fallback" } })).resolves.toBe("fallback");
+  await expect(resolveMailPassword({ ...validMailControlConfig(), account: { user: "bot@example.com" } })).rejects.toThrow(/password/);
+  await expect(resolveMailPassword({ ...validMailControlConfig(), account: { user: "bot@example.com", password_cmd: ["false"] } })).rejects.toThrow(/exit code 1/);
+  await expect(resolveMailPassword({ ...validMailControlConfig(), account: { user: "bot@example.com", password_cmd: [] } })).rejects.toThrow(/non-empty argv/);
 });
 
 test("orch config records project workspaces by id", () => {
