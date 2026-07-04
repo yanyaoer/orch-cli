@@ -70,7 +70,7 @@ export function isGoodVerdict(verdict: string | null): boolean {
   return verdict !== null && goodVerdicts.has(verdict);
 }
 
-function looksStale(status: RunStatus): boolean {
+export function looksStale(status: RunStatus): boolean {
   if (!nonTerminal.has(status.state)) return false;
   if (status.pid !== null) return !isPidAlive(status.pid);
   // Orphaned before spawn: no pid was ever recorded and the run has not moved

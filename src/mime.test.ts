@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import {
   decodeHeader,
+  decodeHtmlEntities,
   extractMailText,
   extractPlainText,
   parseAddress,
@@ -45,6 +46,15 @@ describe("decodeHeader", () => {
   });
 });
 
+describe("decodeHtmlEntities", () => {
+  it("leaves out-of-range numeric character references literal instead of throwing", () => {
+    expect(() => decodeHtmlEntities("a &#999999999999999999999999; b")).not.toThrow();
+    expect(() => decodeHtmlEntities("a &#xFFFFFFFF; b")).not.toThrow();
+    expect(decodeHtmlEntities("a &#999999999999999999999999; b")).toBe("a &#999999999999999999999999; b");
+    expect(decodeHtmlEntities("a &#xFFFFFFFF; b")).toBe("a &#xFFFFFFFF; b");
+  });
+});
+
 describe("extractMailText", () => {
   it("uses non-empty text/plain as task text and ignores HTML alternatives", () => {
     const html = [
@@ -81,6 +91,25 @@ describe("extractMailText", () => {
   it("returns text/plain-only task text without htmlOnly", () => {
     const raw = ["Content-Type: text/plain; charset=utf-8", "", "Do the work"].join("\r\n");
     expect(extractMailText(raw)).toEqual({ text: "Do the work", htmlOnly: false });
+  });
+
+  it("ignores text/plain attachments when collecting authoritative body text", () => {
+    const raw = [
+      "Content-Type: multipart/mixed; boundary=\"mix\"",
+      "",
+      "--mix",
+      "Content-Type: text/html; charset=utf-8",
+      "",
+      "<p>HTML instruction</p>",
+      "--mix",
+      "Content-Type: text/plain; charset=utf-8",
+      "Content-Disposition: attachment; filename=\"task.txt\"",
+      "",
+      "attachment instruction",
+      "--mix--",
+      "",
+    ].join("\r\n");
+    expect(extractMailText(raw)).toEqual({ text: "HTML instruction", htmlOnly: true });
   });
 
   it("returns an empty non-htmlOnly result for an empty message", () => {
@@ -171,6 +200,19 @@ describe("extractPlainText", () => {
 });
 
 describe("parseAuthenticationResults", () => {
+  it("fails closed when trusted authserv-id is empty", () => {
+    const raw = [
+      "From: User <user@example.com>",
+      "Authentication-Results: ; dkim=pass header.d=example.com; dmarc=pass header.from=example.com",
+      "",
+      "body",
+    ].join("\r\n");
+    const result = parseAuthenticationResults(raw, " ");
+    expect(result.pass).toBe(false);
+    expect(result.reason).toContain("empty trusted authserv-id");
+    expect(result.evaluated).toBe(0);
+  });
+
   it("fails when only an untrusted forged Authentication-Results header passes", () => {
     const raw = [
       "From: Attacker <attacker@example.com>",

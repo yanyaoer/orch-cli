@@ -271,7 +271,20 @@ function splitMultipartBody(body: string, boundary: string): string[] {
   return parts;
 }
 
-function decodeHtmlEntities(value: string): string {
+function decodeNumericHtmlEntity(entity: string, digits: string, radix: number): string {
+  const codePoint = Number.parseInt(digits, radix);
+  if (
+    !Number.isSafeInteger(codePoint) ||
+    codePoint < 0 ||
+    codePoint > 0x10ffff ||
+    (codePoint >= 0xd800 && codePoint <= 0xdfff)
+  ) {
+    return entity;
+  }
+  return String.fromCodePoint(codePoint);
+}
+
+export function decodeHtmlEntities(value: string): string {
   const named: Record<string, string> = {
     amp: "&",
     apos: "'",
@@ -281,8 +294,8 @@ function decodeHtmlEntities(value: string): string {
     quot: "\"",
   };
   return value.replace(/&(#x[0-9A-Fa-f]+|#[0-9]+|[A-Za-z][A-Za-z0-9]+);/g, (entity, body: string) => {
-    if (body.startsWith("#x")) return String.fromCodePoint(Number.parseInt(body.slice(2), 16));
-    if (body.startsWith("#")) return String.fromCodePoint(Number.parseInt(body.slice(1), 10));
+    if (body.startsWith("#x")) return decodeNumericHtmlEntity(entity, body.slice(2), 16);
+    if (body.startsWith("#")) return decodeNumericHtmlEntity(entity, body.slice(1), 10);
     return named[body.toLowerCase()] ?? entity;
   });
 }
@@ -559,6 +572,8 @@ function cleanExtractedText(text: string): string {
 function parseMimePart(raw: string, depth: number): MimeTextParts {
   if (depth > 20) return { plain: [], html: [] };
   const { headers, body } = parseHeaderBlock(raw);
+  const contentDisposition = parseParameterizedHeader(headers.get("content-disposition")?.[0], "");
+  if (contentDisposition.value === "attachment") return { plain: [], html: [] };
   const contentType = parseParameterizedHeader(headers.get("content-type")?.[0], "text/plain");
   if (contentType.value.startsWith("multipart/")) {
     const boundary = contentType.params.get("boundary");
@@ -771,10 +786,24 @@ function methodResult(value: string, method: string): string | null {
   return match?.[1]?.toLowerCase() ?? null;
 }
 
-export function parseAuthenticationResults(raw: string, trustedAuthservId: string): AuthenticationResultsCheck {
-  const from = headerValues(raw, "From").flatMap(parseAddress)[0] ?? null;
-  const fromDomain = from?.domain ?? null;
+export function parseAuthenticationResults(
+  raw: string,
+  trustedAuthservId: string,
+  fromMailbox?: ParsedAddress | null,
+): AuthenticationResultsCheck {
   const trusted = trustedAuthservId.trim().toLowerCase();
+  if (!trusted) {
+    return { pass: false, reason: "empty trusted authserv-id", trustedAuthservId: trusted, evaluated: 0, fromDomain: null };
+  }
+  const from =
+    fromMailbox ??
+    (() => {
+      const fromHeaders = headerValues(raw, "From");
+      if (fromHeaders.length !== 1) return null;
+      const mailboxes = parseAddress(fromHeaders[0]!);
+      return mailboxes.length === 1 ? mailboxes[0]! : null;
+    })();
+  const fromDomain = from?.domain ?? null;
   if (!fromDomain) {
     return { pass: false, reason: "missing From domain", trustedAuthservId: trusted, evaluated: 0, fromDomain: null };
   }
