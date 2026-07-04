@@ -587,6 +587,7 @@ export function buildControllerTask(input: BuildControllerTaskInput): string {
     "- Finish one batch of work, then exit. Do not run a long-lived watch loop; at most one bounded <=120s wait is allowed.",
     "- You have no Edit/Write; dispatch a worker to change code.",
     `- Orchestrate with orch fanout/cross-review --thread ${thread} --task <file>; choose the narrow worker/reviewer set needed for this batch.`,
+    "- Before dispatching with orch fanout/cross-review, check the workspace repo for docs/adr/ and docs/specs/; when a decision or spec is relevant to the batch, inline the relevant excerpts (not just file paths) into the --task file so each task stays self-contained for replay/audit.",
     "- Decide completed worker runs with orch decision accept|rework after reading their results.",
     `- After consuming an instruction, acknowledge it with orch mailctl ack --thread ${thread} --attention <id>.`,
     "- Report only for milestones, blockers, and final results via orch mailctl reply --report-key <progress:<run_id>|settled:<gen>|reply:<msg_sha>>.",

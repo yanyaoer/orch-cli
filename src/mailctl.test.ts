@@ -609,6 +609,8 @@ describe("buildControllerTask", () => {
     expect(task).toContain("You have no Edit/Write; dispatch a worker to change code");
     expect(task).toContain("Your only tools are Bash for `orch ...` commands plus read-only Read/Grep/Glob/LS");
     expect(task).toContain("orch fanout/cross-review --thread em-abc123 --task <file>");
+    expect(task).toContain("check the workspace repo for docs/adr/ and docs/specs/");
+    expect(task).toContain("inline the relevant excerpts (not just file paths) into the --task file");
     expect(task).toContain("orch decision accept|rework");
     expect(task).toContain("orch mailctl ack --thread em-abc123");
     expect(task).toContain("orch mailctl reply --report-key");

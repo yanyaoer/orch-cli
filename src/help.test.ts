@@ -146,6 +146,8 @@ test("topic help covers task specs, results, events, and concepts", () => {
   expect(topicHelp("task-spec")).toContain("Role:");
   expect(topicHelp("task-spec")).toContain("Agent:");
   expect(topicHelp("task-spec")).toContain("Worktree:");
+  expect(topicHelp("task-spec")).toContain("Constraints: inline the relevant ADR/spec excerpts that bound the solution");
+  expect(topicHelp("task-spec")).toContain("task content is captured into spec.json");
 
   const result = topicHelp("result");
   expect(result).toContain("orch.result/implementer/v1");

@@ -14,6 +14,10 @@ Latest release: `v0.0.4` ([CHANGELOG.md](CHANGELOG.md)).
 
 This repository is the v2 MVP described in [docs/orch-mvp-spec.md](docs/orch-mvp-spec.md).
 
+## Workspace Decisions and Specs
+
+Durable architecture decisions live in [docs/adr/](docs/adr/README.md); task and feature specs live in [docs/specs/](docs/specs/README.md). When those constraints shape an `orch --task` file, inline the binding excerpts so the run remains replayable from `spec.json`.
+
 Shipped on `main` (v0.0.4, see [CHANGELOG.md](CHANGELOG.md)):
 
 - `orch run create` starts one supervised headless worker run. `--mr` is optional: it resolves from an `MR: <id-or-url>` line in the task's leading header block, a merge-request/pull URL in the task text, or the current branch name (`mr_source` reports which).
