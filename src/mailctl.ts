@@ -1,11 +1,21 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync } from "node:fs";
 import type { MailControlConfig } from "./config.ts";
-import { readOrchConfig, resolveMailPassword, type OrchWorkspace } from "./config.ts";
+import {
+  mailControlConfigPath,
+  readMailAgentsConfig,
+  readOrchConfig,
+  resolveMailPassword,
+  upsertMailAgent,
+  validateMailControlConfig,
+  writeMailAgentsConfig,
+  writeMailControlConfig,
+  type OrchWorkspace,
+} from "./config.ts";
 import { MaildirBus, type BusTaskEvent } from "./bus.ts";
 import { sha256 } from "./hash.ts";
 import { appendJsonLine, readJsonFile, writeJsonAtomic, writeJsonExclusive, writeTextAtomic } from "./json.ts";
 import { acquirePidfileLock, acquirePidfileLockWait, LockHeldError } from "./locks.ts";
-import type { MailCliContext } from "./mail-cli.ts";
+import { defaultMailAgents, type MailCliContext } from "./mail-cli.ts";
 import { deliverLocalMail, ensureMailDirs, mailThreadDir } from "./mail.ts";
 import {
   decodeHeader,
@@ -23,6 +33,7 @@ import { getRepoIdentity, mailControlStateDir, statePathSegment } from "./paths.
 import { assertNoPrivateLeak } from "./leak.ts";
 import { buildReplyMessage, submitSmtpMessage } from "./smtp.ts";
 import type { RunStatus } from "./types.ts";
+import { assertKnownFlags, CliError, collectFlags, flagBool, flagNumber, flagString, type ParsedArgs } from "./cli.ts";
 
 export interface MailCursor {
   uidvalidity: number | null;
@@ -142,6 +153,71 @@ export interface ReplyOptions {
 export interface WatchOptions {
   iterations?: number;
   signal?: AbortSignal;
+}
+
+export interface InitResult {
+  config_path: string;
+  trusted_authserv_id: string;
+  agents_seeded: string[];
+}
+
+export interface StatusCursorSummary {
+  last_uid: number | null;
+  consecutive_failures: number;
+  last_error: string | null;
+}
+
+export interface StatusControllerGeneration {
+  gen: number;
+  run_id: string;
+  state: string | null;
+  spawned_at: string;
+  trigger_reasons: string[];
+}
+
+export interface StatusThreadSummary {
+  thread: string;
+  status: "active" | "settled";
+  unacked_attention: number;
+  pending_outbound: number;
+  dropped_outbound: number;
+  controller: {
+    current_run_id: string | null;
+    final_report_sent: boolean;
+    generations: StatusControllerGeneration[];
+  };
+}
+
+export interface StatusSummary {
+  cursor: StatusCursorSummary;
+  active_threads: number;
+  threads: StatusThreadSummary[];
+  outbound: {
+    pending: number;
+    dropped: number;
+  };
+}
+
+export interface AckResult {
+  thread: string;
+  attention: string;
+  acknowledged: boolean;
+  done: boolean;
+}
+
+export interface GuidanceInstruction {
+  attention: string;
+  from: string;
+  subject: string;
+  body: string;
+  parent_event_id: string | null;
+  task_event_id: string;
+  created_at: string;
+}
+
+export interface GuidanceResult {
+  thread: string;
+  instructions: GuidanceInstruction[];
 }
 
 interface ControllerGeneration {
@@ -577,6 +653,146 @@ function appendAudit(type: string, record: Record<string, unknown>): void {
   appendJsonLine(auditPath(), { schema: "orch.mailctl/audit/v1", type, ...record });
 }
 
+function defaultTrustedAuthservId(imapHost: string): string {
+  const host = imapHost.trim().toLowerCase().replace(/\.$/, "");
+  const labels = host.split(".").filter(Boolean);
+  if (labels.length > 2 && /^(?:imap\d*|mail|mx\d*|smtp|pop3?)$/.test(labels[0]!)) {
+    return labels.slice(1).join(".");
+  }
+  return host;
+}
+
+function parsePasswordCmd(value: string): string[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch (error) {
+    throw new CliError(`--password-cmd must be a JSON argv array: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (!Array.isArray(parsed) || parsed.length === 0 || parsed.some((item) => typeof item !== "string" || item.length === 0)) {
+    throw new CliError("--password-cmd must be a non-empty JSON string argv array");
+  }
+  return parsed;
+}
+
+function normalizeAllowedSender(value: string): string {
+  const parsed = parseAddress(value);
+  if (parsed.length !== 1) throw new CliError(`--allow must be a single bare mailbox or address: ${value}`);
+  const address = parsed[0]!.address.toLowerCase();
+  if (!address || /[<>\s]/.test(address) || !address.includes("@")) {
+    throw new CliError(`--allow must be a single bare mailbox or address: ${value}`);
+  }
+  return address;
+}
+
+function optionalPositiveNumber(args: ParsedArgs, name: string): number | undefined {
+  const value = flagNumber(args, name);
+  if (value !== undefined && value <= 0) throw new CliError(`--${name} must be positive`);
+  return value;
+}
+
+function optionalTcpPort(args: ParsedArgs, name: string, fallback: number): number {
+  const value = flagNumber(args, name) ?? fallback;
+  if (!Number.isInteger(value) || value < 1 || value > 65535) throw new CliError(`--${name} must be an integer TCP port in range 1..65535`);
+  return value;
+}
+
+function seedDefaultMailAgents(now: string): string[] {
+  let cfg = readMailAgentsConfig();
+  const seeded: string[] = [];
+  for (const agent of defaultMailAgents(now)) {
+    if (cfg.agents[agent.id]) continue;
+    cfg = upsertMailAgent(cfg, agent);
+    seeded.push(agent.id);
+  }
+  if (seeded.length > 0) writeMailAgentsConfig(cfg);
+  return seeded;
+}
+
+export function mailctlInit(args: ParsedArgs): InitResult {
+  assertKnownFlags(args, "mailctl init", [
+    "user",
+    "imap-host",
+    "imap-port",
+    "smtp-host",
+    "smtp-port",
+    "smtp-mode",
+    "smtp-from",
+    "allow",
+    "workspace",
+    "password-cmd",
+    "trusted-authserv-id",
+    "subject-token",
+    "no-require-auth-results",
+    "reconcile-interval-sec",
+    "controller-timeout-sec",
+    "max-spawns-per-hour",
+    "reports-policy",
+    "max-reports-per-hour",
+    "max-body-bytes",
+    "json",
+  ]);
+  const user = flagString(args, "user").trim();
+  const imapHost = flagString(args, "imap-host").trim().toLowerCase();
+  const smtpHost = flagString(args, "smtp-host").trim().toLowerCase();
+  const allow = Array.from(new Set(collectFlags(args, "allow").map(normalizeAllowedSender)));
+  if (allow.length === 0) throw new CliError("mailctl init requires at least one --allow <sender>");
+  const workspace = flagString(args, "workspace").trim();
+  const smtpMode = flagString(args, "smtp-mode", "implicit");
+  if (smtpMode !== "implicit" && smtpMode !== "starttls") throw new CliError("--smtp-mode must be implicit or starttls");
+  const reportsPolicy = flagString(args, "reports-policy", "auto");
+  if (reportsPolicy !== "auto" && reportsPolicy !== "always" && reportsPolicy !== "never") {
+    throw new CliError("--reports-policy must be auto, always, or never");
+  }
+  const subjectToken = args.flags.has("subject-token") ? flagString(args, "subject-token") : null;
+  if (subjectToken !== null && subjectToken.length === 0) throw new CliError("--subject-token must not be empty");
+
+  const passwordCmd = args.flags.has("password-cmd") ? parsePasswordCmd(flagString(args, "password-cmd")) : undefined;
+  const now = new Date().toISOString();
+  const cfg: MailControlConfig = {
+    version: 1,
+    account: passwordCmd ? { user, password_cmd: passwordCmd } : { user },
+    imap: { host: imapHost, port: optionalTcpPort(args, "imap-port", 993) },
+    smtp: {
+      host: smtpHost,
+      port: optionalTcpPort(args, "smtp-port", smtpMode === "starttls" ? 587 : 465),
+      mode: smtpMode,
+      ...(args.flags.has("smtp-from") ? { from: flagString(args, "smtp-from").trim() } : {}),
+    },
+    allowed_senders: allow,
+    trusted_authserv_id: args.flags.has("trusted-authserv-id")
+      ? flagString(args, "trusted-authserv-id").trim().toLowerCase()
+      : defaultTrustedAuthservId(imapHost),
+    workspace,
+    reconcile_interval_sec: optionalPositiveNumber(args, "reconcile-interval-sec") ?? 60,
+    subject_token: subjectToken,
+    require_auth_results: !flagBool(args, "no-require-auth-results"),
+    controller: {
+      agent: "claude",
+      model: null,
+      timeout_sec: optionalPositiveNumber(args, "controller-timeout-sec") ?? 1800,
+      max_spawns_per_hour: optionalPositiveNumber(args, "max-spawns-per-hour") ?? 6,
+    },
+    reports: {
+      policy: reportsPolicy,
+      max_per_hour: optionalPositiveNumber(args, "max-reports-per-hour") ?? 4,
+      max_body_bytes: optionalPositiveNumber(args, "max-body-bytes") ?? 16384,
+    },
+  };
+  try {
+    validateMailControlConfig(cfg);
+  } catch (error) {
+    throw new CliError(error instanceof Error ? error.message : String(error));
+  }
+  writeMailControlConfig(cfg);
+  const agentsSeeded = seedDefaultMailAgents(now);
+  return {
+    config_path: mailControlConfigPath(),
+    trusted_authserv_id: cfg.trusted_authserv_id,
+    agents_seeded: agentsSeeded,
+  };
+}
+
 function readCursor(): MailCursor | null {
   return readJsonFile<MailCursor | null>(cursorPath(), null);
 }
@@ -776,6 +992,182 @@ function listAttentionForThread(thread: string): AttentionRecord[] {
     .map((path) => readJsonFile<AttentionRecord | null>(path, null))
     .filter((record): record is AttentionRecord => record?.schema === "orch.mailctl/attention/v1" && record.thread === thread)
     .sort((a, b) => a.created_at.localeCompare(b.created_at) || a.msg_sha.localeCompare(b.msg_sha));
+}
+
+function pendingReplyRecords(): PendingReplyRecord[] {
+  return safeJsonFiles(outboxEmailPendingDir())
+    .map((path) => readJsonFile<PendingReplyRecord | null>(path, null))
+    .filter((record): record is PendingReplyRecord => record?.schema === "orch.mailctl/outbox-email/v1");
+}
+
+function droppedReplyRecords(): PendingReplyRecord[] {
+  return safeJsonFiles(outboxEmailDroppedDir())
+    .map((path) => readJsonFile<PendingReplyRecord | null>(path, null))
+    .filter((record): record is PendingReplyRecord => record?.schema === "orch.mailctl/outbox-email/v1");
+}
+
+function sentFinalReportExists(thread: string): boolean {
+  return safeJsonFiles(outboxEmailSentDir())
+    .map((path) => readJsonFile<{ thread?: unknown; report_key?: unknown } | null>(path, null))
+    .some((record) => record?.thread === thread && typeof record.report_key === "string" && record.report_key.startsWith("settled:"));
+}
+
+function settleThreadIfReady(ctx: MailctlContext, thread: string): boolean {
+  const state = readThreadState(thread);
+  if (!state) return false;
+  if (listAttentionForThread(thread).length > 0) return false;
+  if (!sentFinalReportExists(thread)) return false;
+  if (state.status === "settled" && state.controller.final_report_sent === true) return false;
+  writeThreadState({
+    ...state,
+    status: "settled",
+    controller: {
+      ...state.controller,
+      final_report_sent: true,
+    },
+    updated_at: nowIso(ctx),
+  });
+  appendAudit("thread_settled", { thread, reason: "final_report_sent", ts: nowIso(ctx) });
+  return true;
+}
+
+function safeNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function rawCursorSummary(): StatusCursorSummary {
+  const raw = readJsonFile<Record<string, unknown> | null>(cursorPath(), null);
+  return {
+    last_uid: safeNumber(raw?.last_uid) ?? null,
+    consecutive_failures: safeNumber(raw?.consecutive_failures) ?? 0,
+    last_error: typeof raw?.last_error === "string" ? redactHumanText(raw.last_error) : null,
+  };
+}
+
+function statusGeneration(gen: ControllerGeneration): StatusControllerGeneration {
+  return {
+    gen: gen.gen,
+    run_id: gen.run_id,
+    state: readGenerationStatus(gen)?.state ?? null,
+    spawned_at: gen.spawned_at,
+    trigger_reasons: [...gen.trigger_reasons],
+  };
+}
+
+export function mailctlStatus(_ctx: MailctlContext, _opts: { json?: boolean } = {}): StatusSummary {
+  ensureMailctlStateDirs();
+  const pending = pendingReplyRecords();
+  const dropped = droppedReplyRecords();
+  const threads = listThreadStates()
+    .sort((a, b) => a.thread.localeCompare(b.thread))
+    .map((state): StatusThreadSummary => ({
+      thread: state.thread,
+      status: state.status,
+      unacked_attention: listAttentionForThread(state.thread).length,
+      pending_outbound: pending.filter((record) => record.thread === state.thread).length,
+      dropped_outbound: dropped.filter((record) => record.thread === state.thread).length,
+      controller: {
+        current_run_id: state.controller.current_run_id,
+        final_report_sent: state.controller.final_report_sent === true,
+        generations: state.controller.generations.map(statusGeneration),
+      },
+    }));
+  return {
+    cursor: rawCursorSummary(),
+    active_threads: threads.filter((thread) => thread.status === "active").length,
+    threads,
+    outbound: {
+      pending: pending.length,
+      dropped: dropped.length,
+    },
+  };
+}
+
+function redactHumanText(text: string): string {
+  return sanitizeControllerText(text)
+    .replace(/(api[_-]?key|token|secret|password)(\s*[:=]\s*)[^\s]+/gi, "$1$2***REDACTED***")
+    .trim();
+}
+
+export function renderMailctlStatus(summary: StatusSummary): string {
+  const lastError = summary.cursor.last_error ? redactHumanText(summary.cursor.last_error) : "none";
+  const rows = [
+    "mailctl status",
+    `cursor: last_uid=${summary.cursor.last_uid ?? "none"} consecutive_failures=${summary.cursor.consecutive_failures} last_error=${lastError}`,
+    `outbound: pending=${summary.outbound.pending} dropped=${summary.outbound.dropped}`,
+    `threads: active=${summary.active_threads} total=${summary.threads.length}`,
+  ];
+  for (const thread of summary.threads) {
+    rows.push(
+      `  ${thread.thread} ${thread.status} attention=${thread.unacked_attention} generations=${thread.controller.generations.length} current=${thread.controller.current_run_id ?? "none"} final_report_sent=${thread.controller.final_report_sent} pending=${thread.pending_outbound} dropped=${thread.dropped_outbound}`,
+    );
+  }
+  return `${rows.join("\n")}\n`;
+}
+
+function readAttentionRecord(path: string): AttentionRecord | null {
+  return readJsonFile<AttentionRecord | null>(path, null);
+}
+
+function assertAttentionThread(record: AttentionRecord | null, thread: string, attention: string): AttentionRecord {
+  if (!record || record.schema !== "orch.mailctl/attention/v1" || record.thread !== thread) {
+    throw new Error(`mailctl attention id is unknown for ${thread}: ${attention}`);
+  }
+  return record;
+}
+
+function assertAttentionId(attention: string): void {
+  if (!/^[A-Za-z0-9_-]+$/.test(attention)) {
+    throw new Error("mailctl attention id must contain only letters, numbers, underscore, or dash");
+  }
+}
+
+export function mailctlAck(ctx: MailctlContext, opts: { thread: string; attention: string }): AckResult {
+  ensureMailctlStateDirs();
+  assertAttentionId(opts.attention);
+  const source = attentionPath(opts.attention);
+  const done = attentionDonePath(opts.attention);
+  if (existsSync(done) && !existsSync(source)) {
+    assertAttentionThread(readAttentionRecord(done), opts.thread, opts.attention);
+    settleThreadIfReady(ctx, opts.thread);
+    return { thread: opts.thread, attention: opts.attention, acknowledged: false, done: true };
+  }
+  if (!existsSync(source)) {
+    throw new Error(`mailctl attention id is unknown for ${opts.thread}: ${opts.attention}`);
+  }
+  assertAttentionThread(readAttentionRecord(source), opts.thread, opts.attention);
+  mkdirSync(`${mailControlStateDir()}/controller/attention/done`, { recursive: true });
+  renameSync(source, done);
+  appendAudit("attention_acked", { thread: opts.thread, attention: opts.attention, ts: nowIso(ctx) });
+  settleThreadIfReady(ctx, opts.thread);
+  return { thread: opts.thread, attention: opts.attention, acknowledged: true, done: true };
+}
+
+export function mailctlGuidance(_ctx: MailctlContext, opts: { thread: string; json?: boolean }): GuidanceResult {
+  ensureMailctlStateDirs();
+  if (!readThreadState(opts.thread)) throw new Error(`mailctl thread not found: ${opts.thread}`);
+  return {
+    thread: opts.thread,
+    instructions: listAttentionForThread(opts.thread).map((record) => ({
+      attention: record.msg_sha,
+      from: record.from,
+      subject: redactHumanText(record.subject),
+      body: redactHumanText(record.body),
+      parent_event_id: record.parent_event_id,
+      task_event_id: record.task_event_id,
+      created_at: record.created_at,
+    })),
+  };
+}
+
+export function renderMailctlGuidance(guidance: GuidanceResult): string {
+  if (guidance.instructions.length === 0) return `mailctl guidance ${guidance.thread}: no unacked instructions\n`;
+  const rows = [`mailctl guidance ${guidance.thread}`];
+  for (const item of guidance.instructions) {
+    rows.push(`  ${item.attention} from=${item.from} subject=${redactHumanText(item.subject)}`);
+    rows.push(redactHumanText(item.body).split(/\r?\n/).map((line) => `    ${line}`).join("\n"));
+  }
+  return `${rows.join("\n")}\n`;
 }
 
 function backfillAcceptedMarker(ctx: MailctlContext, marker: MessageMarker): void {
@@ -1576,6 +1968,7 @@ export async function mailctlReply(ctx: MailctlContext, opts: ReplyOptions): Pro
   const pendingPath = pendingReplyPath(opts.reportKey);
   const sentPath = sentReplyPath(opts.reportKey);
   if (existsSync(sentPath) || existsSync(pendingPath)) {
+    if (existsSync(sentPath) && opts.reportKey.startsWith("settled:")) settleThreadIfReady(ctx, state.thread);
     return { dryRun: Boolean(opts.dryRun), duplicate: true, sent: existsSync(sentPath), pending: existsSync(pendingPath), sentPath, pendingPath };
   }
   if (sentInLastHour(ctx.now()) >= ctx.config.reports.max_per_hour) {
@@ -1625,6 +2018,7 @@ export async function mailctlReply(ctx: MailctlContext, opts: ReplyOptions): Pro
     const finalPending = readJsonFile<PendingReplyRecord>(pendingPath, pending);
     const finalSentPath = writeSentReply(finalPending, nowIso(ctx));
     rmSync(pendingPath, { force: true });
+    if (opts.reportKey.startsWith("settled:")) settleThreadIfReady(ctx, state.thread);
     appendAudit("reply_sent", { report_key: opts.reportKey, thread: state.thread, sent_path: finalSentPath, ts: nowIso(ctx) });
     return {
       dryRun: false,

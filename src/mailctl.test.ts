@@ -1,20 +1,32 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { writeOrchConfig, type MailControlConfig } from "./config.ts";
+import {
+  mailControlConfigPath,
+  readMailAgentsConfig,
+  readMailControlConfig,
+  writeOrchConfig,
+  type MailControlConfig,
+} from "./config.ts";
 import { readJsonFile, writeJsonAtomic } from "./json.ts";
 import { acquirePidfileLock } from "./locks.ts";
 import { mailEventsPath } from "./mail.ts";
 import {
+  attentionDonePath,
+  attentionPath,
   auditPath,
   buildControllerTask,
   cursorPath,
   evaluateGate,
   ingestLockPath,
+  mailctlAck,
+  mailctlGuidance,
+  mailctlInit,
   mailctlPoll,
   mailctlReconcile,
   mailctlReply,
+  mailctlStatus,
   mailctlThreadStatePath,
   mailctlWatch,
   mergeThread,
@@ -22,6 +34,8 @@ import {
   normalizeMessageId,
   outboxEmailPendingDir,
   outboxEmailSentDir,
+  renderMailctlGuidance,
+  renderMailctlStatus,
   resolveWorkspace,
   sha12,
   taskFilePath,
@@ -34,6 +48,7 @@ import {
   type PollFault,
 } from "./mailctl.ts";
 import type { MailCliContext } from "./mail-cli.ts";
+import { parseArgs } from "./cli.ts";
 
 type ConfigOverrides = Partial<MailControlConfig> & {
   account?: Partial<MailControlConfig["account"]>;
@@ -238,6 +253,21 @@ function busEvents(state = firstThreadState()): any[] {
     .map((line) => JSON.parse(line));
 }
 
+async function runOrch(args: string[], env: Record<string, string>): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  const proc = Bun.spawn([process.execPath, "src/orch.ts", ...args], {
+    cwd: process.cwd(),
+    env: { ...process.env, ...env },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  return { stdout, stderr, exitCode };
+}
+
 function writeFakeOrch(root: string): MailCliContext {
   const script = join(root, "fake-orch.ts");
   writeFileSync(
@@ -337,6 +367,71 @@ describe("mailctl state layout", () => {
     expect(sha12("hello")).toHaveLength(12);
     expect(normalizeMessageId("<Local.Part@Example.COM>")).toBe("<Local.Part@example.com>");
     expect(normalizeMessageId("not a message id", "Message-ID: not a message id")).toBe(sha12("Message-ID: not a message id"));
+  });
+});
+
+describe("mailctlInit", () => {
+  it("writes a 0600 config, seeds default agents, and rejects invalid flags", () => {
+    const root = mkdtempSync(join(tmpdir(), "orch-mailctl-init-"));
+    process.env.XDG_CONFIG_HOME = join(root, "config");
+    const result = mailctlInit(
+      parseArgs([
+        "mailctl",
+        "init",
+        "--user",
+        "bot@example.com",
+        "--imap-host",
+        "imap.example.com",
+        "--smtp-host",
+        "smtp.example.com",
+        "--allow",
+        "Owner <OWNER@example.com>",
+        "--workspace",
+        "default-ws",
+        "--password-cmd",
+        '["printf","secret"]',
+        "--subject-token",
+        "[orch-control]",
+      ]),
+    );
+
+    expect(result.config_path).toBe(mailControlConfigPath());
+    expect(result.trusted_authserv_id).toBe("example.com");
+    expect(result.agents_seeded).toContain("orch-router");
+    expect(statSync(mailControlConfigPath()).mode & 0o777).toBe(0o600);
+    expect(readMailControlConfig()).toMatchObject({
+      account: { user: "bot@example.com", password_cmd: ["printf", "secret"] },
+      imap: { host: "imap.example.com", port: 993 },
+      smtp: { host: "smtp.example.com", port: 465, mode: "implicit" },
+      allowed_senders: ["owner@example.com"],
+      trusted_authserv_id: "example.com",
+      subject_token: "[orch-control]",
+    });
+    expect(readMailAgentsConfig().agents["codex-implementer"]).toBeDefined();
+
+    expect(() =>
+      mailctlInit(parseArgs(["mailctl", "init", "--user", "bot@example.com", "--imap-host", "imap.example.com", "--smtp-host", "smtp.example.com", "--workspace", "default-ws"])),
+    ).toThrow("--allow");
+    expect(() =>
+      mailctlInit(
+        parseArgs([
+          "mailctl",
+          "init",
+          "--user",
+          "bot@example.com",
+          "--imap-host",
+          "imap.example.com",
+          "--smtp-host",
+          "smtp.example.com",
+          "--allow",
+          "owner@example.com",
+          "--workspace",
+          "default-ws",
+          "--password-cmd",
+          "{}",
+        ]),
+      ),
+    ).toThrow("--password-cmd");
   });
 });
 
@@ -724,6 +819,174 @@ describe("mailctlPoll stateful cycle", () => {
     expect(sleeps).toEqual([1000, 1000]);
     expect(transport.listCalls).toBe(2);
     expect(transport.idleCalls).toBe(0);
+  });
+});
+
+describe("mailctlAck, status, and guidance", () => {
+  it("acks attention atomically, clears the T1 trigger, and settles after final report", async () => {
+    const { cfg } = setupMailctl();
+    const transport = new FakeTransport([message(1, "<ack@example.com>")]);
+    const ctx = fakeContext({ cfg, transport });
+    await mailctlPoll(ctx, { reconcile: false });
+    const state = firstThreadState();
+    const attention = readJsonFile<any>(attentionFiles()[0]!, null);
+
+    const acked = mailctlAck(ctx, { thread: state.thread, attention: attention.msg_sha });
+    expect(acked).toMatchObject({ thread: state.thread, attention: attention.msg_sha, acknowledged: true, done: true });
+    expect(existsSync(attentionPath(attention.msg_sha))).toBe(false);
+    expect(existsSync(attentionDonePath(attention.msg_sha))).toBe(true);
+
+    const again = mailctlAck(ctx, { thread: state.thread, attention: attention.msg_sha });
+    expect(again.acknowledged).toBe(false);
+    expect(() => mailctlAck(ctx, { thread: state.thread, attention: "missing" })).toThrow("unknown");
+    expect(() => mailctlAck(ctx, { thread: state.thread, attention: "../escape" })).toThrow("attention id");
+
+    const reconciled = await mailctlReconcile(ctx);
+    expect(reconciled.spawned).toHaveLength(0);
+    expect(reconciled.live).toHaveLength(0);
+
+    const sent = await mailctlReply(ctx, { thread: state.thread, reportKey: "settled:0", body: "final report" });
+    expect(sent.sent).toBe(true);
+    const settled = readJsonFile<any>(mailctlThreadStatePath(state.thread), null);
+    expect(settled.status).toBe("settled");
+    expect(settled.controller.final_report_sent).toBe(true);
+    expect((await mailctlReconcile(ctx)).active_threads).toBe(0);
+  });
+
+  it("summarizes status and guidance and redacts human output", async () => {
+    const { cfg } = setupMailctl();
+    const transport = new FakeTransport([
+      {
+        ref: { uid: 1 },
+        raw: textMail({
+          messageId: "<guidance@example.com>",
+          subject: "Inspect /Users/me/project token=ABCDEFGHIJKLMNOPQRST",
+          body: "Inspect /Users/me/project\ntoken=ABCDEFGHIJKLMNOPQRST",
+        }),
+      },
+    ]);
+    const ctx = fakeContext({ cfg, transport });
+    await mailctlPoll(ctx, { reconcile: false });
+    const state = firstThreadState();
+    writeJsonAtomic(cursorPath(), {
+      uidvalidity: null,
+      last_uid: 1,
+      last_poll_at: "2026-07-04T08:56:28.000Z",
+      consecutive_failures: 3,
+      last_error: "failed under /Users/me/project with token=ABCDEFGHIJKLMNOPQRST",
+    });
+
+    const status = mailctlStatus(ctx, {});
+    expect(status.cursor).toMatchObject({ last_uid: 1, consecutive_failures: 3 });
+    expect(status.cursor.last_error).not.toContain("/Users/me/project");
+    expect(status.cursor.last_error).not.toContain("ABCDEFGHIJKLMNOPQRST");
+    expect(status.threads[0]).toMatchObject({ thread: state.thread, status: "active", unacked_attention: 1 });
+    const renderedStatus = renderMailctlStatus(status);
+    expect(renderedStatus).not.toContain("/Users/me/project");
+    expect(renderedStatus).not.toContain("ABCDEFGHIJKLMNOPQRST");
+
+    const guidance = mailctlGuidance(ctx, { thread: state.thread });
+    expect(guidance.instructions).toHaveLength(1);
+    expect(guidance.instructions[0]!.subject).not.toContain("/Users/me/project");
+    expect(guidance.instructions[0]!.subject).not.toContain("ABCDEFGHIJKLMNOPQRST");
+    expect(guidance.instructions[0]!.body).not.toContain("/Users/me/project");
+    expect(guidance.instructions[0]!.body).not.toContain("ABCDEFGHIJKLMNOPQRST");
+    const renderedGuidance = renderMailctlGuidance(guidance);
+    expect(renderedGuidance).not.toContain("/Users/me/project");
+    expect(renderedGuidance).not.toContain("ABCDEFGHIJKLMNOPQRST");
+  });
+});
+
+describe("orch mailctl CLI dispatch", () => {
+  it("routes subcommands without network when using dry-run or bounded watch", async () => {
+    setupMailctl();
+    const env = {
+      XDG_STATE_HOME: process.env.XDG_STATE_HOME!,
+      XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME!,
+    };
+
+    const init = await runOrch(
+      [
+        "mailctl",
+        "init",
+        "--user",
+        "bot@example.com",
+        "--imap-host",
+        "imap.example.com",
+        "--smtp-host",
+        "smtp.example.com",
+        "--allow",
+        "owner@example.com",
+        "--workspace",
+        "default-ws",
+        "--no-require-auth-results",
+        "--json",
+      ],
+      env,
+    );
+    expect(init.exitCode).toBe(0);
+    expect(JSON.parse(init.stdout)).toMatchObject({ mailctl: "init", trusted_authserv_id: "example.com" });
+
+    const cfg = readMailControlConfig();
+    const transport = new FakeTransport([
+      {
+        ref: { uid: 1 },
+        raw: textMail({
+          messageId: "<cli-dispatch@example.com>",
+          subject: "CLI /Users/me/project token=ABCDEFGHIJKLMNOPQRST",
+          body: "CLI task under /Users/me/project\ntoken=ABCDEFGHIJKLMNOPQRST",
+        }),
+      },
+    ]);
+    const ctx = fakeContext({ cfg, transport });
+    await mailctlPoll(ctx, { reconcile: false });
+    const state = firstThreadState();
+    const attention = readJsonFile<any>(attentionFiles()[0]!, null).msg_sha;
+
+    const poll = await runOrch(["mailctl", "poll", "--dry-run", "--json"], env);
+    expect(poll.exitCode).toBe(0);
+    expect(JSON.parse(poll.stdout)).toMatchObject({ skipped: false, listed: 0 });
+    writeJsonAtomic(cursorPath(), {
+      uidvalidity: null,
+      last_uid: 1,
+      last_poll_at: "2026-07-04T08:56:28.000Z",
+      consecutive_failures: 3,
+      last_error: "failed under /Users/me/project with token=ABCDEFGHIJKLMNOPQRST",
+    });
+
+    const status = await runOrch(["mailctl", "status", "--json"], env);
+    expect(status.exitCode).toBe(0);
+    expect(status.stdout).not.toContain("/Users/me/project");
+    expect(status.stdout).not.toContain("ABCDEFGHIJKLMNOPQRST");
+    expect(JSON.parse(status.stdout).cursor).toMatchObject({ last_uid: 1, consecutive_failures: 3 });
+    expect(JSON.parse(status.stdout).threads[0]).toMatchObject({ thread: state.thread, unacked_attention: 1 });
+
+    const guidance = await runOrch(["mailctl", "guidance", "--thread", state.thread, "--json"], env);
+    expect(guidance.exitCode).toBe(0);
+    expect(guidance.stdout).not.toContain("/Users/me/project");
+    expect(guidance.stdout).not.toContain("ABCDEFGHIJKLMNOPQRST");
+    expect(JSON.parse(guidance.stdout).instructions[0]).toMatchObject({
+      attention,
+      subject: "CLI [local-path] token=***REDACTED***",
+      body: "CLI task under [local-path]\ntoken=***REDACTED***",
+    });
+
+    const reply = await runOrch(["mailctl", "reply", "--thread", state.thread, "--report-key", "progress:cli", "--body", "progress body", "--dry-run"], env);
+    expect(reply.exitCode).toBe(0);
+    expect(reply.stdout).toContain("[orch:progress:cli]");
+    expect(reply.stdout).toContain("progress body");
+
+    const ack = await runOrch(["mailctl", "ack", "--thread", state.thread, "--attention", attention, "--json"], env);
+    expect(ack.exitCode).toBe(0);
+    expect(JSON.parse(ack.stdout)).toMatchObject({ mailctl: "ack", acknowledged: true, done: true });
+
+    const watch = await runOrch(["mailctl", "watch", "--iterations", "0", "--json"], env);
+    expect(watch.exitCode).toBe(0);
+    expect(JSON.parse(watch.stdout)).toMatchObject({ mailctl: "watch", iterations: 0 });
+
+    const unknown = await runOrch(["mailctl", "unknown"], env);
+    expect(unknown.exitCode).toBe(2);
+    expect(unknown.stderr).toContain("usage: orch mailctl");
   });
 });
 

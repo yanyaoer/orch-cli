@@ -52,7 +52,7 @@ export interface MailCliContext {
   readMirrorResult: (runsRoot: string, runId: string) => { result: RoleResult; status: RunStatus | null };
 }
 
-function defaultMailAgents(now: string): MailAgentDefinition[] {
+export function defaultMailAgents(now: string): MailAgentDefinition[] {
   return [
     {
       id: "orch-router",
