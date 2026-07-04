@@ -2,6 +2,19 @@
 
 All notable user-facing changes are recorded here.
 
+## [0.0.6] - 2026-07-04
+
+### Features
+
+- `orch mailctl` — drive orch by real email over IMAP/SMTP (the mail controller). An allowlisted, authenticated sender emails a task; `orch mailctl poll` (the primary cron/launchd contract) ingests it over a zero-dependency IMAP client, publishes a router task, and auto-spawns a headless claude **controller** run that fans the work out (`orch fanout`/`cross-review`), records `orch decision`s, and replies progress over SMTP in the same email thread. `orch mailctl watch` is a foreground IMAP-IDLE convenience — a long-running process, but not a background daemon. Subcommands: `init` / `poll` / `watch` / `status` / `reply` / `ack` / `guidance`. Works with any IMAP/SMTP provider (Gmail via an app password). Inbound email is treated as an authentication boundary: the `From` allowlist is backed by an `Authentication-Results` header pinned to a trusted authserv-id (dkim/dmarc `pass` + domain alignment, evaluated on the top-most trusted instance only, fail-closed) plus an optional subject token; task text comes only from a real `text/plain` part (HTML-only mail is refused with `rejected_html`, so HTML/CSS hidden text can never become task instructions); ingestion is exactly-once via `messages/<sha>` markers; the controller runs with `Bash(orch *)` + read-only tools (it orchestrates, it does not edit code); outbound replies run a mail-specific leak scan.
+- New `controller` result role and `orch.result/controller/v1` schema (`verdict`, `summary`, `actions`) — claude-only, kept out of `writeRoles` (no worktree lock), launched with a `Bash(orch *)` + read-only allowed-tools whitelist so "orchestrate, don't edit" is a mechanism, not a prompt.
+- Persistent constraint layer: `docs/adr/` (architecture decisions) and `docs/specs/` (task/feature specs). When those constraints shape an `orch --task` file, the binding excerpts are inlined so the run stays replayable from `spec.json`. Added controller triage discipline and a hardened spec template.
+
+### Fixes
+
+- IMAP and SMTP socket clients now wait for the socket `open` (TLS handshake) before reading the greeting or writing the first command, and the IMAP client consumes the mandatory server greeting up front — fixing a stall / dropped first write against live servers such as Gmail.
+- The mail controller task is launched with `--permission-mode dontAsk` and an explicit headless directive so a real controller executes its `orch` commands directly instead of stalling in plan mode.
+
 ## [0.0.5] - 2026-07-04
 
 ### Features

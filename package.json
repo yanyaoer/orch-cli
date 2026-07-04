@@ -1,7 +1,7 @@
 {
   "name": "orch-cli",
   "description": "Daemonless multi-agent orchestration for coding work.",
-  "version": "0.0.5",
+  "version": "0.0.6",
   "type": "module",
   "private": true,
   "homepage": "https://yanyaoer.github.io/orch-cli/",

@@ -8,7 +8,7 @@ Daemonless multi-agent orchestration for coding work.
 
 Project page: `docs/index.html` is ready for GitHub Pages and includes a bilingual animated overview.
 
-Latest release: `v0.0.4` ([CHANGELOG.md](CHANGELOG.md)).
+Latest release: `v0.0.6` ([CHANGELOG.md](CHANGELOG.md)).
 
 ## Current Scope
 
@@ -18,7 +18,7 @@ This repository is the v2 MVP described in [docs/orch-mvp-spec.md](docs/orch-mvp
 
 Durable architecture decisions live in [docs/adr/](docs/adr/README.md); task and feature specs live in [docs/specs/](docs/specs/README.md). When those constraints shape an `orch --task` file, inline the binding excerpts so the run remains replayable from `spec.json`.
 
-Shipped on `main` (v0.0.4, see [CHANGELOG.md](CHANGELOG.md)):
+Shipped on `main` (v0.0.6, see [CHANGELOG.md](CHANGELOG.md)):
 
 - `orch run create` starts one supervised headless worker run. `--mr` is optional: it resolves from an `MR: <id-or-url>` line in the task's leading header block, a merge-request/pull URL in the task text, or the current branch name (`mr_source` reports which).
 - Bare `orch` prints the overview: active runs plus every pending action (undecided terminal runs, stale runs, pending outbox) expressed as a runnable orch command line — the same contract humans copy and agents execute from `--json`. `--all` scans every repo under the state root. The overview is a notification center, not a debt ledger: items idle beyond `--attention-days` (default 14, `0` disables) age out, and mrs matching a local branch already merged into HEAD are archived wholesale. `orch decision close` acks a run without queueing a comment; `orch decision sweep --execute` batch-acks the whole backlog by the overview's own rubric.
@@ -55,7 +55,7 @@ One line (downloads the latest release binary for your platform into `~/.local/b
 $ curl -fsSL https://raw.githubusercontent.com/yanyaoer/orch-cli/main/install.sh | sh
 ```
 
-Override the target with `ORCH_INSTALL_DIR=/somewhere` or pin a tag with `ORCH_VERSION=v0.0.4`. Upgrade later with:
+Override the target with `ORCH_INSTALL_DIR=/somewhere` or pin a tag with `ORCH_VERSION=v0.0.6`. Upgrade later with:
 
 ```sh
 $ orch update          # self-replace with the latest release (--check to only compare)
