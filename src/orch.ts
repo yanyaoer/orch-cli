@@ -1376,12 +1376,104 @@ async function waitCommand(args: ParsedArgs): Promise<number> {
 
 const FOLLOW_POLL_MS = 500;
 
+// Without --run, -f multiplexes every active run in the repo (or one mr):
+// existing active runs stream from their current end (-n replays that much
+// context first), runs created while following stream from the top, and a
+// tail(1)-style "==> mr/run <==" header marks every source switch. Runs are
+// dropped once terminal or stale; the loop itself runs until Ctrl-C, since
+// waiting for runs that don't exist yet is the point.
+async function eventsTailAll(args: ParsedArgs, repoKey: string): Promise<number> {
+  const lines = parseTailLines(args);
+  const fileName = flagBool(args, "native") ? "native.jsonl" : "events.jsonl";
+  const mrNames = (): string[] => (args.flags.has("mr") ? [flagString(args, "mr")] : mrDirsForRepo(repoKey));
+
+  type Tracked = { label: string; runDir: string; follower: ReturnType<typeof createFileFollower>; render: (line: string) => string };
+  const tracked = new Map<string, Tracked>();
+  const seen = new Set<string>();
+  let currentLabel = "";
+  const write = (label: string, out: string): void => {
+    if (!out) return;
+    if (currentLabel !== label) {
+      currentLabel = label;
+      process.stdout.write(`==> ${label} <==\n`);
+    }
+    process.stdout.write(out);
+  };
+  const makeRender = (): ((line: string) => string) => {
+    const normalize = fileName === "native.jsonl" ? createNativeNormalizer() : null;
+    return (line) =>
+      normalize
+        ? normalize(line)
+            .map((event) => `${JSON.stringify(event)}\n`)
+            .join("")
+        : line
+          ? `${line}\n`
+          : "";
+  };
+
+  const track = (mrName: string, runId: string, runDir: string, preexisting: boolean): void => {
+    const label = `${mrName}/${runId}`;
+    const render = makeRender();
+    let offset = 0;
+    if (preexisting) {
+      // Pre-existing active run: skip its history (replay -n lines of it as
+      // context), follow from the last complete line.
+      const text = readTextFile(`${runDir}/${fileName}`) ?? "";
+      const complete = text.slice(0, text.lastIndexOf("\n") + 1);
+      offset = Buffer.byteLength(complete, "utf8");
+      if (lines !== null) write(label, tailText(complete.split("\n").map(render).join(""), lines));
+    }
+    tracked.set(runDir, { label, runDir, follower: createFileFollower(`${runDir}/${fileName}`, offset), render });
+  };
+
+  const discover = (firstPass: boolean): void => {
+    for (const mrName of mrNames()) {
+      const runsRoot = `${mrStateDir(repoKey, mrName)}/runs`;
+      if (!existsSync(runsRoot)) continue;
+      for (const entry of readdirSync(runsRoot, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue;
+        const runDir = `${runsRoot}/${entry.name}`;
+        if (seen.has(runDir)) continue;
+        seen.add(runDir);
+        const status = readJsonFile<RunStatus | null>(`${runDir}/status.json`, null);
+        const active = status !== null && nonTerminalStates.has(status.state) && !looksStale(status);
+        // On the first pass terminal runs are history; later they are news.
+        if (firstPass && !active) continue;
+        track(mrName, entry.name, runDir, firstPass);
+      }
+    }
+  };
+
+  let firstPass = true;
+  for (;;) {
+    discover(firstPass);
+    firstPass = false;
+    for (const t of tracked.values()) {
+      const emit = (): void => {
+        for (const line of t.follower.drain()) write(t.label, t.render(line));
+      };
+      emit();
+      const status = readJsonFile<RunStatus | null>(`${t.runDir}/status.json`, null);
+      if (status && (!nonTerminalStates.has(status.state) || looksStale(status))) {
+        emit(); // the worker may flush final lines right before going terminal
+        tracked.delete(t.runDir);
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, FOLLOW_POLL_MS));
+  }
+}
+
 async function eventsTail(args: ParsedArgs): Promise<number> {
+  const worktree = resolve(flagString(args, "worktree", process.cwd()));
+  const follow = flagBool(args, "follow");
+  if (!args.flags.has("run")) {
+    if (!follow) throw new CliError("missing --run (with -f, --run may be omitted to follow every active run)");
+    const repo = await getRepoIdentity(worktree);
+    return eventsTailAll(args, repo.repo_key);
+  }
   const runId = flagString(args, "run");
   const mr = args.flags.has("mr") ? flagString(args, "mr") : undefined;
-  const worktree = resolve(flagString(args, "worktree", process.cwd()));
   const lines = parseTailLines(args);
-  const follow = flagBool(args, "follow");
   const repo = await getRepoIdentity(worktree);
   const located = locateRun(repo.repo_key, runId, mr);
 
