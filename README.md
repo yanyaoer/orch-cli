@@ -234,6 +234,28 @@ $ orch mailctl guidance --thread em-<id>                             # unacked i
 
 **Daemonless, precisely.** `poll` is the primary contract — a bounded one-shot ingest + reconcile you drive from `cron` or `launchd`, exactly the stateless-reconciler model, with no orch-owned background service. `watch` is a **foreground** convenience: it is honestly a long-running process (an IMAP-IDLE loop), but it is *not a daemon* — it never forks or detaches, owns no global scheduler, holds no persistent model session, and does one bounded reconcile per wake before returning to IDLE (`Ctrl-C` exits). So the "daemonless" claim means *no background service / no `orchd`*, not "no long-running process ever". **For unattended operation, drive `poll` from cron/launchd — do not keep `watch` alive under a restart supervisor.**
 
+**Scheduling `poll`.** Without a scheduler, mail sits unread on the IMAP server until the next manual `poll`. On macOS, a per-user LaunchAgent runs `poll` every 5 minutes (missed intervals coalesce into one run after wake; the unquoted heredoc expands `$HOME` at write time — launchd does not expand variables):
+
+```sh
+$ cat > ~/Library/LaunchAgents/com.orch.mailctl-poll.plist <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.orch.mailctl-poll</string>
+  <key>ProgramArguments</key><array>
+    <string>$HOME/.local/bin/orch</string>
+    <string>mailctl</string><string>poll</string>
+  </array>
+  <key>StartInterval</key><integer>300</integer>
+  <key>StandardOutPath</key><string>/tmp/orch-mailctl-poll.log</string>
+  <key>StandardErrorPath</key><string>/tmp/orch-mailctl-poll.log</string>
+</dict></plist>
+EOF
+$ launchctl load ~/Library/LaunchAgents/com.orch.mailctl-poll.plist
+```
+
+On Linux, the cron equivalent is `*/5 * * * * "$HOME"/.local/bin/orch mailctl poll`. Overlapping cycles are safe either way — a `poll` that finds `ingest.lock` held skips quietly. Check `orch mailctl status` for `last_poll_at` and `consecutive_failures` to confirm the schedule is alive.
+
 State lives under `${XDG_STATE_HOME:-$HOME/.local/state}/orch/mail-control/` (a single `ingest.lock`, exactly-once `messages/<sha>` markers, per-thread mappings, outbound queue) plus per-thread controller runs under the usual run tree with mr `mailctl-em-<id>`.
 
 Inbound email is treated as an **authentication boundary**:
