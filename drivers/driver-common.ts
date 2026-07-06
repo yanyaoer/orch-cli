@@ -1,7 +1,7 @@
 import { closeSync, existsSync, openSync, readFileSync, writeFileSync, writeSync } from "node:fs";
-import { isResultRole, type AgentName, type RunSpec, type RoleResult } from "../src/types.ts";
+import { isResultRole, type AgentName, type ResultCoercion, type RunSpec, type RoleResult } from "../src/types.ts";
 import { fallbackResult, resultSchemaName, validateRoleResult } from "../src/schema.ts";
-import { writeJsonAtomic } from "../src/json.ts";
+import { appendJsonLine, countLines, writeJsonAtomic } from "../src/json.ts";
 import { normalizeNativeText, type NativeEvent } from "../src/native-events.ts";
 
 export interface DriverArgs {
@@ -246,6 +246,37 @@ function tryParseJson(text: string): unknown | null {
   }
 }
 
+export interface ExtractedResult {
+  result: RoleResult;
+  coercions: ResultCoercion[];
+}
+
+const COERCION_VALUE_LIMIT = 120;
+
+function compactCoercionValue(value: unknown): string {
+  let text: string;
+  if (typeof value === "string") {
+    text = value;
+  } else if (value === undefined) {
+    text = "undefined";
+  } else {
+    try {
+      text = JSON.stringify(value) ?? String(value);
+    } catch {
+      text = String(value);
+    }
+  }
+  const compact = text.replace(/\s+/g, " ").trim();
+  return compact.length > COERCION_VALUE_LIMIT ? `${compact.slice(0, COERCION_VALUE_LIMIT - 3)}...` : compact;
+}
+
+function recordCoercion(coercions: ResultCoercion[], field: string, from: unknown, to: unknown, reason: string): void {
+  const compactFrom = compactCoercionValue(from);
+  const compactTo = compactCoercionValue(to);
+  if (compactFrom === compactTo) return;
+  coercions.push({ field, from: compactFrom, to: compactTo, reason });
+}
+
 function findJsonObjectEnd(text: string, start: number): number | null {
   let depth = 0;
   let inString = false;
@@ -309,7 +340,7 @@ function parsedJsonCandidates(text: string): unknown[] {
   return candidates;
 }
 
-function roleResultFromCandidate(value: unknown, spec: RunSpec): RoleResult | null {
+function roleResultFromCandidate(value: unknown, spec: RunSpec): ExtractedResult | null {
   const normalized = normalizedRoleResult(value, spec);
   if (normalized) return normalized;
 
@@ -341,25 +372,48 @@ function coercedString(item: unknown): string {
   return JSON.stringify(item);
 }
 
-function coerceStringArray(obj: Record<string, unknown>, field: string): void {
-  if (Array.isArray(obj[field])) obj[field] = (obj[field] as unknown[]).map(coercedString);
+function coerceStringArray(obj: Record<string, unknown>, field: string, coercions: ResultCoercion[]): void {
+  if (!Array.isArray(obj[field])) return;
+  obj[field] = (obj[field] as unknown[]).map((item, index) => {
+    const coerced = coercedString(item);
+    if (typeof item !== "string" || item !== coerced) {
+      recordCoercion(coercions, `${field}[${index}]`, item, coerced, "string array item");
+    }
+    return coerced;
+  });
 }
 
-function coerceFindings(obj: Record<string, unknown>, field: string, blocking: boolean): void {
+function coerceFindings(obj: Record<string, unknown>, field: string, blocking: boolean, coercions: ResultCoercion[]): void {
   if (!Array.isArray(obj[field])) return;
   obj[field] = (obj[field] as unknown[]).map((item, index) => {
     const finding: Record<string, unknown> =
       item && typeof item === "object" && !Array.isArray(item) ? { ...(item as Record<string, unknown>) } : { body: String(item) };
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      recordCoercion(coercions, `${field}[${index}]`, item, finding, "finding object");
+    }
     if (typeof finding.body !== "string" || !finding.body.trim()) {
       const body = [finding.description, finding.message, finding.detail, finding.text].find(
         (v) => typeof v === "string" && v.trim(),
       );
-      if (body) finding.body = body;
+      if (body) {
+        recordCoercion(coercions, `${field}[${index}].body`, finding.body, body, "body alias");
+        finding.body = body;
+      }
     }
     if (blocking) {
-      if (typeof finding.id !== "string" || !finding.id.trim()) finding.id = `finding-${index + 1}`;
-      if (typeof finding.severity !== "string" || !finding.severity.trim()) finding.severity = "unspecified";
-      if (typeof finding.file !== "string" || !finding.file.trim()) finding.file = "unspecified";
+      if (typeof finding.id !== "string" || !finding.id.trim()) {
+        const next = `finding-${index + 1}`;
+        recordCoercion(coercions, `${field}[${index}].id`, finding.id, next, "required finding field default");
+        finding.id = next;
+      }
+      if (typeof finding.severity !== "string" || !finding.severity.trim()) {
+        recordCoercion(coercions, `${field}[${index}].severity`, finding.severity, "unspecified", "required finding field default");
+        finding.severity = "unspecified";
+      }
+      if (typeof finding.file !== "string" || !finding.file.trim()) {
+        recordCoercion(coercions, `${field}[${index}].file`, finding.file, "unspecified", "required finding field default");
+        finding.file = "unspecified";
+      }
     }
     return finding;
   });
@@ -374,16 +428,22 @@ const VERDICT_SYNONYMS: Record<string, string> = {
 };
 
 // Models routinely omit arrays that would be empty; restoring them is unambiguous.
-function coerceMissingArrays(obj: Record<string, unknown>, fields: string[]): void {
+function coerceMissingArrays(obj: Record<string, unknown>, fields: string[], coercions: ResultCoercion[]): void {
   for (const field of fields) {
-    if (obj[field] === undefined || obj[field] === null) obj[field] = [];
+    if (obj[field] === undefined || obj[field] === null) {
+      recordCoercion(coercions, field, obj[field], [], "missing array default");
+      obj[field] = [];
+    }
   }
 }
 
-function coerceRoleResult(role: RunSpec["role"], obj: Record<string, unknown>): void {
+function coerceRoleResult(role: RunSpec["role"], obj: Record<string, unknown>, coercions: ResultCoercion[]): void {
   if (typeof obj.verdict === "string") {
-    const verdict = obj.verdict.trim().toLowerCase();
-    obj.verdict = VERDICT_SYNONYMS[verdict] ?? verdict;
+    const original = obj.verdict;
+    const verdict = original.trim().toLowerCase();
+    const coerced = VERDICT_SYNONYMS[verdict] ?? verdict;
+    recordCoercion(coercions, "verdict", original, coerced, VERDICT_SYNONYMS[verdict] ? "known synonym" : "normalized verdict");
+    obj.verdict = coerced;
   }
   if (role === "reviewer") {
     // Gemini-family models flatten the two finding arrays into a single
@@ -395,52 +455,73 @@ function coerceRoleResult(role: RunSpec["role"], obj: Record<string, unknown>): 
         obj.non_blocking_findings = Array.isArray(obj.non_blocking_findings)
           ? [...(obj.non_blocking_findings as unknown[]), ...(obj.findings as unknown[])]
           : obj.findings;
+        recordCoercion(coercions, "findings", obj.findings, { non_blocking_findings: obj.non_blocking_findings }, "flattened reviewer findings");
       } else {
         obj.blocking_findings = obj.findings;
+        recordCoercion(coercions, "findings", obj.findings, { blocking_findings: obj.blocking_findings }, "flattened reviewer findings");
       }
       delete obj.findings;
     }
-    coerceMissingArrays(obj, ["blocking_findings", "non_blocking_findings", "suggested_tests"]);
-    coerceFindings(obj, "blocking_findings", true);
-    coerceFindings(obj, "non_blocking_findings", false);
-    coerceStringArray(obj, "suggested_tests");
-    if (typeof obj.reviews_run_id !== "string") obj.reviews_run_id = obj.reviews_run_id == null ? "" : String(obj.reviews_run_id);
+    coerceMissingArrays(obj, ["blocking_findings", "non_blocking_findings", "suggested_tests"], coercions);
+    coerceFindings(obj, "blocking_findings", true, coercions);
+    coerceFindings(obj, "non_blocking_findings", false, coercions);
+    coerceStringArray(obj, "suggested_tests", coercions);
+    if (typeof obj.reviews_run_id !== "string") {
+      const next = obj.reviews_run_id == null ? "" : String(obj.reviews_run_id);
+      recordCoercion(coercions, "reviews_run_id", obj.reviews_run_id, next, "stringified id");
+      obj.reviews_run_id = next;
+    }
   } else if (role === "implementer") {
-    coerceMissingArrays(obj, ["changed_files", "tests", "acceptance", "risks"]);
-    coerceStringArray(obj, "changed_files");
-    coerceStringArray(obj, "risks");
+    coerceMissingArrays(obj, ["changed_files", "tests", "acceptance", "risks"], coercions);
+    coerceStringArray(obj, "changed_files", coercions);
+    coerceStringArray(obj, "risks", coercions);
   } else if (role === "controller") {
-    coerceMissingArrays(obj, ["actions"]);
-    coerceStringArray(obj, "actions");
+    coerceMissingArrays(obj, ["actions"], coercions);
+    coerceStringArray(obj, "actions", coercions);
   } else if (role === "verifier") {
-    coerceMissingArrays(obj, ["commands", "acceptance"]);
-    if (typeof obj.verifies_run_id !== "string") obj.verifies_run_id = obj.verifies_run_id == null ? "" : String(obj.verifies_run_id);
+    coerceMissingArrays(obj, ["commands", "acceptance"], coercions);
+    if (typeof obj.verifies_run_id !== "string") {
+      const next = obj.verifies_run_id == null ? "" : String(obj.verifies_run_id);
+      recordCoercion(coercions, "verifies_run_id", obj.verifies_run_id, next, "stringified id");
+      obj.verifies_run_id = next;
+    }
   }
 }
 
-function normalizedRoleResult(value: unknown, spec: RunSpec): RoleResult | null {
+function normalizedRoleResult(value: unknown, spec: RunSpec): ExtractedResult | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   if (!isResultRole(spec.role)) return null;
 
   const schemaName = resultSchemaName(spec.role);
   const obj = { ...(value as Record<string, unknown>) };
+  const coercions: ResultCoercion[] = [];
   // Candidates only come from this run's own stream, so the spec is the
   // authority on run_id — models frequently invent one, which used to reject
   // the entire result.
-  obj.run_id = spec.run_id;
-  if (validateRoleResult(spec.role, obj).ok) return obj as unknown as RoleResult;
-  if (obj.schema === undefined) obj.schema = schemaName;
-  coerceRoleResult(spec.role, obj);
+  if (obj.run_id !== spec.run_id) {
+    recordCoercion(coercions, "run_id", obj.run_id, spec.run_id, "spec run_id is authoritative");
+    obj.run_id = spec.run_id;
+  }
+  if (validateRoleResult(spec.role, obj).ok) return { result: obj as unknown as RoleResult, coercions };
+  if (obj.schema === undefined) {
+    recordCoercion(coercions, "schema", obj.schema, schemaName, "missing schema");
+    obj.schema = schemaName;
+  }
+  coerceRoleResult(spec.role, obj, coercions);
 
-  return validateRoleResult(spec.role, obj).ok ? (obj as unknown as RoleResult) : null;
+  return validateRoleResult(spec.role, obj).ok ? { result: obj as unknown as RoleResult, coercions } : null;
+}
+
+export function extractResultWithCoercionsFromText(text: string, spec: RunSpec): ExtractedResult | null {
+  for (const candidate of parsedJsonCandidates(text)) {
+    const extracted = roleResultFromCandidate(candidate, spec);
+    if (extracted) return extracted;
+  }
+  return null;
 }
 
 export function extractResultFromText(text: string, spec: RunSpec): RoleResult | null {
-  for (const candidate of parsedJsonCandidates(text)) {
-    const result = roleResultFromCandidate(candidate, spec);
-    if (result) return result;
-  }
-  return null;
+  return extractResultWithCoercionsFromText(text, spec)?.result ?? null;
 }
 
 function candidateTexts(events: NativeEvent[], kind: NativeEvent["kind"], format: NativeEvent["format"]): string[] {
@@ -474,12 +555,31 @@ function collectResultCandidates(runDir: string): string[] {
   return candidates;
 }
 
-export function extractResultFromRunDir(runDir: string, spec: RunSpec): RoleResult | null {
+export function extractResultWithCoercionsFromRunDir(runDir: string, spec: RunSpec): ExtractedResult | null {
   for (const candidate of collectResultCandidates(runDir)) {
-    const result = extractResultFromText(candidate, spec);
-    if (result) return result;
+    const extracted = extractResultWithCoercionsFromText(candidate, spec);
+    if (extracted) return extracted;
   }
   return null;
+}
+
+export function extractResultFromRunDir(runDir: string, spec: RunSpec): RoleResult | null {
+  return extractResultWithCoercionsFromRunDir(runDir, spec)?.result ?? null;
+}
+
+export function appendResultCoercionEvent(runDir: string, coercions: ResultCoercion[]): void {
+  if (coercions.length === 0) return;
+  try {
+    const eventsPath = `${runDir}/events.jsonl`;
+    appendJsonLine(eventsPath, {
+      type: "result_coercion",
+      seq: countLines(eventsPath),
+      ts: new Date().toISOString(),
+      coercions,
+    });
+  } catch {
+    // Coercion visibility is diagnostic only; extraction/result writing must win.
+  }
 }
 
 // Best human-readable stand-in for the worker's final answer, used to preserve
@@ -620,9 +720,10 @@ export async function runProviderDriver(provider: AgentName, argv: string[]): Pr
   const code = await proc.exited;
   writeExitCode(args.runDir, code);
 
-  const extracted = extractResultFromRunDir(args.runDir, spec);
+  const extracted = extractResultWithCoercionsFromRunDir(args.runDir, spec);
   if (extracted) {
-    writeResult(args.runDir, spec, extracted);
+    writeResult(args.runDir, spec, extracted.result);
+    appendResultCoercionEvent(args.runDir, extracted.coercions);
     return code;
   }
 

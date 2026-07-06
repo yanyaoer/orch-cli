@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -13,6 +13,7 @@ import {
   ompModelChain,
   OMP_MODEL_CHAIN,
   rawResultText,
+  runProviderDriver,
 } from "./driver-common.ts";
 import type { RunSpec } from "../src/types.ts";
 
@@ -50,6 +51,51 @@ function spec(role: RunSpec["role"], runId: string): RunSpec {
     timeout_sec: 60,
     created_at: "2026-06-19T12:00:00.000Z",
   };
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+function writeFakeCodex(binDir: string, output: unknown): void {
+  const path = join(binDir, "codex");
+  writeFileSync(path, `#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' ${shellQuote(JSON.stringify(output))}\n`, "utf8");
+  chmodSync(path, 0o755);
+}
+
+async function runFakeCodexResult(output: unknown): Promise<{ runDir: string; exitCode: number }> {
+  const root = tempDir();
+  const runDir = join(root, "run");
+  const binDir = join(root, "bin");
+  const worktree = join(root, "worktree");
+  mkdirSync(runDir, { recursive: true });
+  mkdirSync(binDir, { recursive: true });
+  mkdirSync(worktree, { recursive: true });
+  writeFakeCodex(binDir, output);
+
+  const runSpec = spec("reviewer", "review-coercion-event");
+  const specPath = join(runDir, "spec.json");
+  writeFileSync(specPath, `${JSON.stringify(runSpec, null, 2)}\n`, "utf8");
+
+  const previousPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${previousPath ?? ""}`;
+  try {
+    const exitCode = await runProviderDriver("codex", ["--spec", specPath, "--run-dir", runDir, "--worktree", worktree]);
+    return { runDir, exitCode };
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+  }
+}
+
+function readRunEvents(runDir: string): Array<{ type?: unknown; coercions?: Array<{ field?: unknown; from?: unknown; to?: unknown }> }> {
+  const path = join(runDir, "events.jsonl");
+  if (!existsSync(path)) return [];
+  return readFileSync(path, "utf8")
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
 }
 
 test("buildWorkerEnv preserves normal env and removes recursive tool settings", () => {
@@ -514,6 +560,40 @@ test("extractResultFromText coerces benign schema deviations instead of discardi
     summary: "coordinated one batch",
     actions: ["ack: acked inbound message", "queued worker"],
   });
+});
+
+test("runProviderDriver records result_coercion events for verdict synonym coercions", async () => {
+  const { runDir, exitCode } = await runFakeCodexResult({
+    schema: "orch.result/reviewer/v1",
+    run_id: "model-invented-id",
+    verdict: "approved",
+    reviews_run_id: "impl-a",
+    blocking_findings: [],
+    non_blocking_findings: [],
+    suggested_tests: [],
+  });
+
+  expect(exitCode).toBe(0);
+  const events = readRunEvents(runDir);
+  const coercionEvent = events.find((event) => event.type === "result_coercion");
+  expect(coercionEvent?.coercions?.some((coercion) => coercion.field === "verdict" && coercion.from === "approved" && coercion.to === "approve")).toBe(
+    true,
+  );
+});
+
+test("runProviderDriver does not record result_coercion events for conforming results", async () => {
+  const { runDir, exitCode } = await runFakeCodexResult({
+    schema: "orch.result/reviewer/v1",
+    run_id: "review-coercion-event",
+    verdict: "approve",
+    reviews_run_id: "impl-a",
+    blocking_findings: [],
+    non_blocking_findings: [],
+    suggested_tests: [],
+  });
+
+  expect(exitCode).toBe(0);
+  expect(readRunEvents(runDir).some((event) => event.type === "result_coercion")).toBe(false);
 });
 
 test("rawResultText returns the final-message candidate and null when empty", () => {

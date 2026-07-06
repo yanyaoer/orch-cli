@@ -77,11 +77,19 @@ export interface RunStatus {
   head_sha: string | null;
 }
 
+export interface ResultCoercion {
+  field: string;
+  from: string;
+  to: string;
+  reason: string;
+}
+
 export interface OrchEvent {
-  type: "created" | "starting" | "running" | "heartbeat" | "done" | "failed" | "timeout" | "stale";
+  type: "created" | "starting" | "running" | "heartbeat" | "done" | "failed" | "timeout" | "stale" | "result_coercion";
   seq: number;
   ts: string;
   message?: string;
+  coercions?: ResultCoercion[];
 }
 
 export interface CommandResult {
