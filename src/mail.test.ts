@@ -133,8 +133,6 @@ test("mail decision events round-trip through local mail storage", async () => {
       "reviewer",
       "--capability",
       "tests",
-      "--max-concurrency",
-      "2",
       "--auto-invite",
     ],
     env,

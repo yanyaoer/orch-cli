@@ -60,7 +60,6 @@ export function defaultMailAgents(now: string): MailAgentDefinition[] {
       provider: "router",
       roles: ["router"],
       capabilities: ["decompose", "route", "replan"],
-      max_concurrency: 1,
       trust: "internal",
       auto_invite: false,
       work_mode: "route",
@@ -73,7 +72,6 @@ export function defaultMailAgents(now: string): MailAgentDefinition[] {
       provider: "codex",
       roles: ["implementer", "debugger", "rework"],
       capabilities: ["code-edit", "debug", "tests"],
-      max_concurrency: 1,
       trust: "internal",
       auto_invite: true,
       work_mode: "implement",
@@ -86,7 +84,6 @@ export function defaultMailAgents(now: string): MailAgentDefinition[] {
       provider: "claude",
       roles: ["reviewer", "challenger"],
       capabilities: ["architecture", "code-review", "long-context"],
-      max_concurrency: 1,
       trust: "internal",
       auto_invite: true,
       work_mode: "review",
@@ -99,7 +96,6 @@ export function defaultMailAgents(now: string): MailAgentDefinition[] {
       provider: "omp",
       roles: ["reviewer"],
       capabilities: ["code-review", "research", "long-context"],
-      max_concurrency: 1,
       trust: "internal",
       // Not auto-invited into router followups (keeps gemini out of every review);
       // cross-review / investigate add it explicitly via defaultAgentIds.
@@ -114,7 +110,6 @@ export function defaultMailAgents(now: string): MailAgentDefinition[] {
       provider: "pi",
       roles: ["verifier"],
       capabilities: ["verification", "test-execution"],
-      max_concurrency: 1,
       trust: "internal",
       auto_invite: true,
       work_mode: "verify",
@@ -706,8 +701,6 @@ export async function mail(args: ParsedArgs, context: MailCliContext): Promise<n
       const roles = collectFlags(args, "role");
       if (roles.length === 0) throw new CliError("mail agent bind requires at least one --role <role>");
       const capabilities = collectFlags(args, "capability");
-      const maxConcurrency = flagNumber(args, "max-concurrency") ?? 1;
-      if (!Number.isInteger(maxConcurrency) || maxConcurrency < 1) throw new CliError("--max-concurrency must be a positive integer");
       const sessionMode = flagString(args, "session-mode", "fresh_persistent");
       if (sessionMode !== "ephemeral" && sessionMode !== "fresh_persistent" && sessionMode !== "resume_exact") {
         throw new CliError("--session-mode must be ephemeral, fresh_persistent, or resume_exact");
@@ -718,7 +711,6 @@ export async function mail(args: ParsedArgs, context: MailCliContext): Promise<n
         provider,
         roles,
         capabilities,
-        max_concurrency: maxConcurrency,
         trust,
         auto_invite: flagBool(args, "auto-invite"),
         work_mode: flagString(args, "work-mode", roles[0]!),

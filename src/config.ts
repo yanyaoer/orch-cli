@@ -38,7 +38,6 @@ export interface MailAgentDefinition {
   provider: string;
   roles: string[];
   capabilities: string[];
-  max_concurrency: number;
   trust: "internal" | "external";
   auto_invite: boolean;
   work_mode: string;

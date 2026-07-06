@@ -2190,13 +2190,15 @@ async function main(): Promise<number> {
   return 2;
 }
 
-main()
-  .then((code) => process.exit(code))
-  .catch((error) => {
-    if (error instanceof CliError) {
-      process.stderr.write(`${error.message}\n`);
+if (import.meta.main) {
+  main()
+    .then((code) => process.exit(code))
+    .catch((error) => {
+      if (error instanceof CliError) {
+        process.stderr.write(`${error.message}\n`);
+        process.exit(1);
+      }
+      process.stderr.write(`${error instanceof Error ? error.stack : String(error)}\n`);
       process.exit(1);
-    }
-    process.stderr.write(`${error instanceof Error ? error.stack : String(error)}\n`);
-    process.exit(1);
-  });
+    });
+}

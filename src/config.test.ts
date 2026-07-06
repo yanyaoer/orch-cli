@@ -1,10 +1,11 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtempSync, realpathSync, rmSync, statSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   addWorkspace,
   buildBridgeUrls,
+  mailAgentsConfigPath,
   mailControlConfigPath,
   parseWorkersUrl,
   readBridgeConfig,
@@ -108,7 +109,6 @@ test("mail agent config records mailbox and capabilities by id", () => {
       provider: "codex",
       roles: ["reviewer"],
       capabilities: ["tests"],
-      max_concurrency: 2,
       trust: "internal",
       auto_invite: true,
       work_mode: "review",
@@ -120,9 +120,47 @@ test("mail agent config records mailbox and capabilities by id", () => {
       provider: "codex",
       roles: ["reviewer"],
       capabilities: ["tests"],
-      max_concurrency: 2,
       work_mode: "review",
       provider_session_mode: "fresh_persistent",
+    });
+  } finally {
+    if (prev === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = prev;
+  }
+});
+
+test("mail agent config loads on-disk JSON that still carries legacy fields", () => {
+  const prev = process.env.XDG_CONFIG_HOME;
+  process.env.XDG_CONFIG_HOME = tempDir();
+  try {
+    const path = mailAgentsConfigPath();
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(
+      path,
+      JSON.stringify({
+        version: 1,
+        agents: {
+          "legacy-agent": {
+            id: "legacy-agent",
+            address: "orch+legacy@example.com",
+            provider: "codex",
+            roles: ["reviewer"],
+            capabilities: ["tests"],
+            max_concurrency: 2,
+            trust: "internal",
+            auto_invite: true,
+            work_mode: "review",
+            provider_session_mode: "fresh_persistent",
+            updated_at: "2026-06-24T00:00:00.000Z",
+          },
+        },
+      }),
+    );
+    const cfg = readMailAgentsConfig();
+    expect(cfg.agents["legacy-agent"]).toMatchObject({
+      id: "legacy-agent",
+      provider: "codex",
+      roles: ["reviewer"],
     });
   } finally {
     if (prev === undefined) delete process.env.XDG_CONFIG_HOME;
