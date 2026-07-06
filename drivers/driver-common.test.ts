@@ -905,3 +905,36 @@ test("extractResultFromRunDir accepts claude final text with prose before result
 
   expect(extractResultFromRunDir(runDir, spec("verifier", "verify-claude-prose"))).toEqual(verifier);
 });
+
+test("extractResultFromText accepts a fenced gemini-style result with finding/scenario prose", () => {
+  // Observed live from omp/gemini: the whole result inside a ```json fence,
+  // findings carrying finding (title) + scenario (detail) instead of body.
+  const raw = [
+    "```json",
+    JSON.stringify(
+      {
+        schema: "orch.result/reviewer/v1",
+        verdict: "request_changes",
+        blocking_findings: [
+          { severity: "critical", file: "src/x.ts:1", finding: "Broken cooldown", scenario: "When X flaps, Y alerts forever." },
+        ],
+        non_blocking_findings: [{ severity: "low", file: "src/y.ts:2", finding: "Doc gap", scenario: "Z is undocumented." }],
+        suggested_tests: [],
+        reviews_run_id: "review-fenced",
+      },
+      null,
+      2,
+    ),
+    "```",
+    "",
+  ].join("\n");
+
+  const result = extractResultFromText(raw, spec("reviewer", "review-fenced"));
+  expect(result).toMatchObject({
+    verdict: "request_changes",
+    blocking_findings: [
+      { id: "finding-1", severity: "critical", file: "src/x.ts:1", body: "Broken cooldown\n\nWhen X flaps, Y alerts forever." },
+    ],
+    non_blocking_findings: [{ body: "Doc gap\n\nZ is undocumented." }],
+  });
+});

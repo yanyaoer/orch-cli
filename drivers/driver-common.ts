@@ -395,9 +395,12 @@ function coerceFindings(obj: Record<string, unknown>, field: string, blocking: b
       recordCoercion(coercions, `${field}[${index}]`, item, finding, "finding object");
     }
     if (typeof finding.body !== "string" || !finding.body.trim()) {
-      const body = [finding.description, finding.message, finding.detail, finding.text].find(
-        (v) => typeof v === "string" && v.trim(),
-      );
+      // Models name the prose differently (gemini emits finding+scenario);
+      // when a title and a detail field coexist, keep both halves.
+      const isProse = (v: unknown): v is string => typeof v === "string" && v.trim().length > 0;
+      const title = [finding.finding, finding.title, finding.summary].find(isProse);
+      const detail = [finding.scenario, finding.description, finding.message, finding.detail, finding.text].find(isProse);
+      const body = [title, detail].filter(Boolean).join("\n\n");
       if (body) {
         recordCoercion(coercions, `${field}[${index}].body`, finding.body, body, "body alias");
         finding.body = body;
