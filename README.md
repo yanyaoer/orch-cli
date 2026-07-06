@@ -231,10 +231,13 @@ $ orch mailctl init --user you@example.com \
     --trusted-authserv-id mx.google.com
 $ orch mailctl poll --json      # main contract: one bounded ingest + reconcile cycle (cron/launchd)
 $ orch mailctl watch            # foreground convenience: IMAP IDLE + periodic reconcile
-$ orch mailctl status           # cursor, active threads, controller generations, outbound queue
+$ orch mailctl status           # cursor, active threads, controller generations, outbound queue, recent rejections
 $ orch mailctl reply   --thread em-<id> --report-key <k> --body "…"   # (used by the controller)
 $ orch mailctl ack     --thread em-<id> --attention <id>              # (used by the controller)
 $ orch mailctl guidance --thread em-<id>                             # unacked instructions for the controller
+$ orch mailctl attachments --thread em-<id>                          # quarantined attachments for a thread
+$ orch mailctl attachment show --id att-<id>                         # print a safe text attachment (log/patch/md/json/csv)
+$ orch mailctl attachment promote --id att-<id> [--dest <dir>]       # copy a stored payload out of quarantine
 ```
 
 **Daemonless, precisely.** `poll` is the primary contract — a bounded one-shot ingest + reconcile you drive from `cron` or `launchd`, exactly the stateless-reconciler model, with no orch-owned background service. `watch` is a **foreground** convenience: it is honestly a long-running process (an IMAP-IDLE loop), but it is *not a daemon* — it never forks or detaches, owns no global scheduler, holds no persistent model session, and does one bounded reconcile per wake before returning to IDLE (`Ctrl-C` exits). So the "daemonless" claim means *no background service / no `orchd`*, not "no long-running process ever". **For unattended operation, drive `poll` from cron/launchd — do not keep `watch` alive under a restart supervisor.**
@@ -267,8 +270,9 @@ Inbound email is treated as an **authentication boundary**:
 
 - `From` must be on the `allowed_senders` allowlist (weak by itself), and must not be the account itself.
 - By default (`require_auth_results`) the message must carry an `Authentication-Results` header from the configured `trusted_authserv_id` with dkim/dmarc `pass` and domain alignment — evaluated on the single top-most trusted instance only, fail-closed. A forged lower A-R can't override it. An optional `subject_token` adds a second factor.
-- Task text comes only from a real `text/plain` part; **HTML-only mail is refused** (`rejected_html`) so HTML/CSS hidden text can never become task instructions. Quoted/forwarded tails and attachments are stripped.
-- Rejections leave a `rejected_*` marker (never silent); `messages/<sha>` markers make ingestion exactly-once across crashes.
+- Task text comes only from a real `text/plain` part; **HTML-only mail is refused** (`rejected_html`) so HTML/CSS hidden text can never become task instructions. Quoted/forwarded tails and attachments are stripped from task text.
+- Attachments on accepted mail are **quarantined**, not lost: payloads land under `mail-control/attachments/quarantine/<att-id>/` (never the worktree, never the prompt). The controller sees only a summary line per attachment; it reads safe text types (`txt/log/md/patch/diff/json/csv`) via `orch mailctl attachment show`, and anything else stays sealed unless a human (or the controller, explicitly) runs `attachment promote`.
+- Rejections leave a `rejected_*` marker (never silent); `messages/<sha>` markers make ingestion exactly-once across crashes. `orch mailctl status` counts the last 7 days of `rejected_*` markers by reason, and the `orch` overview flags rejects that fire after the sender allowlist passes (auth/token/html_only/parse_error) — the "owner locked out by a missing subject token" case is visible without reading `audit.jsonl`.
 - The controller runs with `Bash(orch *)` + read-only tools (no Edit/Write): it **orchestrates, it does not edit code** — code changes are dispatched to write-role workers holding the worktree lock.
 - Outbound replies run a mail-specific leak scan (local paths / secret shapes / size cap) and `ORCH_MIRROR_ALLOW_PRIVATE` does not open the mail channel.
 

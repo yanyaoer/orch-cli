@@ -196,6 +196,38 @@ test("mailctl overview action is emitted once when failures and dropped replies 
   expect(overview.actions[0]!.argv).toEqual(["orch", "mailctl", "status"]);
 });
 
+function writeRejectedMarker(stateHome: string, name: string, status: string, createdAt: string): void {
+  const dir = join(stateHome, "orch", "mail-control", "messages");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    join(dir, `${name}.json`),
+    JSON.stringify({ schema: "orch.mailctl/message-marker/v1", msg_sha: name, status, created_at: createdAt }),
+    "utf8",
+  );
+}
+
+test("recent suspect rejected mail emits one status action; spam and stale rejects do not", () => {
+  const stateHome = makeStateHome();
+  const recent = new Date().toISOString();
+  const stale = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString();
+
+  writeRejectedMarker(stateHome, "m-spam", "rejected_sender", recent);
+  writeRejectedMarker(stateHome, "m-accepted", "accepted", recent);
+  writeRejectedMarker(stateHome, "m-stale-token", "rejected_token", stale);
+  expect(buildOverview([REPO], false).actions.filter((action) => action.kind === "mailctl")).toEqual([]);
+
+  writeRejectedMarker(stateHome, "m-token", "rejected_token", recent);
+  writeRejectedMarker(stateHome, "m-token-2", "rejected_token", recent);
+  writeRejectedMarker(stateHome, "m-auth", "rejected_auth", recent);
+  const overview = buildOverview([REPO], false);
+  expect(overview.actions).toHaveLength(1);
+  expect(overview.actions[0]).toMatchObject({
+    kind: "mailctl",
+    reason: "mailctl: 3 rejected emails need review, last 7d (auth=1 token=2)",
+    argv: ["orch", "mailctl", "status"],
+  });
+});
+
 test("missing or corrupt mailctl cursor is ignored without throwing", () => {
   const stateHome = makeStateHome();
   expect(buildOverview([REPO], false).actions).toEqual([]);

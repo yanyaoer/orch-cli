@@ -83,12 +83,16 @@ import { mail, mailFanout, type MailCliContext } from "./mail-cli.ts";
 import {
   createMailTransport,
   mailctlAck,
+  mailctlAttachmentPromote,
+  mailctlAttachments,
+  mailctlAttachmentShow,
   mailctlGuidance,
   mailctlInit,
   mailctlPoll,
   mailctlReply,
   mailctlStatus,
   mailctlWatch,
+  renderMailctlAttachments,
   renderMailctlGuidance,
   renderMailctlStatus,
   type MailCursor,
@@ -1126,12 +1130,41 @@ export async function mailctl(args: ParsedArgs, context: MailCliContext): Promis
       else process.stdout.write(renderMailctlGuidance(result));
       return 0;
     }
+
+    if (mode === "attachments") {
+      assertKnownFlags(args, "mailctl attachments", ["thread", "json"]);
+      const result = mailctlAttachments({ thread: args.flags.has("thread") ? flagString(args, "thread") : undefined });
+      if (flagBool(args, "json")) printJson(result);
+      else process.stdout.write(renderMailctlAttachments(result));
+      return 0;
+    }
+
+    if (mode === "attachment") {
+      const action = args.positionals[2];
+      if (action === "show") {
+        assertKnownFlags(args, "mailctl attachment show", ["id"]);
+        process.stdout.write(mailctlAttachmentShow(flagString(args, "id")));
+        return 0;
+      }
+      if (action === "promote") {
+        assertKnownFlags(args, "mailctl attachment promote", ["id", "dest", "json"]);
+        const result = mailctlAttachmentPromote(mailctlContext(context), {
+          id: flagString(args, "id"),
+          dest: args.flags.has("dest") ? resolve(flagString(args, "dest")) : undefined,
+        });
+        if (flagBool(args, "json")) printJson({ mailctl: "attachment-promote", ...result });
+        else process.stdout.write(`${result.path}\n`);
+        return 0;
+      }
+      process.stderr.write("usage: orch mailctl attachment show|promote --id att-<id> [--dest <dir>]\n");
+      return 2;
+    }
   } catch (error) {
     if (error instanceof CliError) throw error;
     throw new CliError(error instanceof Error ? error.message : String(error));
   }
 
-  process.stderr.write("usage: orch mailctl init|poll|watch|status|reply|ack|guidance [flags]\n");
+  process.stderr.write("usage: orch mailctl init|poll|watch|status|reply|ack|guidance|attachments|attachment [flags]\n");
   return 2;
 }
 

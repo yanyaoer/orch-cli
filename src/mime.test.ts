@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import {
   decodeHeader,
   decodeHtmlEntities,
+  extractMailAttachments,
   extractMailText,
   extractPlainText,
   parseAddress,
@@ -354,5 +355,45 @@ describe("parseReferences", () => {
       inReplyTo: ["<leaf@example.com>"],
       all: ["<root@example.com>", "<mid@sub.example.com>", "<leaf@example.com>"],
     });
+  });
+});
+
+describe("extractMailAttachments", () => {
+  it("collects disposition and filename-bearing parts with decoded bytes, skipping body text", () => {
+    const raw = [
+      'Content-Type: multipart/mixed; boundary="mix"',
+      "",
+      "--mix",
+      "Content-Type: text/plain; charset=utf-8",
+      "",
+      "Fix the bug, log attached",
+      "--mix",
+      'Content-Type: text/plain; charset=utf-8; name="crash.log"',
+      "Content-Transfer-Encoding: base64",
+      'Content-Disposition: attachment; filename="crash.log"',
+      "",
+      Buffer.from("line1\nline2\n").toString("base64"),
+      "--mix",
+      'Content-Type: image/png; name="=?UTF-8?B?5oiq5Zu+?=.png"',
+      "Content-Transfer-Encoding: base64",
+      "Content-Disposition: inline",
+      "",
+      Buffer.from([0x89, 0x50, 0x4e, 0x47]).toString("base64"),
+      "--mix--",
+      "",
+    ].join("\r\n");
+
+    const attachments = extractMailAttachments(raw);
+    expect(attachments).toHaveLength(2);
+    expect(attachments[0]).toMatchObject({ filename: "crash.log", contentType: "text/plain" });
+    expect(new TextDecoder().decode(attachments[0]!.bytes)).toBe("line1\nline2\n");
+    expect(attachments[1]).toMatchObject({ filename: "截图.png", contentType: "image/png" });
+    expect([...attachments[1]!.bytes]).toEqual([0x89, 0x50, 0x4e, 0x47]);
+    expect(extractMailText(raw)).toEqual({ text: "Fix the bug, log attached", htmlOnly: false });
+  });
+
+  it("returns nothing for plain text and multipart/alternative mail", () => {
+    expect(extractMailAttachments(["Content-Type: text/plain", "", "body"].join("\r\n"))).toEqual([]);
+    expect(extractMailAttachments(multipartAlternativeMessage("plain", "<p>html</p>"))).toEqual([]);
   });
 });

@@ -220,6 +220,35 @@ function droppedMailctlReplies(): number {
   }
 }
 
+// Reject reasons that fire only after the sender allowlist passes (or that mean
+// mail could not be judged at all): each one is likely the owner locked out, not spam.
+const REJECT_REASONS_NEEDING_REVIEW = new Set(["auth", "token", "html_only", "parse_error", "conflict", "error"]);
+const REJECTED_LOOKBACK_DAYS = 7;
+
+function recentSuspectRejects(): Map<string, number> {
+  const messagesDir = `${mailControlStateDir()}/messages`;
+  const counts = new Map<string, number>();
+  if (!existsSync(messagesDir)) return counts;
+  const cutoff = Date.now() - REJECTED_LOOKBACK_DAYS * 24 * 60 * 60 * 1000;
+  let entries;
+  try {
+    entries = readdirSync(messagesDir, { withFileTypes: true });
+  } catch {
+    return counts;
+  }
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+    const marker = readJsonFile<{ status?: unknown; created_at?: unknown } | null>(`${messagesDir}/${entry.name}`, null);
+    if (typeof marker?.status !== "string" || !marker.status.startsWith("rejected_")) continue;
+    const reason = marker.status.slice("rejected_".length);
+    if (!REJECT_REASONS_NEEDING_REVIEW.has(reason)) continue;
+    const ts = Date.parse(typeof marker.created_at === "string" ? marker.created_at : "");
+    if (!Number.isFinite(ts) || ts < cutoff) continue;
+    counts.set(reason, (counts.get(reason) ?? 0) + 1);
+  }
+  return counts;
+}
+
 function mailctlHealthAction(): OverviewAction | null {
   const failures = mailctlConsecutiveFailures();
   if (failures >= 3) {
@@ -237,6 +266,22 @@ function mailctlHealthAction(): OverviewAction | null {
     return {
       kind: "mailctl",
       reason: `mailctl: ${dropped} dropped ${dropped === 1 ? "reply" : "replies"}`,
+      argv: ["orch", "mailctl", "status"],
+      repo_key: "",
+      mr: "mailctl",
+    };
+  }
+
+  const rejects = recentSuspectRejects();
+  if (rejects.size > 0) {
+    const total = [...rejects.values()].reduce((sum, count) => sum + count, 0);
+    const detail = [...rejects.entries()]
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([reason, count]) => `${reason}=${count}`)
+      .join(" ");
+    return {
+      kind: "mailctl",
+      reason: `mailctl: ${total} rejected email${total === 1 ? "" : "s"} need review, last ${REJECTED_LOOKBACK_DAYS}d (${detail})`,
       argv: ["orch", "mailctl", "status"],
       repo_key: "",
       mr: "mailctl",

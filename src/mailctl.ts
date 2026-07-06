@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import type { MailControlConfig } from "./config.ts";
 import {
   mailControlConfigPath,
@@ -19,6 +19,7 @@ import { defaultMailAgents, type MailCliContext } from "./mail-cli.ts";
 import { deliverLocalMail, ensureMailDirs, mailThreadDir } from "./mail.ts";
 import {
   decodeHeader,
+  extractMailAttachments,
   extractMailText,
   headerValues,
   parseAddress,
@@ -200,6 +201,13 @@ export interface StatusSummary {
     pending: number;
     dropped: number;
   };
+  rejected_recent: RejectedRecentSummary;
+}
+
+export interface RejectedRecentSummary {
+  days: number;
+  total: number;
+  by_reason: Record<string, number>;
 }
 
 export interface AckResult {
@@ -216,6 +224,7 @@ export interface GuidanceInstruction {
   body: string;
   parent_event_id: string | null;
   task_event_id: string;
+  attachments: MailAttachmentSummary[];
   created_at: string;
 }
 
@@ -296,6 +305,27 @@ interface AttentionRecord {
   workspace_id: string;
   workspace_path: string;
   repo_key: string;
+  attachments?: MailAttachmentSummary[];
+  created_at: string;
+}
+
+export interface MailAttachmentSummary {
+  att_id: string;
+  filename: string;
+  content_type: string;
+  size_bytes: number;
+  safe: boolean;
+  stored: boolean;
+}
+
+export interface MailAttachmentRecord extends MailAttachmentSummary {
+  schema: "orch.mailctl/attachment/v1";
+  msg_sha: string;
+  thread: string;
+  from: string;
+  sha256: string;
+  payload_path: string | null;
+  promoted_path: string | null;
   created_at: string;
 }
 
@@ -364,6 +394,14 @@ export function outboxEmailPendingDir(): string {
 
 export function outboxEmailSentDir(): string {
   return `${mailControlStateDir()}/outbox-email/sent`;
+}
+
+export function attachmentsQuarantineDir(): string {
+  return `${mailControlStateDir()}/attachments/quarantine`;
+}
+
+export function attachmentsPromotedDir(): string {
+  return `${mailControlStateDir()}/attachments/promoted`;
 }
 
 export function outboxEmailDroppedDir(): string {
@@ -1187,7 +1225,25 @@ function statusGeneration(gen: ControllerGeneration): StatusControllerGeneration
   };
 }
 
-export function mailctlStatus(_ctx: MailctlContext, _opts: { json?: boolean } = {}): StatusSummary {
+export const REJECTED_RECENT_DAYS = 7;
+
+export function recentRejectedSummary(nowMs: number, days = REJECTED_RECENT_DAYS): RejectedRecentSummary {
+  const cutoff = nowMs - days * 24 * 60 * 60 * 1000;
+  const by_reason: Record<string, number> = {};
+  let total = 0;
+  for (const path of safeJsonFiles(`${mailControlStateDir()}/messages`)) {
+    const marker = readJsonFile<MessageMarker | null>(path, null);
+    if (marker?.schema !== "orch.mailctl/message-marker/v1") continue;
+    if (!marker.status.startsWith("rejected_")) continue;
+    if (Date.parse(marker.created_at) < cutoff) continue;
+    const reason = marker.status.slice("rejected_".length);
+    by_reason[reason] = (by_reason[reason] ?? 0) + 1;
+    total += 1;
+  }
+  return { days, total, by_reason };
+}
+
+export function mailctlStatus(ctx: MailctlContext, _opts: { json?: boolean } = {}): StatusSummary {
   ensureMailctlStateDirs();
   const pending = pendingReplyRecords();
   const dropped = droppedReplyRecords();
@@ -1213,6 +1269,7 @@ export function mailctlStatus(_ctx: MailctlContext, _opts: { json?: boolean } = 
       pending: pending.length,
       dropped: dropped.length,
     },
+    rejected_recent: recentRejectedSummary(ctx.now()),
   };
 }
 
@@ -1228,6 +1285,14 @@ export function renderMailctlStatus(summary: StatusSummary): string {
     "mailctl status",
     `cursor: last_uid=${summary.cursor.last_uid ?? "none"} consecutive_failures=${summary.cursor.consecutive_failures} last_error=${lastError}`,
     `outbound: pending=${summary.outbound.pending} dropped=${summary.outbound.dropped}`,
+    `rejected(${summary.rejected_recent.days}d): ${
+      summary.rejected_recent.total === 0
+        ? "none"
+        : `total=${summary.rejected_recent.total} ${Object.entries(summary.rejected_recent.by_reason)
+            .sort(([a], [b]) => a.localeCompare(b))
+            .map(([reason, count]) => `${reason}=${count}`)
+            .join(" ")}`
+    }`,
     `threads: active=${summary.active_threads} total=${summary.threads.length}`,
   ];
   for (const thread of summary.threads) {
@@ -1288,6 +1353,7 @@ export function mailctlGuidance(_ctx: MailctlContext, opts: { thread: string; js
       body: redactHumanText(record.body),
       parent_event_id: record.parent_event_id,
       task_event_id: record.task_event_id,
+      attachments: record.attachments ?? [],
       created_at: record.created_at,
     })),
   };
@@ -1299,8 +1365,64 @@ export function renderMailctlGuidance(guidance: GuidanceResult): string {
   for (const item of guidance.instructions) {
     rows.push(`  ${item.attention} from=${item.from} subject=${redactHumanText(item.subject)}`);
     rows.push(redactHumanText(item.body).split(/\r?\n/).map((line) => `    ${line}`).join("\n"));
+    for (const attachment of item.attachments) rows.push(`    ${attachmentLine(attachment)}`);
   }
   return `${rows.join("\n")}\n`;
+}
+
+export function mailctlAttachments(opts: { thread?: string } = {}): { attachments: MailAttachmentRecord[] } {
+  const dir = attachmentsQuarantineDir();
+  const ids = existsSync(dir) ? readdirSync(dir) : [];
+  const attachments = ids
+    .map((id) => readJsonFile<MailAttachmentRecord | null>(`${dir}/${id}/meta.json`, null))
+    .filter((record): record is MailAttachmentRecord => record?.schema === "orch.mailctl/attachment/v1")
+    .filter((record) => !opts.thread || record.thread === opts.thread)
+    .sort((a, b) => a.created_at.localeCompare(b.created_at) || a.att_id.localeCompare(b.att_id));
+  return { attachments };
+}
+
+export function renderMailctlAttachments(result: { attachments: MailAttachmentRecord[] }): string {
+  if (result.attachments.length === 0) return "mailctl attachments: none\n";
+  const rows = ["mailctl attachments"];
+  for (const item of result.attachments) {
+    const promoted = item.promoted_path ? ` promoted=${item.promoted_path}` : "";
+    rows.push(`  ${item.att_id} thread=${item.thread} ${item.filename} ${item.content_type} ${item.size_bytes}B safe=${item.safe} stored=${item.stored}${promoted}`);
+  }
+  return `${rows.join("\n")}\n`;
+}
+
+function readAttachmentRecord(attId: string): MailAttachmentRecord {
+  if (!/^att-[0-9a-f]{12}$/.test(attId)) {
+    throw new Error("mailctl attachment id must look like att-<12 hex chars>");
+  }
+  const record = readJsonFile<MailAttachmentRecord | null>(attachmentMetaPath(attId), null);
+  if (record?.schema !== "orch.mailctl/attachment/v1") throw new Error(`mailctl attachment not found: ${attId}`);
+  return record;
+}
+
+export function mailctlAttachmentShow(attId: string): Uint8Array {
+  const record = readAttachmentRecord(attId);
+  if (!record.stored || !record.payload_path) throw new Error(`mailctl attachment payload was not stored (too large): ${attId}`);
+  if (!record.safe) {
+    throw new Error(`mailctl attachment is not a safe text type (${record.content_type}); export it with: orch mailctl attachment promote --id ${attId}`);
+  }
+  return readFileSync(record.payload_path);
+}
+
+export function mailctlAttachmentPromote(ctx: MailctlContext, opts: { id: string; dest?: string }): { path: string; promoted: boolean } {
+  const record = readAttachmentRecord(opts.id);
+  if (!record.stored || !record.payload_path) throw new Error(`mailctl attachment payload was not stored (too large): ${opts.id}`);
+  const destDir = opts.dest ?? `${attachmentsPromotedDir()}/${statePathSegment(record.thread, "thread")}`;
+  const destPath = `${destDir}/${record.filename}`;
+  if (existsSync(destPath)) {
+    if (sha256(readFileSync(destPath)) === record.sha256) return { path: destPath, promoted: false };
+    throw new Error(`refusing to overwrite existing file with different content: ${destPath}`);
+  }
+  mkdirSync(destDir, { recursive: true });
+  copyFileSync(record.payload_path, destPath);
+  writeJsonAtomic(attachmentMetaPath(opts.id), { ...record, promoted_path: destPath });
+  appendAudit("attachment_promoted", { att_id: opts.id, thread: record.thread, dest: destPath, ts: nowIso(ctx) });
+  return { path: destPath, promoted: true };
 }
 
 function backfillAcceptedMarker(ctx: MailctlContext, marker: MessageMarker): void {
@@ -1329,6 +1451,110 @@ async function markProcessedBestEffort(ctx: MailctlContext, ref: MailMessageRef,
   }
 }
 
+const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
+const MAX_ATTACHMENTS_PER_MESSAGE = 20;
+const SAFE_ATTACHMENT_MIME_TYPES = new Set(["text/plain", "text/markdown", "text/x-diff", "text/x-patch", "text/csv", "application/json"]);
+const SAFE_ATTACHMENT_EXTENSIONS = new Set(["txt", "log", "md", "markdown", "patch", "diff", "json", "csv"]);
+
+function sanitizeAttachmentFilename(filename: string | null, index: number): string {
+  const base = (filename ?? "").split(/[\\/]/).pop() ?? "";
+  const cleaned = base.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^[.-]+/, "").slice(0, 80);
+  return cleaned || `attachment-${index}.bin`;
+}
+
+function isSafeAttachment(filename: string, contentType: string): boolean {
+  if (SAFE_ATTACHMENT_MIME_TYPES.has(contentType)) return true;
+  const extension = filename.includes(".") ? (filename.split(".").pop() ?? "").toLowerCase() : "";
+  return SAFE_ATTACHMENT_EXTENSIONS.has(extension);
+}
+
+function attachmentMetaPath(attId: string): string {
+  return `${attachmentsQuarantineDir()}/${attId}/meta.json`;
+}
+
+function attachmentSummary(record: MailAttachmentRecord): MailAttachmentSummary {
+  return {
+    att_id: record.att_id,
+    filename: record.filename,
+    content_type: record.content_type,
+    size_bytes: record.size_bytes,
+    safe: record.safe,
+    stored: record.stored,
+  };
+}
+
+function quarantineMailAttachments(ctx: MailctlContext, args: { raw: string; msgSha: string; thread: string; from: string }): MailAttachmentSummary[] {
+  const extracted = extractMailAttachments(args.raw);
+  if (extracted.length === 0) return [];
+  const summaries: MailAttachmentSummary[] = [];
+  for (const [index, attachment] of extracted.slice(0, MAX_ATTACHMENTS_PER_MESSAGE).entries()) {
+    const attId = `att-${sha12(`${args.msgSha}:${index}`)}`;
+    const metaPath = attachmentMetaPath(attId);
+    const existing = readJsonFile<MailAttachmentRecord | null>(metaPath, null);
+    if (existing?.schema === "orch.mailctl/attachment/v1") {
+      summaries.push(attachmentSummary(existing));
+      continue;
+    }
+    const filename = sanitizeAttachmentFilename(attachment.filename, index);
+    const stored = attachment.bytes.byteLength <= MAX_ATTACHMENT_BYTES;
+    mkdirSync(`${attachmentsQuarantineDir()}/${attId}`, { recursive: true });
+    const payloadPath = stored ? `${attachmentsQuarantineDir()}/${attId}/${filename}` : null;
+    if (payloadPath) writeFileSync(payloadPath, attachment.bytes);
+    const record: MailAttachmentRecord = {
+      schema: "orch.mailctl/attachment/v1",
+      att_id: attId,
+      msg_sha: args.msgSha,
+      thread: args.thread,
+      from: args.from,
+      filename,
+      content_type: attachment.contentType,
+      size_bytes: attachment.bytes.byteLength,
+      sha256: sha256(attachment.bytes),
+      safe: isSafeAttachment(filename, attachment.contentType),
+      stored,
+      payload_path: payloadPath,
+      promoted_path: null,
+      created_at: nowIso(ctx),
+    };
+    try {
+      writeJsonExclusive(metaPath, record);
+    } catch (error) {
+      if (!isEexist(error)) throw error;
+    }
+    appendAudit("attachment_quarantined", {
+      att_id: attId,
+      msg_sha: args.msgSha,
+      thread: args.thread,
+      filename,
+      content_type: record.content_type,
+      size_bytes: record.size_bytes,
+      safe: record.safe,
+      stored,
+      ts: record.created_at,
+    });
+    summaries.push(attachmentSummary(record));
+  }
+  if (extracted.length > MAX_ATTACHMENTS_PER_MESSAGE) {
+    appendAudit("attachments_skipped", {
+      msg_sha: args.msgSha,
+      thread: args.thread,
+      skipped: extracted.length - MAX_ATTACHMENTS_PER_MESSAGE,
+      ts: nowIso(ctx),
+    });
+  }
+  return summaries;
+}
+
+// Attachments are informational; a quarantine failure must not stall mail ingest.
+function quarantineAttachmentsBestEffort(ctx: MailctlContext, args: { raw: string; msgSha: string; thread: string; from: string }): MailAttachmentSummary[] {
+  try {
+    return quarantineMailAttachments(ctx, args);
+  } catch (error) {
+    appendAudit("attachment_quarantine_failed", { msg_sha: args.msgSha, thread: args.thread, error: errorMessage(error), ts: nowIso(ctx) });
+    return [];
+  }
+}
+
 async function publishRouterTask(args: {
   ctx: MailctlContext;
   raw: string;
@@ -1340,6 +1566,7 @@ async function publishRouterTask(args: {
   workspace: OrchWorkspace;
   repoKey: string;
   threadDir: string;
+  attachments: MailAttachmentSummary[];
   opts: PollOptions;
 }): Promise<{ taskEvent: BusTaskEvent; attentionPath: string }> {
   const taskText = args.gate.bodyText.trim();
@@ -1395,6 +1622,7 @@ async function publishRouterTask(args: {
     workspace_id: args.workspace.id,
     workspace_path: args.workspace.path,
     repo_key: args.repoKey,
+    ...(args.attachments.length > 0 ? { attachments: args.attachments } : {}),
     created_at: nowIso(args.ctx),
   };
   return { taskEvent, attentionPath: writeAttention(attention) };
@@ -1423,6 +1651,12 @@ async function processAcceptedMessage(args: {
     threadDir,
     ts,
   });
+  const attachments = quarantineAttachmentsBestEffort(args.ctx, {
+    raw: args.raw,
+    msgSha: args.msgSha,
+    thread: merge.thread,
+    from: args.gate.from ?? "",
+  });
   const published = await publishRouterTask({
     ctx: args.ctx,
     raw: args.raw,
@@ -1434,6 +1668,7 @@ async function processAcceptedMessage(args: {
     workspace,
     repoKey: repo.repo_key,
     threadDir,
+    attachments,
     opts: args.opts,
   });
 
@@ -1701,6 +1936,21 @@ interface TriggerSet {
   unackedText: string;
 }
 
+function attachmentLine(item: MailAttachmentSummary): string {
+  const access = !item.stored
+    ? "payload too large; not stored"
+    : item.safe
+      ? `read with: orch mailctl attachment show --id ${item.att_id}`
+      : `binary; export with: orch mailctl attachment promote --id ${item.att_id}`;
+  return `- ${item.att_id} ${item.filename} (${item.content_type}, ${item.size_bytes} bytes; ${access})`;
+}
+
+function attachmentNotes(record: AttentionRecord): string {
+  const items = record.attachments ?? [];
+  if (items.length === 0) return "";
+  return `\n\nAttachments (quarantined, not in the worktree):\n${items.map(attachmentLine).join("\n")}`;
+}
+
 function threadTriggerSet(state: MailctlThreadState): TriggerSet | null {
   const reasons: string[] = [];
   const attention = listAttentionForThread(state.thread);
@@ -1724,7 +1974,7 @@ function threadTriggerSet(state: MailctlThreadState): TriggerSet | null {
     reasons,
     summary: reasons.join("; "),
     fp: sha256(reasons.join("\n")),
-    unackedText: attention.map((item) => `## ${item.msg_sha}\n${item.body}`).join("\n\n"),
+    unackedText: attention.map((item) => `## ${item.msg_sha}\n${item.body}${attachmentNotes(item)}`).join("\n\n"),
   };
 }
 

@@ -31,6 +31,12 @@ export interface ExtractedMailText {
   htmlOnly: boolean;
 }
 
+export interface ExtractedMailAttachment {
+  filename: string | null;
+  contentType: string;
+  bytes: Uint8Array;
+}
+
 interface MimeTextParts {
   plain: string[];
   html: string[];
@@ -597,6 +603,32 @@ function parseMimePart(raw: string, depth: number): MimeTextParts {
     return { plain: [], html: decoded.trim() ? [cleanExtractedText(htmlToText(decoded))] : [] };
   }
   return { plain: [], html: [] };
+}
+
+function collectAttachmentParts(raw: string, depth: number): ExtractedMailAttachment[] {
+  if (depth > 20) return [];
+  const { headers, body } = parseHeaderBlock(raw);
+  const contentType = parseParameterizedHeader(headers.get("content-type")?.[0], "text/plain");
+  if (contentType.value.startsWith("multipart/")) {
+    const boundary = contentType.params.get("boundary");
+    if (!boundary) return [];
+    return splitMultipartBody(body, boundary).flatMap((part) => collectAttachmentParts(part, depth + 1));
+  }
+
+  const contentDisposition = parseParameterizedHeader(headers.get("content-disposition")?.[0], "");
+  const filename = contentDisposition.params.get("filename") ?? contentType.params.get("name") ?? null;
+  if (contentDisposition.value !== "attachment" && !filename) return [];
+  return [
+    {
+      filename: filename?.trim() || null,
+      contentType: contentType.value,
+      bytes: decodeTransferBody(body, headers.get("content-transfer-encoding")?.[0]),
+    },
+  ];
+}
+
+export function extractMailAttachments(raw: string | Uint8Array): ExtractedMailAttachment[] {
+  return collectAttachmentParts(rawToBinaryString(raw), 0);
 }
 
 export function extractMailText(raw: string | Uint8Array): ExtractedMailText {

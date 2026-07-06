@@ -21,6 +21,9 @@ import {
   evaluateGate,
   ingestLockPath,
   mailctlAck,
+  mailctlAttachmentPromote,
+  mailctlAttachments,
+  mailctlAttachmentShow,
   mailctlGuidance,
   mailctlInit,
   mailctlPoll,
@@ -1222,5 +1225,142 @@ describe("mailctlReply outbound policy", () => {
     expect(transport.sent).toHaveLength(0);
     expect(jsonFiles(outboxEmailPendingDir())).toEqual(beforePending);
     expect(jsonFiles(outboxEmailSentDir())).toEqual(beforeSent);
+  });
+});
+
+function attachmentMail(options: {
+  messageId?: string;
+  body?: string;
+  attName?: string;
+  attType?: string;
+  attContent?: string | Buffer;
+} = {}): string {
+  const boundary = "orchmix";
+  const attName = options.attName ?? "crash.log";
+  const attType = options.attType ?? "text/plain";
+  const content = Buffer.from(options.attContent ?? "line1\nline2\n").toString("base64");
+  return [
+    "From: Owner <owner@example.com>",
+    "Subject: Task",
+    `Message-ID: ${options.messageId ?? "<attach@example.com>"}`,
+    authPass(),
+    `Content-Type: multipart/mixed; boundary="${boundary}"`,
+    "",
+    `--${boundary}`,
+    "Content-Type: text/plain; charset=utf-8",
+    "",
+    options.body ?? "Fix the bug, log attached",
+    `--${boundary}`,
+    `Content-Type: ${attType}; name="${attName}"`,
+    "Content-Transfer-Encoding: base64",
+    `Content-Disposition: attachment; filename="${attName}"`,
+    "",
+    content,
+    `--${boundary}--`,
+    "",
+  ].join("\r\n");
+}
+
+describe("mailctl attachments", () => {
+  it("quarantines safe attachments from accepted mail and exposes them to guidance, controller text, and show", async () => {
+    const { cfg, workspace } = setupMailctl();
+    const transport = new FakeTransport([{ ref: { uid: 1 }, raw: attachmentMail() }]);
+    const ctx = fakeContext({ cfg, transport });
+
+    const result = await mailctlPoll(ctx, { reconcile: false });
+    expect(result.accepted).toBe(1);
+
+    const listed = mailctlAttachments();
+    expect(listed.attachments).toHaveLength(1);
+    const attachment = listed.attachments[0]!;
+    expect(attachment.att_id).toMatch(/^att-[0-9a-f]{12}$/);
+    expect(attachment).toMatchObject({ filename: "crash.log", content_type: "text/plain", safe: true, stored: true, promoted_path: null });
+    expect(attachment.payload_path).toContain(join("mail-control", "attachments", "quarantine"));
+    expect(readFileSync(attachment.payload_path!, "utf8")).toBe("line1\nline2\n");
+    expect(readdirSync(workspace)).toEqual([]);
+
+    expect(new TextDecoder().decode(mailctlAttachmentShow(attachment.att_id))).toBe("line1\nline2\n");
+
+    const state = firstThreadState();
+    expect(mailctlAttachments({ thread: state.thread }).attachments).toHaveLength(1);
+    expect(mailctlAttachments({ thread: "em-other" }).attachments).toHaveLength(0);
+
+    const guidance = mailctlGuidance(ctx, { thread: state.thread });
+    expect(guidance.instructions[0]!.attachments).toEqual([
+      {
+        att_id: attachment.att_id,
+        filename: "crash.log",
+        content_type: "text/plain",
+        size_bytes: 12,
+        safe: true,
+        stored: true,
+      },
+    ]);
+    expect(renderMailctlGuidance(guidance)).toContain(`orch mailctl attachment show --id ${attachment.att_id}`);
+
+    const attention = readJsonFile<any>(attentionFiles()[0]!, null);
+    expect(attention.attachments).toHaveLength(1);
+    expect(auditRows().some((row) => row.type === "attachment_quarantined" && row.att_id === attachment.att_id)).toBe(true);
+
+    const task = buildControllerTask({
+      thread: state.thread,
+      workspace: "default-ws",
+      triggerReason: "T1",
+      unackedMailText: `## ${attention.msg_sha}\n${attention.body}\n\nAttachments (quarantined, not in the worktree):\n- ${attachment.att_id} crash.log`,
+    });
+    expect(task).toContain(attachment.att_id);
+  });
+
+  it("refuses to show unsafe binaries, promotes them idempotently, and dedupes quarantine on re-ingest", async () => {
+    const { cfg } = setupMailctl();
+    const binary = Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0x00, 0x01]);
+    const transport = new FakeTransport([
+      { ref: { uid: 1 }, raw: attachmentMail({ attName: "core.bin", attType: "application/octet-stream", attContent: binary }) },
+    ]);
+    const ctx = fakeContext({ cfg, transport });
+    await mailctlPoll(ctx, { reconcile: false });
+
+    const attachment = mailctlAttachments().attachments[0]!;
+    expect(attachment).toMatchObject({ filename: "core.bin", safe: false, stored: true });
+    expect(() => mailctlAttachmentShow(attachment.att_id)).toThrow("not a safe text type");
+    expect(() => mailctlAttachmentShow("att-000000000000")).toThrow("not found");
+    expect(() => mailctlAttachmentShow("../../etc/passwd")).toThrow("attachment id");
+
+    const promoted = mailctlAttachmentPromote(ctx, { id: attachment.att_id });
+    expect(promoted.promoted).toBe(true);
+    expect(readFileSync(promoted.path)).toEqual(binary);
+    expect(mailctlAttachmentPromote(ctx, { id: attachment.att_id })).toEqual({ path: promoted.path, promoted: false });
+    expect(mailctlAttachments().attachments[0]!.promoted_path).toBe(promoted.path);
+    expect(auditRows().some((row) => row.type === "attachment_promoted" && row.att_id === attachment.att_id)).toBe(true);
+
+    // Same message replayed through a crash window must not duplicate quarantine entries.
+    const replay = new FakeTransport([
+      { ref: { uid: 2 }, raw: attachmentMail({ messageId: "<replay@example.com>", attName: "core.bin", attType: "application/octet-stream", attContent: binary }) },
+    ]);
+    const replayCtx = fakeContext({ cfg, transport: replay });
+    await expect(mailctlPoll(replayCtx, { fault: "publish-before-marker", reconcile: false })).rejects.toThrow("injected");
+    await mailctlPoll(replayCtx, { reconcile: false });
+    expect(mailctlAttachments().attachments).toHaveLength(2);
+  });
+
+  it("counts recent rejected markers in status by reason", async () => {
+    const { cfg } = setupMailctl();
+    const transport = new FakeTransport([
+      { ref: { uid: 1 }, raw: textMail({ from: "Mallory <mallory@example.com>", messageId: "<spam@example.com>" }) },
+      { ref: { uid: 2 }, raw: textMail({ messageId: "<html@example.com>", contentType: "text/html", body: "<p>hi</p>" }) },
+      { ref: { uid: 3 }, raw: textMail({ messageId: "<ok@example.com>" }) },
+    ]);
+    const ctx = fakeContext({ cfg, transport });
+    const result = await mailctlPoll(ctx, { reconcile: false });
+    expect(result.accepted).toBe(1);
+    expect(result.rejected).toBe(2);
+
+    const status = mailctlStatus(ctx, {});
+    expect(status.rejected_recent).toEqual({ days: 7, total: 2, by_reason: { html_only: 1, sender: 1 } });
+    expect(renderMailctlStatus(status)).toContain("rejected(7d): total=2 html_only=1 sender=1");
+
+    // Markers older than the window age out of the summary.
+    const later = fakeContext({ cfg, transport: new FakeTransport(), now: Date.parse("2026-07-04T08:56:28.000Z") + 8 * 24 * 60 * 60 * 1000 });
+    expect(mailctlStatus(later, {}).rejected_recent).toEqual({ days: 7, total: 0, by_reason: {} });
   });
 });
