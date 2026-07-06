@@ -550,6 +550,21 @@ function printResultSummary(result: RoleResult): void {
   }
 }
 
+function evidencePaths(runDir: string): string[] {
+  const artifactsDir = `${runDir}/artifacts`;
+  if (!existsSync(`${artifactsDir}/diff.patch`)) return [];
+  return ["git-status.txt", "diff.patch", "changed-files.txt"]
+    .map((name) => `${artifactsDir}/${name}`)
+    .filter((path) => existsSync(path));
+}
+
+function printEvidenceSummary(runDir: string): void {
+  const paths = evidencePaths(runDir);
+  if (paths.length === 0) return;
+  process.stdout.write("\nevidence:\n");
+  for (const path of paths) process.stdout.write(`  - ${path}\n`);
+}
+
 function orchCommand(): string[] {
   const scriptPath = process.argv[1];
   if (scriptPath?.endsWith(".ts")) return [process.execPath, scriptPath];
@@ -1579,6 +1594,7 @@ async function result(args: ParsedArgs): Promise<number> {
     throw new CliError(`result.json is not valid JSON for run: ${runId}`);
   }
   printResultSummary(parsed);
+  printEvidenceSummary(located.run_dir);
   return 0;
 }
 

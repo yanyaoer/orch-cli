@@ -368,11 +368,21 @@ test("observability commands read local run state", async () => {
   expect(jsonResult).toMatchObject({ exitCode: 0, stderr: "" });
   expect(jsonResult.stdout).toBe(`${rawResult}\n`);
 
+  const artifactsDir = join(runDir, "artifacts");
+  mkdirSync(artifactsDir, { recursive: true });
+  writeFileSync(join(artifactsDir, "git-status.txt"), " M src/orch.ts\n", "utf8");
+  writeFileSync(join(artifactsDir, "diff.patch"), "diff --git a/src/orch.ts b/src/orch.ts\n", "utf8");
+  writeFileSync(join(artifactsDir, "changed-files.txt"), "src/orch.ts\n", "utf8");
+
   const humanResult = await runOrch(["result", "--run", runId, "--worktree", worktree], env);
   expect(humanResult).toMatchObject({ exitCode: 0, stderr: "" });
   expect(humanResult.stdout).toContain("schema: orch.result/implementer/v1");
   expect(humanResult.stdout).toContain("changed_files:");
   expect(humanResult.stdout).toContain("bun test (exit 0): passed");
+  expect(humanResult.stdout).toContain("evidence:");
+  expect(humanResult.stdout).toContain(join(artifactsDir, "git-status.txt"));
+  expect(humanResult.stdout).toContain(join(artifactsDir, "diff.patch"));
+  expect(humanResult.stdout).toContain(join(artifactsDir, "changed-files.txt"));
 });
 
 test("result text renderer handles controller results", async () => {

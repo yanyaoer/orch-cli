@@ -99,6 +99,27 @@ async function gitHead(worktree: string): Promise<string | null> {
   }
 }
 
+async function writeEvidence(runDir: string, spec: RunSpec): Promise<void> {
+  try {
+    const baseSha = typeof spec.base_sha === "string" ? spec.base_sha.trim() : "";
+    if (!writeRoles.has(spec.role) || !baseSha) return;
+    const artifactsDir = runDirFile(runDir, "artifacts");
+    mkdirSync(artifactsDir, { recursive: true });
+    const status = await Bun.$`git -C ${spec.worktree} status --porcelain=v1`.quiet().text();
+    writeFileSync(`${artifactsDir}/git-status.txt`, status, "utf8");
+
+    // Diffing the base SHA against the worktree captures uncommitted tracked
+    // edits. Untracked files are intentionally visible only in git-status.txt.
+    const diff = await Bun.$`git -C ${spec.worktree} diff --binary ${baseSha} -- .`.quiet().text();
+    writeFileSync(`${artifactsDir}/diff.patch`, diff, "utf8");
+
+    const changed = await Bun.$`git -C ${spec.worktree} diff --name-only ${baseSha} -- .`.quiet().text();
+    writeFileSync(`${artifactsDir}/changed-files.txt`, changed, "utf8");
+  } catch {
+    // Evidence is diagnostic only; collection must not change the run outcome.
+  }
+}
+
 function readProviderResumeId(runDir: string): string | null {
   try {
     return providerResumeIdFromNativeText(readFileSync(runDirFile(runDir, "native.jsonl"), "utf8"));
@@ -250,6 +271,7 @@ export async function runSupervisor(runDir: string, orchCommand: string[]): Prom
     if (resultErrors.length > 0) {
       writeFileSync(runDirFile(runDir, "schema.errors.log"), `${resultErrors.join("\n")}\n`, "utf8");
     }
+    await writeEvidence(runDir, spec);
     appendEvent(runDir, {
       type: finalState === "done" ? "done" : finalState === "timeout" ? "timeout" : "failed",
       seq: nextSeq(runDir),
@@ -272,6 +294,7 @@ export async function runSupervisor(runDir: string, orchCommand: string[]): Prom
     if (pgid !== null) killProcessGroup(pgid, "SIGTERM");
     const spec = loadedSpec ?? fallbackSpec(runDir);
     ensureResult(runDir, spec, message);
+    await writeEvidence(runDir, spec);
     appendEvent(runDir, { type: "failed", seq: nextSeq(runDir), ts: now(), message });
     updateStatus(runDir, spec, {
       state: "failed",
