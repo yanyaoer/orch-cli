@@ -79,7 +79,8 @@ import { runPiDriver } from "../drivers/pi-headless.ts";
 import { runOmpDriver } from "../drivers/omp-headless.ts";
 import { addWorkspace, chatgptBridgeConfigPath, readBridgeConfig, readMailControlConfig, validateMailControlConfig, writeBridgeConfig } from "./config.ts";
 import { buildBundle, type BundleOptions } from "./handoff-pro.ts";
-import { mail, mailFanout, type MailCliContext } from "./mail-cli.ts";
+import { mail, mailFanout, type MailCliContext, type MailFanoutOutcome } from "./mail-cli.ts";
+import { fallbackRawReview, planAutoDecision } from "./review-auto.ts";
 import {
   createMailTransport,
   mailctlAck,
@@ -1229,26 +1230,206 @@ export async function mailctl(args: ParsedArgs, context: MailCliContext): Promis
 }
 
 // cross-review: one diff reviewed in parallel by distinct model families.
+// --auto inlines the follow-up ritual: wait for this fan-out's runs to settle,
+// record the unambiguous decisions, queue ONE merged mirror comment (dry-run
+// preview unless --execute).
 async function crossReview(args: ParsedArgs): Promise<number> {
-  return mailFanout(args, mailFanoutContext(), {
+  const auto = flagBool(args, "auto");
+  for (const flag of ["execute", "wait-sec"]) {
+    if (!auto && args.flags.has(flag)) throw new CliError(`--${flag} requires --auto`);
+  }
+  const outcome = await mailFanout(args, mailFanoutContext(), {
     command: "cross-review",
     role: "reviewer",
     defaultAgentIds: ["claude-reviewer", "omp-reviewer"],
+    extraFlags: ["auto", "execute", "wait-sec"],
   });
+  if (!auto || outcome.code !== 0 || outcome.dry_run) {
+    printJson(outcome.payload);
+    return outcome.code;
+  }
+  return crossReviewAuto(args, outcome);
 }
 
 // fanout: generic — run any result role across --to-agent / auto-invited agents.
 async function fanout(args: ParsedArgs): Promise<number> {
-  return mailFanout(args, mailFanoutContext(), { command: "fanout" });
+  const outcome = await mailFanout(args, mailFanoutContext(), { command: "fanout" });
+  printJson(outcome.payload);
+  return outcome.code;
 }
 
 // investigate: read-only research/analysis, defaults to the gemini + claude reviewers.
 async function investigate(args: ParsedArgs): Promise<number> {
-  return mailFanout(args, mailFanoutContext(), {
+  const outcome = await mailFanout(args, mailFanoutContext(), {
     command: "investigate",
     role: "reviewer",
     defaultAgentIds: ["omp-reviewer", "claude-reviewer"],
   });
+  printJson(outcome.payload);
+  return outcome.code;
+}
+
+function runIdOfClaim(run: unknown): string | null {
+  if (run && typeof run === "object" && typeof (run as { run_id?: unknown }).run_id === "string") {
+    return (run as { run_id: string }).run_id;
+  }
+  return null;
+}
+
+// A fallback result's synthetic finding is a driver error message, not a
+// review; the comment carries the recovered raw review text instead.
+function unparsedRunSection(mr: string, runId: string, state: string, raw: string): string {
+  const text =
+    raw.length > MIRROR_BODY_MAX_CHARS
+      ? `${raw.slice(0, MIRROR_BODY_MAX_CHARS)}\n\n…(raw review truncated; run \`orch result --run ${runId}\` for the rest)`
+      : raw;
+  return [
+    "### orch run result",
+    "",
+    `- MR/PR: ${mr}`,
+    `- Run: ${runId}`,
+    `- State: ${state}`,
+    "- Verdict: unparsed (driver schema fallback — raw review below)",
+    "",
+    text,
+  ].join("\n");
+}
+
+// The auto phase acts only on the runs THIS fan-out claimed — never on the
+// thread's history — and decides only unambiguous outcomes (planAutoDecision).
+// Rework/fallback/failed runs are surfaced with the exact follow-up command
+// instead of being auto-driven: no unbounded impl↔review loops.
+async function crossReviewAuto(args: ParsedArgs, outcome: MailFanoutOutcome): Promise<number> {
+  const execute = flagBool(args, "execute");
+  const waitSec = flagNumber(args, "wait-sec") ?? 900;
+  if (!Number.isFinite(waitSec) || waitSec <= 0) throw new CliError("--wait-sec must be positive");
+  const runIds = new Set(outcome.runs.map((item) => runIdOfClaim(item.run)).filter((id): id is string => id !== null));
+  if (runIds.size === 0) {
+    printJson({
+      ...outcome.payload,
+      auto: "skipped",
+      reason: `no new runs claimed (thread tasks already acked); follow up with: orch verdict --thread ${outcome.thread} --wait`,
+    });
+    return 0;
+  }
+  const mr = outcome.runs[0]!.mr;
+  const repoKey = outcome.repo_key;
+
+  const deadline = Date.now() + waitSec * 1000;
+  let tracked = collectMrRuns(repoKey, mr).filter((run) => runIds.has(run.run_id));
+  while (!(tracked.length === runIds.size && tracked.every((run) => isTerminal(run.state) || run.stale))) {
+    if (Date.now() >= deadline) {
+      throw new CliError(
+        `--auto timed out after ${waitSec}s (${tracked.filter((run) => isTerminal(run.state)).length}/${runIds.size} terminal); runs continue — follow up with: orch verdict --thread ${outcome.thread} --wait`,
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+    tracked = collectMrRuns(repoKey, mr).filter((run) => runIds.has(run.run_id));
+  }
+
+  const mrDir = mrStateDir(repoKey, mr);
+  ensureStateLayout(mrDir);
+  const runsRoot = `${mrDir}/runs`;
+  const ts = new Date().toISOString();
+  const sections: string[] = [];
+  const attention: string[] = [];
+  const reportRuns: Array<Record<string, unknown>> = [];
+  for (const run of tracked) {
+    // failed/timeout/stale runs may never have written result.json; surface
+    // them instead of crashing — and never decide a run without a result.
+    const result = readJsonFile<RoleResult | null>(`${runsRoot}/${run.run_id}/result.json`, null);
+    const status = readJsonFile<RunStatus | null>(`${runsRoot}/${run.run_id}/status.json`, null);
+    const raw = result ? fallbackRawReview(`${runsRoot}/${run.run_id}`, result) : null;
+    const plan =
+      result === null
+        ? { decision: null, reason: null, attention: `no result.json; inspect: orch events tail --run ${run.run_id} --native` }
+        : planAutoDecision(run, raw !== null);
+    let decision: string | null = null;
+    if (plan.decision) {
+      try {
+        writeJsonExclusive(`${runsRoot}/${run.run_id}/decision.json`, { verdict: plan.decision, run_id: run.run_id, reason: plan.reason, ts });
+        decision = plan.decision;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        decision = "already-decided";
+      }
+    }
+    if (plan.attention) attention.push(`${run.run_id} (${run.agent}): ${plan.attention}`);
+    sections.push(
+      result === null
+        ? ["### orch run result", "", `- MR/PR: ${mr}`, `- Run: ${run.run_id}`, `- State: ${run.state}`, "- Verdict: none (no result.json)"].join("\n")
+        : raw !== null
+          ? unparsedRunSection(mr, run.run_id, run.state, raw)
+          : mirrorBody(mr, run.run_id, result, status),
+    );
+    reportRuns.push({
+      run_id: run.run_id,
+      agent: run.agent,
+      state: run.state,
+      verdict: result === null ? null : raw !== null ? "unparsed" : run.verdict,
+      blocking: run.blocking,
+      decision,
+      attention: plan.attention,
+    });
+  }
+
+  const header = [
+    "### orch cross-review",
+    "",
+    `- MR/PR: ${mr}`,
+    `- Thread: ${outcome.thread}`,
+    `- Runs: ${tracked.map((run) => `${run.agent}/${run.run_id}`).join(", ")}`,
+  ].join("\n");
+  const body = [header, ...sections].join("\n\n---\n\n");
+  const outboxPath = enqueueComment(mrDir, { kind: "comment", mr, body, created_at: ts });
+
+  const forge = detectForge(outcome.remote_url);
+  let comment: Record<string, unknown> = { outbox_path: outboxPath, mode: "queued", forge };
+  let sendFailed = false;
+  if (forge === "none") {
+    comment = { ...comment, note: "no github/gitlab remote; comment stays queued" };
+  } else {
+    const adapter = createForgeAdapter(forge, execute, outcome.worktree);
+    if (!adapter) throw new CliError(`unsupported forge: ${forge}`);
+    // Same serialization as mirror sync --execute: one sender per MR outbox.
+    const outboxLock = execute ? await acquirePidfileLockWait(`${mrDir}/locks/outbox.lock`, 10_000) : null;
+    try {
+      const command = await adapter.postComment(mr, body);
+      const success = command.exit_code === 0;
+      let finalPath = outboxPath;
+      if (execute && success) {
+        finalPath = `${sentOutboxDir(mrDir)}/${basename(outboxPath)}`;
+        renameSync(outboxPath, finalPath);
+      }
+      sendFailed = execute && !success;
+      comment = {
+        outbox_path: finalPath,
+        mode: execute ? (success ? "sent" : "failed") : "dry-run",
+        forge,
+        command: argvForDisplay(command.argv),
+        exit_code: command.exit_code,
+      };
+      if (command.stderr) process.stderr.write(command.stderr);
+    } finally {
+      outboxLock?.release();
+    }
+  }
+
+  // --auto sends only its own comment; older queued comments stay untouched.
+  const otherPending = pendingOutboxFiles(mrDir).filter((file) => `${pendingOutboxDir(mrDir)}/${file}` !== outboxPath);
+  printJson({
+    mail: "cross-review",
+    auto: true,
+    thread: outcome.thread,
+    mr,
+    fanout: outcome.payload,
+    runs: reportRuns,
+    comment,
+    attention,
+    ...(otherPending.length > 0 ? { other_pending_outbox: otherPending.length, other_pending_hint: `orch mirror sync --mr ${mr}` } : {}),
+    ...(execute ? {} : { next: `orch mirror sync --mr ${mr} --execute` }),
+  });
+  return sendFailed ? 1 : 0;
 }
 
 function mrStatusSection(repoKey: string, mr: string): { mr: string; state_dir: string; runs: Array<RunStatus & { stale: boolean }> } {

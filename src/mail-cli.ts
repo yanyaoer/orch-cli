@@ -570,6 +570,30 @@ export interface MailFanoutOptions {
   role?: string;
   // Default mail-agent ids when neither --to-agent nor role auto-invite applies.
   defaultAgentIds?: string[];
+  // Command-specific flags accepted on top of FANOUT_FLAGS (e.g. cross-review --auto).
+  extraFlags?: readonly string[];
+}
+
+export interface MailFanoutClaimedRun {
+  event_id: string;
+  role: string;
+  agent_id: string;
+  mr: string;
+  run: unknown;
+}
+
+// mailFanout returns instead of printing: callers own the output, so
+// cross-review --auto can fold the fan-out payload into its final report
+// rather than emitting two JSON documents from one invocation.
+export interface MailFanoutOutcome {
+  code: number;
+  dry_run: boolean;
+  thread: string;
+  worktree: string;
+  repo_key: string;
+  remote_url: string;
+  runs: MailFanoutClaimedRun[];
+  payload: Record<string, unknown>;
 }
 
 const FANOUT_FLAGS = [
@@ -593,8 +617,8 @@ const FANOUT_FLAGS = [
 
 // Mail-native fan-out: derive mr/worktree from the thread, publish one task per
 // target agent, then claim+run each. Replaces the need for explicit --mr.
-export async function mailFanout(args: ParsedArgs, context: MailCliContext, opts: MailFanoutOptions): Promise<number> {
-  assertKnownFlags(args, opts.command, FANOUT_FLAGS);
+export async function mailFanout(args: ParsedArgs, context: MailCliContext, opts: MailFanoutOptions): Promise<MailFanoutOutcome> {
+  assertKnownFlags(args, opts.command, [...FANOUT_FLAGS, ...(opts.extraFlags ?? [])]);
   const thread = flagString(args, "thread");
   const worktree = mailWorktree(args);
   const repo = await getRepoIdentity(worktree);
@@ -628,15 +652,23 @@ export async function mailFanout(args: ParsedArgs, context: MailCliContext, opts
   }
 
   if (flagBool(args, "dry-run")) {
-    printJson({
-      mail: opts.command,
-      thread,
-      role,
-      worktree,
+    return {
+      code: 0,
       dry_run: true,
-      agents: agents.map((agent) => ({ agent_id: agent.id, provider: agent.provider })),
-    });
-    return 0;
+      thread,
+      worktree,
+      repo_key: repo.repo_key,
+      remote_url: repo.remote_url,
+      runs: [],
+      payload: {
+        mail: opts.command,
+        thread,
+        role,
+        worktree,
+        dry_run: true,
+        agents: agents.map((agent) => ({ agent_id: agent.id, provider: agent.provider })),
+      },
+    };
   }
 
   const taskText = readFileSync(resolve(flagString(args, "task")), "utf8");
@@ -668,15 +700,23 @@ export async function mailFanout(args: ParsedArgs, context: MailCliContext, opts
     fanoutLock.release();
   }
 
-  const runs: unknown[] = [];
+  const runs: MailFanoutClaimedRun[] = [];
   for (const agent of agents) {
     const eventIds = assigned.filter((item) => item.agent_id === agent.id).map((item) => item.event_id);
     const claimed = await claimMailTasks(withAgentFlag(args, agent.id), threadDir, thread, worktree, repo.repo_key, context, { eventIds });
     runs.push(...claimed);
   }
 
-  printJson({ mail: opts.command, thread, role, worktree, assigned, runs });
-  return 0;
+  return {
+    code: 0,
+    dry_run: false,
+    thread,
+    worktree,
+    repo_key: repo.repo_key,
+    remote_url: repo.remote_url,
+    runs,
+    payload: { mail: opts.command, thread, role, worktree, assigned, runs },
+  };
 }
 
 export async function mail(args: ParsedArgs, context: MailCliContext): Promise<number> {

@@ -52,7 +52,10 @@ Install: `curl -fsSL https://raw.githubusercontent.com/yanyaoer/orch-cli/main/in
   `--to-agent <mail-agent-id>` (repeatable) to override the default roster. Each
   publishes one task per agent then claims+runs it; re-running a thread skips
   acked tasks. Needs `orch mail agent defaults` once. `--dry-run` shows the
-  resolved agents without publishing. Follow with `orch status` / `orch result`.
+  resolved agents without publishing. Follow with `orch status` / `orch result`
+  — or add `--auto` (cross-review only) to wait for the runs, record the
+  unambiguous decisions, and queue ONE merged MR comment (dry-run preview;
+  `--execute` posts it; fallback/failed runs are surfaced, never auto-decided).
 - **Drive orch by email** → `orch mailctl` (init/poll/watch/status/reply/ack/guidance/attachments):
   an allowlisted, authenticated sender emails a task; `poll` ingests it (IMAP) and
   auto-spawns a claude **controller** run that fans work out and replies in-thread
