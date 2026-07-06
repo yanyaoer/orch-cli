@@ -625,8 +625,63 @@ function readMirrorResult(runsRoot: string, runId: string): { result: RoleResult
   return { result, status };
 }
 
+// GitHub caps issue comments at 65536 chars; stay under it with room for the
+// forge CLI's own wrapping. One pathological finding must not eat the budget.
+const MIRROR_BODY_MAX_CHARS = 60_000;
+const MIRROR_FINDING_MAX_CHARS = 4_000;
+
+function mirrorListLines(title: string, items: string[]): string[] {
+  if (items.length === 0) return [];
+  return [`${title} (${items.length}):`, "", ...items.map((item) => `- ${item}`), ""];
+}
+
+// Findings render as plain paragraphs, not markdown list items: multi-line
+// finding bodies (blank lines included) survive GitHub/GitLab rendering intact.
+function mirrorFindingLines(title: string, findings: Array<{ id: string; severity?: string; file?: string; body: string }>): string[] {
+  if (findings.length === 0) return [];
+  const lines = [`${title} (${findings.length}):`, ""];
+  for (const finding of findings) {
+    const meta = [finding.severity, finding.id, finding.file].filter(Boolean).join(" | ");
+    const body = finding.body.length > MIRROR_FINDING_MAX_CHARS ? `${finding.body.slice(0, MIRROR_FINDING_MAX_CHARS)}…(finding truncated)` : finding.body;
+    lines.push(`**[${meta}]**`, body, "");
+  }
+  return lines;
+}
+
+function commandLine(command: { cmd: string; exit_code: number; summary: string }): string {
+  return `exit=${command.exit_code} \`${command.cmd}\` — ${command.summary}`;
+}
+
+// The comment is the human-facing mirror of result.json: every structured
+// field a decision was based on belongs in it, not just the summary line.
+function resultDetailLines(result: RoleResult): string[] {
+  switch (result.schema) {
+    case "orch.result/reviewer/v1":
+      return [
+        ...mirrorFindingLines("Blocking findings", result.blocking_findings),
+        ...mirrorFindingLines("Non-blocking findings", result.non_blocking_findings),
+        ...mirrorListLines("Suggested tests", result.suggested_tests),
+      ];
+    case "orch.result/verifier/v1":
+      return [
+        ...mirrorListLines("Commands", result.commands.map(commandLine)),
+        ...mirrorListLines("Acceptance", result.acceptance.map((item) => `${item.id}: ${item.status}`)),
+      ];
+    case "orch.result/implementer/v1":
+      return [
+        ...mirrorListLines("Tests", result.tests.map(commandLine)),
+        ...mirrorListLines("Acceptance", result.acceptance.map((item) => `${item.id}: ${item.status}${item.evidence ? ` — ${item.evidence}` : ""}`)),
+        ...mirrorListLines("Risks", result.risks),
+      ];
+    case "orch.result/controller/v1":
+      return mirrorListLines("Actions", result.actions);
+    default:
+      return [];
+  }
+}
+
 function mirrorBody(mr: string, runId: string, result: RoleResult, status: RunStatus | null): string {
-  return [
+  const lines = [
     "### orch run result",
     "",
     `- MR/PR: ${mr}`,
@@ -637,7 +692,12 @@ function mirrorBody(mr: string, runId: string, result: RoleResult, status: RunSt
     "Summary:",
     "",
     resultSummary(result),
-  ].join("\n");
+  ];
+  const detail = resultDetailLines(result);
+  if (detail.length > 0) lines.push("", ...detail);
+  const body = lines.join("\n").replace(/\n{3,}/g, "\n\n").trimEnd();
+  if (body.length <= MIRROR_BODY_MAX_CHARS) return body;
+  return `${body.slice(0, MIRROR_BODY_MAX_CHARS)}\n\n…(comment truncated; run \`orch result --run ${runId}\` for the full result)`;
 }
 
 function decisionBody(

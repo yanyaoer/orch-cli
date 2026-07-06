@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { sha256 } from "./hash.ts";
 import { repoKeyFromRemote } from "./paths.ts";
-import type { ControllerResult, ImplementerResult, RoleResult, RunStatus } from "./types.ts";
+import type { ControllerResult, ImplementerResult, ReviewerResult, RoleResult, RunStatus } from "./types.ts";
 
 async function runOrch(args: string[], env: Record<string, string>): Promise<{ stdout: string; stderr: string; exitCode: number }> {
   const proc = Bun.spawn([process.execPath, "src/orch.ts", ...args], {
@@ -1367,12 +1367,89 @@ test("decision records local verdict and queues mirror outbox payload", async ()
   expect(outboxPayload.body).toContain("### orch decision");
   expect(outboxPayload.body).toContain("Decision: accept");
   expect(outboxPayload.body).toContain("implemented P3 outbox flow");
+  expect(outboxPayload.body).toContain("exit=0 `bun test` — passed");
+  expect(outboxPayload.body).toContain("outbox: pass — pending payload written");
 
   const sync = await runOrch(["mirror", "sync", "--mr", mr, "--worktree", worktree], env);
   expect(sync).toMatchObject({ exitCode: 0, stderr: "" });
   expect(sync.stdout).toContain("gh pr comment 123 --body");
   expect(readdirSync(pendingDir).filter((file) => file.endsWith(".json"))).toHaveLength(1);
   expect(readdirSync(sentDir).filter((file) => file.endsWith(".json"))).toHaveLength(0);
+});
+
+test("reviewer decision mirrors full findings detail and caps oversized bodies", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orch-decision-findings-test-"));
+  const stateHome = join(root, "state");
+  const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
+  const remote = "git@github.com:example/repo.git";
+  await runCmd(["git", "init"], worktree);
+  await runCmd(["git", "remote", "add", "origin", remote], worktree);
+
+  const repoKey = repoKeyFromRemote(remote, worktree);
+  const mr = "77";
+  const runId = "rev-a-20260619T120000Z-def456";
+  const mrDir = join(stateHome, "orch", repoKey, "mrs", mr);
+  const runDir = join(mrDir, "runs", runId);
+  mkdirSync(runDir, { recursive: true });
+
+  const status: RunStatus = {
+    run_id: runId,
+    mr,
+    role: "reviewer",
+    agent: "claude",
+    tag: "rev-a",
+    provider_session_name: null,
+    provider_session_id: null,
+    provider_session_mode: "fresh_persistent",
+    state: "done",
+    pid: null,
+    pgid: null,
+    started_at: "2026-06-19T12:00:00.000Z",
+    updated_at: "2026-06-19T12:01:00.000Z",
+    exit_code: 0,
+    timeout_sec: 3600,
+    last_event_seq: 1,
+    native_event_count: 0,
+    provider_resume_id: null,
+    worktree,
+    base_sha: "base",
+    head_sha: "head",
+  };
+  const result: ReviewerResult = {
+    schema: "orch.result/reviewer/v1",
+    run_id: runId,
+    verdict: "request_changes",
+    reviews_run_id: "impl-a",
+    blocking_findings: [
+      { id: "B1", severity: "high", file: "src/rerank.kt:59", body: "no relocation ready await\n\nsecond paragraph with detail" },
+      { id: "B2", severity: "high", file: "src/rerank.kt:211", body: "x".repeat(70_000) },
+    ],
+    non_blocking_findings: [{ id: "NB1", body: "nested timeout duplication" }],
+    suggested_tests: ["cover empty docs response"],
+  };
+  writeFileSync(join(runDir, "status.json"), `${JSON.stringify(status, null, 2)}\n`, "utf8");
+  writeFileSync(join(runDir, "result.json"), `${JSON.stringify(result, null, 2)}\n`, "utf8");
+
+  const decision = await runOrch(
+    ["decision", "rework", "--mr", mr, "--run", runId, "--worktree", worktree, "--reason", "blocking findings"],
+    { XDG_STATE_HOME: stateHome },
+  );
+  expect(decision).toMatchObject({ exitCode: 0, stderr: "" });
+
+  const pendingDir = join(mrDir, "outbox", "pending");
+  const pending = readdirSync(pendingDir).filter((file) => file.endsWith(".json"));
+  expect(pending).toHaveLength(1);
+  const body = JSON.parse(readFileSync(join(pendingDir, pending[0]!), "utf8")).body as string;
+
+  expect(body).toContain("Blocking findings (2):");
+  expect(body).toContain("**[high | B1 | src/rerank.kt:59]**");
+  expect(body).toContain("second paragraph with detail");
+  expect(body).toContain("…(finding truncated)");
+  expect(body).toContain("Non-blocking findings (1):");
+  expect(body).toContain("**[NB1]**");
+  expect(body).toContain("Suggested tests (1):");
+  expect(body).toContain("- cover empty docs response");
+  expect(body.length).toBeLessThanOrEqual(60_000 + 200);
 });
 
 test("decision refuses unsafe mirror body before writing outbox payload", async () => {
