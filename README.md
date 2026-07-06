@@ -218,6 +218,12 @@ $ orch status --mr review-123                     # follow the runs (mr == threa
 - `investigate`: reviewer role for read-only research; default agents `omp-reviewer` + `claude-reviewer`.
 - `--to-agent <mail-agent-id>` (repeatable) overrides the default roster; `--dry-run` prints the resolved agents without publishing; `--model <ref>` forwards a provider model override to every spawned run.
 - Re-running the same thread with the same task is idempotent: already-acked assignments are reused and not run again; nacked or expired assignments can be claimed without publishing duplicates.
+- `cross-review --auto` inlines the follow-up ritual: it waits for this fan-out's runs to settle (`--wait-sec`, default 900), records the unambiguous decisions (approve + 0 blocking → accept, real blocking findings → rework), and queues ONE merged comment covering every run instead of one per run. The comment stays a dry-run preview in the outbox until you pass `--execute` (same A5 posture as `orch mirror sync`). Runs whose result can't be trusted are surfaced with the exact follow-up command, never auto-decided: driver schema fallbacks get their raw review text recovered from `result.raw.md` into the comment body (the synthetic `orch-driver-result` placeholder is never mirrored), and failed/timeout/stale runs are listed under `attention`. Rework dispatch stays a human/controller call — `--auto` does not loop implementers.
+
+```sh
+$ orch cross-review --thread 3823 --task review.md --auto            # preview: decisions recorded, comment queued
+$ orch cross-review --thread 3823 --task review.md --auto --execute  # same, and the merged comment is posted
+```
 
 ## Mail Controller (`orch mailctl`)
 

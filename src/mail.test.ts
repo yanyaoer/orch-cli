@@ -396,6 +396,70 @@ test("cross-review fans one task across reviewer agents via mail, deriving mr fr
   expect(readdirSync(runsRoot)).toHaveLength(2);
 });
 
+test("cross-review --auto records decisions and queues one merged mirror comment", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orch-cross-review-auto-"));
+  const stateHome = join(root, "state");
+  const configHome = join(root, "config");
+  const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
+  const remote = "git@github.com:example/repo.git";
+  await initRepo(worktree, remote);
+  const env = { XDG_STATE_HOME: stateHome, XDG_CONFIG_HOME: configHome, ORCH_DRIVER_FAKE_RESULT: "1" };
+  const thread = "review-auto-1";
+  const taskPath = join(root, "review.md");
+  writeFileSync(taskPath, "Review the pending diff.\n", "utf8");
+  await runOrch(["mail", "agent", "defaults"], env);
+
+  // --execute / --wait-sec are meaningless without --auto; reject them early.
+  const bare = await runOrch(["cross-review", "--thread", thread, "--task", taskPath, "--worktree", worktree, "--execute"], env);
+  expect(bare.exitCode).not.toBe(0);
+  expect(bare.stderr).toContain("--execute requires --auto");
+
+  const auto = await runOrch(["cross-review", "--thread", thread, "--task", taskPath, "--worktree", worktree, "--auto"], env);
+  expect(auto).toMatchObject({ exitCode: 0, stderr: "" });
+  const payload = JSON.parse(auto.stdout) as {
+    auto: boolean;
+    mr: string;
+    runs: Array<{ run_id: string; verdict: string | null; decision: string | null; attention: string | null }>;
+    comment: { mode: string; outbox_path: string };
+    attention: string[];
+    next: string;
+  };
+  expect(payload.auto).toBe(true);
+  expect(payload.mr).toBe(thread); // mr derived from the thread
+  expect(payload.runs).toHaveLength(2);
+  for (const run of payload.runs) {
+    expect(run.verdict).toBe("approve"); // fake driver reviewer result
+    expect(run.decision).toBe("accept");
+    expect(run.attention).toBeNull();
+  }
+  expect(payload.attention).toEqual([]);
+  expect(payload.comment.mode).toBe("dry-run"); // A5: nothing posted without --execute
+  expect(payload.next).toContain("orch mirror sync");
+
+  const mrDir = join(stateHome, "orch", repoKeyFromRemote(remote, worktree), "mrs", thread);
+  const runDirs = readdirSync(join(mrDir, "runs"));
+  expect(runDirs).toHaveLength(2);
+  for (const dir of runDirs) {
+    const decision = JSON.parse(readFileSync(join(mrDir, "runs", dir, "decision.json"), "utf8")) as { verdict: string };
+    expect(decision.verdict).toBe("accept");
+  }
+  // one merged comment for the whole fan-out, not one per run
+  const pending = readdirSync(join(mrDir, "outbox", "pending"));
+  expect(pending).toHaveLength(1);
+  const comment = JSON.parse(readFileSync(join(mrDir, "outbox", "pending", pending[0]!), "utf8")) as { body: string };
+  expect(comment.body).toContain("### orch cross-review");
+  expect(comment.body.match(/### orch run result/g)).toHaveLength(2);
+  expect(comment.body).toContain("Verdict: approve");
+
+  // re-running the thread claims nothing new; --auto reports that instead of re-deciding
+  const again = await runOrch(["cross-review", "--thread", thread, "--task", taskPath, "--worktree", worktree, "--auto"], env);
+  expect(again.exitCode).toBe(0);
+  const againPayload = JSON.parse(again.stdout) as { auto: string; reason: string };
+  expect(againPayload.auto).toBe("skipped");
+  expect(againPayload.reason).toContain("orch verdict --thread");
+  expect(readdirSync(join(mrDir, "outbox", "pending"))).toHaveLength(1);
+});
+
 test("concurrent cross-review fan-outs publish exactly one task per agent", async () => {
   const root = mkdtempSync(join(tmpdir(), "orch-cross-review-race-"));
   const stateHome = join(root, "state");
