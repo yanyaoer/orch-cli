@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createFileFollower } from "./json.ts";
@@ -55,6 +55,18 @@ test("createFileFollower tolerates a missing file and reports sawFile", () => {
     writeFileSync(path, "x\n");
     expect(follower.drain()).toEqual(["x"]);
     expect(follower.sawFile()).toBe(true);
+  });
+});
+
+test("createFileFollower keeps a multi-byte codepoint split across writes intact", () => {
+  withDir((dir) => {
+    const path = join(dir, "events.jsonl");
+    const bytes = Buffer.from("汉\n", "utf8");
+    writeFileSync(path, bytes.subarray(0, 2));
+    const follower = createFileFollower(path);
+    expect(follower.drain()).toEqual([]);
+    appendFileSync(path, bytes.subarray(2));
+    expect(follower.drain()).toEqual(["汉"]);
   });
 });
 

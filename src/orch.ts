@@ -1434,9 +1434,13 @@ async function eventsTailAll(args: ParsedArgs, repoKey: string): Promise<number>
         if (!entry.isDirectory()) continue;
         const runDir = `${runsRoot}/${entry.name}`;
         if (seen.has(runDir)) continue;
-        seen.add(runDir);
         const status = readJsonFile<RunStatus | null>(`${runDir}/status.json`, null);
-        const active = status !== null && nonTerminalStates.has(status.state) && !looksStale(status);
+        // A run mid-creation (directory exists, status.json not yet written)
+        // stays out of `seen` so the next pass re-examines it instead of
+        // skipping it for its whole lifetime.
+        if (status === null) continue;
+        seen.add(runDir);
+        const active = nonTerminalStates.has(status.state) && !looksStale(status);
         // On the first pass terminal runs are history; later they are news.
         if (firstPass && !active) continue;
         track(mrName, entry.name, runDir, firstPass);
