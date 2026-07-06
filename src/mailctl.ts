@@ -39,6 +39,10 @@ export interface MailCursor {
   uidvalidity: number | null;
   last_uid: number | null;
   last_poll_at: string | null;
+  consecutive_failures?: number;
+  last_error?: string | null;
+  last_alert_at?: string | null;
+  alerted_streak?: number | null;
 }
 
 export interface MailMessageRef {
@@ -843,6 +847,124 @@ function safeJsonFiles(dir: string): string[] {
     .sort();
 }
 
+const POLL_FAILURE_ALERT_THRESHOLD = 3;
+const POLL_FAILURE_ALERT_COOLDOWN_MS = 6 * 60 * 60 * 1000;
+const POLL_FAILURE_ALERT_THREAD = "mailctl-alert";
+
+function mailHeaderValue(value: string): string {
+  return value.replace(/[\r\n]+/g, " ").trim();
+}
+
+function normalizeMailText(value: string): string {
+  return value.replace(/\r\n/g, "\n").replace(/\r/g, "\n").replace(/\n/g, "\r\n");
+}
+
+function outboxEmailRecordCount(): number {
+  return safeJsonFiles(outboxEmailPendingDir()).length + safeJsonFiles(outboxEmailSentDir()).length + safeJsonFiles(outboxEmailDroppedDir()).length;
+}
+
+function shouldQueuePollFailureAlert(ctx: MailctlContext, cursor: MailCursor | null): boolean {
+  const failures = safeNumber(cursor?.consecutive_failures) ?? 0;
+  if (failures < POLL_FAILURE_ALERT_THRESHOLD) return false;
+  if ((safeNumber(cursor?.alerted_streak) ?? 0) > 0) return false;
+  if (typeof cursor?.last_alert_at === "string") {
+    const lastAlertAt = Date.parse(cursor.last_alert_at);
+    if (Number.isFinite(lastAlertAt) && ctx.now() - lastAlertAt < POLL_FAILURE_ALERT_COOLDOWN_MS) return false;
+  }
+  return true;
+}
+
+function buildPollFailureAlert(ctx: MailctlContext, cursor: MailCursor): PendingReplyRecord {
+  const ts = nowIso(ctx);
+  const failures = safeNumber(cursor.consecutive_failures) ?? 0;
+  const from = ctx.config.account.user;
+  const to = ctx.config.allowed_senders[0];
+  if (!to) throw new Error("mailctl poll alert has no configured recipient");
+  const reportKey = `alert:mailctl-poll-failing:${ctx.now().toString(36)}:${outboxEmailRecordCount() + 1}`;
+  const messageId = replyMessageId(ctx, POLL_FAILURE_ALERT_THREAD, reportKey);
+  const body = [
+    `consecutive_failures: ${failures}`,
+    `last_error: ${cursor.last_error ? redactHumanText(cursor.last_error) : "none"}`,
+    `last_poll_at: ${cursor.last_poll_at ?? "never"}`,
+    "Alerts are delivered on the next successful SMTP connection, so this may describe a past outage.",
+  ].join("\n");
+  const raw = normalizeMailText(
+    [
+      `From: ${mailHeaderValue(from)}`,
+      `To: ${mailHeaderValue(to)}`,
+      "Subject: [orch-alert] mailctl poll failing",
+      `Date: ${new Date(ctx.now()).toUTCString()}`,
+      `Message-ID: ${messageId}`,
+      "MIME-Version: 1.0",
+      "Content-Type: text/plain; charset=utf-8",
+      "Content-Transfer-Encoding: 8bit",
+      "",
+      body,
+      "",
+    ].join("\r\n"),
+  );
+  return {
+    schema: "orch.mailctl/outbox-email/v1",
+    report_key: reportKey,
+    thread: POLL_FAILURE_ALERT_THREAD,
+    body,
+    raw,
+    message_id: messageId,
+    attempts: 0,
+    created_at: ts,
+    updated_at: ts,
+    next_attempt_at: ts,
+    last_error: null,
+  };
+}
+
+function queuePollFailureAlert(ctx: MailctlContext, cursor: MailCursor): void {
+  if (!shouldQueuePollFailureAlert(ctx, cursor)) return;
+  ensureMailctlStateDirs();
+  const alert = buildPollFailureAlert(ctx, cursor);
+  writeJsonExclusive(pendingReplyPath(alert.report_key), alert);
+  const ts = nowIso(ctx);
+  patchCursor(ctx, { last_alert_at: ts, alerted_streak: cursor.consecutive_failures ?? POLL_FAILURE_ALERT_THRESHOLD });
+  appendAudit("alert_queued", { report_key: alert.report_key, message_id: alert.message_id, consecutive_failures: cursor.consecutive_failures ?? null, ts });
+}
+
+function recordPollFailureAlertError(ctx: MailctlContext, lastError: string, error: unknown): void {
+  const alertError = redactHumanText(errorMessage(error));
+  try {
+    patchCursor(ctx, { last_error: `${lastError}; alert_queue_error: ${alertError}` });
+  } catch {
+    // Keep the original poll failure path unchanged even if the diagnostic write fails.
+  }
+  try {
+    appendAudit("alert_queue_failed", { error: alertError, ts: nowIso(ctx) });
+  } catch {
+    // Best-effort audit only.
+  }
+}
+
+export function recordMailctlPollFailure(ctx: MailctlContext, error: unknown): void {
+  const lastError = redactHumanText(errorMessage(error));
+  try {
+    const cursor = readCursor();
+    const consecutiveFailures = (safeNumber(cursor?.consecutive_failures) ?? 0) + 1;
+    patchCursor(ctx, {
+      consecutive_failures: consecutiveFailures,
+      last_error: lastError,
+    });
+    try {
+      queuePollFailureAlert(ctx, readCursor() ?? { uidvalidity: null, last_uid: null, last_poll_at: null, consecutive_failures: consecutiveFailures, last_error: lastError });
+    } catch (alertError) {
+      recordPollFailureAlertError(ctx, lastError, alertError);
+    }
+  } catch (recordError) {
+    try {
+      appendAudit("poll_failure_record_failed", { error: redactHumanText(errorMessage(recordError)), ts: nowIso(ctx) });
+    } catch {
+      // The caller must still see the original poll failure.
+    }
+  }
+}
+
 function listThreadStates(): MailctlThreadState[] {
   return safeJsonFiles(`${mailControlStateDir()}/threads`)
     .map((path) => readJsonFile<MailctlThreadState | null>(path, null))
@@ -1520,6 +1642,10 @@ async function mailctlPollUnlocked(ctx: MailctlContext, opts: PollOptions): Prom
     uidvalidity,
     last_uid: highWater,
     last_poll_at: nowIso(ctx),
+    consecutive_failures: 0,
+    last_error: null,
+    last_alert_at: null,
+    alerted_streak: null,
   };
   writeCursor(nextCursor);
   result.cursor = nextCursor;
@@ -1547,9 +1673,14 @@ export async function mailctlPoll(ctx: MailctlContext, opts: PollOptions = {}): 
   }
 
   try {
-    const result = await mailctlPollUnlocked(ctx, opts);
-    if (opts.reconcile !== false) result.reconciled = await mailctlReconcileUnlocked(ctx);
-    return result;
+    try {
+      const result = await mailctlPollUnlocked(ctx, opts);
+      if (opts.reconcile !== false) result.reconciled = await mailctlReconcileUnlocked(ctx);
+      return result;
+    } catch (error) {
+      recordMailctlPollFailure(ctx, error);
+      throw error;
+    }
   } finally {
     lock.release();
   }

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -131,6 +131,7 @@ function textMail(options: {
 class FakeTransport implements MailTransport {
   marks: number[] = [];
   sent: string[] = [];
+  failList: Error | null = null;
   failSend = false;
   idleCalls = 0;
   listCalls = 0;
@@ -139,6 +140,7 @@ class FakeTransport implements MailTransport {
 
   async listNew(_sinceDays: number, _cursor: MailCursor | null): Promise<MailMessageRef[]> {
     this.listCalls += 1;
+    if (this.failList) throw this.failList;
     return this.messages.map((message) => message.ref);
   }
 
@@ -893,6 +895,105 @@ describe("mailctlPoll stateful cycle", () => {
     expect(sleeps).toEqual([1000, 1000]);
     expect(transport.listCalls).toBe(2);
     expect(transport.idleCalls).toBe(0);
+  });
+});
+
+describe("mailctlPoll failure alerting", () => {
+  function pendingOutboxRecords(): any[] {
+    return jsonFiles(outboxEmailPendingDir()).map((path) => readJsonFile<any>(path, null));
+  }
+
+  it("queues exactly one alert on the third consecutive failure and suppresses the fourth within cooldown", async () => {
+    const { cfg } = setupMailctl();
+    const transport = new FakeTransport([]);
+    transport.failList = new Error("imap failed under /Users/me/project with token=ABCDEFGHIJKLMNOPQRST");
+    const ctx = fakeContext({ cfg, transport });
+    writeJsonAtomic(cursorPath(), {
+      uidvalidity: null,
+      last_uid: 7,
+      last_poll_at: "2026-07-04T07:00:00.000Z",
+      consecutive_failures: 0,
+      last_error: null,
+    });
+
+    await expect(mailctlPoll(ctx, { reconcile: false })).rejects.toThrow("imap failed");
+    await expect(mailctlPoll(ctx, { reconcile: false })).rejects.toThrow("imap failed");
+    await expect(mailctlPoll(ctx, { reconcile: false })).rejects.toThrow("imap failed");
+
+    const pending = pendingOutboxRecords();
+    expect(pending).toHaveLength(1);
+    expect(pending[0]).toMatchObject({
+      schema: "orch.mailctl/outbox-email/v1",
+      thread: "mailctl-alert",
+      attempts: 0,
+      last_error: null,
+    });
+    expect(pending[0].raw).toContain("From: bot@example.com\r\n");
+    expect(pending[0].raw).toContain("To: owner@example.com\r\n");
+    expect(pending[0].raw).toContain("Subject: [orch-alert] mailctl poll failing\r\n");
+    expect(pending[0].body).toContain("consecutive_failures: 3");
+    expect(pending[0].body).toContain("last_poll_at: 2026-07-04T07:00:00.000Z");
+    expect(pending[0].body).toContain("Alerts are delivered on the next successful SMTP connection");
+    expect(pending[0].body).not.toContain("/Users/me/project");
+    expect(pending[0].body).not.toContain("ABCDEFGHIJKLMNOPQRST");
+    expect(auditRows().filter((row) => row.type === "alert_queued")).toHaveLength(1);
+
+    await expect(mailctlPoll(ctx, { reconcile: false })).rejects.toThrow("imap failed");
+
+    const cursor = readJsonFile<any>(cursorPath(), null);
+    expect(pendingOutboxRecords()).toHaveLength(1);
+    expect(cursor).toMatchObject({ consecutive_failures: 4, alerted_streak: 3 });
+  });
+
+  it("queues a new alert after recovery starts a new failure streak", async () => {
+    const { cfg } = setupMailctl();
+    const transport = new FakeTransport([]);
+    transport.failList = new Error("imap down");
+    const ctx = fakeContext({ cfg, transport });
+
+    for (let i = 0; i < 3; i += 1) {
+      await expect(mailctlPoll(ctx, { reconcile: false })).rejects.toThrow("imap down");
+    }
+    expect(pendingOutboxRecords()).toHaveLength(1);
+
+    transport.failList = null;
+    await expect(mailctlPoll(ctx, { reconcile: false })).resolves.toMatchObject({ skipped: false, errors: 0 });
+    expect(readJsonFile<any>(cursorPath(), null)).toMatchObject({
+      consecutive_failures: 0,
+      last_error: null,
+      last_alert_at: null,
+      alerted_streak: null,
+    });
+
+    transport.failList = new Error("imap down again");
+    for (let i = 0; i < 3; i += 1) {
+      await expect(mailctlPoll(ctx, { reconcile: false })).rejects.toThrow("imap down again");
+    }
+
+    expect(pendingOutboxRecords()).toHaveLength(2);
+    expect(auditRows().filter((row) => row.type === "alert_queued")).toHaveLength(2);
+  });
+
+  it("keeps the original poll failure when alert queueing fails", async () => {
+    const { cfg } = setupMailctl();
+    const transport = new FakeTransport([]);
+    transport.failList = new Error("imap unavailable");
+    const ctx = fakeContext({ cfg, transport });
+
+    await expect(mailctlPoll(ctx, { reconcile: false })).rejects.toThrow("imap unavailable");
+    await expect(mailctlPoll(ctx, { reconcile: false })).rejects.toThrow("imap unavailable");
+    chmodSync(outboxEmailPendingDir(), 0o500);
+    try {
+      await expect(mailctlPoll(ctx, { reconcile: false })).rejects.toThrow("imap unavailable");
+    } finally {
+      chmodSync(outboxEmailPendingDir(), 0o700);
+    }
+
+    const cursor = readJsonFile<any>(cursorPath(), null);
+    expect(cursor.consecutive_failures).toBe(3);
+    expect(cursor.last_error).toContain("imap unavailable");
+    expect(cursor.last_error).toContain("alert_queue_error");
+    expect(auditRows().some((row) => row.type === "alert_queue_failed")).toBe(true);
   });
 });
 
