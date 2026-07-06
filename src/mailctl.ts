@@ -874,6 +874,11 @@ function shouldQueuePollFailureAlert(ctx: MailctlContext, cursor: MailCursor | n
   return true;
 }
 
+// The alert body bypasses assertMailReplyPolicy / the leak scan that normal
+// replies get in mailctlReply — it is queued straight into the outbox. That is
+// only safe while the body stays limited to fixed cursor fields (count,
+// redacted last_error, last_poll_at); anything richer must go through the same
+// policy checks as mailctlReply.
 function buildPollFailureAlert(ctx: MailctlContext, cursor: MailCursor): PendingReplyRecord {
   const ts = nowIso(ctx);
   const failures = safeNumber(cursor.consecutive_failures) ?? 0;
@@ -1644,7 +1649,10 @@ async function mailctlPollUnlocked(ctx: MailctlContext, opts: PollOptions): Prom
     last_poll_at: nowIso(ctx),
     consecutive_failures: 0,
     last_error: null,
-    last_alert_at: null,
+    // last_alert_at survives successful polls: the 6h alert cooldown must span
+    // failure streaks, otherwise a flapping mailbox (3 fails, 1 success,
+    // repeat) emits one alert per streak with no cooldown at all.
+    last_alert_at: readCursor()?.last_alert_at ?? null,
     alerted_streak: null,
   };
   writeCursor(nextCursor);

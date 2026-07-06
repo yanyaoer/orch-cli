@@ -945,12 +945,13 @@ describe("mailctlPoll failure alerting", () => {
     expect(cursor).toMatchObject({ consecutive_failures: 4, alerted_streak: 3 });
   });
 
-  it("queues a new alert after recovery starts a new failure streak", async () => {
+  it("suppresses a flapping streak inside the 6h cooldown and alerts again after it", async () => {
     const { cfg } = setupMailctl();
     const transport = new FakeTransport([]);
-    transport.failList = new Error("imap down");
-    const ctx = fakeContext({ cfg, transport });
+    const t0 = Date.parse("2026-07-04T08:56:28.000Z");
+    const ctx = fakeContext({ cfg, transport, now: t0 });
 
+    transport.failList = new Error("imap down");
     for (let i = 0; i < 3; i += 1) {
       await expect(mailctlPoll(ctx, { reconcile: false })).rejects.toThrow("imap down");
     }
@@ -958,18 +959,27 @@ describe("mailctlPoll failure alerting", () => {
 
     transport.failList = null;
     await expect(mailctlPoll(ctx, { reconcile: false })).resolves.toMatchObject({ skipped: false, errors: 0 });
-    expect(readJsonFile<any>(cursorPath(), null)).toMatchObject({
-      consecutive_failures: 0,
-      last_error: null,
-      last_alert_at: null,
-      alerted_streak: null,
-    });
+    // Cooldown memory survives the successful poll; only the streak resets.
+    const cursor = readJsonFile<any>(cursorPath(), null);
+    expect(cursor).toMatchObject({ consecutive_failures: 0, last_error: null, alerted_streak: null });
+    expect(typeof cursor.last_alert_at).toBe("string");
 
+    // A new streak one hour later flaps inside the cooldown: no second alert.
+    const ctx1h = fakeContext({ cfg, transport, now: t0 + 60 * 60 * 1000 });
     transport.failList = new Error("imap down again");
     for (let i = 0; i < 3; i += 1) {
-      await expect(mailctlPoll(ctx, { reconcile: false })).rejects.toThrow("imap down again");
+      await expect(mailctlPoll(ctx1h, { reconcile: false })).rejects.toThrow("imap down again");
     }
+    expect(pendingOutboxRecords()).toHaveLength(1);
 
+    // Recover, then a streak past the cooldown queues the second alert.
+    transport.failList = null;
+    await expect(mailctlPoll(ctx1h, { reconcile: false })).resolves.toMatchObject({ skipped: false, errors: 0 });
+    const ctx7h = fakeContext({ cfg, transport, now: t0 + 7 * 60 * 60 * 1000 });
+    transport.failList = new Error("imap down later");
+    for (let i = 0; i < 3; i += 1) {
+      await expect(mailctlPoll(ctx7h, { reconcile: false })).rejects.toThrow("imap down later");
+    }
     expect(pendingOutboxRecords()).toHaveLength(2);
     expect(auditRows().filter((row) => row.type === "alert_queued")).toHaveLength(2);
   });

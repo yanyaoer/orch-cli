@@ -197,7 +197,10 @@ export function buildProviderArgv(
     if (spec.role === "controller") argv.push("--allowedTools", CLAUDE_CONTROLLER_ALLOWED_TOOLS, "--permission-mode", "dontAsk");
     else if (readOnly) argv.push("--permission-mode", "plan");
     // Write roles and verifier run headless: without an explicit mode, edits
-    // and test commands wait for interactive approval that never comes.
+    // and test commands wait for interactive approval that never comes. Blast
+    // radius note: bypassPermissions disables claude's sandbox entirely, wider
+    // than codex write roles (which keep codex's default workspace-write
+    // sandbox). Role→read-only mapping is identical; sandbox strength is not.
     else argv.push("--permission-mode", "bypassPermissions");
     if (spec.provider_session_name) argv.push("--name", spec.provider_session_name);
     if (spec.provider_session_mode === "ephemeral") {

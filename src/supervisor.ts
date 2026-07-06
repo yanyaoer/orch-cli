@@ -105,16 +105,16 @@ async function writeEvidence(runDir: string, spec: RunSpec): Promise<void> {
     if (!writeRoles.has(spec.role) || !baseSha) return;
     const artifactsDir = runDirFile(runDir, "artifacts");
     mkdirSync(artifactsDir, { recursive: true });
-    const status = await Bun.$`git -C ${spec.worktree} status --porcelain=v1`.quiet().text();
-    writeFileSync(`${artifactsDir}/git-status.txt`, status, "utf8");
+    // git output is redirected straight to the artifact files so a large or
+    // binary diff never transits JS memory. No timeout: these are read-only
+    // git commands and the whole block is best-effort diagnostics.
+    await Bun.$`git -C ${spec.worktree} status --porcelain=v1 > ${`${artifactsDir}/git-status.txt`}`.quiet();
 
     // Diffing the base SHA against the worktree captures uncommitted tracked
     // edits. Untracked files are intentionally visible only in git-status.txt.
-    const diff = await Bun.$`git -C ${spec.worktree} diff --binary ${baseSha} -- .`.quiet().text();
-    writeFileSync(`${artifactsDir}/diff.patch`, diff, "utf8");
+    await Bun.$`git -C ${spec.worktree} diff --binary ${baseSha} -- . > ${`${artifactsDir}/diff.patch`}`.quiet();
 
-    const changed = await Bun.$`git -C ${spec.worktree} diff --name-only ${baseSha} -- .`.quiet().text();
-    writeFileSync(`${artifactsDir}/changed-files.txt`, changed, "utf8");
+    await Bun.$`git -C ${spec.worktree} diff --name-only ${baseSha} -- . > ${`${artifactsDir}/changed-files.txt`}`.quiet();
   } catch {
     // Evidence is diagnostic only; collection must not change the run outcome.
   }
