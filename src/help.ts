@@ -186,7 +186,7 @@ export function eventsTailHelp(): string {
     "",
     "Usage:",
     "  orch events tail --run <run_id> [--mr <id>] [--worktree <path>] [-n <lines>] [--native] [-f]",
-    "  orch events tail -f [--mr <id>] [--worktree <path>] [-n <lines>] [--native]",
+    "  orch events tail -f [--all] [--mr <id>] [--worktree <path>] [-n <lines>] [--native]",
     "",
     "Flags:",
     "  --run <run_id>        Local orch run id to read; omitted with -f follows every active run",
@@ -200,6 +200,8 @@ export function eventsTailHelp(): string {
     "                        every active run (tail-style ==> mr/run <== headers), picks up runs",
     "                        created while following, and runs until Ctrl-C; -n replays that many",
     "                        lines of context per run, otherwise streaming starts at the tail",
+    "  --all                 With -f and no --run: follow every repo under the orch state root,",
+    "                        not just the current worktree's (headers gain a repo: prefix)",
     "  --help                Show this help",
     "",
     "Examples:",
@@ -208,6 +210,7 @@ export function eventsTailHelp(): string {
     "  orch events tail --run impl-a-20260619T120000Z-abc123 --native -n 20",
     "  orch events tail --run impl-a-20260619T120000Z-abc123 --native -f",
     "  orch events tail -f --native",
+    "  orch events tail -f --all",
   ]);
 }
 

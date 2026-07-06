@@ -65,7 +65,8 @@ Install: `curl -fsSL https://raw.githubusercontent.com/yanyaoer/orch-cli/main/in
   `final` / `raw`), provider-independent — no per-provider parsing. Add `-f`
   to stream live until the run ends (auto-exits on terminal/stale); `-f`
   without `--run` multiplexes every active run in the repo (and runs created
-  while following) with tail-style `==> mr/run <==` headers until Ctrl-C.
+  while following) with tail-style `==> mr/run <==` headers until Ctrl-C —
+  scope is the current worktree's repo, `--all` follows every repo.
   Lifecycle authority stays with plain `orch events tail` (events.jsonl) +
   `orch status`.
 - **Let ChatGPT read this repo live** (a *tool-capable* model, gpt-5.5 non-Pro) →

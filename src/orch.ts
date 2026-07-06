@@ -1376,16 +1376,18 @@ async function waitCommand(args: ParsedArgs): Promise<number> {
 
 const FOLLOW_POLL_MS = 500;
 
-// Without --run, -f multiplexes every active run in the repo (or one mr):
-// existing active runs stream from their current end (-n replays that much
-// context first), runs created while following stream from the top, and a
-// tail(1)-style "==> mr/run <==" header marks every source switch. Runs are
+// Without --run, -f multiplexes every active run in the repo (or one mr, or
+// every repo with --all): existing active runs stream from their current end
+// (-n replays that much context first), runs created while following stream
+// from the top, and a tail(1)-style "==> mr/run <==" header marks every
+// source switch (prefixed with the repo's short name under --all). Runs are
 // dropped once terminal or stale; the loop itself runs until Ctrl-C, since
 // waiting for runs that don't exist yet is the point.
-async function eventsTailAll(args: ParsedArgs, repoKey: string): Promise<number> {
+async function eventsTailAll(args: ParsedArgs, repoKeys: string[]): Promise<number> {
   const lines = parseTailLines(args);
   const fileName = flagBool(args, "native") ? "native.jsonl" : "events.jsonl";
-  const mrNames = (): string[] => (args.flags.has("mr") ? [flagString(args, "mr")] : mrDirsForRepo(repoKey));
+  const mrNamesFor = (repoKey: string): string[] => (args.flags.has("mr") ? [flagString(args, "mr")] : mrDirsForRepo(repoKey));
+  const labelPrefix = (repoKey: string): string => (repoKeys.length > 1 ? `${basename(repoKey)}:` : "");
 
   type Tracked = { label: string; runDir: string; follower: ReturnType<typeof createFileFollower>; render: (line: string) => string };
   const tracked = new Map<string, Tracked>();
@@ -1411,8 +1413,7 @@ async function eventsTailAll(args: ParsedArgs, repoKey: string): Promise<number>
           : "";
   };
 
-  const track = (mrName: string, runId: string, runDir: string, preexisting: boolean): void => {
-    const label = `${mrName}/${runId}`;
+  const track = (label: string, runDir: string, preexisting: boolean): void => {
     const render = makeRender();
     let offset = 0;
     if (preexisting) {
@@ -1427,23 +1428,25 @@ async function eventsTailAll(args: ParsedArgs, repoKey: string): Promise<number>
   };
 
   const discover = (firstPass: boolean): void => {
-    for (const mrName of mrNames()) {
-      const runsRoot = `${mrStateDir(repoKey, mrName)}/runs`;
-      if (!existsSync(runsRoot)) continue;
-      for (const entry of readdirSync(runsRoot, { withFileTypes: true })) {
-        if (!entry.isDirectory()) continue;
-        const runDir = `${runsRoot}/${entry.name}`;
-        if (seen.has(runDir)) continue;
-        const status = readJsonFile<RunStatus | null>(`${runDir}/status.json`, null);
-        // A run mid-creation (directory exists, status.json not yet written)
-        // stays out of `seen` so the next pass re-examines it instead of
-        // skipping it for its whole lifetime.
-        if (status === null) continue;
-        seen.add(runDir);
-        const active = nonTerminalStates.has(status.state) && !looksStale(status);
-        // On the first pass terminal runs are history; later they are news.
-        if (firstPass && !active) continue;
-        track(mrName, entry.name, runDir, firstPass);
+    for (const repoKey of repoKeys) {
+      for (const mrName of mrNamesFor(repoKey)) {
+        const runsRoot = `${mrStateDir(repoKey, mrName)}/runs`;
+        if (!existsSync(runsRoot)) continue;
+        for (const entry of readdirSync(runsRoot, { withFileTypes: true })) {
+          if (!entry.isDirectory()) continue;
+          const runDir = `${runsRoot}/${entry.name}`;
+          if (seen.has(runDir)) continue;
+          const status = readJsonFile<RunStatus | null>(`${runDir}/status.json`, null);
+          // A run mid-creation (directory exists, status.json not yet written)
+          // stays out of `seen` so the next pass re-examines it instead of
+          // skipping it for its whole lifetime.
+          if (status === null) continue;
+          seen.add(runDir);
+          const active = nonTerminalStates.has(status.state) && !looksStale(status);
+          // On the first pass terminal runs are history; later they are news.
+          if (firstPass && !active) continue;
+          track(`${labelPrefix(repoKey)}${mrName}/${entry.name}`, runDir, firstPass);
+        }
       }
     }
   };
@@ -1451,6 +1454,14 @@ async function eventsTailAll(args: ParsedArgs, repoKey: string): Promise<number>
   let firstPass = true;
   for (;;) {
     discover(firstPass);
+    if (firstPass) {
+      // Say what is being followed up front: an empty scope otherwise looks
+      // like a hang (the classic miss is running this from the wrong repo).
+      const scope = repoKeys.length === 1 ? repoKeys[0] : `${repoKeys.length} repos`;
+      process.stderr.write(
+        `following ${scope} · ${tracked.size} active run(s); waiting for new runs (Ctrl-C to stop${repoKeys.length === 1 ? ", --all for every repo" : ""})\n`,
+      );
+    }
     firstPass = false;
     for (const t of tracked.values()) {
       const emit = (): void => {
@@ -1472,9 +1483,11 @@ async function eventsTail(args: ParsedArgs): Promise<number> {
   const follow = flagBool(args, "follow");
   if (!args.flags.has("run")) {
     if (!follow) throw new CliError("missing --run (with -f, --run may be omitted to follow every active run)");
+    if (flagBool(args, "all")) return eventsTailAll(args, collectRepoKeys());
     const repo = await getRepoIdentity(worktree);
-    return eventsTailAll(args, repo.repo_key);
+    return eventsTailAll(args, [repo.repo_key]);
   }
+  if (flagBool(args, "all")) throw new CliError("--all follows every active run; drop --run to use it");
   const runId = flagString(args, "run");
   const mr = args.flags.has("mr") ? flagString(args, "mr") : undefined;
   const lines = parseTailLines(args);
