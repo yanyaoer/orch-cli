@@ -35,6 +35,9 @@ export interface ExtractedMailAttachment {
   filename: string | null;
   contentType: string;
   bytes: Uint8Array;
+  // Set (and bytes left empty) when decoding was skipped because the estimated
+  // decoded size exceeds AttachmentExtractionLimits.maxDecodedBytes.
+  approxBytes?: number;
 }
 
 interface MimeTextParts {
@@ -605,30 +608,78 @@ function parseMimePart(raw: string, depth: number): MimeTextParts {
   return { plain: [], html: [] };
 }
 
-function collectAttachmentParts(raw: string, depth: number): ExtractedMailAttachment[] {
-  if (depth > 20) return [];
+// RFC2231/5987 extended parameter value: charset'language'percent-encoded.
+function decodeRfc2231Value(value: string): string | null {
+  const match = /^([^']*)'[^']*'([\s\S]*)$/.exec(value);
+  if (!match) return null;
+  const encoded = match[2]!;
+  const bytes: number[] = [];
+  for (let i = 0; i < encoded.length; i += 1) {
+    const char = encoded[i]!;
+    if (char === "%" && /^[0-9A-Fa-f]{2}$/.test(encoded.slice(i + 1, i + 3))) {
+      bytes.push(Number.parseInt(encoded.slice(i + 1, i + 3), 16));
+      i += 2;
+      continue;
+    }
+    const code = char.charCodeAt(0);
+    if (code > 0xff) return null;
+    bytes.push(code);
+  }
+  return decodeBytes(Uint8Array.from(bytes), match[1] || "utf-8");
+}
+
+function attachmentFilename(contentDisposition: ParsedHeaderValue, contentType: ParsedHeaderValue): string | null {
+  for (const params of [contentDisposition.params, contentType.params]) {
+    const extended = params.get("filename*") ?? params.get("name*");
+    if (extended) {
+      const decoded = decodeRfc2231Value(extended);
+      if (decoded?.trim()) return decoded.trim();
+    }
+    const plain = params.get("filename") ?? params.get("name");
+    if (plain?.trim()) return plain.trim();
+  }
+  return null;
+}
+
+export interface AttachmentExtractionLimits {
+  maxParts?: number;
+  maxDecodedBytes?: number;
+}
+
+function approxDecodedBytes(bodyLength: number, encoding: string | null | undefined): number {
+  return (encoding ?? "").trim().toLowerCase() === "base64" ? Math.floor(bodyLength * 0.75) : bodyLength;
+}
+
+function collectAttachmentParts(raw: string, depth: number, limits: AttachmentExtractionLimits, out: ExtractedMailAttachment[]): void {
+  if (depth > 20) return;
+  if (limits.maxParts !== undefined && out.length >= limits.maxParts) return;
   const { headers, body } = parseHeaderBlock(raw);
   const contentType = parseParameterizedHeader(headers.get("content-type")?.[0], "text/plain");
   if (contentType.value.startsWith("multipart/")) {
     const boundary = contentType.params.get("boundary");
-    if (!boundary) return [];
-    return splitMultipartBody(body, boundary).flatMap((part) => collectAttachmentParts(part, depth + 1));
+    if (!boundary) return;
+    for (const part of splitMultipartBody(body, boundary)) collectAttachmentParts(part, depth + 1, limits, out);
+    return;
   }
 
   const contentDisposition = parseParameterizedHeader(headers.get("content-disposition")?.[0], "");
-  const filename = contentDisposition.params.get("filename") ?? contentType.params.get("name") ?? null;
-  if (contentDisposition.value !== "attachment" && !filename) return [];
-  return [
-    {
-      filename: filename?.trim() || null,
-      contentType: contentType.value,
-      bytes: decodeTransferBody(body, headers.get("content-transfer-encoding")?.[0]),
-    },
-  ];
+  const filename = attachmentFilename(contentDisposition, contentType);
+  if (contentDisposition.value !== "attachment" && !filename) return;
+  const encoding = headers.get("content-transfer-encoding")?.[0];
+  // Refuse to materialize a payload that will not be stored anyway: judge the
+  // decoded size from the encoded body before decoding.
+  const approx = approxDecodedBytes(body.length, encoding);
+  if (limits.maxDecodedBytes !== undefined && approx > limits.maxDecodedBytes) {
+    out.push({ filename, contentType: contentType.value, bytes: new Uint8Array(0), approxBytes: approx });
+    return;
+  }
+  out.push({ filename, contentType: contentType.value, bytes: decodeTransferBody(body, encoding) });
 }
 
-export function extractMailAttachments(raw: string | Uint8Array): ExtractedMailAttachment[] {
-  return collectAttachmentParts(rawToBinaryString(raw), 0);
+export function extractMailAttachments(raw: string | Uint8Array, limits: AttachmentExtractionLimits = {}): ExtractedMailAttachment[] {
+  const out: ExtractedMailAttachment[] = [];
+  collectAttachmentParts(rawToBinaryString(raw), 0, limits, out);
+  return out;
 }
 
 export function extractMailText(raw: string | Uint8Array): ExtractedMailText {

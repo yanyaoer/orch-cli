@@ -1,4 +1,4 @@
-import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import type { MailControlConfig } from "./config.ts";
 import {
   mailControlConfigPath,
@@ -323,7 +323,7 @@ export interface MailAttachmentRecord extends MailAttachmentSummary {
   msg_sha: string;
   thread: string;
   from: string;
-  sha256: string;
+  sha256: string | null;
   payload_path: string | null;
   promoted_path: string | null;
   created_at: string;
@@ -1235,7 +1235,8 @@ export function recentRejectedSummary(nowMs: number, days = REJECTED_RECENT_DAYS
     const marker = readJsonFile<MessageMarker | null>(path, null);
     if (marker?.schema !== "orch.mailctl/message-marker/v1") continue;
     if (!marker.status.startsWith("rejected_")) continue;
-    if (Date.parse(marker.created_at) < cutoff) continue;
+    const ts = Date.parse(marker.created_at);
+    if (!Number.isFinite(ts) || ts < cutoff) continue;
     const reason = marker.status.slice("rejected_".length);
     by_reason[reason] = (by_reason[reason] ?? 0) + 1;
     total += 1;
@@ -1400,13 +1401,20 @@ function readAttachmentRecord(attId: string): MailAttachmentRecord {
   return record;
 }
 
+// Terminal-escape hygiene for `attachment show`: strip C0/C1 controls (except
+// tab/newline/CR) after a lossy UTF-8 decode. Removing raw 0x80-0x9f bytes
+// would corrupt multibyte sequences, so filtering happens on code points.
+// `attachment promote` remains the byte-exact path.
+const ATTACHMENT_SHOW_CONTROL_CHARS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g;
+
 export function mailctlAttachmentShow(attId: string): Uint8Array {
   const record = readAttachmentRecord(attId);
   if (!record.stored || !record.payload_path) throw new Error(`mailctl attachment payload was not stored (too large): ${attId}`);
   if (!record.safe) {
     throw new Error(`mailctl attachment is not a safe text type (${record.content_type}); export it with: orch mailctl attachment promote --id ${attId}`);
   }
-  return readFileSync(record.payload_path);
+  const text = new TextDecoder("utf-8", { fatal: false }).decode(readFileSync(record.payload_path));
+  return new TextEncoder().encode(text.replace(ATTACHMENT_SHOW_CONTROL_CHARS, ""));
 }
 
 export function mailctlAttachmentPromote(ctx: MailctlContext, opts: { id: string; dest?: string }): { path: string; promoted: boolean } {
@@ -1414,12 +1422,16 @@ export function mailctlAttachmentPromote(ctx: MailctlContext, opts: { id: string
   if (!record.stored || !record.payload_path) throw new Error(`mailctl attachment payload was not stored (too large): ${opts.id}`);
   const destDir = opts.dest ?? `${attachmentsPromotedDir()}/${statePathSegment(record.thread, "thread")}`;
   const destPath = `${destDir}/${record.filename}`;
-  if (existsSync(destPath)) {
+  mkdirSync(destDir, { recursive: true });
+  try {
+    // O_EXCL create: no exists/copy window, and an existing symlink fails here
+    // instead of being followed.
+    writeFileSync(destPath, readFileSync(record.payload_path), { flag: "wx" });
+  } catch (error) {
+    if (!isEexist(error)) throw error;
     if (sha256(readFileSync(destPath)) === record.sha256) return { path: destPath, promoted: false };
     throw new Error(`refusing to overwrite existing file with different content: ${destPath}`);
   }
-  mkdirSync(destDir, { recursive: true });
-  copyFileSync(record.payload_path, destPath);
   writeJsonAtomic(attachmentMetaPath(opts.id), { ...record, promoted_path: destPath });
   appendAudit("attachment_promoted", { att_id: opts.id, thread: record.thread, dest: destPath, ts: nowIso(ctx) });
   return { path: destPath, promoted: true };
@@ -1468,6 +1480,12 @@ function isSafeAttachment(filename: string, contentType: string): boolean {
   return SAFE_ATTACHMENT_EXTENSIONS.has(extension);
 }
 
+// The declared media type flows into controller task text and guidance output;
+// clamp it to an RFC-token shape so a malformed header cannot smuggle prose.
+function clampContentType(value: string): string {
+  return /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/.test(value) ? value : "application/octet-stream";
+}
+
 function attachmentMetaPath(attId: string): string {
   return `${attachmentsQuarantineDir()}/${attId}/meta.json`;
 }
@@ -1484,10 +1502,12 @@ function attachmentSummary(record: MailAttachmentRecord): MailAttachmentSummary 
 }
 
 function quarantineMailAttachments(ctx: MailctlContext, args: { raw: string; msgSha: string; thread: string; from: string }): MailAttachmentSummary[] {
-  const extracted = extractMailAttachments(args.raw);
+  // Caps are enforced during MIME traversal: collection stops at maxParts and
+  // oversized payloads are never decoded into memory, only measured.
+  const extracted = extractMailAttachments(args.raw, { maxParts: MAX_ATTACHMENTS_PER_MESSAGE, maxDecodedBytes: MAX_ATTACHMENT_BYTES });
   if (extracted.length === 0) return [];
   const summaries: MailAttachmentSummary[] = [];
-  for (const [index, attachment] of extracted.slice(0, MAX_ATTACHMENTS_PER_MESSAGE).entries()) {
+  for (const [index, attachment] of extracted.entries()) {
     const attId = `att-${sha12(`${args.msgSha}:${index}`)}`;
     const metaPath = attachmentMetaPath(attId);
     const existing = readJsonFile<MailAttachmentRecord | null>(metaPath, null);
@@ -1496,7 +1516,8 @@ function quarantineMailAttachments(ctx: MailctlContext, args: { raw: string; msg
       continue;
     }
     const filename = sanitizeAttachmentFilename(attachment.filename, index);
-    const stored = attachment.bytes.byteLength <= MAX_ATTACHMENT_BYTES;
+    const contentType = clampContentType(attachment.contentType);
+    const stored = attachment.approxBytes === undefined && attachment.bytes.byteLength <= MAX_ATTACHMENT_BYTES;
     mkdirSync(`${attachmentsQuarantineDir()}/${attId}`, { recursive: true });
     const payloadPath = stored ? `${attachmentsQuarantineDir()}/${attId}/${filename}` : null;
     if (payloadPath) writeFileSync(payloadPath, attachment.bytes);
@@ -1507,10 +1528,10 @@ function quarantineMailAttachments(ctx: MailctlContext, args: { raw: string; msg
       thread: args.thread,
       from: args.from,
       filename,
-      content_type: attachment.contentType,
-      size_bytes: attachment.bytes.byteLength,
-      sha256: sha256(attachment.bytes),
-      safe: isSafeAttachment(filename, attachment.contentType),
+      content_type: contentType,
+      size_bytes: attachment.approxBytes ?? attachment.bytes.byteLength,
+      sha256: stored ? sha256(attachment.bytes) : null,
+      safe: isSafeAttachment(filename, contentType),
       stored,
       payload_path: payloadPath,
       promoted_path: null,
@@ -1534,11 +1555,11 @@ function quarantineMailAttachments(ctx: MailctlContext, args: { raw: string; msg
     });
     summaries.push(attachmentSummary(record));
   }
-  if (extracted.length > MAX_ATTACHMENTS_PER_MESSAGE) {
-    appendAudit("attachments_skipped", {
+  if (extracted.length >= MAX_ATTACHMENTS_PER_MESSAGE) {
+    appendAudit("attachments_capped", {
       msg_sha: args.msgSha,
       thread: args.thread,
-      skipped: extracted.length - MAX_ATTACHMENTS_PER_MESSAGE,
+      cap: MAX_ATTACHMENTS_PER_MESSAGE,
       ts: nowIso(ctx),
     });
   }

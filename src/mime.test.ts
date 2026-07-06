@@ -397,3 +397,36 @@ describe("extractMailAttachments", () => {
     expect(extractMailAttachments(multipartAlternativeMessage("plain", "<p>html</p>"))).toEqual([]);
   });
 });
+
+describe("extractMailAttachments limits and RFC2231", () => {
+  it("decodes RFC2231 filename* parameters", () => {
+    const raw = [
+      'Content-Type: multipart/mixed; boundary="m"',
+      "",
+      "--m",
+      "Content-Type: application/octet-stream",
+      "Content-Disposition: attachment; filename*=UTF-8''%E6%88%AA%E5%9B%BE.patch",
+      "",
+      "data",
+      "--m--",
+      "",
+    ].join("\r\n");
+    expect(extractMailAttachments(raw)[0]!.filename).toBe("截图.patch");
+  });
+
+  it("stops collecting at maxParts and skips decoding oversized payloads", () => {
+    const part = (name: string, content: string) =>
+      [`--m`, `Content-Type: text/plain; name="${name}"`, "Content-Transfer-Encoding: base64", `Content-Disposition: attachment; filename="${name}"`, "", Buffer.from(content).toString("base64")].join("\r\n");
+    const raw = ['Content-Type: multipart/mixed; boundary="m"', "", part("a.log", "aaaa"), part("b.log", "b".repeat(100)), part("c.log", "cccc"), "--m--", ""].join("\r\n");
+
+    const capped = extractMailAttachments(raw, { maxParts: 2 });
+    expect(capped.map((item) => item.filename)).toEqual(["a.log", "b.log"]);
+
+    const limited = extractMailAttachments(raw, { maxDecodedBytes: 50 });
+    expect(limited[0]!.approxBytes).toBeUndefined();
+    expect(new TextDecoder().decode(limited[0]!.bytes)).toBe("aaaa");
+    expect(limited[1]!.approxBytes).toBeGreaterThanOrEqual(100);
+    expect(limited[1]!.bytes.byteLength).toBe(0);
+    expect(limited[2]!.approxBytes).toBeUndefined();
+  });
+});
