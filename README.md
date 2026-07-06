@@ -24,7 +24,7 @@ Shipped on `main` (v0.0.6, see [CHANGELOG.md](CHANGELOG.md)):
 - Bare `orch` prints the overview: active runs plus every pending action (undecided terminal runs, stale runs, pending outbox) expressed as a runnable orch command line — the same contract humans copy and agents execute from `--json`. `--all` scans every repo under the state root. The overview is a notification center, not a debt ledger: items idle beyond `--attention-days` (default 14, `0` disables) age out, and mrs matching a local branch already merged into HEAD are archived wholesale. `orch decision close` acks a run without queueing a comment; `orch decision sweep --execute` batch-acks the whole backlog by the overview's own rubric.
 - `orch verdict --thread <id>` aggregates a fan-out thread's verdicts into one suggestion (accept / rework / inspect / pending / reap); `--wait` blocks until the thread settles. `orch wait --thread <id>` is the wait-any primitive: it blocks until the next run needs attention, and a recorded decision acts as the ack so handled runs are never returned again.
 - `orch run list`, `orch status`, `orch events tail`, and `orch result` read local run state; omitting `--mr` aggregates across all MRs in the repo. `orch result --wait` blocks until the run reaches a terminal state; reviewer results render findings, verifier results render commands and acceptance.
-- `orch events tail --native` renders the provider-native stream (`native.jsonl`) as normalized progress events — `session`, `assistant`, `tool_use`, `tool_result`, `usage`, `final`, `raw` — so a controller can see what a worker is doing without parsing per-provider formats. The same normalizer (`src/native-events.ts`) backs result extraction and resume-id detection.
+- `orch events tail --native` renders the provider-native stream (`native.jsonl`) as normalized progress events — `session`, `assistant`, `tool_use`, `tool_result`, `usage`, `final`, `raw` — so a controller can see what a worker is doing without parsing per-provider formats. The same normalizer (`src/native-events.ts`) backs result extraction and resume-id detection. `-f/--follow` streams appended lines live: with `--run` it exits once the run is terminal (or stale) and drained; without `--run` it multiplexes every active run in the repo (`--all`: every repo) with tail-style `==> mr/run <==` headers, picks up runs created while following, and announces its scope on stderr up front.
 - Non-terminal runs whose supervisor pid is gone show as `stale?`; `orch run reap` persists them as `stale`. A provider that exits 0 without any output fails its run instead of quietly reporting done.
 - `orch decision` records `accept` or `rework` locally and queues a mirror comment.
 - `orch mail` provides the local message bus: signed mail events, Maildir delivery, router dispatch, atomic task claim, and result-driven review/verify follow-ups.
@@ -152,6 +152,11 @@ $ orch status --json --worktree .
 $ orch events tail --run review-a-20260619T120000-abc123 -n 20
 $ orch events tail --run review-a-20260619T120000-abc123 --native -n 20
                            # provider progress: session/assistant/tool_use/tool_result/usage/final/raw
+$ orch events tail --run review-a-20260619T120000-abc123 --native -f
+                           # follow live; exits once the run is terminal (or stale) and drained
+$ orch events tail -f --all --native
+                           # no --run: multiplex every active run (tail-style ==> mr/run <== headers),
+                           # pick up runs created while following, until Ctrl-C; --all spans every repo
 $ orch run reap            # persist stale for runs whose supervisor died
 ```
 
@@ -360,7 +365,8 @@ orch run reap      Persist stale for non-terminal runs whose supervisor died
 orch cross-review  Review one diff in parallel with several agents (via mail thread)
 orch fanout        Run one task across several agents, any result role (via mail thread)
 orch investigate   Read-only research/analysis, defaults to gemini-3.1-pro (via mail thread)
-orch events tail   Print a run's local events.jsonl (--native: normalized provider progress)
+orch events tail   Print a run's local events.jsonl (--native: normalized provider progress;
+                   -f: follow live, without --run multiplexing every active run, --all every repo)
 orch result        Print a run's local result.json
 orch status        Read local run status for an MR
 orch decision      Record accept/rework and queue a PR/MR mirror comment
