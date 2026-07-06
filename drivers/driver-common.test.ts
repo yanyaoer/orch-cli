@@ -131,6 +131,8 @@ test("buildProviderArgv keeps defaults fresh and only resumes exact sessions", (
     "text",
     "--effort",
     "medium",
+    "--permission-mode",
+    "bypassPermissions",
   ]);
   expect(buildProviderArgv("codex", base, "/run", "/worktree")).toEqual([
     "codex",
@@ -172,6 +174,8 @@ test("buildProviderArgv keeps defaults fresh and only resumes exact sessions", (
     "text",
     "--effort",
     "medium",
+    "--permission-mode",
+    "bypassPermissions",
     "--name",
     "mr123-review",
     "--resume",
@@ -426,6 +430,8 @@ test("buildProviderArgv picks claude model/effort by role", () => {
     "text",
     "--effort",
     "medium",
+    "--permission-mode",
+    "bypassPermissions",
   ]);
 
   // verifier stays on the CLI default model (sonnet), low effort (mechanical checks).
@@ -439,6 +445,8 @@ test("buildProviderArgv picks claude model/effort by role", () => {
     "text",
     "--effort",
     "low",
+    "--permission-mode",
+    "bypassPermissions",
   ]);
 
   expect(argv("controller", "role-controller")).toEqual([

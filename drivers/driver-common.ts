@@ -195,7 +195,10 @@ export function buildProviderArgv(
     // workers hold the worktree lock. Keep this whitelist narrow: no Edit/Write,
     // and Bash stays constrained to `orch *` to prevent controller-side writes.
     if (spec.role === "controller") argv.push("--allowedTools", CLAUDE_CONTROLLER_ALLOWED_TOOLS, "--permission-mode", "dontAsk");
-    if (readOnly) argv.push("--permission-mode", "plan");
+    else if (readOnly) argv.push("--permission-mode", "plan");
+    // Write roles and verifier run headless: without an explicit mode, edits
+    // and test commands wait for interactive approval that never comes.
+    else argv.push("--permission-mode", "bypassPermissions");
     if (spec.provider_session_name) argv.push("--name", spec.provider_session_name);
     if (spec.provider_session_mode === "ephemeral") {
       argv.push("--no-session-persistence");
