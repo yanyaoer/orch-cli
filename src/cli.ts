@@ -26,6 +26,10 @@ export function parseArgs(argv: string[]): ParsedArgs {
       }
       continue;
     }
+    if (arg === "-f") {
+      flags.set("follow", true);
+      continue;
+    }
     if (!arg.startsWith("--")) {
       positionals.push(arg);
       continue;
@@ -41,9 +45,10 @@ export function parseArgs(argv: string[]): ParsedArgs {
     }
     const key = body;
     const next = argv[i + 1];
-    // -n is a flag of its own (special-cased above), never a flag value:
-    // without this, a boolean flag right before it swallows it (--native -n 2).
-    if (!next || next.startsWith("--") || next === "-n") {
+    // -n and -f are flags of their own (special-cased above), never flag
+    // values: without this, a boolean flag right before one swallows it
+    // (--native -n 2, --native -f).
+    if (!next || next.startsWith("--") || next === "-n" || next === "-f") {
       flags.set(key, true);
     } else {
       flags.set(key, next);

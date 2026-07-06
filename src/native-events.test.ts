@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { normalizeNativeLine, normalizeNativeText, providerResumeIdFromNativeText } from "./native-events.ts";
+import { createNativeNormalizer, normalizeNativeLine, normalizeNativeText, providerResumeIdFromNativeText } from "./native-events.ts";
 
 function jsonl(lines: unknown[]): string {
   return lines.map((line) => (typeof line === "string" ? line : JSON.stringify(line))).join("\n") + "\n";
@@ -123,4 +123,19 @@ test("long tool detail is compacted and truncated", () => {
   expect(toolUse!.kind).toBe("tool_use");
   expect(toolUse!.text!.length).toBeLessThanOrEqual(201);
   expect(toolUse!.text!.endsWith("…")).toBe(true);
+});
+
+test("createNativeNormalizer dedups sessions across incremental calls", () => {
+  const normalize = createNativeNormalizer();
+  const first = normalize(JSON.stringify({ type: "system", subtype: "init", session_id: "sess-1", model: "sonnet" }));
+  expect(first).toEqual([{ kind: "session", format: "claude", session_id: "sess-1" }]);
+
+  const repeat = normalize(
+    JSON.stringify({
+      type: "assistant",
+      session_id: "sess-1",
+      message: { role: "assistant", content: [{ type: "text", text: "hi" }] },
+    }),
+  );
+  expect(repeat).toEqual([{ kind: "assistant", format: "claude", text: "hi" }]);
 });

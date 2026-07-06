@@ -62,7 +62,8 @@ Install: `curl -fsSL https://raw.githubusercontent.com/yanyaoer/orch-cli/main/in
 - **Watch what a worker is doing** → `orch events tail --run <id> --native`:
   renders the provider-native stream (`native.jsonl`) as normalized progress
   events (`session` / `assistant` / `tool_use` / `tool_result` / `usage` /
-  `final` / `raw`), provider-independent — no per-provider parsing. Lifecycle
+  `final` / `raw`), provider-independent — no per-provider parsing. Add `-f`
+  to stream live until the run ends (auto-exits on terminal/stale). Lifecycle
   authority stays with plain `orch events tail` (events.jsonl) + `orch status`.
 - **Let ChatGPT read this repo live** (a *tool-capable* model, gpt-5.5 non-Pro) →
   `orch chatgpt-bridge`: deploys a Cloudflare Worker MCP bridge (no tunnel) so

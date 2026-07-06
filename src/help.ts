@@ -185,7 +185,7 @@ export function eventsTailHelp(): string {
     "orch events tail: print a run's local events.jsonl",
     "",
     "Usage:",
-    "  orch events tail --run <run_id> [--mr <id>] [--worktree <path>] [-n <lines>] [--native]",
+    "  orch events tail --run <run_id> [--mr <id>] [--worktree <path>] [-n <lines>] [--native] [-f]",
     "",
     "Flags:",
     "  --run <run_id>        Local orch run id to read (required)",
@@ -194,12 +194,15 @@ export function eventsTailHelp(): string {
     "  -n <lines>            Print only the last N lines; omitted prints the whole file",
     "  --native              Render native.jsonl as normalized provider progress events instead",
     "                        (kinds: session, assistant, tool_use, tool_result, usage, final, raw)",
+    "  -f, --follow          Stream new lines as the worker appends them; exits once the run",
+    "                        reaches a terminal state (or turns stale) and the file is drained",
     "  --help                Show this help",
     "",
     "Examples:",
     "  orch events tail --run impl-a-20260619T120000Z-abc123 --mr 123",
     "  orch events tail --run impl-a-20260619T120000Z-abc123 --worktree . -n 20",
     "  orch events tail --run impl-a-20260619T120000Z-abc123 --native -n 20",
+    "  orch events tail --run impl-a-20260619T120000Z-abc123 --native -f",
   ]);
 }
 

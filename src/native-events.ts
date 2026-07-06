@@ -217,13 +217,14 @@ export function normalizeNativeLine(line: string): NativeEvent[] {
   return events;
 }
 
-// Whole-file view with session dedup: providers repeat the session id on every
+// Line normalizer with session dedup: providers repeat the session id on every
 // line (claude does), which would drown the tail output; the first sighting of
-// each id is the only one that carries information.
-export function normalizeNativeText(text: string): NativeEvent[] {
-  const events: NativeEvent[] = [];
+// each id is the only one that carries information. The dedup state lives in
+// the returned closure so a follow loop can feed lines incrementally.
+export function createNativeNormalizer(): (line: string) => NativeEvent[] {
   const seenSessions = new Set<string>();
-  for (const line of text.split("\n")) {
+  return (line) => {
+    const events: NativeEvent[] = [];
     for (const event of normalizeNativeLine(line)) {
       if (event.kind === "session") {
         if (!event.session_id || seenSessions.has(event.session_id)) continue;
@@ -231,8 +232,13 @@ export function normalizeNativeText(text: string): NativeEvent[] {
       }
       events.push(event);
     }
-  }
-  return events;
+    return events;
+  };
+}
+
+export function normalizeNativeText(text: string): NativeEvent[] {
+  const normalize = createNativeNormalizer();
+  return text.split("\n").flatMap(normalize);
 }
 
 export function providerResumeIdFromNativeText(text: string): string | null {

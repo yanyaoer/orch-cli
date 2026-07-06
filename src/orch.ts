@@ -20,11 +20,20 @@ import { isResultRole, writeRoles } from "./types.ts";
 import { acquirePidfileLock, acquirePidfileLockWait, isPidAlive, LockHeldError } from "./locks.ts";
 import { randomHex, sha256 } from "./hash.ts";
 import { ensureStateLayout, getRepoIdentity, lockPathForWorktree, mrStateDir, orchStateRoot, type RepoIdentity } from "./paths.ts";
-import { appendJsonLine, countLines, jsonBytes, readJsonFile, writeJsonAtomic, writeJsonExclusive, writeTextAtomic } from "./json.ts";
+import {
+  appendJsonLine,
+  countLines,
+  createFileFollower,
+  jsonBytes,
+  readJsonFile,
+  writeJsonAtomic,
+  writeJsonExclusive,
+  writeTextAtomic,
+} from "./json.ts";
 import { argvForDisplay, createForgeAdapter, detectForge } from "./forge.ts";
 import { findPrivateLeak, privateLeakAllowed, privateLeakErrorMessage } from "./leak.ts";
 import { runSupervisor, writeInitialRunFiles } from "./supervisor.ts";
-import { normalizeNativeText } from "./native-events.ts";
+import { createNativeNormalizer } from "./native-events.ts";
 import {
   buildOverview,
   collectMrRuns,
@@ -1365,11 +1374,14 @@ async function waitCommand(args: ParsedArgs): Promise<number> {
   }
 }
 
+const FOLLOW_POLL_MS = 500;
+
 async function eventsTail(args: ParsedArgs): Promise<number> {
   const runId = flagString(args, "run");
   const mr = args.flags.has("mr") ? flagString(args, "mr") : undefined;
   const worktree = resolve(flagString(args, "worktree", process.cwd()));
   const lines = parseTailLines(args);
+  const follow = flagBool(args, "follow");
   const repo = await getRepoIdentity(worktree);
   const located = locateRun(repo.repo_key, runId, mr);
 
@@ -1377,22 +1389,46 @@ async function eventsTail(args: ParsedArgs): Promise<number> {
   // events (session/assistant/tool_use/tool_result/usage/final/raw) — a
   // read-side view of what the worker is doing; orch lifecycle events stay in
   // events.jsonl and remain the state authority.
-  if (flagBool(args, "native")) {
-    const nativePath = `${located.run_dir}/native.jsonl`;
-    const text = readTextFile(nativePath);
-    if (text === null) throw new CliError(`native.jsonl not found for run: ${runId}`);
-    const rendered = normalizeNativeText(text)
-      .map((event) => JSON.stringify(event))
-      .join("\n");
-    process.stdout.write(tailText(rendered ? `${rendered}\n` : "", lines));
-    return 0;
-  }
+  const fileName = flagBool(args, "native") ? "native.jsonl" : "events.jsonl";
+  const filePath = `${located.run_dir}/${fileName}`;
+  const normalize = fileName === "native.jsonl" ? createNativeNormalizer() : null;
+  const renderLine = (line: string): string =>
+    normalize
+      ? normalize(line)
+          .map((event) => `${JSON.stringify(event)}\n`)
+          .join("")
+      : line
+        ? `${line}\n`
+        : "";
 
-  const eventsPath = `${located.run_dir}/events.jsonl`;
-  const text = readTextFile(eventsPath);
-  if (text === null) throw new CliError(`events.jsonl not found for run: ${runId}`);
-  process.stdout.write(tailText(text, lines));
-  return 0;
+  const text = readTextFile(filePath);
+  if (text === null && !follow) throw new CliError(`${fileName} not found for run: ${runId}`);
+
+  // The snapshot stops at the last newline so a trailing half-written line is
+  // not rendered twice; in follow mode it stays buffered until complete.
+  const snapshot = follow ? (text ?? "").slice(0, (text ?? "").lastIndexOf("\n") + 1) : (text ?? "");
+  process.stdout.write(tailText(snapshot.split("\n").map(renderLine).join(""), lines));
+  if (!follow) return 0;
+
+  // -f/--follow: stream lines as the worker appends them, then exit once the
+  // run is terminal (or stale: pid gone) and the file is drained.
+  const follower = createFileFollower(filePath, Buffer.byteLength(snapshot, "utf8"));
+  const emit = (): void => {
+    for (const line of follower.drain()) process.stdout.write(renderLine(line));
+  };
+  for (;;) {
+    emit();
+    const status = readJsonFile<RunStatus | null>(`${located.run_dir}/status.json`, null);
+    if (status && (!nonTerminalStates.has(status.state) || looksStale(status))) {
+      emit(); // the worker may flush final lines right before going terminal
+      if (text === null && !follower.sawFile()) throw new CliError(`${fileName} not found for run: ${runId}`);
+      if (nonTerminalStates.has(status.state)) {
+        process.stderr.write(`orch events tail: run ${runId} looks stale (pid ${status.pid} is gone); stopping\n`);
+      }
+      return 0;
+    }
+    await new Promise((resolve) => setTimeout(resolve, FOLLOW_POLL_MS));
+  }
 }
 
 async function result(args: ParsedArgs): Promise<number> {
