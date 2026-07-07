@@ -77,6 +77,12 @@ export function runCreateHelp(): string {
     "  --model <ref>             Provider model override passed through to supported drivers",
     "  --worktree <path>         Git worktree where the worker runs; defaults to the current directory",
     "  --task <file>             Task spec file passed to the worker; omitted means an empty task",
+    "  --resume-from <run_id>    Continue that run's provider session with this task: the worker keeps",
+    "                            its context (files read, reasoning, prompt cache) instead of starting",
+    "                            from zero. Inherits agent/role/mr/worktree/model from the prior run",
+    "                            unless overridden; conflicts with --agent (sessions are not portable)",
+    "                            and the --session-* flags. Typical use: dispatch the rework run against",
+    "                            the reviewed implementer run",
     "  --idempotency-key <key>   Reuse an existing run for the same key; default includes mr, tag, task, session, and model settings",
     "  --retry                   Create a new run even when --idempotency-key already exists",
     "  --allow-dirty             Acknowledge dirty write-role worktree and suppress the warning",
@@ -90,6 +96,7 @@ export function runCreateHelp(): string {
     "",
     "Example:",
     "  orch run create --mr 123 --role implementer --agent codex --tag impl-a --worktree . --task task.md --timeout-sec 3600",
+    "  orch run create --resume-from impl-a-20260707T010000-abc123 --tag rework-a --task rework.md",
   ]);
 }
 
