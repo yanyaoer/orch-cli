@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fallbackRawReview, planAutoDecision, sanitizeCommentBody } from "./review-auto.ts";
+import { fallbackRawReview, planAutoDecision, sanitizeCommentBody, withheldSection } from "./review-auto.ts";
 import type { ReviewerResult } from "./types.ts";
 
 function reviewerResult(overrides: Partial<ReviewerResult> = {}): ReviewerResult {
@@ -45,6 +45,13 @@ test("fallbackRawReview refuses a raw file that is a JSONL event stream", () => 
   );
   // machine log, not a review: keep the short driver summary instead
   expect(fallbackRawReview(dir, fallback)).toContain("did not return a valid orch result JSON");
+});
+
+test("withheldSection never contains a private-path marker itself", async () => {
+  const { findPrivateLeak } = await import("./leak.ts");
+  const section = withheldSection("6", "run-1", "done", "unparsed");
+  expect(findPrivateLeak(section)).toBeNull();
+  expect(section).toContain("orch result --run run-1");
 });
 
 test("sanitizeCommentBody relativizes worktree and home prefixes", () => {

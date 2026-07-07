@@ -49,6 +49,24 @@ export function sanitizeCommentBody(text: string, worktree: string, home: string
   return out;
 }
 
+// Replacement for a comment section that still trips the leak guard after
+// sanitizing. Deliberately does NOT name the detected marker: the marker
+// string is itself a private-path marker ("/Users/", ".claude", …), so
+// quoting it would re-trigger the guard on the merged body — a reviewer
+// finding that QUOTED the marker list is exactly how this was discovered.
+export function withheldSection(mr: string, runId: string, state: string, verdict: string): string {
+  return [
+    "### orch run result",
+    "",
+    `- MR/PR: ${mr}`,
+    `- Run: ${runId}`,
+    `- State: ${state}`,
+    `- Verdict: ${verdict}`,
+    "",
+    `Content withheld: contains a private local path; read it with \`orch result --run ${runId}\`.`,
+  ].join("\n");
+}
+
 export interface AutoDecisionPlan {
   decision: "accept" | "rework" | null;
   reason: string | null;
