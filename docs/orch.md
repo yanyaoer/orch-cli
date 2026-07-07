@@ -26,7 +26,10 @@ Install: `curl -fsSL https://raw.githubusercontent.com/yanyaoer/orch-cli/main/in
 - **Run a headless worker** to implement / review / verify a task → `orch run create`
   (driver = codex|claude|pi|omp, role = implementer|reviewer|verifier). Read the result
   with `orch status` / `orch result`; record `orch decision` and `orch mirror` it to
-  the PR/MR comment.
+  the PR/MR comment. **Dispatching a rework?** Use `orch run create
+  --resume-from <prior_run_id> --task rework.md` — the worker resumes the prior
+  run's provider session (context + prompt cache) instead of re-reading the repo
+  from zero; agent/role/mr/worktree are inherited.
 - **omp = oh-my-pi, model-aware with quota fallback** → defaults to
   `google-antigravity/gemini-3.1-pro` and falls back to
   `zenmux/anthropic/claude-fable-5`, then `openai-codex/gpt-5.5` when the active

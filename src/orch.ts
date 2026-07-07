@@ -314,7 +314,7 @@ function mrFromTask(taskText: string): string | null {
   return mrFromForgeUrl(taskText);
 }
 
-type MrSource = "flag" | "task" | "branch";
+type MrSource = "flag" | "task" | "branch" | "resume-from";
 
 async function resolveMr(args: ParsedArgs, taskText: string, worktree: string): Promise<{ mr: string; source: MrSource }> {
   if (args.flags.has("mr")) return { mr: flagString(args, "mr"), source: "flag" };
@@ -738,6 +738,7 @@ const RUN_CREATE_FLAGS = [
   "model",
   "worktree",
   "task",
+  "resume-from",
   "idempotency-key",
   "retry",
   "allow-dirty",
@@ -749,15 +750,80 @@ const RUN_CREATE_FLAGS = [
   "json",
 ] as const;
 
+// --resume-from <run_id>: continue a prior run's provider session with a new
+// task. The worker keeps its accumulated context — files read, reasoning,
+// provider prompt cache — instead of re-reading the repo from zero. Typical
+// use: dispatch the rework run against the implementer run the reviewer's
+// blocking findings were about. Agent/role/mr/worktree/model are inherited
+// from the prior run unless explicitly overridden (agent is never overridable:
+// provider sessions are not portable across providers).
+interface ResumeContext {
+  run_id: string;
+  mr: string;
+  role: RunRole;
+  agent: AgentName;
+  worktree: string;
+  session: ProviderSessionConfig;
+}
+
+async function resolveResumeFrom(args: ParsedArgs): Promise<ResumeContext> {
+  const runId = flagString(args, "resume-from");
+  for (const flag of ["session-mode", "session-id", "session-name"] as const) {
+    if (args.flags.has(flag)) throw new CliError(`--${flag} conflicts with --resume-from; the session is inherited from the prior run`);
+  }
+  const probeWorktree = resolve(flagString(args, "worktree", process.cwd()));
+  const repo = await getRepoIdentity(probeWorktree);
+  const located = locateRun(repo.repo_key, runId, args.flags.has("mr") ? flagString(args, "mr") : undefined);
+  const status = readJsonFile<RunStatus | null>(`${located.run_dir}/status.json`, null);
+  if (!status) throw new CliError(`status.json not found for run: ${runId}`);
+  if (!isTerminal(status.state)) throw new CliError(`run ${runId} is still ${status.state}; only terminal runs can be resumed`);
+  if (status.provider_session_mode === "ephemeral") {
+    throw new CliError(
+      `run ${runId} ran with --session-mode ephemeral, so its provider session was not persisted; create resumable runs with fresh_persistent`,
+    );
+  }
+  // provider_resume_id is backfilled from the native stream at terminal state;
+  // an explicitly-resumed run may only carry the id in its session config.
+  const resumeId = status.provider_resume_id ?? status.provider_session_id;
+  if (!resumeId) throw new CliError(`run ${runId} recorded no provider session id; cannot resume`);
+  if (args.flags.has("agent") && flagString(args, "agent") !== status.agent) {
+    throw new CliError(
+      `--agent ${flagString(args, "agent")} conflicts with --resume-from: run ${runId} ran on ${status.agent} and provider sessions are not portable`,
+    );
+  }
+  if (status.agent === "claude" && !isUuid(resumeId)) {
+    throw new CliError(`claude resume requires a UUID session id; run ${runId} recorded: ${resumeId}`);
+  }
+  const spec = readJsonFile<RunSpec | null>(`${located.run_dir}/spec.json`, null);
+  const model = args.flags.has("model") ? flagString(args, "model").trim() : (spec?.model ?? null);
+  if (model === "") throw new CliError("--model must not be empty");
+  const worktree = args.flags.has("worktree") ? probeWorktree : existsSync(status.worktree) ? status.worktree : probeWorktree;
+  return {
+    run_id: runId,
+    mr: located.mr,
+    role: status.role,
+    agent: status.agent,
+    worktree,
+    session: {
+      provider_session_name: spec?.provider_session_name ?? null,
+      provider_session_id: resumeId,
+      provider_session_mode: "resume_exact",
+      model,
+    },
+  };
+}
+
 async function createRun(args: ParsedArgs): Promise<number> {
   assertKnownFlags(args, "run create", RUN_CREATE_FLAGS);
-  const role = flagString(args, "role") as RunRole;
-  const agent = flagString(args, "agent") as AgentName;
+  const resume = args.flags.has("resume-from") ? await resolveResumeFrom(args) : null;
+  const role = resume && !args.flags.has("role") ? resume.role : (flagString(args, "role") as RunRole);
+  const agent = resume ? resume.agent : (flagString(args, "agent") as AgentName);
   const tag = flagString(args, "tag", role);
-  const worktree = resolve(flagString(args, "worktree", process.cwd()));
+  const worktree = resume ? resume.worktree : resolve(flagString(args, "worktree", process.cwd()));
   const taskPath = args.flags.has("task") ? resolve(flagString(args, "task")) : null;
   const taskText = taskPath ? readFileSync(taskPath, "utf8") : "";
-  const { mr, source: mrSource } = await resolveMr(args, taskText, worktree);
+  const { mr, source: mrSource } =
+    resume && !args.flags.has("mr") ? { mr: resume.mr, source: "resume-from" as const } : await resolveMr(args, taskText, worktree);
   // Reviewer runs finish in minutes in practice (52/67 recorded runs override
   // the old 4h default); keep the long default only for roles that build/test.
   const timeoutSec = Number(flagString(args, "timeout-sec", role === "reviewer" ? "3600" : "14400"));
@@ -767,7 +833,7 @@ async function createRun(args: ParsedArgs): Promise<number> {
   }
   validateRunAgent(agent, role);
   if (!Number.isFinite(timeoutSec) || timeoutSec <= 0) throw new CliError("--timeout-sec must be positive");
-  const providerSession = providerSessionConfig(args, agent);
+  const providerSession = resume ? resume.session : providerSessionConfig(args, agent);
 
   const repo = await getRepoIdentity(worktree);
   const mrDir = mrStateDir(repo.repo_key, mr);

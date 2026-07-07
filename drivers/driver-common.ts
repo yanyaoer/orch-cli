@@ -631,7 +631,9 @@ export async function maybeWriteFakeResult(runDir: string, spec: RunSpec, provid
   if (Number.isFinite(sleepMs) && sleepMs > 0) await sleep(sleepMs);
   writeFileSync(
     `${runDir}/native.jsonl`,
-    `${JSON.stringify({ type: "fake", provider, run_id: spec.run_id, ts: new Date().toISOString() })}\n`,
+    // session_id: fixed UUID so fake runs are resumable in tests (claude's
+    // resume path requires a UUID; the value itself is never dereferenced).
+    `${JSON.stringify({ type: "fake", provider, run_id: spec.run_id, session_id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", ts: new Date().toISOString() })}\n`,
     "utf8",
   );
   writeResult(

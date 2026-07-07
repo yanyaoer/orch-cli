@@ -1798,3 +1798,84 @@ test("codex, claude, and pi drivers can complete from provider-native output wit
     expect("verdict" in result ? result.verdict : "").toBe("completed");
   }
 });
+
+test("run create --resume-from inherits agent/role/mr/session from the prior run", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orch-resume-from-"));
+  const stateHome = join(root, "state");
+  const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
+  await initGitWorktree(worktree);
+  const taskPath = join(root, "task.md");
+  writeFileSync(taskPath, "Implement the feature.\n", "utf8");
+  const env = { XDG_STATE_HOME: stateHome, ORCH_DRIVER_FAKE_RESULT: "1" };
+
+  const created = await runOrch(
+    ["run", "create", "--mr", "9", "--role", "implementer", "--agent", "claude", "--worktree", worktree, "--task", taskPath, "--timeout-sec", "10"],
+    env,
+  );
+  expect(created).toMatchObject({ exitCode: 0 });
+  const payload = JSON.parse(created.stdout) as { run_id: string; status_path: string };
+  const status = await waitForRunDone(payload.status_path);
+  // the fake driver's native stream carries a session id; the supervisor backfills it
+  expect(status.provider_resume_id).toBe("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee");
+
+  const reworkTask = join(root, "rework.md");
+  writeFileSync(reworkTask, "Fix the blocking findings.\n", "utf8");
+  const dry = await runOrch(
+    ["run", "create", "--resume-from", payload.run_id, "--worktree", worktree, "--task", reworkTask, "--dry-run", "--json"],
+    env,
+  );
+  expect(dry).toMatchObject({ exitCode: 0, stderr: "" });
+  const plan = JSON.parse(dry.stdout) as {
+    mr: string;
+    provider_session_mode: string;
+    provider_session_id: string;
+    driver_plan: { argv: string[] };
+    provider_plan: { argv: string[] };
+  };
+  expect(plan.mr).toBe("9"); // inherited from the prior run, no --mr passed
+  expect(plan.provider_session_mode).toBe("resume_exact");
+  expect(plan.provider_session_id).toBe("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee");
+  expect(plan.driver_plan.argv.join(" ")).toContain("__driver-claude"); // agent inherited
+  expect(plan.provider_plan.argv.join(" ")).toContain("--resume eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee");
+
+  // conflicts and misuse are rejected early
+  const withMode = await runOrch(
+    ["run", "create", "--resume-from", payload.run_id, "--session-mode", "ephemeral", "--worktree", worktree, "--task", reworkTask],
+    env,
+  );
+  expect(withMode.exitCode).not.toBe(0);
+  expect(withMode.stderr).toContain("--session-mode conflicts with --resume-from");
+
+  const withAgent = await runOrch(
+    ["run", "create", "--resume-from", payload.run_id, "--agent", "codex", "--worktree", worktree, "--task", reworkTask],
+    env,
+  );
+  expect(withAgent.exitCode).not.toBe(0);
+  expect(withAgent.stderr).toContain("sessions are not portable");
+
+  const unknown = await runOrch(["run", "create", "--resume-from", "no-such-run", "--worktree", worktree, "--task", reworkTask], env);
+  expect(unknown.exitCode).not.toBe(0);
+  expect(unknown.stderr).toContain("run not found");
+});
+
+test("run create --resume-from refuses ephemeral prior runs", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orch-resume-eph-"));
+  const stateHome = join(root, "state");
+  const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
+  await initGitWorktree(worktree);
+  const taskPath = join(root, "task.md");
+  writeFileSync(taskPath, "Review it.\n", "utf8");
+  const env = { XDG_STATE_HOME: stateHome, ORCH_DRIVER_FAKE_RESULT: "1" };
+
+  const created = await runOrch(
+    ["run", "create", "--mr", "9", "--role", "reviewer", "--agent", "claude", "--session-mode", "ephemeral", "--worktree", worktree, "--task", taskPath, "--timeout-sec", "10"],
+    env,
+  );
+  expect(created).toMatchObject({ exitCode: 0 });
+  const payload = JSON.parse(created.stdout) as { run_id: string; status_path: string };
+  await waitForRunDone(payload.status_path);
+
+  const resumed = await runOrch(["run", "create", "--resume-from", payload.run_id, "--worktree", worktree, "--task", taskPath], env);
+  expect(resumed.exitCode).not.toBe(0);
+  expect(resumed.stderr).toContain("ephemeral");
+});
