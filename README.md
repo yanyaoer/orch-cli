@@ -8,7 +8,7 @@ Daemonless multi-agent orchestration for coding work.
 
 Project page: `docs/index.html` is ready for GitHub Pages and includes a bilingual animated overview.
 
-Latest release: `v0.0.6` ([CHANGELOG.md](CHANGELOG.md)).
+Latest release: `v0.0.7` ([CHANGELOG.md](CHANGELOG.md)).
 
 ## Current Scope
 
@@ -18,13 +18,14 @@ This repository is the v2 MVP described in [docs/orch-mvp-spec.md](docs/orch-mvp
 
 Durable architecture decisions live in [docs/adr/](docs/adr/README.md); task and feature specs live in [docs/specs/](docs/specs/README.md). When those constraints shape an `orch --task` file, inline the binding excerpts so the run remains replayable from `spec.json`.
 
-Shipped on `main` (v0.0.6, see [CHANGELOG.md](CHANGELOG.md)):
+Shipped on `main` (v0.0.7, see [CHANGELOG.md](CHANGELOG.md)):
 
 - `orch run create` starts one supervised headless worker run. `--mr` is optional: it resolves from an `MR: <id-or-url>` line in the task's leading header block, a merge-request/pull URL in the task text, or the current branch name (`mr_source` reports which).
 - Bare `orch` prints the overview: active runs plus every pending action (undecided terminal runs, stale runs, pending outbox) expressed as a runnable orch command line — the same contract humans copy and agents execute from `--json`. `--all` scans every repo under the state root. The overview is a notification center, not a debt ledger: items idle beyond `--attention-days` (default 14, `0` disables) age out, and mrs matching a local branch already merged into HEAD are archived wholesale. `orch decision close` acks a run without queueing a comment; `orch decision sweep --execute` batch-acks the whole backlog by the overview's own rubric.
 - `orch verdict --thread <id>` aggregates a fan-out thread's verdicts into one suggestion (accept / rework / inspect / pending / reap); `--wait` blocks until the thread settles. `orch wait --thread <id>` is the wait-any primitive: it blocks until the next run needs attention, and a recorded decision acts as the ack so handled runs are never returned again.
 - `orch run list`, `orch status`, `orch events tail`, and `orch result` read local run state; omitting `--mr` aggregates across all MRs in the repo. `orch result --wait` blocks until the run reaches a terminal state; reviewer results render findings, verifier results render commands and acceptance.
 - `orch events tail --native` renders the provider-native stream (`native.jsonl`) as normalized progress events — `session`, `assistant`, `tool_use`, `tool_result`, `usage`, `final`, `raw` — so a controller can see what a worker is doing without parsing per-provider formats. The same normalizer (`src/native-events.ts`) backs result extraction and resume-id detection. `-f/--follow` streams appended lines live: with `--run` it exits once the run is terminal (or stale) and drained; without `--run` it multiplexes every active run in the repo (`--all`: every repo) with tail-style `==> mr/run <==` headers, picks up runs created while following, and announces its scope on stderr up front.
+- `orch search` regex-scans the current repo's local run files (`result.json`, `events.jsonl`, `native.jsonl`, `artifacts/*.{txt,log,patch}`) plus mail `mail-events.jsonl` diagnostics; `orch usage run|thread|daily` aggregates token maps from normalized native usage events and reports missing token data as `has_token_data=false`.
 - Non-terminal runs whose supervisor pid is gone show as `stale?`; `orch run reap` persists them as `stale`. A provider that exits 0 without any output fails its run instead of quietly reporting done.
 - `orch decision` records `accept` or `rework` locally and queues a mirror comment.
 - `orch mail` provides the local message bus: signed mail events, Maildir delivery, router dispatch, atomic task claim, and result-driven review/verify follow-ups.
@@ -55,7 +56,7 @@ One line (downloads the latest release binary for your platform into `~/.local/b
 $ curl -fsSL https://raw.githubusercontent.com/yanyaoer/orch-cli/main/install.sh | sh
 ```
 
-Override the target with `ORCH_INSTALL_DIR=/somewhere` or pin a tag with `ORCH_VERSION=v0.0.6`. Upgrade later with:
+Override the target with `ORCH_INSTALL_DIR=/somewhere` or pin a tag with `ORCH_VERSION=v0.0.7`. Upgrade later with:
 
 ```sh
 $ orch update          # self-replace with the latest release (--check to only compare)
@@ -248,7 +249,7 @@ $ orch mailctl attachment promote --id att-<id> [--dest <dir>]       # copy a st
 
 **Daemonless, precisely.** `poll` is the primary contract — a bounded one-shot ingest + reconcile you drive from `cron` or `launchd`, exactly the stateless-reconciler model, with no orch-owned background service. `watch` is a **foreground** convenience: it is honestly a long-running process (an IMAP-IDLE loop), but it is *not a daemon* — it never forks or detaches, owns no global scheduler, holds no persistent model session, and does one bounded reconcile per wake before returning to IDLE (`Ctrl-C` exits). So the "daemonless" claim means *no background service / no `orchd`*, not "no long-running process ever". **For unattended operation, drive `poll` from cron/launchd — do not keep `watch` alive under a restart supervisor.**
 
-**Scheduling `poll`.** Without a scheduler, mail sits unread on the IMAP server until the next manual `poll`. On macOS, a per-user LaunchAgent runs `poll` every 5 minutes (missed intervals coalesce into one run after wake; the unquoted heredoc expands `$HOME` at write time — launchd does not expand variables):
+**Scheduling `poll`.** Without a scheduler, mail sits unread on the IMAP server until the next manual `poll`. On macOS, a per-user LaunchAgent runs `poll` every 5 minutes (missed intervals coalesce into one run after wake; the unquoted heredoc expands `$HOME` at write time — launchd does not expand variables). launchd jobs get a minimal `PATH` (`/usr/bin:/bin:/usr/sbin:/sbin`), so `EnvironmentVariables` must include the directories of every helper your config shells out to — notably `password_cmd` tools like `pass` (which itself needs Homebrew's `gpg`); without it every poll fails with `Executable not found in $PATH`:
 
 ```sh
 $ cat > ~/Library/LaunchAgents/com.orch.mailctl-poll.plist <<EOF
@@ -260,6 +261,9 @@ $ cat > ~/Library/LaunchAgents/com.orch.mailctl-poll.plist <<EOF
     <string>$HOME/.local/bin/orch</string>
     <string>mailctl</string><string>poll</string>
   </array>
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>/opt/homebrew/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
   <key>StartInterval</key><integer>300</integer>
   <key>StandardOutPath</key><string>/tmp/orch-mailctl-poll.log</string>
   <key>StandardErrorPath</key><string>/tmp/orch-mailctl-poll.log</string>
@@ -373,6 +377,8 @@ orch wait          Block until the next run in a thread needs attention (wait-an
 orch run create    Start one headless worker run for an MR task
 orch run list      List local runs for an MR (dead-pid runs show as stale?)
 orch run reap      Persist stale for non-terminal runs whose supervisor died
+orch search        Regex-search run files and mail event diagnostics
+orch usage         Summarize token usage by run, thread, or day
 orch cross-review  Review one diff in parallel with several agents (via mail thread)
 orch fanout        Run one task across several agents, any result role (via mail thread)
 orch investigate   Read-only research/analysis, defaults to gemini-3.1-pro (via mail thread)

@@ -2,6 +2,16 @@
 
 All notable user-facing changes are recorded here.
 
+## [0.0.7] - 2026-07-07
+
+### Features
+
+- `orch search <regex>` — regex-scan the current repo's local run files (`result.json`, `events.jsonl`, `native.jsonl`, `artifacts/*.{txt,log,patch}`) plus mail `mail-events.jsonl` diagnostics, with `--json` for machine consumption. Pure file scan, no index: "which run hit this error" stops being a hand-rolled grep over the state tree.
+- `orch usage run|thread|daily` — aggregate provider token usage from normalized native usage events per run, per fan-out thread, or per day. Missing token data is reported as `has_token_data=false`, never as zero; models without pricing are listed under `unpriced_models` with `estimated_cost_usd=null`.
+- `orch cross-review --auto [--execute] [--wait-sec N]` — inline the review follow-up ritual: wait for this fan-out's runs to settle, record the unambiguous decisions (approve + 0 blocking → accept, real blocking findings → rework), and queue ONE merged mirror comment covering every run. Dry-run preview by default; `--execute` posts it (and only this comment, never the outbox backlog) under the outbox lock. Uncertain results are surfaced, never auto-decided: driver schema fallbacks get their raw review recovered from `result.raw.md` (JSONL event streams are refused as machine logs), failed/timeout/stale runs land in `attention` with the exact follow-up command, and rework dispatch stays a human/controller call. Comment sections are sanitized (worktree prefix relativized, `$HOME` → `~`); a section still carrying a private path marker is withheld with a pointer to `orch result --run` instead of aborting.
+- `orch run create --resume-from <run_id>` — continue a prior run's provider session with a new task: the worker keeps its accumulated context (files read, reasoning, provider prompt cache) instead of re-reading the repo from zero. Inherits agent/role/mr/worktree/model from the prior run unless overridden; `--agent` and the `--session-*` flags conflict with it. Only terminal, non-ephemeral runs with a recorded provider session id are resumable. Typical use: dispatch the rework run against the implementer run the reviewer's blocking findings were about.
+- Mirror comments now carry the full structured result (blocking/non-blocking findings, suggested tests, commands, acceptance), not just the summary line.
+
 ## [0.0.6] - 2026-07-04
 
 ### Features

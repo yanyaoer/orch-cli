@@ -10,9 +10,11 @@ import {
   runCreateHelp,
   runHelp,
   runListHelp,
+  searchHelp,
   statusHelp,
   topicHelp,
   topLevelHelp,
+  usageHelp,
   unknownTopicHelp,
 } from "./help.ts";
 
@@ -22,6 +24,8 @@ test("top-level help exposes positioning, commands, quickstart, and topics", () 
   expect(text).toContain("daemonless multi-agent orchestrator");
   expect(text).toContain("orch run create");
   expect(text).toContain("orch run list");
+  expect(text).toContain("orch search");
+  expect(text).toContain("orch usage");
   expect(text).toContain("orch cross-review");
   expect(text).toContain("orch fanout");
   expect(text).toContain("orch investigate");
@@ -33,6 +37,8 @@ test("top-level help exposes positioning, commands, quickstart, and topics", () 
   expect(text).toContain("orch mirror sync");
   expect(text).toContain("orch mailctl");
   expect(text).toContain("Quickstart:");
+  expect(text).toContain("orch search 'timeout|permission'");
+  expect(text).toContain("orch usage thread --thread 123 --json");
   expect(text).toContain("orch <command> --help");
   expect(text).toContain("task-spec | result | events | concepts | forge");
 });
@@ -89,6 +95,22 @@ test("command help exposes flags and runnable examples", () => {
   const run = runHelp();
   expect(run).toContain("orch run create");
   expect(run).toContain("orch run list");
+
+  const search = searchHelp();
+  for (const flag of ["--mr", "--run", "--thread", "--worktree", "--json"]) {
+    expect(search).toContain(flag);
+  }
+  expect(search).toContain("artifacts/*.{txt,log,patch}");
+  expect(search).toContain("mail-events.jsonl");
+  expect(search).toContain("orch.search/v1");
+
+  const usage = usageHelp();
+  for (const text of ["usage run", "usage thread", "usage daily", "--days", "--json"]) {
+    expect(usage).toContain(text);
+  }
+  expect(usage).toContain("has_token_data=false");
+  expect(usage).toContain("estimated_cost_usd is always null");
+  expect(usage).toContain("orch.usage/run/v1");
 
   const eventsTail = eventsTailHelp();
   for (const flag of ["--run", "--mr", "--worktree", "-n"]) {

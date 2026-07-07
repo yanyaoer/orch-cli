@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, type Dirent } from "node:fs";
 import pkg from "../package.json";
 import { basename, dirname, resolve } from "node:path";
 import { $ } from "bun";
@@ -33,7 +33,7 @@ import {
 import { argvForDisplay, createForgeAdapter, detectForge } from "./forge.ts";
 import { findPrivateLeak, privateLeakAllowed, privateLeakErrorMessage } from "./leak.ts";
 import { runSupervisor, writeInitialRunFiles } from "./supervisor.ts";
-import { createNativeNormalizer } from "./native-events.ts";
+import { createNativeNormalizer, normalizeNativeLine } from "./native-events.ts";
 import {
   buildOverview,
   collectMrRuns,
@@ -66,9 +66,11 @@ import {
   runCreateHelp,
   runHelp,
   runListHelp,
+  searchHelp,
   statusHelp,
   topicHelp,
   topLevelHelp,
+  usageHelp,
   unknownTopicHelp,
   type HelpTopic,
 } from "./help.ts";
@@ -122,6 +124,51 @@ type LocatedRun = {
   mr: string;
   run_id: string;
   run_dir: string;
+};
+
+type RunLocation = {
+  mr: string;
+  run_id: string;
+  run_dir: string;
+  status: RunStatus | null;
+};
+
+type SearchSource = "run" | "mail";
+
+type SearchFileCandidate = {
+  source: SearchSource;
+  mr: string | null;
+  run_id: string | null;
+  thread: string | null;
+  file: string;
+  path: string;
+};
+
+type SearchHit = {
+  source: SearchSource;
+  mr: string | null;
+  run_id: string | null;
+  thread: string | null;
+  file: string;
+  path: string;
+  line: number;
+  context: string;
+};
+
+type TokenUsageMap = Record<string, number>;
+
+type UsageSummary = {
+  has_token_data: boolean;
+  usage: TokenUsageMap | null;
+  estimated_cost_usd: null;
+  unpriced_models: string[];
+};
+
+type RunUsageSummary = UsageSummary & {
+  mr: string;
+  run_id: string;
+  usage_events: number;
+  source_file: string;
 };
 
 // close = "stop tracking this run" — an ack that queues no mirror comment.
@@ -456,6 +503,256 @@ function locateRun(repoKey: string, runId: string, mr?: string): LocatedRun {
   // (decision bodies, outbox payloads) must carry.
   const recorded = readJsonFile<RunStatus | null>(`${located.run_dir}/status.json`, null)?.mr;
   return recorded ? { ...located, mr: recorded } : located;
+}
+
+function safeDirEntries(path: string): Dirent[] {
+  try {
+    return readdirSync(path, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+}
+
+function runLocation(repoKey: string, runId: string, mr?: string): RunLocation {
+  const located = locateRun(repoKey, runId, mr);
+  const status = readJsonFile<RunStatus | null>(`${located.run_dir}/status.json`, null);
+  return {
+    mr: status?.mr ?? located.mr,
+    run_id: status?.run_id ?? located.run_id,
+    run_dir: located.run_dir,
+    status,
+  };
+}
+
+function runLocationsForMr(repoKey: string, mr: string): RunLocation[] {
+  const runsRoot = `${mrStateDir(repoKey, mr)}/runs`;
+  return safeDirEntries(runsRoot)
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => {
+      const runDir = `${runsRoot}/${entry.name}`;
+      const status = readJsonFile<RunStatus | null>(`${runDir}/status.json`, null);
+      return {
+        mr: status?.mr ?? mr,
+        run_id: status?.run_id ?? entry.name,
+        run_dir: runDir,
+        status,
+      };
+    })
+    .sort((a, b) => (a.status?.started_at ?? "").localeCompare(b.status?.started_at ?? "") || a.run_id.localeCompare(b.run_id));
+}
+
+function runLocationsForRepo(repoKey: string): RunLocation[] {
+  return mrIdsForRepo(repoKey).flatMap((mr) => runLocationsForMr(repoKey, mr));
+}
+
+function scopedRunLocations(repoKey: string, args: ParsedArgs): RunLocation[] {
+  if (args.flags.has("run")) return [runLocation(repoKey, flagString(args, "run"), args.flags.has("mr") ? flagString(args, "mr") : undefined)];
+  if (args.flags.has("mr")) return runLocationsForMr(repoKey, flagString(args, "mr"));
+  return runLocationsForRepo(repoKey);
+}
+
+function searchFilesForRun(run: RunLocation): SearchFileCandidate[] {
+  const candidates: SearchFileCandidate[] = ["result.json", "events.jsonl", "native.jsonl"].map((file) => ({
+    source: "run",
+    mr: run.mr,
+    run_id: run.run_id,
+    thread: null,
+    file,
+    path: `${run.run_dir}/${file}`,
+  }));
+
+  const artifactsDir = `${run.run_dir}/artifacts`;
+  for (const entry of safeDirEntries(artifactsDir)) {
+    if (!entry.isFile()) continue;
+    if (!/\.(txt|log|patch)$/.test(entry.name)) continue;
+    candidates.push({
+      source: "run",
+      mr: run.mr,
+      run_id: run.run_id,
+      thread: null,
+      file: `artifacts/${entry.name}`,
+      path: `${artifactsDir}/${entry.name}`,
+    });
+  }
+  return candidates.filter((candidate) => existsSync(candidate.path));
+}
+
+function searchFilesForMail(repoKey: string, args: ParsedArgs): SearchFileCandidate[] {
+  // Default search scans repo runs plus repo mail diagnostics. A run/MR scoped
+  // search stays run-scoped unless --thread explicitly asks for a mail thread.
+  if ((args.flags.has("mr") || args.flags.has("run")) && !args.flags.has("thread")) return [];
+  const threadsRoot = `${orchStateRoot()}/${repoKey}/mail/threads`;
+  const threadIds = args.flags.has("thread")
+    ? [flagString(args, "thread")]
+    : safeDirEntries(threadsRoot)
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => entry.name)
+        .sort();
+  return threadIds
+    .map((thread) => ({
+      source: "mail" as const,
+      mr: null,
+      run_id: null,
+      thread,
+      file: "mail-events.jsonl",
+      path: `${threadsRoot}/${thread}/inbox/events/mail-events.jsonl`,
+    }))
+    .filter((candidate) => existsSync(candidate.path));
+}
+
+function compileSearchRegex(pattern: string): RegExp {
+  try {
+    return new RegExp(pattern);
+  } catch (error) {
+    throw new CliError(`invalid regex: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function searchCandidate(regex: RegExp, candidate: SearchFileCandidate): SearchHit[] {
+  const text = readTextFile(candidate.path);
+  if (text === null) return [];
+  const hits: SearchHit[] = [];
+  const lines = text.split(/\r?\n/);
+  lines.forEach((line, index) => {
+    if (!regex.test(line)) return;
+    hits.push({
+      source: candidate.source,
+      mr: candidate.mr,
+      run_id: candidate.run_id,
+      thread: candidate.thread,
+      file: candidate.file,
+      path: candidate.path,
+      line: index + 1,
+      context: line,
+    });
+  });
+  return hits;
+}
+
+function renderSearchHits(hits: SearchHit[]): string {
+  if (hits.length === 0) return "no matches\n";
+  return hits
+    .map((hit) => {
+      const owner = hit.source === "run" ? `MR ${hit.mr ?? "-"} run ${hit.run_id ?? "-"}` : `thread ${hit.thread ?? "-"}`;
+      return `${owner} ${hit.file}:${hit.line}: ${hit.context}`;
+    })
+    .join("\n") + "\n";
+}
+
+function addUsage(target: TokenUsageMap, usage: TokenUsageMap): void {
+  for (const [key, value] of Object.entries(usage)) target[key] = (target[key] ?? 0) + value;
+}
+
+function sortedUsage(usage: TokenUsageMap): TokenUsageMap {
+  return Object.fromEntries(Object.entries(usage).sort(([a], [b]) => a.localeCompare(b)));
+}
+
+function tokenUsageOnly(usage: Record<string, number>): TokenUsageMap {
+  return Object.fromEntries(Object.entries(usage).filter(([key]) => key.toLowerCase().includes("token")));
+}
+
+function addModel(models: Set<string>, value: unknown): void {
+  if (typeof value === "string" && value.trim()) models.add(value.trim());
+}
+
+function modelsFromNativeLine(line: string): string[] {
+  let event: unknown;
+  try {
+    event = JSON.parse(line);
+  } catch {
+    return [];
+  }
+  if (!event || typeof event !== "object" || Array.isArray(event)) return [];
+  const obj = event as Record<string, unknown>;
+  const response = obj.response && typeof obj.response === "object" && !Array.isArray(obj.response)
+    ? (obj.response as Record<string, unknown>)
+    : {};
+  const message = obj.message && typeof obj.message === "object" && !Array.isArray(obj.message)
+    ? (obj.message as Record<string, unknown>)
+    : {};
+  return [obj.model, obj.model_name, obj.model_id, response.model, message.model].filter(
+    (value): value is string => typeof value === "string" && value.trim().length > 0,
+  );
+}
+
+function runUsageSummary(run: RunLocation): RunUsageSummary {
+  const usage: TokenUsageMap = {};
+  const models = new Set<string>();
+  const spec = readJsonFile<Partial<RunSpec> | null>(`${run.run_dir}/spec.json`, null);
+  addModel(models, spec?.model);
+  const nativePath = `${run.run_dir}/native.jsonl`;
+  const native = readTextFile(nativePath);
+  let usageEvents = 0;
+  if (native !== null) {
+    for (const line of native.split(/\r?\n/)) {
+      if (!line.trim()) continue;
+      for (const model of modelsFromNativeLine(line)) models.add(model);
+      for (const event of normalizeNativeLine(line)) {
+        if (event.kind !== "usage" || !event.usage) continue;
+        const tokenUsage = tokenUsageOnly(event.usage);
+        if (Object.keys(tokenUsage).length === 0) continue;
+        addUsage(usage, tokenUsage);
+        usageEvents += 1;
+      }
+    }
+  }
+  const hasTokenData = Object.keys(usage).length > 0;
+  return {
+    mr: run.mr,
+    run_id: run.run_id,
+    has_token_data: hasTokenData,
+    usage: hasTokenData ? sortedUsage(usage) : null,
+    estimated_cost_usd: null,
+    unpriced_models: [...models].sort(),
+    usage_events: usageEvents,
+    source_file: nativePath,
+  };
+}
+
+function aggregateRunUsage(runs: RunUsageSummary[]): UsageSummary & {
+  run_count: number;
+  runs_with_token_data: number;
+  missing_runs: string[];
+} {
+  const usage: TokenUsageMap = {};
+  const models = new Set<string>();
+  const missingRuns: string[] = [];
+  let runsWithTokenData = 0;
+  for (const run of runs) {
+    for (const model of run.unpriced_models) models.add(model);
+    if (!run.has_token_data || !run.usage) {
+      missingRuns.push(run.run_id);
+      continue;
+    }
+    addUsage(usage, run.usage);
+    runsWithTokenData += 1;
+  }
+  const hasTokenData = Object.keys(usage).length > 0;
+  return {
+    run_count: runs.length,
+    runs_with_token_data: runsWithTokenData,
+    missing_runs: missingRuns,
+    has_token_data: hasTokenData,
+    usage: hasTokenData ? sortedUsage(usage) : null,
+    estimated_cost_usd: null,
+    unpriced_models: [...models].sort(),
+  };
+}
+
+function renderUsageLine(label: string, summary: UsageSummary): string {
+  const usage = summary.has_token_data && summary.usage
+    ? Object.entries(summary.usage).map(([key, value]) => `${key}=${value}`).join(" ")
+    : "token data missing";
+  const models = summary.unpriced_models.length > 0 ? ` unpriced_models=${summary.unpriced_models.join(",")}` : "";
+  return `${label}: ${usage} estimated_cost_usd=null${models}\n`;
+}
+
+function runUsageDate(run: RunLocation): string | null {
+  const raw = run.status?.started_at ?? run.status?.updated_at ?? null;
+  if (!raw) return null;
+  const time = Date.parse(raw);
+  if (!Number.isFinite(time)) return null;
+  return new Date(time).toISOString().slice(0, 10);
 }
 
 function parseTailLines(args: ParsedArgs): number | null {
@@ -1617,6 +1914,122 @@ async function runList(args: ParsedArgs): Promise<number> {
   return 0;
 }
 
+async function searchCommand(args: ParsedArgs): Promise<number> {
+  assertKnownFlags(args, "search", ["json", "worktree", "mr", "run", "thread"]);
+  if (args.positionals.length !== 2) throw new CliError("usage: orch search <regex> [--mr <id>] [--run <id>] [--thread <id>] [--worktree <path>] [--json]");
+  const pattern = args.positionals[1]!;
+  const regex = compileSearchRegex(pattern);
+  const worktree = resolve(flagString(args, "worktree", process.cwd()));
+  const repo = await getRepoIdentity(worktree);
+  const runFiles = scopedRunLocations(repo.repo_key, args).flatMap(searchFilesForRun);
+  const mailFiles = searchFilesForMail(repo.repo_key, args);
+  const files = [...runFiles, ...mailFiles];
+  const hits = files.flatMap((candidate) => searchCandidate(regex, candidate));
+
+  if (flagBool(args, "json")) {
+    printJson({
+      schema: "orch.search/v1",
+      repo_key: repo.repo_key,
+      worktree: repo.repo_root,
+      pattern,
+      scope: {
+        mr: args.flags.has("mr") ? flagString(args, "mr") : null,
+        run_id: args.flags.has("run") ? flagString(args, "run") : null,
+        thread: args.flags.has("thread") ? flagString(args, "thread") : null,
+      },
+      searched_files: files.length,
+      hits,
+    });
+  } else {
+    process.stdout.write(renderSearchHits(hits));
+  }
+  return 0;
+}
+
+async function usageRun(args: ParsedArgs): Promise<number> {
+  assertKnownFlags(args, "usage run", ["json", "worktree", "mr", "run"]);
+  const worktree = resolve(flagString(args, "worktree", process.cwd()));
+  const repo = await getRepoIdentity(worktree);
+  const run = runLocation(repo.repo_key, flagString(args, "run"), args.flags.has("mr") ? flagString(args, "mr") : undefined);
+  const summary = runUsageSummary(run);
+  if (flagBool(args, "json")) {
+    printJson({ schema: "orch.usage/run/v1", repo_key: repo.repo_key, ...summary });
+  } else {
+    process.stdout.write(renderUsageLine(`MR ${summary.mr} run ${summary.run_id}`, summary));
+  }
+  return 0;
+}
+
+async function usageThread(args: ParsedArgs): Promise<number> {
+  assertKnownFlags(args, "usage thread", ["json", "worktree", "thread", "mr"]);
+  const thread = threadMr(args);
+  const worktree = resolve(flagString(args, "worktree", process.cwd()));
+  const repo = await getRepoIdentity(worktree);
+  const runs = runLocationsForMr(repo.repo_key, thread).map(runUsageSummary);
+  const aggregate = aggregateRunUsage(runs);
+  if (flagBool(args, "json")) {
+    printJson({
+      schema: "orch.usage/thread/v1",
+      repo_key: repo.repo_key,
+      thread,
+      ...aggregate,
+      runs,
+    });
+  } else {
+    process.stdout.write(renderUsageLine(`thread ${thread}`, aggregate));
+    for (const run of runs) process.stdout.write(`  ${renderUsageLine(`run ${run.run_id}`, run)}`);
+  }
+  return 0;
+}
+
+async function usageDaily(args: ParsedArgs): Promise<number> {
+  assertKnownFlags(args, "usage daily", ["json", "worktree", "days"]);
+  const rawDays = flagNumber(args, "days") ?? 7;
+  if (!Number.isInteger(rawDays) || rawDays <= 0) throw new CliError("--days must be a positive integer");
+  const worktree = resolve(flagString(args, "worktree", process.cwd()));
+  const repo = await getRepoIdentity(worktree);
+  const today = new Date().toISOString().slice(0, 10);
+  const since = new Date(Date.now() - (rawDays - 1) * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const byDate = new Map<string, RunLocation[]>();
+  for (const run of runLocationsForRepo(repo.repo_key)) {
+    const date = runUsageDate(run);
+    if (!date || date < since || date > today) continue;
+    byDate.set(date, [...(byDate.get(date) ?? []), run]);
+  }
+  const buckets = [...byDate.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([date, locations]) => {
+      const runs = locations.map(runUsageSummary);
+      return { date, ...aggregateRunUsage(runs), runs };
+    });
+
+  if (flagBool(args, "json")) {
+    printJson({
+      schema: "orch.usage/daily/v1",
+      repo_key: repo.repo_key,
+      days: rawDays,
+      since,
+      until: today,
+      buckets,
+    });
+  } else {
+    if (buckets.length === 0) {
+      process.stdout.write("no runs in selected window\n");
+    } else {
+      for (const bucket of buckets) process.stdout.write(renderUsageLine(bucket.date, bucket));
+    }
+  }
+  return 0;
+}
+
+async function usageCommand(args: ParsedArgs): Promise<number> {
+  const subcommand = args.positionals[1];
+  if (subcommand === "run") return usageRun(args);
+  if (subcommand === "thread") return usageThread(args);
+  if (subcommand === "daily") return usageDaily(args);
+  throw new CliError("usage: orch usage run --run <id> | orch usage thread --thread <id> | orch usage daily [--days N]");
+}
+
 // Bare `orch`: the shared status + pending-actions view. Text and --json are
 // projections of the same aggregation, and every suggested action is a
 // runnable orch command line — humans copy it, agents spawn it.
@@ -2480,6 +2893,14 @@ async function main(): Promise<number> {
       process.stdout.write(runHelp());
       return 0;
     }
+    if (first === "search") {
+      process.stdout.write(searchHelp());
+      return 0;
+    }
+    if (first === "usage") {
+      process.stdout.write(usageHelp());
+      return 0;
+    }
     if (first === "cross-review" || first === "fanout" || first === "investigate") {
       process.stdout.write(fanoutHelp());
       return 0;
@@ -2558,6 +2979,8 @@ async function main(): Promise<number> {
   if (first === "run" && second === "create") return createRun(args);
   if (first === "run" && second === "list") return runList(args);
   if (first === "run" && second === "reap") return runReap(args);
+  if (first === "search") return searchCommand(args);
+  if (first === "usage") return usageCommand(args);
   if (first === "cross-review") return crossReview(args);
   if (first === "fanout") return fanout(args);
   if (first === "investigate") return investigate(args);
