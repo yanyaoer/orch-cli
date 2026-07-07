@@ -80,7 +80,7 @@ import { runOmpDriver } from "../drivers/omp-headless.ts";
 import { addWorkspace, chatgptBridgeConfigPath, readBridgeConfig, readMailControlConfig, validateMailControlConfig, writeBridgeConfig } from "./config.ts";
 import { buildBundle, type BundleOptions } from "./handoff-pro.ts";
 import { mail, mailFanout, type MailCliContext, type MailFanoutOutcome } from "./mail-cli.ts";
-import { fallbackRawReview, planAutoDecision, sanitizeCommentBody } from "./review-auto.ts";
+import { fallbackRawReview, planAutoDecision, sanitizeCommentBody, withheldSection } from "./review-auto.ts";
 import {
   createMailTransport,
   mailctlAck,
@@ -1365,16 +1365,9 @@ async function crossReviewAuto(args: ParsedArgs, outcome: MailFanoutOutcome): Pr
     section = sanitizeCommentBody(section, outcome.worktree, process.env.HOME);
     const leak = privateLeakAllowed() ? null : findPrivateLeak(section);
     if (leak) {
-      section = [
-        "### orch run result",
-        "",
-        `- MR/PR: ${mr}`,
-        `- Run: ${run.run_id}`,
-        `- State: ${run.state}`,
-        `- Verdict: ${verdict ?? "-"}`,
-        "",
-        `Content withheld: contains a private local path (${leak.marker}); read it with \`orch result --run ${run.run_id}\`.`,
-      ].join("\n");
+      // The marker string may only go to stdout (attention), never into the
+      // comment body — it would re-trigger the leak guard on the merged body.
+      section = withheldSection(mr, run.run_id, run.state, verdict ?? "-");
       attention.push(`${run.run_id} (${run.agent}): comment section withheld (private path ${leak.marker})`);
     }
     sections.push(section);
