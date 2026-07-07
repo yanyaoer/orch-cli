@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fallbackRawReview, planAutoDecision } from "./review-auto.ts";
+import { fallbackRawReview, planAutoDecision, sanitizeCommentBody } from "./review-auto.ts";
 import type { ReviewerResult } from "./types.ts";
 
 function reviewerResult(overrides: Partial<ReviewerResult> = {}): ReviewerResult {
@@ -34,6 +34,24 @@ test("fallbackRawReview recovers result.raw.md for driver fallback results", () 
 test("fallbackRawReview falls back to the synthetic finding body without raw file", () => {
   const dir = mkdtempSync(join(tmpdir(), "orch-review-auto-"));
   expect(fallbackRawReview(dir, fallback)).toContain("did not return a valid orch result JSON");
+});
+
+test("fallbackRawReview refuses a raw file that is a JSONL event stream", () => {
+  const dir = mkdtempSync(join(tmpdir(), "orch-review-auto-"));
+  writeFileSync(
+    join(dir, "result.raw.md"),
+    `{"type":"session","id":"x","cwd":"/Users/someone/repo"}\n{"type":"agent_start"}\n`,
+    "utf8",
+  );
+  // machine log, not a review: keep the short driver summary instead
+  expect(fallbackRawReview(dir, fallback)).toContain("did not return a valid orch result JSON");
+});
+
+test("sanitizeCommentBody relativizes worktree and home prefixes", () => {
+  const body = "Bug in /Users/dev/repo/src/a.ts; state at /Users/dev/.local/state/orch/x; see /Users/dev/repo itself.";
+  const clean = sanitizeCommentBody(body, "/Users/dev/repo", "/Users/dev");
+  expect(clean).toBe("Bug in src/a.ts; state at ~/.local/state/orch/x; see <worktree> itself.");
+  expect(sanitizeCommentBody("no paths here", "/Users/dev/repo", "/Users/dev")).toBe("no paths here");
 });
 
 test("fallbackRawReview ignores real reviewer results", () => {
@@ -80,4 +98,9 @@ test("planAutoDecision never decides fallback, failed, stale, or decided runs", 
 
   const decided = planAutoDecision({ ...baseRun, decided: true }, false);
   expect(decided).toMatchObject({ decision: null, attention: null });
+
+  // aligned with decision sweep: done without a verdict is a close, never a rework
+  const noVerdict = planAutoDecision({ ...baseRun, verdict: null }, false);
+  expect(noVerdict.decision).toBeNull();
+  expect(noVerdict.attention).toContain("orch decision close");
 });
