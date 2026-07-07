@@ -20,9 +20,33 @@ export function fallbackRawReview(runDir: string, result: RoleResult): string | 
   const rawPath = `${runDir}/result.raw.md`;
   if (existsSync(rawPath)) {
     const raw = readFileSync(rawPath, "utf8").trim();
-    if (raw.length > 0) return raw;
+    if (raw.length > 0 && !looksLikeEventStream(raw)) return raw;
   }
   return findings[0]!.body;
+}
+
+// A "raw review" that is actually the provider's JSONL event stream (a worker
+// dying before any prose leaves rawResultText holding the stream itself) is a
+// machine log, not a review — keep the short driver summary instead.
+function looksLikeEventStream(raw: string): boolean {
+  const first = raw.split("\n", 1)[0]!.trim();
+  if (!first.startsWith("{")) return false;
+  try {
+    const parsed = JSON.parse(first);
+    return typeof parsed === "object" && parsed !== null;
+  } catch {
+    return false;
+  }
+}
+
+// Reviewer prose quotes absolute local paths as a matter of course (worktree
+// files, state dirs). Relativize the known prefixes so honest content passes
+// the mirror leak guard; the caller withholds any section still carrying a
+// private marker instead of crashing the whole auto phase.
+export function sanitizeCommentBody(text: string, worktree: string, home: string | undefined): string {
+  let out = text.replaceAll(`${worktree}/`, "").replaceAll(worktree, "<worktree>");
+  if (home && home.length > 1) out = out.replaceAll(`${home}/`, "~/").replaceAll(home, "~");
+  return out;
 }
 
 export interface AutoDecisionPlan {
@@ -54,6 +78,11 @@ export function planAutoDecision(run: AutoRun, fallback: boolean): AutoDecisionP
       reason: null,
       attention: `result schema fallback — raw review recovered into the comment; decide manually: orch decision accept|rework --run ${run.run_id}`,
     };
+  }
+  // decision sweep treats done-without-verdict as a close, not a rework; keep
+  // the rubrics aligned but stay conservative — --auto only surfaces it.
+  if (run.verdict === null) {
+    return { decision: null, reason: null, attention: `done without a result verdict; ack with: orch decision close --run ${run.run_id}` };
   }
   if (isGoodVerdict(run.verdict) && (run.blocking ?? 0) === 0) {
     return { decision: "accept", reason: `cross-review --auto: reviewer ${run.verdict}`, attention: null };

@@ -80,7 +80,7 @@ import { runOmpDriver } from "../drivers/omp-headless.ts";
 import { addWorkspace, chatgptBridgeConfigPath, readBridgeConfig, readMailControlConfig, validateMailControlConfig, writeBridgeConfig } from "./config.ts";
 import { buildBundle, type BundleOptions } from "./handoff-pro.ts";
 import { mail, mailFanout, type MailCliContext, type MailFanoutOutcome } from "./mail-cli.ts";
-import { fallbackRawReview, planAutoDecision } from "./review-auto.ts";
+import { fallbackRawReview, planAutoDecision, sanitizeCommentBody } from "./review-auto.ts";
 import {
   createMailTransport,
   mailctlAck,
@@ -1331,9 +1331,15 @@ async function crossReviewAuto(args: ParsedArgs, outcome: MailFanoutOutcome): Pr
   ensureStateLayout(mrDir);
   const runsRoot = `${mrDir}/runs`;
   const ts = new Date().toISOString();
+
+  // Pass 1 — read-only: results, decision plans, comment sections. Nothing is
+  // written until the merged body has passed the leak guard, mirroring
+  // decision()'s ordering: a body that can't be mirrored must never leave
+  // decided-but-unmirrored runs behind (recovery would hit EEXIST).
   const sections: string[] = [];
   const attention: string[] = [];
   const reportRuns: Array<Record<string, unknown>> = [];
+  const plans: Array<{ run_id: string; decision: "accept" | "rework"; reason: string | null; report: Record<string, unknown> }> = [];
   for (const run of tracked) {
     // failed/timeout/stale runs may never have written result.json; surface
     // them instead of crashing — and never decide a run without a result.
@@ -1344,33 +1350,46 @@ async function crossReviewAuto(args: ParsedArgs, outcome: MailFanoutOutcome): Pr
       result === null
         ? { decision: null, reason: null, attention: `no result.json; inspect: orch events tail --run ${run.run_id} --native` }
         : planAutoDecision(run, raw !== null);
-    let decision: string | null = null;
-    if (plan.decision) {
-      try {
-        writeJsonExclusive(`${runsRoot}/${run.run_id}/decision.json`, { verdict: plan.decision, run_id: run.run_id, reason: plan.reason, ts });
-        decision = plan.decision;
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-        decision = "already-decided";
-      }
-    }
     if (plan.attention) attention.push(`${run.run_id} (${run.agent}): ${plan.attention}`);
-    sections.push(
+
+    const verdict = result === null ? null : raw !== null ? "unparsed" : run.verdict;
+    let section =
       result === null
         ? ["### orch run result", "", `- MR/PR: ${mr}`, `- Run: ${run.run_id}`, `- State: ${run.state}`, "- Verdict: none (no result.json)"].join("\n")
         : raw !== null
           ? unparsedRunSection(mr, run.run_id, run.state, raw)
-          : mirrorBody(mr, run.run_id, result, status),
-    );
-    reportRuns.push({
+          : mirrorBody(mr, run.run_id, result, status);
+    // Reviewer prose quotes absolute local paths as a matter of course:
+    // relativize the known prefixes, and withhold a section that still trips
+    // the guard rather than aborting the whole auto phase on honest content.
+    section = sanitizeCommentBody(section, outcome.worktree, process.env.HOME);
+    const leak = privateLeakAllowed() ? null : findPrivateLeak(section);
+    if (leak) {
+      section = [
+        "### orch run result",
+        "",
+        `- MR/PR: ${mr}`,
+        `- Run: ${run.run_id}`,
+        `- State: ${run.state}`,
+        `- Verdict: ${verdict ?? "-"}`,
+        "",
+        `Content withheld: contains a private local path (${leak.marker}); read it with \`orch result --run ${run.run_id}\`.`,
+      ].join("\n");
+      attention.push(`${run.run_id} (${run.agent}): comment section withheld (private path ${leak.marker})`);
+    }
+    sections.push(section);
+
+    const report: Record<string, unknown> = {
       run_id: run.run_id,
       agent: run.agent,
       state: run.state,
-      verdict: result === null ? null : raw !== null ? "unparsed" : run.verdict,
+      verdict,
       blocking: run.blocking,
-      decision,
+      decision: plan.decision,
       attention: plan.attention,
-    });
+    };
+    reportRuns.push(report);
+    if (plan.decision) plans.push({ run_id: run.run_id, decision: plan.decision, reason: plan.reason, report });
   }
 
   const header = [
@@ -1380,20 +1399,37 @@ async function crossReviewAuto(args: ParsedArgs, outcome: MailFanoutOutcome): Pr
     `- Thread: ${outcome.thread}`,
     `- Runs: ${tracked.map((run) => `${run.agent}/${run.run_id}`).join(", ")}`,
   ].join("\n");
-  const body = [header, ...sections].join("\n\n---\n\n");
-  const outboxPath = enqueueComment(mrDir, { kind: "comment", mr, body, created_at: ts });
+  let body = [header, ...sections].join("\n\n---\n\n");
+  // Per-section caps don't bound the sum; GitHub rejects comments over 65536.
+  if (body.length > MIRROR_BODY_MAX_CHARS) {
+    body = `${body.slice(0, MIRROR_BODY_MAX_CHARS)}\n\n…(comment truncated; run \`orch result --run <run_id>\` for the full results)`;
+  }
+  assertMirrorBodySafe(body); // before any write: a leaky body aborts cleanly with nothing recorded
 
   const forge = detectForge(outcome.remote_url);
-  let comment: Record<string, unknown> = { outbox_path: outboxPath, mode: "queued", forge };
+  const adapter = forge === "none" ? null : createForgeAdapter(forge, execute, outcome.worktree);
+  if (forge !== "none" && !adapter) throw new CliError(`unsupported forge: ${forge}`);
+
+  // On --execute, hold the outbox lock across enqueue→post→rename: enqueueing
+  // outside the lock lets a concurrent `mirror sync --execute` send the pending
+  // file first and this command post the same comment a second time.
+  const outboxLock = execute ? await acquirePidfileLockWait(`${mrDir}/locks/outbox.lock`, 10_000) : null;
+  let comment: Record<string, unknown>;
   let sendFailed = false;
-  if (forge === "none") {
-    comment = { ...comment, note: "no github/gitlab remote; comment stays queued" };
-  } else {
-    const adapter = createForgeAdapter(forge, execute, outcome.worktree);
-    if (!adapter) throw new CliError(`unsupported forge: ${forge}`);
-    // Same serialization as mirror sync --execute: one sender per MR outbox.
-    const outboxLock = execute ? await acquirePidfileLockWait(`${mrDir}/locks/outbox.lock`, 10_000) : null;
-    try {
+  let queuedName: string | null = null;
+  try {
+    const outboxPath = enqueueComment(mrDir, { kind: "comment", mr, body, created_at: ts });
+    queuedName = basename(outboxPath);
+    for (const plan of plans) {
+      try {
+        writeJsonExclusive(`${runsRoot}/${plan.run_id}/decision.json`, { verdict: plan.decision, run_id: plan.run_id, reason: plan.reason, ts });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        plan.report.decision = "already-decided";
+      }
+    }
+    comment = { outbox_path: outboxPath, mode: "queued", forge };
+    if (adapter) {
       const command = await adapter.postComment(mr, body);
       const success = command.exit_code === 0;
       let finalPath = outboxPath;
@@ -1410,13 +1446,15 @@ async function crossReviewAuto(args: ParsedArgs, outcome: MailFanoutOutcome): Pr
         exit_code: command.exit_code,
       };
       if (command.stderr) process.stderr.write(command.stderr);
-    } finally {
-      outboxLock?.release();
+    } else {
+      comment = { ...comment, note: "no github/gitlab remote; comment stays queued" };
     }
+  } finally {
+    outboxLock?.release();
   }
 
   // --auto sends only its own comment; older queued comments stay untouched.
-  const otherPending = pendingOutboxFiles(mrDir).filter((file) => `${pendingOutboxDir(mrDir)}/${file}` !== outboxPath);
+  const otherPending = pendingOutboxFiles(mrDir).filter((file) => file !== queuedName);
   printJson({
     mail: "cross-review",
     auto: true,
