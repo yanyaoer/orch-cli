@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { fallbackResult, validateRoleResult } from "./schema.ts";
 import { writeRoles } from "./types.ts";
 
-test("reviewer, verifier, and controller fallback results pass their role validators", () => {
+test("reviewer, verifier, controller, and researcher fallback results pass their role validators", () => {
   const reviewer = fallbackResult({
     role: "reviewer",
     run_id: "review-a",
@@ -24,10 +24,18 @@ test("reviewer, verifier, and controller fallback results pass their role valida
     head_sha: "head",
     summary: "missing provider result",
   });
+  const researcher = fallbackResult({
+    role: "researcher",
+    run_id: "research-a",
+    base_sha: "base",
+    head_sha: "head",
+    summary: "missing provider result",
+  });
 
   expect(validateRoleResult("reviewer", reviewer)).toEqual({ ok: true, errors: [] });
   expect(validateRoleResult("verifier", verifier)).toEqual({ ok: true, errors: [] });
   expect(validateRoleResult("controller", controller)).toEqual({ ok: true, errors: [] });
+  expect(validateRoleResult("researcher", researcher)).toEqual({ ok: true, errors: [] });
 });
 
 test("result validators reject malformed collection items", () => {
@@ -79,8 +87,40 @@ test("result validators reject malformed collection items", () => {
       actions: [123],
     }).ok,
   ).toBe(false);
+
+  expect(
+    validateRoleResult("researcher", {
+      schema: "orch.result/researcher/v1",
+      run_id: "research-a",
+      verdict: "completed",
+      summary: "done",
+      recommendation: "",
+      alternatives: [123],
+      sources: [],
+      open_questions: [],
+      risks: [],
+    }).ok,
+  ).toBe(false);
 });
 
-test("controller is not a write role", () => {
+test("researcher result requires a recommendation and completed|failed verdict", () => {
+  const valid = {
+    schema: "orch.result/researcher/v1",
+    run_id: "research-a",
+    verdict: "completed",
+    summary: "compared three approaches",
+    recommendation: "adopt approach B",
+    alternatives: ["approach A: slower", "approach C: more code"],
+    sources: ["https://example.com/doc"],
+    open_questions: [],
+    risks: ["migration cost"],
+  };
+  expect(validateRoleResult("researcher", valid)).toEqual({ ok: true, errors: [] });
+  expect(validateRoleResult("researcher", { ...valid, recommendation: "" }).ok).toBe(false);
+  expect(validateRoleResult("researcher", { ...valid, verdict: "approve" }).ok).toBe(false);
+});
+
+test("controller and researcher are not write roles", () => {
   expect(writeRoles.has("controller")).toBe(false);
+  expect(writeRoles.has("researcher")).toBe(false);
 });

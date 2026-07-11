@@ -126,30 +126,43 @@ export function ompFallbackConfigYaml(fallbacks: readonly string[]): string {
   return ["retry:", "  fallbackChains:", "    default:", ...fallbacks.map((model) => `      - ${model}`), ""].join("\n");
 }
 
-// Worktree permission posture matched to the role's constraint. `reviewer` is the
-// pure read-only analysis role, so its provider is launched without write access.
-// Write roles (implementer/...) and `verifier` (which must run tests/commands)
-// keep each provider's default write-capable posture.
+// Worktree permission posture matched to the role's constraint. `reviewer` and
+// `researcher` are pure read-only analysis roles, so their providers are
+// launched without write access. Write roles (implementer/...) and `verifier`
+// (which must run tests/commands) keep each provider's default write-capable posture.
 export function isReadOnlyRole(role: RunSpec["role"]): boolean {
-  return role === "reviewer";
+  return role === "reviewer" || role === "researcher";
 }
 
 export const CLAUDE_CONTROLLER_ALLOWED_TOOLS = "Bash(orch *),Read,Grep,Glob,LS";
 
+// Researcher does web research (jina/tvly CLIs + claude-native web tools) plus
+// read-only repo inspection; no Edit/Write and no general Bash, so it can
+// deliver plans but never code. dontAsk denies everything off this list headless.
+export const CLAUDE_RESEARCHER_ALLOWED_TOOLS = "Bash(jina *),Bash(tvly *),WebSearch,WebFetch,Read,Grep,Glob,LS";
+
+// Researcher provider/model combos are pinned to the two strongest reasoning
+// stacks: codex on gpt-5.6-sol and claude on fable, both at xhigh effort.
+export const CODEX_RESEARCHER_MODEL = "gpt-5.6-sol";
+
 // claude model tier by role: reviewer escalates to opus (deep critique, paired
 // with omp's gemini-3.1-pro as a distinct model family in cross-review);
+// researcher escalates further to fable (deep research/architecture);
 // implementer/verifier stay on the claude CLI's default model (sonnet) and only dial --effort.
 const CLAUDE_ROLE_MODEL: Partial<Record<RunSpec["role"], string>> = {
   reviewer: "opus",
+  researcher: "fable",
 };
 
-// claude reasoning effort by role: reviewer needs the deepest pass, verifier is
-// mechanical (tests/acceptance checks) so it stays cheap, implementer sits in
-// between and can be bumped manually per-task via provider_session_name/task text.
+// claude reasoning effort by role: researcher and reviewer need the deepest
+// passes, verifier is mechanical (tests/acceptance checks) so it stays cheap,
+// implementer sits in between and can be bumped manually per-task via
+// provider_session_name/task text.
 const CLAUDE_ROLE_EFFORT: Partial<Record<RunSpec["role"], string>> = {
   implementer: "medium",
   verifier: "low",
   reviewer: "high",
+  researcher: "xhigh",
   controller: "medium",
 };
 
@@ -164,6 +177,9 @@ export function buildProviderArgv(
 
   if (spec.role === "controller" && provider !== "claude") {
     throw new Error("controller role only supports claude provider");
+  }
+  if (spec.role === "researcher" && provider !== "claude" && provider !== "codex") {
+    throw new Error("researcher role only supports claude and codex providers");
   }
 
   if (provider === "omp") {
@@ -195,6 +211,9 @@ export function buildProviderArgv(
     // workers hold the worktree lock. Keep this whitelist narrow: no Edit/Write,
     // and Bash stays constrained to `orch *` to prevent controller-side writes.
     if (spec.role === "controller") argv.push("--allowedTools", CLAUDE_CONTROLLER_ALLOWED_TOOLS, "--permission-mode", "dontAsk");
+    // Researcher needs web tools, which plan mode would deny headless; it rides
+    // its own whitelist under dontAsk instead (read-only repo + web, no writes).
+    else if (spec.role === "researcher") argv.push("--allowedTools", CLAUDE_RESEARCHER_ALLOWED_TOOLS, "--permission-mode", "dontAsk");
     else if (readOnly) argv.push("--permission-mode", "plan");
     // Write roles and verifier run headless: without an explicit mode, edits
     // and test commands wait for interactive approval that never comes. Blast
@@ -213,15 +232,23 @@ export function buildProviderArgv(
 
   if (provider === "codex") {
     const lastMessagePath = `${runDir}/last_message.txt`;
+    // Researcher: pin the strong-reasoning model at xhigh effort and enable
+    // codex-native web search — the read-only sandbox blocks network for shell
+    // commands, so web research must ride the Responses web_search tool.
+    const researcherFlags =
+      spec.role === "researcher" ? ["-c", "model_reasoning_effort=xhigh", "-c", "tools.web_search=true"] : [];
+    const model = spec.model ?? (spec.role === "researcher" ? CODEX_RESEARCHER_MODEL : null);
     if (spec.provider_session_mode === "resume_exact" && spec.provider_session_id) {
       const resume = ["codex", "exec", "resume", "--json", "--output-last-message", lastMessagePath];
-      if (spec.model) resume.push("--model", spec.model);
+      if (model) resume.push("--model", model);
+      resume.push(...researcherFlags);
       if (readOnly) resume.push("--sandbox", "read-only");
       resume.push(spec.provider_session_id, "-");
       return resume;
     }
     const argv = ["codex", "exec", "--json", "--cd", worktree, "--output-last-message", lastMessagePath];
-    if (spec.model) argv.push("--model", spec.model);
+    if (model) argv.push("--model", model);
+    argv.push(...researcherFlags);
     if (readOnly) argv.push("--sandbox", "read-only");
     if (spec.provider_session_mode === "ephemeral") argv.push("--ephemeral");
     argv.push("-");
@@ -484,6 +511,21 @@ function coerceRoleResult(role: RunSpec["role"], obj: Record<string, unknown>, c
   } else if (role === "controller") {
     coerceMissingArrays(obj, ["actions"], coercions);
     coerceStringArray(obj, "actions", coercions);
+  } else if (role === "researcher") {
+    coerceMissingArrays(obj, ["alternatives", "sources", "open_questions", "risks"], coercions);
+    for (const field of ["alternatives", "sources", "open_questions", "risks"]) {
+      coerceStringArray(obj, field, coercions);
+    }
+    if (typeof obj.recommendation !== "string" || !obj.recommendation.trim()) {
+      // Models name the deliverable differently; the aliases are unambiguous.
+      const alias = [obj.proposal, obj.decision, obj.conclusion].find(
+        (v): v is string => typeof v === "string" && v.trim().length > 0,
+      );
+      if (alias) {
+        recordCoercion(coercions, "recommendation", obj.recommendation, alias, "recommendation alias");
+        obj.recommendation = alias;
+      }
+    }
   } else if (role === "verifier") {
     coerceMissingArrays(obj, ["commands", "acceptance"], coercions);
     if (typeof obj.verifies_run_id !== "string") {
@@ -665,6 +707,18 @@ export async function maybeWriteFakeResult(runDir: string, spec: RunSpec, provid
             verifies_run_id: spec.run_id,
             commands: [],
             acceptance: [],
+          }
+      : spec.role === "researcher"
+        ? {
+            schema: "orch.result/researcher/v1",
+            run_id: spec.run_id,
+            verdict: "completed",
+            summary: `fake ${provider} research completed`,
+            recommendation: "fake recommendation",
+            alternatives: [],
+            sources: [],
+            open_questions: [],
+            risks: [],
           }
         : {
             schema: "orch.result/implementer/v1",

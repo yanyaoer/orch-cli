@@ -1,6 +1,7 @@
 import type {
   ControllerResult,
   ImplementerResult,
+  ResearcherResult,
   ResultRole,
   RoleResult,
   RunRole,
@@ -107,6 +108,7 @@ export function resultSchemaName(role: ResultRole): RoleResult["schema"] {
   if (role === "implementer") return "orch.result/implementer/v1";
   if (role === "reviewer") return "orch.result/reviewer/v1";
   if (role === "controller") return "orch.result/controller/v1";
+  if (role === "researcher") return "orch.result/researcher/v1";
   return "orch.result/verifier/v1";
 }
 
@@ -145,6 +147,14 @@ export function validateRoleResult(role: RunRole, value: unknown): ValidationRes
     errors.push(...missing.map((field) => `${field} is required`));
     if (obj.verdict !== "completed" && obj.verdict !== "failed") errors.push("verdict must be completed|failed");
     validateStringArray(obj, "actions", errors);
+  } else if (role === "researcher") {
+    const missing = requireFields(obj, ["verdict", "summary", "recommendation"]);
+    errors.push(...missing.map((field) => `${field} is required`));
+    if (obj.verdict !== "completed" && obj.verdict !== "failed") errors.push("verdict must be completed|failed");
+    validateStringArray(obj, "alternatives", errors);
+    validateStringArray(obj, "sources", errors);
+    validateStringArray(obj, "open_questions", errors);
+    validateStringArray(obj, "risks", errors);
   } else {
     const missing = requireFields(obj, ["verdict"]);
     errors.push(...missing.map((field) => `${field} is required`));
@@ -195,6 +205,19 @@ export function fallbackResult(args: {
       summary: args.summary,
       actions: [],
     } satisfies ControllerResult;
+  }
+  if (args.role === "researcher") {
+    return {
+      schema: "orch.result/researcher/v1",
+      run_id: args.run_id,
+      verdict: "failed",
+      summary: args.summary,
+      recommendation: "No recommendation produced by the driver.",
+      alternatives: [],
+      sources: [],
+      open_questions: [],
+      risks: [args.summary],
+    } satisfies ResearcherResult;
   }
   return {
     schema: "orch.result/implementer/v1",

@@ -8,6 +8,7 @@ import type {
   ControllerResult,
   ImplementerResult,
   ProviderSessionMode,
+  ResearcherResult,
   ReviewerResult,
   RoleResult,
   RunRole,
@@ -834,6 +835,26 @@ function printResultSummary(result: RoleResult): void {
     return;
   }
 
+  if (result.schema === "orch.result/researcher/v1") {
+    const researcher = result as ResearcherResult;
+    process.stdout.write(`\nrecommendation:\n  ${researcher.recommendation.replaceAll("\n", "\n  ")}\n`);
+    const sections: Array<[string, string[]]> = [
+      ["alternatives", researcher.alternatives],
+      ["sources", researcher.sources],
+      ["open_questions", researcher.open_questions],
+      ["risks", researcher.risks],
+    ];
+    for (const [label, items] of sections) {
+      process.stdout.write(`\n${label}:\n`);
+      if (items.length === 0) {
+        process.stdout.write("  - none\n");
+      } else {
+        for (const item of items) process.stdout.write(`  - ${item}\n`);
+      }
+    }
+    return;
+  }
+
   const implementer = result as ImplementerResult;
   process.stdout.write("\nchanged_files:\n");
   if (implementer.changed_files.length === 0) {
@@ -973,6 +994,17 @@ function resultDetailLines(result: RoleResult): string[] {
       ];
     case "orch.result/controller/v1":
       return mirrorListLines("Actions", result.actions);
+    case "orch.result/researcher/v1":
+      return [
+        "Recommendation:",
+        "",
+        result.recommendation,
+        "",
+        ...mirrorListLines("Alternatives considered", result.alternatives),
+        ...mirrorListLines("Sources", result.sources),
+        ...mirrorListLines("Open questions", result.open_questions),
+        ...mirrorListLines("Risks", result.risks),
+      ];
     default:
       return [];
   }
@@ -1024,6 +1056,9 @@ function validateRunAgent(agent: AgentName, _role: RunRole): void {
   if (!VALID_AGENTS.includes(agent)) throw new CliError(`unsupported agent: ${agent}`);
   if (_role === "controller" && agent !== "claude") {
     throw new CliError("controller role only supports the claude agent");
+  }
+  if (_role === "researcher" && agent !== "claude" && agent !== "codex") {
+    throw new CliError("researcher role only supports the claude and codex agents");
   }
 }
 
@@ -1126,7 +1161,7 @@ async function createRun(args: ParsedArgs): Promise<number> {
   const timeoutSec = Number(flagString(args, "timeout-sec", role === "reviewer" ? "3600" : "14400"));
 
   if (!isResultRole(role)) {
-    throw new CliError(`P1 only supports result-schema roles: implementer, reviewer, verifier, controller (got ${role})`);
+    throw new CliError(`P1 only supports result-schema roles: implementer, reviewer, verifier, controller, researcher (got ${role})`);
   }
   validateRunAgent(agent, role);
   if (!Number.isFinite(timeoutSec) || timeoutSec <= 0) throw new CliError("--timeout-sec must be positive");

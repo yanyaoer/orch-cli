@@ -578,8 +578,10 @@ test("mail submit to router routes default codex claude pi agents", async () => 
   expect(defaults).toMatchObject({ exitCode: 0, stderr: "" });
   const defaultAgents = JSON.parse(defaults.stdout).agents as Array<{ id: string; provider: string; work_mode: string }>;
   expect(defaultAgents.map((agent) => agent.id)).toEqual([
+    "claude-researcher",
     "claude-reviewer",
     "codex-implementer",
+    "codex-researcher",
     "omp-reviewer",
     "orch-router",
     "pi-verifier",
@@ -588,6 +590,8 @@ test("mail submit to router routes default codex claude pi agents", async () => 
   expect(defaultAgents.map((agent) => [agent.provider, agent.work_mode])).toContainEqual(["codex", "implement"]);
   expect(defaultAgents.map((agent) => [agent.provider, agent.work_mode])).toContainEqual(["claude", "review"]);
   expect(defaultAgents.map((agent) => [agent.provider, agent.work_mode])).toContainEqual(["pi", "verify"]);
+  expect(defaultAgents.map((agent) => [agent.provider, agent.work_mode])).toContainEqual(["codex", "research"]);
+  expect(defaultAgents.map((agent) => [agent.provider, agent.work_mode])).toContainEqual(["claude", "research"]);
 
   const workspace = await runOrch(["workspace", "add", "--id", "orch-cli", "--path", worktree], env);
   expect(workspace).toMatchObject({ exitCode: 0, stderr: "" });

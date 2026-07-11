@@ -7,6 +7,8 @@ import {
   buildProviderArgv,
   buildWorkerEnv,
   CLAUDE_CONTROLLER_ALLOWED_TOOLS,
+  CLAUDE_RESEARCHER_ALLOWED_TOOLS,
+  CODEX_RESEARCHER_MODEL,
   extractResultFromRunDir,
   extractResultFromText,
   ompFallbackConfigYaml,
@@ -442,6 +444,114 @@ test("buildProviderArgv matches read-only posture to the reviewer role per provi
     "read,grep,find,ls",
     "--no-session",
   ]);
+});
+
+test("buildProviderArgv gives researcher a read-only web-research posture on claude and codex", () => {
+  const base = spec("researcher", "research-posture");
+
+  // claude researcher runs fable at xhigh effort; web tools ride an explicit
+  // whitelist under dontAsk (plan mode would deny them headless), no Edit/Write.
+  expect(buildProviderArgv("claude", base, "/run", "/worktree")).toEqual([
+    "claude",
+    "-p",
+    "--verbose",
+    "--output-format",
+    "stream-json",
+    "--input-format",
+    "text",
+    "--model",
+    "fable",
+    "--effort",
+    "xhigh",
+    "--allowedTools",
+    CLAUDE_RESEARCHER_ALLOWED_TOOLS,
+    "--permission-mode",
+    "dontAsk",
+  ]);
+
+  // codex researcher defaults to gpt-5.6-sol at xhigh reasoning with native
+  // web search enabled, inside the read-only sandbox.
+  expect(buildProviderArgv("codex", base, "/run", "/worktree")).toEqual([
+    "codex",
+    "exec",
+    "--json",
+    "--cd",
+    "/worktree",
+    "--output-last-message",
+    "/run/last_message.txt",
+    "--model",
+    CODEX_RESEARCHER_MODEL,
+    "-c",
+    "model_reasoning_effort=xhigh",
+    "-c",
+    "tools.web_search=true",
+    "--sandbox",
+    "read-only",
+    "-",
+  ]);
+
+  // an explicit model override wins over the researcher default.
+  const overridden = buildProviderArgv("codex", { ...base, model: "gpt-6" }, "/run", "/worktree");
+  expect(overridden).toContain("gpt-6");
+  expect(overridden).not.toContain(CODEX_RESEARCHER_MODEL);
+
+  // resume keeps the researcher flags.
+  expect(
+    buildProviderArgv(
+      "codex",
+      { ...base, provider_session_mode: "resume_exact", provider_session_id: "sess-1" },
+      "/run",
+      "/worktree",
+    ),
+  ).toEqual([
+    "codex",
+    "exec",
+    "resume",
+    "--json",
+    "--output-last-message",
+    "/run/last_message.txt",
+    "--model",
+    CODEX_RESEARCHER_MODEL,
+    "-c",
+    "model_reasoning_effort=xhigh",
+    "-c",
+    "tools.web_search=true",
+    "--sandbox",
+    "read-only",
+    "sess-1",
+    "-",
+  ]);
+
+  for (const provider of ["pi", "omp"] as const) {
+    expect(() => buildProviderArgv(provider, base, "/run", "/worktree")).toThrow(
+      "researcher role only supports claude and codex providers",
+    );
+  }
+});
+
+test("extractResultFromText coerces researcher alias fields and missing arrays", () => {
+  const runSpec = spec("researcher", "research-coerce");
+  const result = extractResultFromText(
+    JSON.stringify({
+      schema: "orch.result/researcher/v1",
+      run_id: "invented",
+      verdict: "complete",
+      summary: "compared approaches",
+      proposal: "adopt approach B",
+      sources: ["https://example.com/doc"],
+    }),
+    runSpec,
+  );
+  expect(result).toMatchObject({
+    schema: "orch.result/researcher/v1",
+    run_id: "research-coerce",
+    verdict: "completed",
+    recommendation: "adopt approach B",
+    sources: ["https://example.com/doc"],
+    alternatives: [],
+    open_questions: [],
+    risks: [],
+  });
 });
 
 test("buildProviderArgv picks claude model/effort by role", () => {

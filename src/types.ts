@@ -3,11 +3,12 @@ export type RunRole =
   | "reviewer"
   | "verifier"
   | "controller"
+  | "researcher"
   | "challenger"
   | "rework"
   | "debugger";
 
-export type ResultRole = "implementer" | "reviewer" | "verifier" | "controller";
+export type ResultRole = "implementer" | "reviewer" | "verifier" | "controller" | "researcher";
 
 export type AgentName = "codex" | "claude" | "pi" | "omp";
 
@@ -145,7 +146,21 @@ export interface ControllerResult {
   actions: string[];
 }
 
-export type RoleResult = ImplementerResult | ReviewerResult | VerifierResult | ControllerResult;
+// Researcher/architect: read-only deep research and solution design (web
+// research allowed); delivers a recommendation, never code.
+export interface ResearcherResult {
+  schema: "orch.result/researcher/v1";
+  run_id: string;
+  verdict: "completed" | "failed";
+  summary: string;
+  recommendation: string;
+  alternatives: string[];
+  sources: string[];
+  open_questions: string[];
+  risks: string[];
+}
+
+export type RoleResult = ImplementerResult | ReviewerResult | VerifierResult | ControllerResult | ResearcherResult;
 
 export const writeRoles = new Set<RunRole>([
   "implementer",
@@ -155,5 +170,5 @@ export const writeRoles = new Set<RunRole>([
 ]);
 
 export function isResultRole(role: RunRole): role is ResultRole {
-  return role === "implementer" || role === "reviewer" || role === "verifier" || role === "controller";
+  return role === "implementer" || role === "reviewer" || role === "verifier" || role === "controller" || role === "researcher";
 }

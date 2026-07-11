@@ -24,7 +24,7 @@ Install: `curl -fsSL https://raw.githubusercontent.com/yanyaoer/orch-cli/main/in
   done); `orch verdict --thread <id> --wait` waits for the whole thread and
   suggests accept / rework / inspect.
 - **Run a headless worker** to implement / review / verify a task → `orch run create`
-  (driver = codex|claude|pi|omp, role = implementer|reviewer|verifier). Read the result
+  (driver = codex|claude|pi|omp, role = implementer|reviewer|verifier|researcher). Read the result
   with `orch status` / `orch result`; record `orch decision` and `orch mirror` it to
   the PR/MR comment. **Dispatching a rework?** Use `orch run create
   --resume-from <prior_run_id> --task rework.md` — the worker resumes the prior
@@ -47,6 +47,14 @@ Install: `curl -fsSL https://raw.githubusercontent.com/yanyaoer/orch-cli/main/in
   `--effort low` (mechanical test/acceptance checks, cheapest tier). An explicit
   `orch run create --model <ref>` is recorded in `spec.json` and overrides the
   provider model for model-aware drivers such as pi, omp, codex, and claude.
+- **Need a plan/architecture decision, not code? `--role researcher`** →
+  read-only architect + deep-research role, claude/codex only: claude runs
+  fable at xhigh effort (web via jina/tvly CLIs + WebSearch/WebFetch, no
+  Edit/Write), codex defaults to gpt-5.6-sol at xhigh reasoning (native web
+  search — the read-only sandbox blocks shell network). Result schema
+  `orch.result/researcher/v1`: recommendation + alternatives / sources /
+  open_questions / risks. `orch fanout --role researcher` fans one question to
+  codex-researcher + claude-researcher for a second opinion.
 - **Fan one task across agents (mail-native)** → `orch cross-review`
   (claude+omp review one diff), `orch fanout --role <r>` (generic, any result
   role), `orch investigate` (read-only research, defaults to omp+claude). These

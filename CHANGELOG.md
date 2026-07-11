@@ -2,6 +2,12 @@
 
 All notable user-facing changes are recorded here.
 
+## [Unreleased]
+
+### Features
+
+- New `researcher` result role (architect / deep research): read-only, web-research capable, delivers a plan instead of code. Claude runs `fable` at `xhigh` effort under a `dontAsk` whitelist (`jina`/`tvly` CLIs + WebSearch/WebFetch + read-only repo tools, no Edit/Write); codex defaults to `gpt-5.6-sol` at `xhigh` reasoning with native web search enabled inside the read-only sandbox (which blocks shell network, so web CLIs ride codex's `web_search` tool instead). Claude/codex only; no worktree lock. Result schema `orch.result/researcher/v1`: `verdict`, `summary`, `recommendation`, `alternatives[]`, `sources[]`, `open_questions[]`, `risks[]`. `orch mail agent defaults` now also binds `codex-researcher` + `claude-researcher` (auto-invited), so `orch fanout --role researcher` fans one question across both stacks.
+
 ## [0.0.7] - 2026-07-07
 
 ### Features
