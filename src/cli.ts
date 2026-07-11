@@ -101,3 +101,10 @@ export function flagNumber(args: ParsedArgs, name: string): number | undefined {
 export function printJson(value: unknown): void {
   process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
 }
+
+// `--task -` support: read the whole task text from stdin. Lets a controller
+// whose Bash is restricted to `orch *` author tasks via heredoc instead of
+// needing a Write tool.
+export async function readStdinText(): Promise<string> {
+  return await new Response(Bun.stdin.stream()).text();
+}

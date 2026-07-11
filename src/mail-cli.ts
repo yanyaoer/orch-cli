@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { resolve } from "node:path";
 import { MaildirBus, type BusTaskLease } from "./bus.ts";
-import { assertKnownFlags, CliError, collectFlags, flagBool, flagNumber, flagString, printJson, type ParsedArgs } from "./cli.ts";
+import { assertKnownFlags, CliError, collectFlags, flagBool, flagNumber, flagString, printJson, readStdinText, type ParsedArgs } from "./cli.ts";
 import {
   mailAgentsConfigPath,
   readMailAgentsConfig,
@@ -708,7 +708,9 @@ export async function mailFanout(args: ParsedArgs, context: MailCliContext, opts
     };
   }
 
-  const taskText = readFileSync(resolve(flagString(args, "task")), "utf8");
+  const taskFlagValue = flagString(args, "task");
+  const taskText = taskFlagValue === "-" ? await readStdinText() : readFileSync(resolve(taskFlagValue), "utf8");
+  if (taskFlagValue === "-" && !taskText.trim()) throw new CliError("--task - received empty stdin");
   const taskSha = sha256(taskText);
   const workspace = workspaceForMail(args.flags.has("workspace") ? flagString(args, "workspace") : undefined);
   const from = flagString(args, "from", "human@local.orch");

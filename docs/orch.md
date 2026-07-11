@@ -15,6 +15,9 @@ permissions, model/effort tiers, result schemas — live in the CLI:
   `orch decision sweep`. Thread loops: `orch wait --thread <id>` blocks until
   the next run needs attention; `orch verdict --thread <id> --wait` suggests a
   whole-thread outcome.
+- **Start a brand-new task from one sentence** → `orch new '<description>'
+  [--workspace <id>]`: a researcher drafts the plan, you confirm/amend it in the
+  terminal, then a controller session dispatches and drives the work.
 - **Implement / review / verify / research one task** → `orch run create`
   (agent = codex|claude|pi|omp, role = implementer|reviewer|verifier|researcher).
   Follow with `orch status` / `orch result`; record `orch decision`, then

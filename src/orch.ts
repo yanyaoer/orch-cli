@@ -62,6 +62,7 @@ import {
   mirrorSyncHelp,
   mailHelp,
   mailctlHelp,
+  newHelp,
   workspaceHelp,
   resultCommandHelp,
   runCreateHelp,
@@ -80,7 +81,7 @@ import { runClaudeDriver } from "../drivers/claude-headless.ts";
 import { deployWorker, locateBridgeDir, runChatgptBridge } from "../drivers/chatgpt-bridge.ts";
 import { runPiDriver } from "../drivers/pi-headless.ts";
 import { runOmpDriver } from "../drivers/omp-headless.ts";
-import { addWorkspace, chatgptBridgeConfigPath, readBridgeConfig, readMailControlConfig, validateMailControlConfig, writeBridgeConfig } from "./config.ts";
+import { addWorkspace, chatgptBridgeConfigPath, readBridgeConfig, readMailAgentsConfig, readMailControlConfig, readOrchConfig, validateMailControlConfig, writeBridgeConfig } from "./config.ts";
 import { buildBundle, type BundleOptions } from "./handoff-pro.ts";
 import { mail, mailFanout, type MailCliContext, type MailFanoutOutcome } from "./mail-cli.ts";
 import { fallbackRawReview, planAutoDecision, sanitizeCommentBody, withheldSection } from "./review-auto.ts";
@@ -105,7 +106,7 @@ import {
   type MailctlContext,
 } from "./mailctl.ts";
 import { workspace } from "./workspace-cli.ts";
-import { assertKnownFlags, CliError, collectFlags, flagBool, flagNumber, flagString, hasHelp, parseArgs, printJson, type ParsedArgs } from "./cli.ts";
+import { assertKnownFlags, CliError, collectFlags, flagBool, flagNumber, flagString, hasHelp, parseArgs, printJson, readStdinText, type ParsedArgs } from "./cli.ts";
 import { buildPrompt, buildProviderArgv } from "../drivers/driver-common.ts";
 
 type IdempotencyRecord = {
@@ -1152,8 +1153,10 @@ async function createRun(args: ParsedArgs): Promise<number> {
   const agent = resume ? resume.agent : (flagString(args, "agent") as AgentName);
   const tag = flagString(args, "tag", role);
   const worktree = resume ? resume.worktree : resolve(flagString(args, "worktree", process.cwd()));
-  const taskPath = args.flags.has("task") ? resolve(flagString(args, "task")) : null;
-  const taskText = taskPath ? readFileSync(taskPath, "utf8") : "";
+  const taskFlag = args.flags.has("task") ? flagString(args, "task") : null;
+  const taskPath = taskFlag !== null && taskFlag !== "-" ? resolve(taskFlag) : null;
+  const taskText = taskFlag === "-" ? await readStdinText() : taskPath ? readFileSync(taskPath, "utf8") : "";
+  if (taskFlag === "-" && !taskText.trim()) throw new CliError("--task - received empty stdin");
   const { mr, source: mrSource } =
     resume && !args.flags.has("mr") ? { mr: resume.mr, source: "resume-from" as const } : await resolveMr(args, taskText, worktree);
   // Reviewer runs finish in minutes in practice (52/67 recorded runs override
@@ -1667,6 +1670,286 @@ async function investigate(args: ParsedArgs): Promise<number> {
   });
   printJson(outcome.payload);
   return outcome.code;
+}
+
+// ---------------------------------------------------------------------------
+// orch new: one-sentence task -> researcher drafts a plan -> human confirms in
+// the terminal -> the same provider session resumes as a controller and
+// dispatches/drives the work. Plan phase is mechanically read-only (researcher
+// role); only the confirmed session gets the controller's `Bash(orch *)` reach.
+
+const NEW_FLAGS = ["workspace", "worktree", "mr", "model", "timeout-sec", "yes"] as const;
+
+function newMrSlug(description: string, now = new Date()): string {
+  const slug = description
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 24)
+    .replace(/-+$/g, "");
+  // Non-ASCII descriptions (e.g. Chinese) slug to nothing; fall back to the date.
+  return slug || now.toISOString().slice(0, 10).replaceAll("-", "");
+}
+
+function newPlanTask(mr: string, description: string): string {
+  return [
+    "# orch new — planning phase",
+    "",
+    "You are the planning phase of `orch new`. A human reads your result in a",
+    "terminal, answers your open questions, and then a controller session resumed",
+    "from this one dispatches the work. Plan only — change nothing.",
+    "",
+    `Thread/MR for the eventual runs: ${mr}`,
+    "",
+    "## Task request",
+    description,
+    "",
+    "## Deliverable (orch.result/researcher/v1)",
+    "- recommendation: the executable plan — goal, scope, ordered task breakdown",
+    "  (per task: role implementer|reviewer|verifier, a one-paragraph task spec,",
+    "  acceptance checks), grounded in the actual repo (read it first).",
+    "- open_questions: numbered questions the human must answer before execution,",
+    '  each ending with "— recommended: <your default>". Empty when unambiguous.',
+    "- risks / alternatives as applicable.",
+  ].join("\n");
+}
+
+function newPlanRevisionTask(answer: string): string {
+  return [
+    "# orch new — plan revision",
+    "",
+    "Human answers / amendments to your plan and open questions:",
+    "",
+    answer,
+    "",
+    "Update the plan (same orch.result/researcher/v1 contract). Keep only the",
+    "open_questions that remain genuinely ambiguous after these answers.",
+  ].join("\n");
+}
+
+function newExecTask(mr: string, worktree: string, plan: string, notes: string[]): string {
+  return [
+    "# orch new — execution controller",
+    "",
+    "## Execution mode",
+    "- You are running HEADLESS and NON-INTERACTIVE; no human approves anything mid-run.",
+    "- Do NOT enter plan mode. Execute your `orch ...` commands directly, then output the orch.result/controller/v1 JSON.",
+    "- Tools: Bash restricted to `orch *` plus read-only Read/Grep/Glob/LS. No Edit/Write — dispatch workers to change code.",
+    "",
+    "## Context",
+    `- Thread/MR: ${mr}`,
+    `- Worktree: ${worktree}`,
+    "",
+    "## Confirmed plan (human-approved)",
+    plan,
+    "",
+    "## Human clarifications",
+    notes.length > 0 ? notes.map((note, index) => `${index + 1}. ${note}`).join("\n") : "(recommended answers accepted as-is)",
+    "",
+    "## Rules",
+    "- Author every task inline via stdin (`--task -` reads the task text from a heredoc):",
+    `    orch fanout --thread ${mr} --role <role> --task - <<'EOF' ... EOF`,
+    `    orch cross-review --thread ${mr} --task - <<'EOF' ... EOF   (review pass)`,
+    `    orch run create --mr ${mr} --role <role> --agent <codex|claude|pi|omp> --task - <<'EOF' ... EOF`,
+    "    orch run create --resume-from <run_id> --task - <<'EOF' ... EOF   (rework)",
+    "- Inline every constraint a worker needs (relevant docs/adr + docs/specs excerpts); workers never see this controller's context.",
+    `- After dispatching, loop: orch wait --thread ${mr} -> read orch result --mr ${mr} --run <id> -> record orch decision accept|rework --mr ${mr} --run <id> --reason '...'; repeat until it returns settled.`,
+    "- At most 2 rework cycles per task; report the blocker in your summary instead of looping further.",
+    "- Final output must be orch.result/controller/v1 JSON; list dispatched runs and decisions in actions[].",
+  ].join("\n");
+}
+
+// Terminal Q&A input: one shared line iterator over stdin (avoids node:readline,
+// whose types clash with Bun's stdin stream).
+async function* stdinLineIterator(): AsyncGenerator<string> {
+  const decoder = new TextDecoder();
+  const reader = Bun.stdin.stream().getReader();
+  let buffer = "";
+  for (;;) {
+    const chunk = await reader.read();
+    if (chunk.done) break;
+    buffer += decoder.decode(chunk.value, { stream: true });
+    let index: number;
+    while ((index = buffer.indexOf("\n")) >= 0) {
+      yield buffer.slice(0, index).replace(/\r$/, "");
+      buffer = buffer.slice(index + 1);
+    }
+  }
+  if (buffer.length > 0) yield buffer;
+}
+
+interface NewRunHandle {
+  run_id: string;
+  status_path: string;
+  result_path: string;
+}
+
+// Spawn `orch run create ... --json` as a subprocess (same pattern as mail
+// claim) so newCommand's own stdout stays reserved for its final JSON payload.
+async function newSpawnRunCreate(argv: string[], worktree: string): Promise<NewRunHandle> {
+  const proc = Bun.spawn([...orchCommand(), "run", "create", ...argv, "--json"], {
+    cwd: worktree,
+    stdout: "pipe",
+    stderr: "pipe",
+    env: process.env,
+  });
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  if (exitCode !== 0) throw new CliError(`orch run create failed: ${(stderr.trim() || stdout.trim()).slice(0, 800)}`);
+  const payload = JSON.parse(stdout) as { run_id: string; status_path: string; result_path?: string; run_dir?: string };
+  return {
+    run_id: payload.run_id,
+    status_path: payload.status_path,
+    result_path: payload.result_path ?? `${payload.run_dir}/result.json`,
+  };
+}
+
+async function newWaitRun(handle: NewRunHandle, label: string): Promise<RunStatus> {
+  let lastState = "";
+  for (;;) {
+    const status = readJsonFile<RunStatus | null>(handle.status_path, null);
+    if (status && status.state !== lastState) {
+      lastState = status.state;
+      process.stderr.write(`[orch new] ${label} ${handle.run_id}: ${status.state}\n`);
+    }
+    if (status && isTerminal(status.state)) return status;
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+  }
+}
+
+function newReadPlanResult(handle: NewRunHandle, status: RunStatus): ResearcherResult {
+  const result = readJsonFile<RoleResult | null>(handle.result_path, null);
+  if (status.state !== "done" || !result || result.schema !== "orch.result/researcher/v1" || result.verdict !== "completed") {
+    throw new CliError(
+      `plan run ${handle.run_id} ended ${status.state}${result ? ` (${resultVerdict(result)})` : ""}; inspect: orch result --mr ${status.mr} --run ${handle.run_id}`,
+    );
+  }
+  return result;
+}
+
+function newRenderPlan(result: ResearcherResult): void {
+  const write = (line: string) => process.stderr.write(`${line}\n`);
+  write("");
+  write("## Proposed plan");
+  write(result.recommendation);
+  if (result.open_questions.length > 0) {
+    write("");
+    write("## Open questions");
+    result.open_questions.forEach((question, index) => write(`${index + 1}. ${question}`));
+  }
+  if (result.risks.length > 0) {
+    write("");
+    write("## Risks");
+    for (const risk of result.risks) write(`- ${risk}`);
+  }
+  write("");
+}
+
+async function newCommand(args: ParsedArgs): Promise<number> {
+  assertKnownFlags(args, "new", NEW_FLAGS);
+  const description = (args.positionals[1] ?? "").trim();
+  if (!description) throw new CliError("usage: orch new '<task description>' [--workspace <id>] [flags]");
+  const yes = flagBool(args, "yes");
+  if (!process.stdin.isTTY && !yes) {
+    throw new CliError("orch new is interactive; pass --yes to accept the recommended plan without confirmation");
+  }
+
+  let worktree: string;
+  if (args.flags.has("worktree")) {
+    worktree = resolve(flagString(args, "worktree"));
+  } else if (args.flags.has("workspace")) {
+    const id = flagString(args, "workspace");
+    const workspace = readOrchConfig().workspaces[id];
+    if (!workspace) throw new CliError(`unknown workspace: ${id} (register with: orch workspace add --id ${id} --path <path>)`);
+    worktree = workspace.path;
+  } else {
+    worktree = process.cwd();
+  }
+
+  const repo = await getRepoIdentity(worktree);
+  const mr = args.flags.has("mr") ? flagString(args, "mr") : `new-${newMrSlug(description)}-${randomHex(2)}`;
+  const mrDir = mrStateDir(repo.repo_key, mr);
+  mkdirSync(`${mrDir}/tasks`, { recursive: true });
+
+  // The exec controller dispatches through the mail layer; seed the default
+  // roster on first use only (a non-empty roster may carry user customization).
+  if (Object.keys(readMailAgentsConfig().agents).length === 0) {
+    process.stderr.write("[orch new] no mail agents configured; running `orch mail agent defaults`\n");
+    const seeded = Bun.spawn([...orchCommand(), "mail", "agent", "defaults"], { cwd: worktree, stdout: "ignore", stderr: "pipe", env: process.env });
+    if ((await seeded.exited) !== 0) throw new CliError(`orch mail agent defaults failed: ${await new Response(seeded.stderr).text()}`);
+  }
+
+  const passthrough: string[] = [];
+  if (args.flags.has("model")) passthrough.push("--model", flagString(args, "model"));
+  if (args.flags.has("timeout-sec")) passthrough.push("--timeout-sec", flagString(args, "timeout-sec"));
+
+  const planTaskPath = `${mrDir}/tasks/plan.md`;
+  writeTextAtomic(planTaskPath, newPlanTask(mr, description));
+  process.stderr.write(`[orch new] mr ${mr} · worktree ${worktree}\n`);
+  let handle = await newSpawnRunCreate(
+    ["--mr", mr, "--role", "researcher", "--agent", "claude", "--tag", "plan", "--worktree", worktree, "--task", planTaskPath, ...passthrough],
+    worktree,
+  );
+  process.stderr.write(`[orch new] watch: orch events tail --run ${handle.run_id} --mr ${mr} --native -f\n`);
+  const planRuns: string[] = [handle.run_id];
+  let plan = newReadPlanResult(handle, await newWaitRun(handle, "plan"));
+  newRenderPlan(plan);
+
+  const notes: string[] = [];
+  if (!yes) {
+    const lineSource = stdinLineIterator();
+    for (;;) {
+      process.stderr.write("回车=按当前方案执行 · 输入回答/修改意见=再规划一轮 · q=放弃\n> ");
+      const next = await lineSource.next();
+      const answer = next.done ? "" : next.value.trim();
+      if (answer === "") break;
+      if (answer.toLowerCase() === "q") {
+        process.stderr.write(`[orch new] aborted; plan run(s) kept for audit under mr ${mr}\n`);
+        printJson({ new: mr, worktree, state: "aborted", plan_runs: planRuns });
+        return 1;
+      }
+      notes.push(answer);
+      const revisionPath = `${mrDir}/tasks/plan-round-${notes.length + 1}.md`;
+      writeTextAtomic(revisionPath, newPlanRevisionTask(answer));
+      handle = await newSpawnRunCreate(
+        ["--resume-from", handle.run_id, "--tag", `plan-r${notes.length + 1}`, "--task", revisionPath],
+        worktree,
+      );
+      planRuns.push(handle.run_id);
+      plan = newReadPlanResult(handle, await newWaitRun(handle, "plan"));
+      newRenderPlan(plan);
+    }
+  }
+
+  const execTaskPath = `${mrDir}/tasks/exec.md`;
+  writeTextAtomic(execTaskPath, newExecTask(mr, worktree, plan.recommendation, notes));
+  const execHandle = await newSpawnRunCreate(
+    ["--resume-from", handle.run_id, "--role", "controller", "--tag", "exec", "--task", execTaskPath],
+    worktree,
+  );
+  process.stderr.write(`[orch new] executing; follow along: orch wait --thread ${mr} · orch events tail --mr ${mr} -f --native\n`);
+  const execStatus = await newWaitRun(execHandle, "exec");
+  const execResult = readJsonFile<RoleResult | null>(execHandle.result_path, null);
+  if (execResult && "summary" in execResult) process.stderr.write(`\n[orch new] controller summary: ${execResult.summary}\n`);
+  if (execResult && execResult.schema === "orch.result/controller/v1") {
+    for (const action of execResult.actions) process.stderr.write(`  - ${action}\n`);
+  }
+
+  const ok = execStatus.state === "done" && execResult !== null && resultVerdict(execResult) === "completed";
+  printJson({
+    new: mr,
+    worktree,
+    state: ok ? "completed" : "needs_attention",
+    plan_runs: planRuns,
+    exec_run: execHandle.run_id,
+    exec_state: execStatus.state,
+    exec_verdict: execResult ? resultVerdict(execResult) : null,
+    follow_up: [`orch verdict --thread ${mr}`, `orch result --mr ${mr} --run ${execHandle.run_id}`, "orch"],
+  });
+  return ok ? 0 : 1;
 }
 
 function runIdOfClaim(run: unknown): string | null {
@@ -2918,6 +3201,10 @@ async function main(): Promise<number> {
       process.stdout.write(waitHelp());
       return 0;
     }
+    if (first === "new") {
+      process.stdout.write(newHelp());
+      return 0;
+    }
     if (first === "run" && second === "create") {
       process.stdout.write(runCreateHelp());
       return 0;
@@ -3013,6 +3300,7 @@ async function main(): Promise<number> {
 
   if (first === "verdict") return verdictCommand(args);
   if (first === "wait") return waitCommand(args);
+  if (first === "new") return newCommand(args);
   if (first === "run" && second === "create") return createRun(args);
   if (first === "run" && second === "list") return runList(args);
   if (first === "run" && second === "reap") return runReap(args);
