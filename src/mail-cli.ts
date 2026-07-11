@@ -28,7 +28,7 @@ import {
 } from "./mail.ts";
 import { getRepoIdentity, mrStateDir, orchStateRoot } from "./paths.ts";
 import type { AgentName, RoleResult, RunRole, RunStatus } from "./types.ts";
-import { isResultRole } from "./types.ts";
+import { isRunRole } from "./types.ts";
 import { acquirePidfileLockWait, type PidfileLock } from "./locks.ts";
 
 interface LocatedRun {
@@ -70,7 +70,7 @@ export function defaultMailAgents(now: string): MailAgentDefinition[] {
       id: "codex-implementer",
       address: "orch+codex.implementer@local.orch",
       provider: "codex",
-      roles: ["implementer", "debugger", "rework"],
+      roles: ["implementer"],
       capabilities: ["code-edit", "debug", "tests"],
       trust: "internal",
       auto_invite: true,
@@ -82,7 +82,7 @@ export function defaultMailAgents(now: string): MailAgentDefinition[] {
       id: "claude-reviewer",
       address: "orch+claude.reviewer@local.orch",
       provider: "claude",
-      roles: ["reviewer", "challenger"],
+      roles: ["reviewer"],
       capabilities: ["architecture", "code-review", "long-context"],
       trust: "internal",
       auto_invite: true,
@@ -122,9 +122,23 @@ export function defaultMailAgents(now: string): MailAgentDefinition[] {
       capabilities: ["code-review", "research", "long-context"],
       trust: "internal",
       // Not auto-invited into router followups (keeps gemini out of every review);
-      // cross-review / investigate add it explicitly via defaultAgentIds.
+      // cross-review adds it explicitly via defaultAgentIds.
       auto_invite: false,
       work_mode: "review",
+      provider_session_mode: "ephemeral",
+      updated_at: now,
+    },
+    {
+      id: "omp-researcher",
+      address: "orch+omp.researcher@local.orch",
+      provider: "omp",
+      roles: ["researcher"],
+      capabilities: ["research", "long-context"],
+      trust: "internal",
+      // Like omp-reviewer: not auto-invited (keeps gemini out of every
+      // researcher fan-out); investigate adds it explicitly via defaultAgentIds.
+      auto_invite: false,
+      work_mode: "research",
       provider_session_mode: "ephemeral",
       updated_at: now,
     },
@@ -429,9 +443,8 @@ function mailAgentProvider(agent: MailAgentDefinition): AgentName {
 }
 
 function mailTaskRole(event: TaskRequestedMailEvent): RunRole {
-  const role = event.role as RunRole;
-  if (!isResultRole(role)) throw new CliError(`mail task role cannot start a run: ${event.role}`);
-  return role;
+  if (!isRunRole(event.role)) throw new CliError(`mail task role cannot start a run: ${event.role}`);
+  return event.role;
 }
 
 async function runCreateFromMail(argv: string[], worktree: string): Promise<{ stdout: string; stderr: string; exitCode: number }> {
@@ -651,8 +664,8 @@ export async function mailFanout(args: ParsedArgs, context: MailCliContext, opts
   const bus = new MaildirBus(threadDir, thread, repo.repo_key);
 
   const role = opts.role ?? flagString(args, "role");
-  if (!isResultRole(role as RunRole)) {
-    throw new CliError(`fan-out only supports result-schema roles: implementer, reviewer, verifier (got ${role})`);
+  if (!isRunRole(role)) {
+    throw new CliError(`fan-out only supports result-schema roles: implementer, reviewer, verifier, controller, researcher (got ${role})`);
   }
 
   const cfg = readMailAgentsConfig();

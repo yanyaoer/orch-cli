@@ -1,5 +1,5 @@
 import { closeSync, existsSync, openSync, readFileSync, writeFileSync, writeSync } from "node:fs";
-import { isResultRole, type AgentName, type ResultCoercion, type RunSpec, type RoleResult } from "../src/types.ts";
+import { isRunRole, type AgentName, type ResultCoercion, type RunSpec, type RoleResult } from "../src/types.ts";
 import { fallbackResult, resultSchemaName, validateRoleResult } from "../src/schema.ts";
 import { appendJsonLine, countLines, writeJsonAtomic } from "../src/json.ts";
 import { normalizeNativeText, type NativeEvent } from "../src/native-events.ts";
@@ -28,7 +28,7 @@ export function readSpec(path: string): RunSpec {
 }
 
 export function buildPrompt(spec: RunSpec, provider: string): string {
-  const schemaName = isResultRole(spec.role) ? resultSchemaName(spec.role) : "orch.result/implementer/v1";
+  const schemaName = isRunRole(spec.role) ? resultSchemaName(spec.role) : "orch.result/implementer/v1";
   return [
     `You are running under orch provider driver: ${provider}.`,
     `Run id: ${spec.run_id}`,
@@ -106,7 +106,7 @@ export function buildWorkerEnv(baseEnv: NodeJS.ProcessEnv = process.env): Record
 export const OMP_MODEL_CHAIN: readonly string[] = [
   "google-antigravity/gemini-3.1-pro",
   "zenmux/anthropic/claude-fable-5",
-  "openai-codex/gpt-5.5",
+  "openai-codex/gpt-5.6",
 ];
 
 export function ompModelChain(model: string | null | undefined): { primary: string; fallbacks: string[] } {
@@ -141,8 +141,8 @@ export const CLAUDE_CONTROLLER_ALLOWED_TOOLS = "Bash(orch *),Read,Grep,Glob,LS";
 // deliver plans but never code. dontAsk denies everything off this list headless.
 export const CLAUDE_RESEARCHER_ALLOWED_TOOLS = "Bash(jina *),Bash(tvly *),WebSearch,WebFetch,Read,Grep,Glob,LS";
 
-// Researcher provider/model combos are pinned to the two strongest reasoning
-// stacks: codex on gpt-5.6-sol and claude on fable, both at xhigh effort.
+// Researcher model per provider: codex pins gpt-5.6-sol and claude pins fable,
+// both at xhigh effort; omp rides its normal gemini quota-fallback chain.
 export const CODEX_RESEARCHER_MODEL = "gpt-5.6-sol";
 
 // claude model tier by role: reviewer escalates to opus (deep critique, paired
@@ -178,8 +178,10 @@ export function buildProviderArgv(
   if (spec.role === "controller" && provider !== "claude") {
     throw new Error("controller role only supports claude provider");
   }
-  if (spec.role === "researcher" && provider !== "claude" && provider !== "codex") {
-    throw new Error("researcher role only supports claude and codex providers");
+  // pi is excluded: no strong-reasoning model and no web path. omp researcher
+  // runs the gemini chain with read-only tools (repo-internal research, no web).
+  if (spec.role === "researcher" && provider === "pi") {
+    throw new Error("researcher role only supports claude, codex, and omp providers");
   }
 
   if (provider === "omp") {
@@ -375,7 +377,7 @@ function roleResultFromCandidate(value: unknown, spec: RunSpec): ExtractedResult
   if (normalized) return normalized;
 
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  if (!isResultRole(spec.role)) return null;
+  if (!isRunRole(spec.role)) return null;
 
   const obj = value as Record<string, unknown>;
   const schemaName = resultSchemaName(spec.role);
@@ -538,7 +540,7 @@ function coerceRoleResult(role: RunSpec["role"], obj: Record<string, unknown>, c
 
 function normalizedRoleResult(value: unknown, spec: RunSpec): ExtractedResult | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  if (!isResultRole(spec.role)) return null;
+  if (!isRunRole(spec.role)) return null;
 
   const schemaName = resultSchemaName(spec.role);
   const obj = { ...(value as Record<string, unknown>) };

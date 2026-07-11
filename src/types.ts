@@ -1,14 +1,6 @@
-export type RunRole =
-  | "implementer"
-  | "reviewer"
-  | "verifier"
-  | "controller"
-  | "researcher"
-  | "challenger"
-  | "rework"
-  | "debugger";
-
-export type ResultRole = "implementer" | "reviewer" | "verifier" | "controller" | "researcher";
+// Every run role has a result schema. Rework/debug follow-ups are implementer
+// runs (dispatch with --resume-from and a tag), not separate roles.
+export type RunRole = "implementer" | "reviewer" | "verifier" | "controller" | "researcher";
 
 export type AgentName = "codex" | "claude" | "pi" | "omp";
 
@@ -162,13 +154,10 @@ export interface ResearcherResult {
 
 export type RoleResult = ImplementerResult | ReviewerResult | VerifierResult | ControllerResult | ResearcherResult;
 
-export const writeRoles = new Set<RunRole>([
-  "implementer",
-  "challenger",
-  "rework",
-  "debugger",
-]);
+export const writeRoles = new Set<RunRole>(["implementer"]);
 
-export function isResultRole(role: RunRole): role is ResultRole {
-  return role === "implementer" || role === "reviewer" || role === "verifier" || role === "controller" || role === "researcher";
+// Runtime validator for role strings arriving from CLI flags, mail events, or
+// legacy spec.json files (which may carry retired roles such as debugger).
+export function isRunRole(value: string): value is RunRole {
+  return value === "implementer" || value === "reviewer" || value === "verifier" || value === "controller" || value === "researcher";
 }

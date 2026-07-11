@@ -32,7 +32,7 @@ Install: `curl -fsSL https://raw.githubusercontent.com/yanyaoer/orch-cli/main/in
   from zero; agent/role/mr/worktree are inherited.
 - **omp = oh-my-pi, model-aware with quota fallback** → defaults to
   `google-antigravity/gemini-3.1-pro` and falls back to
-  `zenmux/anthropic/claude-fable-5`, then `openai-codex/gpt-5.5` when the active
+  `zenmux/anthropic/claude-fable-5`, then `openai-codex/gpt-5.6` when the active
   model's quota/rate limit is exhausted (omp-native `retry.fallbackChains` via a
   per-run config overlay). An explicit `--model <ref>` becomes the primary; the
   rest of the chain stays as fallbacks. Runs ephemeral (one-shot) by default.
@@ -48,16 +48,17 @@ Install: `curl -fsSL https://raw.githubusercontent.com/yanyaoer/orch-cli/main/in
   `orch run create --model <ref>` is recorded in `spec.json` and overrides the
   provider model for model-aware drivers such as pi, omp, codex, and claude.
 - **Need a plan/architecture decision, not code? `--role researcher`** →
-  read-only architect + deep-research role, claude/codex only: claude runs
-  fable at xhigh effort (web via jina/tvly CLIs + WebSearch/WebFetch, no
-  Edit/Write), codex defaults to gpt-5.6-sol at xhigh reasoning (native web
-  search — the read-only sandbox blocks shell network). Result schema
+  read-only architect + deep-research role: claude runs fable at xhigh effort
+  (web via jina/tvly CLIs + WebSearch/WebFetch, no Edit/Write), codex defaults
+  to gpt-5.6-sol at xhigh reasoning (native web search — the read-only sandbox
+  blocks shell network), omp rides its gemini chain read-only (repo-internal
+  research, no web); pi is not supported. Result schema
   `orch.result/researcher/v1`: recommendation + alternatives / sources /
   open_questions / risks. `orch fanout --role researcher` fans one question to
   codex-researcher + claude-researcher for a second opinion.
 - **Fan one task across agents (mail-native)** → `orch cross-review`
   (claude+omp review one diff), `orch fanout --role <r>` (generic, any result
-  role), `orch investigate` (read-only research, defaults to omp+claude). These
+  role), `orch investigate` (researcher role, defaults to omp+claude). These
   route through the mail layer: pass `--thread <id>` (it supplies the mr + the
   workspace worktree — **no `--mr` needed**), `--task <file>`, and optionally
   `--to-agent <mail-agent-id>` (repeatable) to override the default roster. Each
@@ -96,6 +97,6 @@ Install: `curl -fsSL https://raw.githubusercontent.com/yanyaoer/orch-cli/main/in
 
 ## Division of labor
 Strong model plans (via handoff-pro); tool-capable workers (codex / pi / gpt-5.5)
-execute; omp (gemini-3.1-pro with quota fallback to claude-fable-5, then gpt-5.5)
+execute; omp (gemini-3.1-pro with quota fallback to claude-fable-5, then gpt-5.6)
 covers review / research; orch orchestrates and keeps all run state auditable
 under XDG_STATE.

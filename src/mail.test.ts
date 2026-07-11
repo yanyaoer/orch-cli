@@ -540,7 +540,7 @@ test("fanout forwards --model to spawned runs and honors --to-agent override", a
   expect(spec.role).toBe("verifier");
 });
 
-test("investigate defaults to omp+claude reviewers and rejects unknown flags", async () => {
+test("investigate defaults to omp+claude researchers and rejects unknown flags", async () => {
   const root = mkdtempSync(join(tmpdir(), "orch-investigate-"));
   const stateHome = join(root, "state");
   const configHome = join(root, "config");
@@ -554,8 +554,8 @@ test("investigate defaults to omp+claude reviewers and rejects unknown flags", a
   const dry = await runOrch(["investigate", "--thread", "research-1", "--task", taskPath, "--worktree", worktree, "--dry-run"], env);
   expect(dry).toMatchObject({ exitCode: 0, stderr: "" });
   const payload = JSON.parse(dry.stdout) as { role: string; agents: Array<{ agent_id: string }> };
-  expect(payload.role).toBe("reviewer");
-  expect(payload.agents.map((agent) => agent.agent_id)).toEqual(["omp-reviewer", "claude-reviewer"]);
+  expect(payload.role).toBe("researcher");
+  expect(payload.agents.map((agent) => agent.agent_id)).toEqual(["omp-researcher", "claude-researcher"]);
 
   // A typo'd flag must fail loudly instead of being silently ignored.
   const typo = await runOrch(["investigate", "--thread", "research-1", "--task", taskPath, "--worktree", worktree, "--modle", "x"], env);
@@ -582,6 +582,7 @@ test("mail submit to router routes default codex claude pi agents", async () => 
     "claude-reviewer",
     "codex-implementer",
     "codex-researcher",
+    "omp-researcher",
     "omp-reviewer",
     "orch-router",
     "pi-verifier",

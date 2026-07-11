@@ -379,11 +379,11 @@ test("buildProviderArgv runs omp with the default model chain and @file prompt",
 test("ompModelChain puts the requested model first and keeps the rest as quota fallbacks", () => {
   expect(ompModelChain(null)).toEqual({
     primary: "google-antigravity/gemini-3.1-pro",
-    fallbacks: ["zenmux/anthropic/claude-fable-5", "openai-codex/gpt-5.5"],
+    fallbacks: ["zenmux/anthropic/claude-fable-5", "openai-codex/gpt-5.6"],
   });
   expect(ompModelChain("zenmux/anthropic/claude-fable-5")).toEqual({
     primary: "zenmux/anthropic/claude-fable-5",
-    fallbacks: ["google-antigravity/gemini-3.1-pro", "openai-codex/gpt-5.5"],
+    fallbacks: ["google-antigravity/gemini-3.1-pro", "openai-codex/gpt-5.6"],
   });
   // A model outside the chain keeps the full chain as fallbacks.
   expect(ompModelChain("openai/gpt-5.5-pro")).toEqual({
@@ -393,8 +393,8 @@ test("ompModelChain puts the requested model first and keeps the rest as quota f
 });
 
 test("ompFallbackConfigYaml renders omp's native retry.fallbackChains overlay", () => {
-  expect(ompFallbackConfigYaml(["zenmux/anthropic/claude-fable-5", "openai-codex/gpt-5.5"])).toBe(
-    ["retry:", "  fallbackChains:", "    default:", "      - zenmux/anthropic/claude-fable-5", "      - openai-codex/gpt-5.5", ""].join(
+  expect(ompFallbackConfigYaml(["zenmux/anthropic/claude-fable-5", "openai-codex/gpt-5.6"])).toBe(
+    ["retry:", "  fallbackChains:", "    default:", "      - zenmux/anthropic/claude-fable-5", "      - openai-codex/gpt-5.6", ""].join(
       "\n",
     ),
   );
@@ -522,11 +522,25 @@ test("buildProviderArgv gives researcher a read-only web-research posture on cla
     "-",
   ]);
 
-  for (const provider of ["pi", "omp"] as const) {
-    expect(() => buildProviderArgv(provider, base, "/run", "/worktree")).toThrow(
-      "researcher role only supports claude and codex providers",
-    );
-  }
+  // omp researcher rides the normal gemini chain with read-only tools (no web).
+  expect(buildProviderArgv("omp", { ...base, provider_session_mode: "ephemeral" }, "/run", "/worktree")).toEqual([
+    "omp",
+    "--model",
+    "google-antigravity/gemini-3.1-pro",
+    "--config",
+    "/run/omp-fallback.yml",
+    "-p",
+    "--mode",
+    "json",
+    "--tools",
+    "read,grep,find,ls",
+    "--no-session",
+    "@/run/prompt.md",
+  ]);
+
+  expect(() => buildProviderArgv("pi", base, "/run", "/worktree")).toThrow(
+    "researcher role only supports claude, codex, and omp providers",
+  );
 });
 
 test("extractResultFromText coerces researcher alias fields and missing arrays", () => {

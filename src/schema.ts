@@ -2,13 +2,12 @@ import type {
   ControllerResult,
   ImplementerResult,
   ResearcherResult,
-  ResultRole,
   RoleResult,
   RunRole,
   ReviewerResult,
   VerifierResult,
 } from "./types.ts";
-import { isResultRole } from "./types.ts";
+import { isRunRole } from "./types.ts";
 
 // TS validation in this file is the canonical result schema.
 export interface ValidationResult {
@@ -104,7 +103,7 @@ function validateFindings(obj: Record<string, unknown>, field: string, errors: s
   });
 }
 
-export function resultSchemaName(role: ResultRole): RoleResult["schema"] {
+export function resultSchemaName(role: RunRole): RoleResult["schema"] {
   if (role === "implementer") return "orch.result/implementer/v1";
   if (role === "reviewer") return "orch.result/reviewer/v1";
   if (role === "controller") return "orch.result/controller/v1";
@@ -113,8 +112,8 @@ export function resultSchemaName(role: ResultRole): RoleResult["schema"] {
 }
 
 export function validateRoleResult(role: RunRole, value: unknown): ValidationResult {
-  if (!isResultRole(role)) {
-    return { ok: false, errors: [`role ${role} has no MVP result schema`] };
+  if (!isRunRole(role)) {
+    return { ok: false, errors: [`role ${role} has no result schema`] };
   }
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return { ok: false, errors: ["result must be an object"] };

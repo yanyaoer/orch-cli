@@ -6,7 +6,13 @@ All notable user-facing changes are recorded here.
 
 ### Features
 
-- New `researcher` result role (architect / deep research): read-only, web-research capable, delivers a plan instead of code. Claude runs `fable` at `xhigh` effort under a `dontAsk` whitelist (`jina`/`tvly` CLIs + WebSearch/WebFetch + read-only repo tools, no Edit/Write); codex defaults to `gpt-5.6-sol` at `xhigh` reasoning with native web search enabled inside the read-only sandbox (which blocks shell network, so web CLIs ride codex's `web_search` tool instead). Claude/codex only; no worktree lock. Result schema `orch.result/researcher/v1`: `verdict`, `summary`, `recommendation`, `alternatives[]`, `sources[]`, `open_questions[]`, `risks[]`. `orch mail agent defaults` now also binds `codex-researcher` + `claude-researcher` (auto-invited), so `orch fanout --role researcher` fans one question across both stacks.
+- New `researcher` result role (architect / deep research): read-only, web-research capable, delivers a plan instead of code. Claude runs `fable` at `xhigh` effort under a `dontAsk` whitelist (`jina`/`tvly` CLIs + WebSearch/WebFetch + read-only repo tools, no Edit/Write); codex defaults to `gpt-5.6-sol` at `xhigh` reasoning with native web search enabled inside the read-only sandbox (which blocks shell network, so web CLIs ride codex's `web_search` tool instead); omp rides its gemini quota-fallback chain with read-only tools (repo-internal research, no web). pi is not supported; no worktree lock. Result schema `orch.result/researcher/v1`: `verdict`, `summary`, `recommendation`, `alternatives[]`, `sources[]`, `open_questions[]`, `risks[]`. `orch mail agent defaults` now also binds `codex-researcher` + `claude-researcher` (auto-invited) and `omp-researcher` (explicit), so `orch fanout --role researcher` fans one question across both strong-reasoning stacks.
+- `orch investigate` now dispatches the `researcher` role (default agents `omp-researcher` + `claude-researcher`): research questions deliver a recommendation instead of being coerced into a reviewer approve/request_changes verdict.
+
+### Changes
+
+- Removed the never-dispatchable `challenger`, `rework`, and `debugger` roles: both the run gate and the mail claim path always rejected them, so they existed only in types, roster bindings, and controller guidance. `implementer` is now the only write role; rework/debug follow-ups are implementer runs dispatched with `--resume-from` and a tag. Run `orch mail agent defaults` to refresh roster bindings.
+- omp quota-fallback chain tail bumped from `openai-codex/gpt-5.5` to `openai-codex/gpt-5.6`.
 
 ## [0.0.7] - 2026-07-07
 

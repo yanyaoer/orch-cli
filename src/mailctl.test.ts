@@ -626,7 +626,7 @@ describe("buildControllerTask", () => {
     expect(task).toContain("do not cap the number of clarification questions");
     expect(task).toContain("confirm the claim with a read-only orch investigate before dispatching an implementer");
     expect(task).toContain("report that instead of fixing an unverified claim");
-    expect(task).toContain("When authoring a debugger-role task");
+    expect(task).toContain("When authoring a debugging task (implementer role");
     expect(task).toContain("red-capable reproduction command");
     expect(task).toContain("result tests[] field BEFORE attempting a fix");
     expect(task).toContain("3-5 ranked falsifiable hypotheses");

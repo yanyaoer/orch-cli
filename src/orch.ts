@@ -17,7 +17,7 @@ import type {
   RunStatus,
   VerifierResult,
 } from "./types.ts";
-import { isResultRole, writeRoles } from "./types.ts";
+import { isRunRole, writeRoles } from "./types.ts";
 import { acquirePidfileLock, acquirePidfileLockWait, isPidAlive, LockHeldError } from "./locks.ts";
 import { randomHex, sha256 } from "./hash.ts";
 import { ensureStateLayout, getRepoIdentity, lockPathForWorktree, mrStateDir, orchStateRoot, type RepoIdentity } from "./paths.ts";
@@ -1057,8 +1057,8 @@ function validateRunAgent(agent: AgentName, _role: RunRole): void {
   if (_role === "controller" && agent !== "claude") {
     throw new CliError("controller role only supports the claude agent");
   }
-  if (_role === "researcher" && agent !== "claude" && agent !== "codex") {
-    throw new CliError("researcher role only supports the claude and codex agents");
+  if (_role === "researcher" && agent === "pi") {
+    throw new CliError("researcher role only supports the claude, codex, and omp agents");
   }
 }
 
@@ -1160,8 +1160,8 @@ async function createRun(args: ParsedArgs): Promise<number> {
   // the old 4h default); keep the long default only for roles that build/test.
   const timeoutSec = Number(flagString(args, "timeout-sec", role === "reviewer" ? "3600" : "14400"));
 
-  if (!isResultRole(role)) {
-    throw new CliError(`P1 only supports result-schema roles: implementer, reviewer, verifier, controller, researcher (got ${role})`);
+  if (!isRunRole(role)) {
+    throw new CliError(`unsupported role: ${role} (valid: implementer, reviewer, verifier, controller, researcher)`);
   }
   validateRunAgent(agent, role);
   if (!Number.isFinite(timeoutSec) || timeoutSec <= 0) throw new CliError("--timeout-sec must be positive");
@@ -1656,12 +1656,14 @@ async function fanout(args: ParsedArgs): Promise<number> {
   return outcome.code;
 }
 
-// investigate: read-only research/analysis, defaults to the gemini + claude reviewers.
+// investigate: read-only research/analysis, defaults to the gemini + claude
+// researchers. Researcher (not reviewer) role: research questions deliver a
+// recommendation, not an approve/request_changes verdict.
 async function investigate(args: ParsedArgs): Promise<number> {
   const outcome = await mailFanout(args, mailFanoutContext(), {
     command: "investigate",
-    role: "reviewer",
-    defaultAgentIds: ["omp-reviewer", "claude-reviewer"],
+    role: "researcher",
+    defaultAgentIds: ["omp-researcher", "claude-researcher"],
   });
   printJson(outcome.payload);
   return outcome.code;
