@@ -82,6 +82,7 @@ import { deployWorker, locateBridgeDir, runChatgptBridge } from "../drivers/chat
 import { runPiDriver } from "../drivers/pi-headless.ts";
 import { runOmpDriver } from "../drivers/omp-headless.ts";
 import { addWorkspace, chatgptBridgeConfigPath, readBridgeConfig, readMailAgentsConfig, readMailControlConfig, readOrchConfig, validateMailControlConfig, writeBridgeConfig } from "./config.ts";
+import { createInterface, type Interface as ReadlineInterface, type ReadLineOptions } from "node:readline";
 import { buildBundle, type BundleOptions } from "./handoff-pro.ts";
 import { mail, mailFanout, type MailCliContext, type MailFanoutOutcome } from "./mail-cli.ts";
 import { fallbackRawReview, planAutoDecision, sanitizeCommentBody, withheldSection } from "./review-auto.ts";
@@ -1705,9 +1706,26 @@ function newPlanTask(mr: string, description: string): string {
     description,
     "",
     "## Deliverable (orch.result/researcher/v1)",
-    "- recommendation: the executable plan — goal, scope, ordered task breakdown",
-    "  (per task: role implementer|reviewer|verifier, a one-paragraph task spec,",
-    "  acceptance checks), grounded in the actual repo (read it first).",
+    "- recommendation: an executable plan grounded in the actual repo (read it",
+    "  first), written as markdown under these exact headings:",
+    "  ## Destination",
+    "  Settle this FIRST because the destination fixes the scope. In 1-2 lines,",
+    '  describe what "done" looks like.',
+    "  ## Out of scope",
+    "  List work consciously ruled out of this effort.",
+    "  ## Tasks (now)",
+    "  Include at least one task, and only tasks that can be specified precisely",
+    "  NOW. For each task, give a kebab-case short name, role",
+    "  (implementer|reviewer|verifier), a one-paragraph spec, and acceptance",
+    "  checks. If nothing can be specified precisely yet, the request is not",
+    "  ready — say so up front and apply the abort/direct-run guidance below.",
+    "  ## Later (not yet specified)",
+    "  Give only coarse-grained notes on work that depends on earlier results and",
+    '  cannot be phrased precisely yet. Never pre-slice it into tasks. The test is:',
+    '  "can you state it precisely now?" (not "can you answer it now?").',
+    "- If the whole request fits in a single worker run, say so up front and",
+    "  recommend that the human abort (`q`) and use `orch run create` directly",
+    "  instead of `orch new`.",
     "- open_questions: numbered questions the human must answer before execution,",
     '  each ending with "— recommended: <your default>". Empty when unambiguous.',
     "- risks / alternatives as applicable.",
@@ -1723,7 +1741,9 @@ function newPlanRevisionTask(answer: string): string {
     answer,
     "",
     "Update the plan (same orch.result/researcher/v1 contract). Keep only the",
-    "open_questions that remain genuinely ambiguous after these answers.",
+    "open_questions that remain genuinely ambiguous after these answers. The",
+    "revised recommendation must keep the same heading structure: Destination /",
+    "Out of scope / Tasks (now) / Later (not yet specified).",
   ].join("\n");
 }
 
@@ -1750,8 +1770,20 @@ function newExecTask(mr: string, worktree: string, plan: string, notes: string[]
     "- Author every task inline via stdin (`--task -` reads the task text from a heredoc):",
     `    orch fanout --thread ${mr} --role <role> --task - <<'EOF' ... EOF`,
     `    orch cross-review --thread ${mr} --task - <<'EOF' ... EOF   (review pass)`,
-    `    orch run create --mr ${mr} --role <role> --agent <codex|claude|pi|omp> --task - <<'EOF' ... EOF`,
-    "    orch run create --resume-from <run_id> --task - <<'EOF' ... EOF   (rework)",
+    `    orch run create --mr ${mr} --role <role> --agent <codex|claude|pi|omp> --tag <name> --task - <<'EOF' ... EOF`,
+    "    orch run create --resume-from <run_id> --tag <name> --task - <<'EOF' ... EOF   (rework)",
+    "- Dispatch only the tasks under `## Tasks (now)` first. Specify items under",
+    "  `## Later (not yet specified)` yourself, in your own controller context,",
+    "  as concrete tasks only after the earlier results land — never dispatch",
+    "  them as-is and never send them back to a researcher.",
+    "- If `## Tasks (now)` is empty, report it as a blocker in your summary",
+    "  instead of looping.",
+    "- Tag every `orch run create` dispatch (including `--resume-from` reworks)",
+    "  with the task's kebab-case short name via `--tag <name>` so",
+    "  overview/events read by name; fanout/cross-review runs auto-tag as",
+    "  `mail-<role>-<agent>`.",
+    "- Inline each task's acceptance checks into the worker task text, and use",
+    "  them as the accept/rework criteria when recording decisions.",
     "- Inline every constraint a worker needs (relevant docs/adr + docs/specs excerpts); workers never see this controller's context.",
     `- After dispatching, loop: orch wait --thread ${mr} -> read orch result --mr ${mr} --run <id> -> record orch decision accept|rework --mr ${mr} --run <id> --reason '...'; repeat until it returns settled.`,
     "- At most 2 rework cycles per task; report the blocker in your summary instead of looping further.",
@@ -1759,23 +1791,54 @@ function newExecTask(mr: string, worktree: string, plan: string, notes: string[]
   ].join("\n");
 }
 
-// Terminal Q&A input: one shared line iterator over stdin (avoids node:readline,
-// whose types clash with Bun's stdin stream).
-async function* stdinLineIterator(): AsyncGenerator<string> {
-  const decoder = new TextDecoder();
-  const reader = Bun.stdin.stream().getReader();
-  let buffer = "";
-  for (;;) {
-    const chunk = await reader.read();
-    if (chunk.done) break;
-    buffer += decoder.decode(chunk.value, { stream: true });
-    let index: number;
-    while ((index = buffer.indexOf("\n")) >= 0) {
-      yield buffer.slice(0, index).replace(/\r$/, "");
-      buffer = buffer.slice(index + 1);
-    }
+// Terminal Q&A input rides node:readline in terminal mode: per-character line
+// editing (CJK/emoji deletes stay atomic, width math is east-asian aware —
+// verified identical to Node v24), emacs keybindings (C-a/C-e/C-w/C-u, arrows),
+// and history across replan rounds. Bun's process.stdin/stderr typings clash
+// with node:readline's stream types; the casts are runtime-safe.
+function newReadline(): ReadlineInterface {
+  return createInterface({ input: process.stdin, output: process.stderr } as unknown as ReadLineOptions);
+}
+
+function newAskLine(rl: ReadlineInterface, promptText: string): Promise<string> {
+  return new Promise((resolveAnswer) => rl.question(promptText, resolveAnswer));
+}
+
+// `e` at the prompt: multi-line answers go through $VISUAL/$EDITOR on a draft
+// file seeded with the open questions (git-commit style; `#` lines stripped).
+// Returns null when the editor exits non-zero (vim `:cq`) — caller re-prompts.
+async function newEditAnswer(mrDir: string, rl: ReadlineInterface, openQuestions: string[]): Promise<string | null> {
+  const draftPath = `${mrDir}/tasks/answer-draft.md`;
+  writeTextAtomic(
+    draftPath,
+    [
+      "# orch new — 多行回答/修改意见。# 开头的行会被忽略;保存退出即提交;清空(或只留注释)=按当前方案执行;:cq 退出=放弃本次回答。",
+      ...openQuestions.map((question, index) => `# Q${index + 1}. ${question.replaceAll("\n", " ")}`),
+      "",
+    ].join("\n"),
+  );
+  const editor = process.env.VISUAL?.trim() || process.env.EDITOR?.trim() || "vi";
+  // Hand the terminal to the editor: drop raw mode while it runs, restore after.
+  rl.pause();
+  if (process.stdin.isTTY) process.stdin.setRawMode(false);
+  const proc = Bun.spawn(["/bin/sh", "-c", `${editor} "$1"`, "orch-new-editor", draftPath], {
+    stdin: "inherit",
+    stdout: "inherit",
+    stderr: "inherit",
+    env: process.env,
+  });
+  const code = await proc.exited;
+  if (process.stdin.isTTY) process.stdin.setRawMode(true);
+  rl.resume();
+  if (code !== 0) {
+    process.stderr.write(`[orch new] editor exited ${code}; 本次回答已丢弃\n`);
+    return null;
   }
-  if (buffer.length > 0) yield buffer;
+  return readFileSync(draftPath, "utf8")
+    .split("\n")
+    .filter((line) => !line.startsWith("#"))
+    .join("\n")
+    .trim();
 }
 
 interface NewRunHandle {
@@ -1900,27 +1963,32 @@ async function newCommand(args: ParsedArgs): Promise<number> {
 
   const notes: string[] = [];
   if (!yes) {
-    const lineSource = stdinLineIterator();
-    for (;;) {
-      process.stderr.write("回车=按当前方案执行 · 输入回答/修改意见=再规划一轮 · q=放弃\n> ");
-      const next = await lineSource.next();
-      const answer = next.done ? "" : next.value.trim();
-      if (answer === "") break;
-      if (answer.toLowerCase() === "q") {
-        process.stderr.write(`[orch new] aborted; plan run(s) kept for audit under mr ${mr}\n`);
-        printJson({ new: mr, worktree, state: "aborted", plan_runs: planRuns });
-        return 1;
+    const rl = newReadline();
+    try {
+      for (;;) {
+        process.stderr.write("回车=按当前方案执行 · 输入回答/修改意见=再规划一轮 · e=编辑器多行回答 · q=放弃\n");
+        const raw = (await newAskLine(rl, "> ")).trim();
+        if (raw.toLowerCase() === "q") {
+          process.stderr.write(`[orch new] aborted; plan run(s) kept for audit under mr ${mr}\n`);
+          printJson({ new: mr, worktree, state: "aborted", plan_runs: planRuns });
+          return 1;
+        }
+        const answer = raw.toLowerCase() === "e" ? await newEditAnswer(mrDir, rl, plan.open_questions) : raw;
+        if (answer === null) continue;
+        if (answer === "") break;
+        notes.push(answer);
+        const revisionPath = `${mrDir}/tasks/plan-round-${notes.length + 1}.md`;
+        writeTextAtomic(revisionPath, newPlanRevisionTask(answer));
+        handle = await newSpawnRunCreate(
+          ["--resume-from", handle.run_id, "--tag", `plan-r${notes.length + 1}`, "--task", revisionPath],
+          worktree,
+        );
+        planRuns.push(handle.run_id);
+        plan = newReadPlanResult(handle, await newWaitRun(handle, "plan"));
+        newRenderPlan(plan);
       }
-      notes.push(answer);
-      const revisionPath = `${mrDir}/tasks/plan-round-${notes.length + 1}.md`;
-      writeTextAtomic(revisionPath, newPlanRevisionTask(answer));
-      handle = await newSpawnRunCreate(
-        ["--resume-from", handle.run_id, "--tag", `plan-r${notes.length + 1}`, "--task", revisionPath],
-        worktree,
-      );
-      planRuns.push(handle.run_id);
-      plan = newReadPlanResult(handle, await newWaitRun(handle, "plan"));
-      newRenderPlan(plan);
+    } finally {
+      rl.close();
     }
   }
 

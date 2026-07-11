@@ -78,12 +78,16 @@ test("orch new --yes plans as researcher then executes as controller in the same
   const runsDir = join(stateHome, "orch", repoKeyFromRemote(remote, worktree), "mrs", "new-x", "runs");
   const planSpec = JSON.parse(readFileSync(join(runsDir, payload.plan_runs[0]!, "spec.json"), "utf8")) as RunSpec;
   expect(planSpec).toMatchObject({ role: "researcher", agent: "claude", provider_session_mode: "fresh_persistent" });
+  expect(planSpec.task_text).toContain("## Destination");
+  expect(planSpec.task_text).toContain("## Later (not yet specified)");
   const execSpec = JSON.parse(readFileSync(join(runsDir, payload.exec_run, "spec.json"), "utf8")) as RunSpec;
   expect(execSpec).toMatchObject({ role: "controller", agent: "claude", provider_session_mode: "resume_exact" });
   // The exec controller resumes the plan session and is taught the inline-task dispatch pattern.
   expect(execSpec.provider_session_id).toBe(planSpec.provider_session_id ?? execSpec.provider_session_id);
   expect(execSpec.task_text).toContain("--task - <<'EOF'");
   expect(execSpec.task_text).toContain("orch wait --thread new-x");
+  expect(execSpec.task_text).toContain("--tag");
+  expect(execSpec.task_text).toContain("## Tasks (now)");
 }, 30_000);
 
 test("orch new without a TTY requires --yes", async () => {
