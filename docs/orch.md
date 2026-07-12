@@ -16,8 +16,8 @@ permissions, model/effort tiers, result schemas — live in the CLI:
   the next run needs attention; `orch verdict --thread <id> --wait` suggests a
   whole-thread outcome.
 - **Start a brand-new task from one sentence** → `orch new '<description>'
-  [--workspace <id>]`: a researcher drafts the plan, you confirm/amend it in the
-  terminal, then a controller session dispatches and drives the work.
+  [--workspace <id>]`: Fable drafts a validated plan, you confirm/amend it, then
+  the resumed controller drives workers; persisted worker decisions determine success.
 - **Implement / review / verify / research one task** → `orch run create`
   (agent = codex|claude|pi|omp, role = implementer|reviewer|verifier|researcher).
   Follow with `orch status` / `orch result`; record `orch decision`, then

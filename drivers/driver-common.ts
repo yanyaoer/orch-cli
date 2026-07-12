@@ -684,6 +684,40 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function fakeResearchValue(spec: RunSpec, field: "RECOMMENDATION" | "OPEN_QUESTIONS"): string | undefined {
+  const revision = spec.tag.startsWith("plan-r") ? process.env[`ORCH_DRIVER_FAKE_RESEARCH_REVISION_${field}`] : undefined;
+  return revision ?? process.env[`ORCH_DRIVER_FAKE_RESEARCH_${field}`];
+}
+
+function fakeResearchQuestions(spec: RunSpec): string[] {
+  const raw = fakeResearchValue(spec, "OPEN_QUESTIONS");
+  if (!raw) return [];
+  const value = JSON.parse(raw) as unknown;
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
+    throw new Error("ORCH_DRIVER_FAKE_RESEARCH[_REVISION]_OPEN_QUESTIONS must be a JSON string array");
+  }
+  return value;
+}
+
+const FAKE_RESEARCH_PLAN = [
+  "## Destination",
+  "Complete one fake worker task.",
+  "",
+  "## Out of scope",
+  "None.",
+  "",
+  "## Tasks (now)",
+  "### fake-task",
+  "- Role: implementer",
+  "- After: none",
+  "- Spec: Execute the fake task without external side effects.",
+  "- Acceptance:",
+  "  - the fake worker reaches done",
+  "",
+  "## Later (not yet specified)",
+  "None.",
+].join("\n");
+
 export async function maybeWriteFakeResult(runDir: string, spec: RunSpec, provider: string): Promise<boolean> {
   if (process.env.ORCH_DRIVER_FAKE_RESULT !== "1") return false;
   const sleepMs = Number(process.env.ORCH_DRIVER_FAKE_SLEEP_MS ?? "0");
@@ -731,10 +765,10 @@ export async function maybeWriteFakeResult(runDir: string, spec: RunSpec, provid
             run_id: spec.run_id,
             verdict: "completed",
             summary: `fake ${provider} research completed`,
-            recommendation: "fake recommendation",
+            recommendation: fakeResearchValue(spec, "RECOMMENDATION") ?? FAKE_RESEARCH_PLAN,
             alternatives: [],
             sources: [],
-            open_questions: [],
+            open_questions: fakeResearchQuestions(spec),
             risks: [],
           }
         : {

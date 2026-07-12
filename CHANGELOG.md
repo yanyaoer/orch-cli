@@ -6,6 +6,8 @@ All notable user-facing changes are recorded here.
 
 ### Changes
 
+- `mailctl sync` now isolates outbound policy failures per report instead of poisoning an entire MR: path-shaped private markers are redacted and revalidated with an audited fingerprint, genuinely unsafe reports are quarantined once while safe siblings continue, and sync-only threads no longer inflate active controller counts. SMTP state now distinguishes exhausted from recipient-superseded records, removes historical dropped markers after successful delivery, and recovers a pending+sent crash window without retransmitting.
+- `orch new` now validates a strict, inspectable Markdown plan contract before execution, resolves recommended defaults into one self-contained final plan, blocks `--yes` when no safe default exists, pins the default planning/resumed-controller model to Fable, and derives completion from persisted worker status/result/decision files. A controller that dispatches nothing or leaves failed, undecided, or closed workers now returns `needs_attention` even if it claims `completed`.
 - pi defaults to `openai-codex/gpt-5.6-sol` at `--thinking xhigh` (no fallback chain; explicit `--model` overrides).
 - omp default rebuilt around `openai-codex/gpt-5.6-sol` at `--thinking=xhigh` (was `google-antigravity/gemini-3.1-pro`): the quota-fallback chain is now gpt-5.6-sol → claude-fable-5 → gemini-3.1-pro, with gemini demoted to the tail because its provider intermittently geo-rejects behind VPNs. An explicit `--model <ref>` still becomes the primary with the rest of the chain as fallbacks.
 

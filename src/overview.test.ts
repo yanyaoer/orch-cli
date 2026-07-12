@@ -85,6 +85,12 @@ function writeDroppedMailctlReply(stateHome: string, name = "reply-1.json"): voi
   writeFileSync(join(dir, name), JSON.stringify({ schema: "orch.mailctl/outbox-email/v1" }), "utf8");
 }
 
+function writeQuarantinedMailctlReply(stateHome: string, name = "reply-q.json"): void {
+  const dir = join(stateHome, "orch", "mail-control", "outbox-email", "quarantined");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, name), JSON.stringify({ schema: "orch.mailctl/outbox-email-quarantine/v1", resolution: null }), "utf8");
+}
+
 function seedMixedMr(stateHome: string): void {
   // done+approve, no decision -> decision accept action
   writeRun(stateHome, REPO, "42", status({ run_id: "r-approve", mr: "42", state: "done", exit_code: 0 }), { verdict: "approve" });
@@ -181,6 +187,25 @@ test("dropped mailctl reply emits one status action", () => {
   expect(overview.actions[0]).toMatchObject({
     kind: "mailctl",
     reason: "mailctl: 1 dropped reply",
+    argv: ["orch", "mailctl", "status"],
+  });
+});
+
+test("a sent marker suppresses a historical dropped mailctl action", () => {
+  const stateHome = makeStateHome();
+  writeDroppedMailctlReply(stateHome);
+  const sentDir = join(stateHome, "orch", "mail-control", "outbox-email", "sent");
+  mkdirSync(sentDir, { recursive: true });
+  writeFileSync(join(sentDir, "reply-1.json"), "{}", "utf8");
+  expect(buildOverview([REPO], false).actions).toEqual([]);
+});
+
+test("unresolved policy quarantine emits one status action", () => {
+  const stateHome = makeStateHome();
+  writeQuarantinedMailctlReply(stateHome);
+  expect(buildOverview([REPO], false).actions[0]).toMatchObject({
+    kind: "mailctl",
+    reason: "mailctl: 1 policy-quarantined reply",
     argv: ["orch", "mailctl", "status"],
   });
 });

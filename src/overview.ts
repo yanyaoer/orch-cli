@@ -210,11 +210,26 @@ function mailctlConsecutiveFailures(): number {
 
 function droppedMailctlReplies(): number {
   const droppedDir = `${mailControlStateDir()}/outbox-email/dropped`;
+  const sentDir = `${mailControlStateDir()}/outbox-email/sent`;
   if (!existsSync(droppedDir)) return 0;
   try {
-    return readdirSync(droppedDir, { withFileTypes: true })
-      .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
-      .length;
+    return readdirSync(droppedDir, { withFileTypes: true }).filter(
+      (entry) => entry.isFile() && entry.name.endsWith(".json") && !existsSync(`${sentDir}/${entry.name}`),
+    ).length;
+  } catch {
+    return 0;
+  }
+}
+
+function quarantinedMailctlReplies(): number {
+  const dir = `${mailControlStateDir()}/outbox-email/quarantined`;
+  if (!existsSync(dir)) return 0;
+  try {
+    return readdirSync(dir, { withFileTypes: true }).filter((entry) => {
+      if (!entry.isFile() || !entry.name.endsWith(".json")) return false;
+      const record = readJsonFile<{ resolution?: unknown } | null>(`${dir}/${entry.name}`, null);
+      return record?.resolution === null;
+    }).length;
   } catch {
     return 0;
   }
@@ -266,6 +281,17 @@ function mailctlHealthAction(): OverviewAction | null {
     return {
       kind: "mailctl",
       reason: `mailctl: ${dropped} dropped ${dropped === 1 ? "reply" : "replies"}`,
+      argv: ["orch", "mailctl", "status"],
+      repo_key: "",
+      mr: "mailctl",
+    };
+  }
+
+  const quarantined = quarantinedMailctlReplies();
+  if (quarantined > 0) {
+    return {
+      kind: "mailctl",
+      reason: `mailctl: ${quarantined} policy-quarantined ${quarantined === 1 ? "reply" : "replies"}`,
       argv: ["orch", "mailctl", "status"],
       repo_key: "",
       mr: "mailctl",

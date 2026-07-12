@@ -39,6 +39,8 @@ import {
   messageMarkerPath,
   normalizeMessageId,
   droppedReplyPath,
+  quarantineReplyPath,
+  supersededReplyPath,
   outboxEmailPendingDir,
   outboxEmailSentDir,
   pendingReplyPath,
@@ -1308,6 +1310,28 @@ describe("mailctlReply outbound policy", () => {
     expect(pendingFiles.length).toBeGreaterThanOrEqual(1);
   });
 
+  it("keeps deferred rate-limited dry-runs write-free", async () => {
+    const { cfg } = setupMailctl({ reports: { policy: "auto", max_per_hour: 1, max_body_bytes: 16_384 } });
+    const transport = new FakeTransport([message(1, "<reply-dry-rate@example.com>")]);
+    const ctx = fakeContext({ cfg, transport });
+    await mailctlPoll(ctx, { reconcile: false });
+    const thread = firstThreadState().thread;
+    await mailctlReply(ctx, { thread, reportKey: "progress:first", body: "first" });
+    const pendingBefore = jsonFiles(outboxEmailPendingDir());
+    const auditBefore = auditRows().length;
+
+    const dry = await mailctlReply(ctx, {
+      thread,
+      reportKey: "progress:dry-rate",
+      body: "preview",
+      dryRun: true,
+      deferOnRateLimit: true,
+    });
+    expect(dry).toMatchObject({ dryRun: true, pending: false, sent: false });
+    expect(jsonFiles(outboxEmailPendingDir())).toEqual(pendingBefore);
+    expect(auditRows()).toHaveLength(auditBefore);
+  });
+
   it("rejects unsafe report keys before sending or touching outbox state", async () => {
     const { cfg } = setupMailctl();
     const transport = new FakeTransport([message(1, "<reply-key-policy@example.com>")]);
@@ -1368,6 +1392,39 @@ describe("ensureSyncThreadState", () => {
     expect(duplicate.root_message_id).toBe(state.root_message_id);
     expect(readFileSync(mailctlThreadStatePath(state.thread), "utf8")).toBe(before);
     expect(transport.sent).toHaveLength(1);
+  });
+
+  it("treats sent as authoritative over historical dropped and excludes sync threads from active controllers", async () => {
+    const { cfg, workspace } = setupMailctl({ notify: { enabled: true, to: "notify@example.com", max_per_hour: 10 } });
+    const ctx = fakeContext({ cfg, transport: new FakeTransport() });
+    const state = await ensureSyncThreadState(ctx, {
+      mr: "effective-state",
+      repoKey: "github.com/acme/orch-1234",
+      workspaceId: "default-ws",
+      workspacePath: workspace,
+      taskText: "safe task",
+      origin: "local",
+    });
+    const sent = readJsonFile<any>(sentReplyPath("sync:effective-state:root"), null);
+    writeJsonAtomic(droppedReplyPath("sync:effective-state:root"), {
+      schema: "orch.mailctl/outbox-email/v1",
+      report_key: "sync:effective-state:root",
+      thread: state.thread,
+      raw: sent.raw,
+      message_id: sent.message_id,
+      attempts: 8,
+      created_at: sent.sent_at,
+      updated_at: sent.sent_at,
+      next_attempt_at: sent.sent_at,
+      last_error: "old failure",
+      dropped_at: sent.sent_at,
+    });
+
+    const status = mailctlStatus(ctx);
+    expect(status.outbound).toMatchObject({ pending: 0, dropped: 0, quarantined: 0 });
+    expect(status.active_threads).toBe(0);
+    expect(status.threads.find((thread) => thread.thread === state.thread)).toMatchObject({ kind: "sync" });
+    expect(existsSync(droppedReplyPath("sync:effective-state:root"))).toBe(false);
   });
 
   it("keeps a CRLF-bearing MR on one Subject header line", async () => {
@@ -1567,6 +1624,38 @@ describe("mailctlSync MR projector", () => {
     expect(decision).toContain("reason: verified");
   });
 
+  it("projects an authoritative result even when status is stale", async () => {
+    const { cfg, workspace } = setupMailctl({ notify: { enabled: true, to: "notify@example.com", max_per_hour: 10 } });
+    const repo = await getRepoIdentity(workspace);
+    writeSyncRun({
+      repoKey: repo.repo_key,
+      mr: "stale-status",
+      runId: "impl-result-first",
+      workspace,
+      state: "running",
+      result: {
+        schema: "orch.result/implementer/v1",
+        run_id: "impl-result-first",
+        verdict: "completed",
+        summary: "durable result",
+        changed_files: [],
+        tests: [],
+        acceptance: [],
+        risks: [],
+      },
+    });
+    const transport = new FakeTransport();
+
+    const projected = await mailctlSync(fakeContext({ cfg, transport }), { execute: true });
+
+    expect(projected.mrs[0]?.report_keys).toEqual([
+      "sync:stale-status:impl-result-first:dispatched",
+      "sync:stale-status:impl-result-first:result",
+    ]);
+    expect(transport.sent).toHaveLength(3);
+    expect(transport.sent[2]).toContain("summary: durable result");
+  });
+
   it("returns a dry-run plan without creating thread or outbox state", async () => {
     const { cfg, workspace } = setupMailctl({ notify: { enabled: true, max_per_hour: 10 } });
     const transport = new FakeTransport();
@@ -1646,11 +1735,14 @@ describe("mailctlSync MR projector", () => {
       workspace: failing.workspace,
       task: "Read /Users/me/.ssh/id_rsa",
     });
-    await expect(mailctlPoll(fakeContext({ cfg: failing.cfg, transport: new FakeTransport() }), { reconcile: false })).resolves.toMatchObject({ skipped: false });
-    // Per-MR isolation: the failure is contained inside sync (sync_mr_failed),
-    // so poll neither throws nor records a whole-sync failure.
-    expect(auditRows().some((row) => row.type === "sync_mr_failed" && row.mr === "13")).toBe(true);
-    expect(stateFiles()).toEqual([]);
+    const failingTransport = new FakeTransport();
+    await expect(mailctlPoll(fakeContext({ cfg: failing.cfg, transport: failingTransport }), { reconcile: false })).resolves.toMatchObject({ skipped: false });
+    // User-authored path examples are redacted and revalidated, not allowed to
+    // poison the whole MR or require a global policy bypass.
+    expect(failingTransport.sent.length).toBeGreaterThanOrEqual(2);
+    expect(failingTransport.sent.join("\n")).not.toContain("/Users/");
+    expect(auditRows().some((row) => row.type === "reply_policy_redacted")).toBe(true);
+    expect(readJsonFile<any>(quarantineReplyPath("sync:13:root"), null)).toMatchObject({ resolution: "redacted" });
   });
 
   it("keeps sync retries inside the hourly cap and threads pending children to the pending dispatched message", async () => {
@@ -1706,12 +1798,18 @@ describe("mailctlSync MR projector", () => {
     writeSyncRun({ repoKey: repo.repo_key, mr: "10", runId: "impl-secret", workspace, task: "token=abcdefghijklmnop" });
     const transport = new FakeTransport();
 
-    const outcome = await mailctlSync(fakeContext({ cfg, transport }), { execute: true });
+    const ctx = fakeContext({ cfg, transport });
+    const outcome = await mailctlSync(ctx, { execute: true });
     expect(outcome.failed).toHaveLength(1);
+    expect(outcome.failed[0]).toMatchObject({ report_key: "sync:10:root", quarantined: true });
     expect(outcome.failed[0]!.error).toContain("secret assignment");
     expect(transport.sent).toEqual([]);
     expect(stateFiles()).toEqual([]);
     expect(jsonFiles(outboxEmailSentDir())).toEqual([]);
+    expect(mailctlStatus(ctx).outbound.quarantined).toBe(1);
+    const auditCount = auditRows().filter((row) => row.type === "reply_policy_quarantined").length;
+    await mailctlSync(ctx, { execute: true });
+    expect(auditRows().filter((row) => row.type === "reply_policy_quarantined")).toHaveLength(auditCount);
   });
 });
 
@@ -1927,6 +2025,41 @@ describe("mailctl attachments hardening", () => {
 });
 
 describe("mailctl sync crash recovery and recipient hygiene", () => {
+  it("finalizes pending+sent crash state without retransmitting", async () => {
+    const { cfg, workspace } = setupMailctl({ notify: { enabled: true, to: "notify@example.com", max_per_hour: 20 } });
+    const transport = new FakeTransport();
+    transport.failSend = true;
+    const now = Date.parse("2026-07-04T08:56:28.000Z");
+    const firstCtx = fakeContext({ cfg, transport, now });
+    await ensureSyncThreadState(firstCtx, {
+      mr: "pending-sent",
+      repoKey: "github.com/acme/orch-1234",
+      workspaceId: "default-ws",
+      workspacePath: workspace,
+      taskText: "safe task",
+      origin: "local",
+    });
+    const key = "sync:pending-sent:root";
+    const pending = readJsonFile<any>(pendingReplyPath(key), null);
+    expect(pending).not.toBeNull();
+    writeJsonAtomic(sentReplyPath(key), {
+      schema: "orch.mailctl/outbox-email-sent/v1",
+      report_key: key,
+      thread: pending.thread,
+      to: pending.to,
+      message_id: pending.message_id,
+      sent_at: new Date(now + 30_000).toISOString(),
+      raw: pending.raw,
+      attempts: pending.attempts,
+    });
+
+    transport.failSend = false;
+    await mailctlPoll(fakeContext({ cfg, transport, now: now + 2 * 60_000 }), { sync: false });
+    expect(transport.sent).toEqual([]);
+    expect(existsSync(pendingReplyPath(key))).toBe(false);
+    expect(auditRows().some((row) => row.type === "reply_retry_finalized_sent" && row.report_key === key)).toBe(true);
+  });
+
   it("re-sends a lost root before children when thread state exists without a root marker", async () => {
     const { cfg, workspace } = setupMailctl({ notify: { enabled: true, to: "notify@example.com", max_per_hour: 20 } });
     const transport = new FakeTransport();
@@ -2009,10 +2142,11 @@ describe("mailctl sync crash recovery and recipient hygiene", () => {
     const changed: MailControlConfig = { ...cfg, notify: { ...cfg.notify, to: "new@example.com" } };
     await mailctlPoll(fakeContext({ cfg: changed, transport, now: now + 2 * 60_000 }), { sync: true });
 
-    expect(readJsonFile<any>(droppedReplyPath("sync:66:root"), null)).toMatchObject({
+    expect(readJsonFile<any>(supersededReplyPath("sync:66:root"), null)).toMatchObject({
       last_error: "notify recipient changed or revoked since queueing",
     });
-    expect(auditRows().some((row) => row.type === "reply_retry_dropped_stale_recipient")).toBe(true);
+    expect(auditRows().some((row) => row.type === "reply_retry_superseded_recipient")).toBe(true);
+    expect(mailctlStatus(fakeContext({ cfg: changed, transport, now: now + 2 * 60_000 })).outbound).toMatchObject({ dropped: 0, superseded: 1 });
     expect(transport.sent.length).toBeGreaterThanOrEqual(3);
     for (const raw of transport.sent) {
       expect(messageHeader(raw, "To")).toBe("new@example.com");
@@ -2146,7 +2280,7 @@ describe("mailctl sync round-2 review fixes", () => {
     transport.failSend = false;
     await mailctlPoll(fakeContext({ cfg, transport, now: now + 2 * 60_000 }), { sync: true });
 
-    expect(readJsonFile<any>(droppedReplyPath("sync:99:root"), null)).toMatchObject({
+    expect(readJsonFile<any>(supersededReplyPath("sync:99:root"), null)).toMatchObject({
       last_error: "notify recipient changed or revoked since queueing",
     });
     expect(transport.sent.length).toBeGreaterThanOrEqual(1);
@@ -2229,44 +2363,46 @@ describe("mailctl sync free-text path templating", () => {
   });
 });
 
-describe("mailctl sync per-MR failure isolation", () => {
-  it("audits and skips an MR whose body trips the leak guard without blocking other MRs", async () => {
+describe("mailctl sync per-report policy isolation", () => {
+  it("quarantines one unsafe report once while safe siblings continue", async () => {
     const { cfg, workspace } = setupMailctl({ notify: { enabled: true, to: "notify@example.com", max_per_hour: 20 } });
     delete process.env.ORCH_MAILCTL_ALLOW_PRIVATE;
     const transport = new FakeTransport();
     const repo = await getRepoIdentity(workspace);
-    const result = (runId: string) => ({
-      schema: "orch.result/implementer/v1",
-      run_id: runId,
-      verdict: "completed",
-      summary: "done",
-      changed_files: [],
-      tests: [],
-      acceptance: [],
-      risks: [],
-    });
-    // This task text discusses the leak marker itself as a literal — it cannot
-    // be path-templated away and must trip the guard.
     writeSyncRun({
       repoKey: repo.repo_key,
       mr: "poison",
       runId: "impl-poison",
       workspace,
-      taskFile: "Documentation task: the guard rejects `/Users/...` and `/home/...` markers.",
+      taskFile: "Safe implementation task.",
       state: "done",
-      result: result("impl-poison"),
+      result: {
+        schema: "orch.result/implementer/v1",
+        run_id: "impl-poison",
+        verdict: "completed",
+        summary: "token=abcdefghijklmnop",
+        changed_files: [],
+        tests: [],
+        acceptance: [],
+        risks: [],
+      },
+      decision: { verdict: "accept", run_id: "impl-poison", reason: "safe decision", ts: "2026-07-04T09:00:00.000Z" },
     });
-    writeSyncRun({ repoKey: repo.repo_key, mr: "21", runId: "impl-clean", workspace, state: "done", result: result("impl-clean") });
 
-    const outcome = await mailctlSync(fakeContext({ cfg, transport }), { execute: true });
-    // The clean MR flows; the poisoned MR is isolated, audited, and reported.
-    expect(outcome.sent).toContain("sync:21:root");
-    expect(outcome.failed).toHaveLength(1);
-    expect(outcome.failed[0]).toMatchObject({ mr: "poison" });
-    expect(outcome.failed[0]!.error).toContain("private local path marker");
-    expect(auditRows().some((row) => row.type === "sync_mr_failed" && row.mr === "poison")).toBe(true);
-    for (const raw of transport.sent) {
-      expect(raw).not.toContain("impl-poison");
-    }
+    const ctx = fakeContext({ cfg, transport });
+    const first = await mailctlSync(ctx, { execute: true });
+    expect(first.sent).toEqual(expect.arrayContaining(["sync:poison:root", "sync:poison:impl-poison:dispatched", "sync:poison:impl-poison:decision"]));
+    expect(first.sent).not.toContain("sync:poison:impl-poison:result");
+    expect(first.failed).toEqual([
+      expect.objectContaining({ mr: "poison", report_key: "sync:poison:impl-poison:result", quarantined: true }),
+    ]);
+    expect(readJsonFile<any>(quarantineReplyPath("sync:poison:impl-poison:result"), null)).toMatchObject({ resolution: null });
+    const auditCount = auditRows().filter((row) => row.type === "reply_policy_quarantined").length;
+
+    const second = await mailctlSync(ctx, { execute: true });
+    expect(second.failed).toEqual([
+      expect.objectContaining({ report_key: "sync:poison:impl-poison:result", quarantined: true }),
+    ]);
+    expect(auditRows().filter((row) => row.type === "reply_policy_quarantined")).toHaveLength(auditCount);
   });
 });
