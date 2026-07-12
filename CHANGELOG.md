@@ -2,6 +2,12 @@
 
 All notable user-facing changes are recorded here.
 
+## [Unreleased]
+
+### Changes
+
+- omp default rebuilt around `openai-codex/gpt-5.6-sol` at `--thinking=xhigh` (was `google-antigravity/gemini-3.1-pro`): the quota-fallback chain is now gpt-5.6-sol → claude-fable-5 → gemini-3.1-pro, with gemini demoted to the tail because its provider intermittently geo-rejects behind VPNs. An explicit `--model <ref>` still becomes the primary with the rest of the chain as fallbacks.
+
 ## [0.0.8] - 2026-07-12
 
 ### Features

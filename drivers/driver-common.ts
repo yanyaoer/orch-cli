@@ -103,11 +103,15 @@ export function buildWorkerEnv(baseEnv: NodeJS.ProcessEnv = process.env): Record
 // recovery consumes it — `retry.modelFallback` (on by default) permits the
 // switch — advancing to the next model when the provider reports
 // quota/rate-limit exhaustion.
+// Primary is gpt-5.6-sol at xhigh thinking; gemini sits at the tail because
+// its provider intermittently geo-rejects behind the corporate VPN.
 export const OMP_MODEL_CHAIN: readonly string[] = [
-  "google-antigravity/gemini-3.1-pro",
+  "openai-codex/gpt-5.6-sol",
   "zenmux/anthropic/claude-fable-5",
-  "openai-codex/gpt-5.6",
+  "google-antigravity/gemini-3.1-pro",
 ];
+
+export const OMP_THINKING = "--thinking=xhigh";
 
 export function ompModelChain(model: string | null | undefined): { primary: string; fallbacks: string[] } {
   const primary = model ?? OMP_MODEL_CHAIN[0]!;
@@ -142,11 +146,12 @@ export const CLAUDE_CONTROLLER_ALLOWED_TOOLS = "Bash(orch *),Read,Grep,Glob,LS";
 export const CLAUDE_RESEARCHER_ALLOWED_TOOLS = "Bash(jina *),Bash(tvly *),WebSearch,WebFetch,Read,Grep,Glob,LS";
 
 // Researcher model per provider: codex pins gpt-5.6-sol and claude pins fable,
-// both at xhigh effort; omp rides its normal gemini quota-fallback chain.
+// both at xhigh effort; omp rides its default quota-fallback chain
+// (gpt-5.6-sol primary at xhigh thinking).
 export const CODEX_RESEARCHER_MODEL = "gpt-5.6-sol";
 
 // claude model tier by role: reviewer escalates to opus (deep critique, paired
-// with omp's gemini-3.1-pro as a distinct model family in cross-review);
+// with omp's gpt-5.6-sol as a distinct model family in cross-review);
 // researcher escalates further to fable (deep research/architecture);
 // implementer/verifier stay on the claude CLI's default model (sonnet) and only dial --effort.
 const CLAUDE_ROLE_MODEL: Partial<Record<RunSpec["role"], string>> = {
@@ -179,14 +184,14 @@ export function buildProviderArgv(
     throw new Error("controller role only supports claude provider");
   }
   // pi is excluded: no strong-reasoning model and no web path. omp researcher
-  // runs the gemini chain with read-only tools (repo-internal research, no web).
+  // runs the default chain with read-only tools (repo-internal research, no web).
   if (spec.role === "researcher" && provider === "pi") {
     throw new Error("researcher role only supports claude, codex, and omp providers");
   }
 
   if (provider === "omp") {
     const { primary, fallbacks } = ompModelChain(spec.model);
-    const argv = ["omp", "--model", primary];
+    const argv = ["omp", "--model", primary, OMP_THINKING];
     // The quota fallback chain rides a per-run config overlay written by
     // runProviderDriver before spawn (omp native retry.fallbackChains).
     if (fallbacks.length > 0) argv.push("--config", ompFallbackConfigPath(runDir));
