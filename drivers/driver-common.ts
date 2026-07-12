@@ -113,6 +113,10 @@ export const OMP_MODEL_CHAIN: readonly string[] = [
 
 export const OMP_THINKING = "--thinking=xhigh";
 
+// pi default mirrors omp's primary: gpt-5.6-sol at xhigh thinking. pi has no
+// quota-fallback chain; an explicit --model overrides the default.
+export const PI_DEFAULT_MODEL = "openai-codex/gpt-5.6-sol";
+
 export function ompModelChain(model: string | null | undefined): { primary: string; fallbacks: string[] } {
   const primary = model ?? OMP_MODEL_CHAIN[0]!;
   return { primary, fallbacks: OMP_MODEL_CHAIN.filter((entry) => entry !== primary) };
@@ -265,8 +269,7 @@ export function buildProviderArgv(
     return argv;
   }
 
-  const argv = ["pi"];
-  if (spec.model) argv.push("--model", spec.model);
+  const argv = ["pi", "--model", spec.model ?? PI_DEFAULT_MODEL, "--thinking", "xhigh"];
   argv.push("-p", "--mode", "json");
   if (readOnly) argv.push("--tools", "read,grep,find,ls");
   if (spec.provider_session_mode === "ephemeral") {

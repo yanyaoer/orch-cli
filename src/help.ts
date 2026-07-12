@@ -75,6 +75,8 @@ export function runCreateHelp(): string {
     "                            and falls back to zenmux/anthropic/claude-fable-5 then",
     "                            google-antigravity/gemini-3.1-pro when the active model's",
     "                            quota/rate limit is exhausted",
+    "                            pi also defaults to openai-codex/gpt-5.6-sol at xhigh thinking",
+    "                            (no fallback chain); --model overrides either driver",
     "  Read-only roles are sandboxed per provider: reviewer launches the worker without",
     "  write access (claude plan mode / codex read-only / pi and omp read tools).",
     "  Controller is Claude-only and launches with an allowed-tool whitelist for",

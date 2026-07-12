@@ -229,7 +229,7 @@ console.log(JSON.stringify({ type: "result", result: JSON.stringify(result(runId
   const pi = `#!/usr/bin/env bun
 ${common}
 const args = Bun.argv.slice(2);
-const expected = ["-p", "--mode", "json", "--no-session"];
+const expected = ["--model", "openai-codex/gpt-5.6-sol", "--thinking", "xhigh", "-p", "--mode", "json", "--no-session"];
 if (JSON.stringify(args) !== JSON.stringify(expected)) {
   console.error("unexpected pi argv: " + JSON.stringify(args));
   process.exit(13);
@@ -600,6 +600,8 @@ test("run create dry-run passes explicit model to the pi provider plan", async (
     "pi",
     "--model",
     model,
+    "--thinking",
+    "xhigh",
     "-p",
     "--mode",
     "json",

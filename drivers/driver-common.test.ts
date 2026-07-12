@@ -194,6 +194,10 @@ test("buildProviderArgv keeps defaults fresh and only resumes exact sessions", (
   ]);
   expect(buildProviderArgv("pi", { ...base, provider_session_mode: "ephemeral" }, "/run", "/worktree")).toEqual([
     "pi",
+    "--model",
+    "openai-codex/gpt-5.6-sol",
+    "--thinking",
+    "xhigh",
     "-p",
     "--mode",
     "json",
@@ -244,7 +248,7 @@ test("buildProviderArgv keeps defaults fresh and only resumes exact sessions", (
       "/run",
       "/worktree",
     ),
-  ).toEqual(["pi", "-p", "--mode", "json", "--session-id", "pi-session"]);
+  ).toEqual(["pi", "--model", "openai-codex/gpt-5.6-sol", "--thinking", "xhigh", "-p", "--mode", "json", "--session-id", "pi-session"]);
 });
 
 test("buildProviderArgv passes explicit model overrides to supporting providers", () => {
@@ -255,6 +259,8 @@ test("buildProviderArgv passes explicit model overrides to supporting providers"
     "pi",
     "--model",
     model,
+    "--thinking",
+    "xhigh",
     "-p",
     "--mode",
     "json",
@@ -440,6 +446,10 @@ test("buildProviderArgv matches read-only posture to the reviewer role per provi
   // pi reviewer is restricted to read-only tools.
   expect(buildProviderArgv("pi", { ...base, provider_session_mode: "ephemeral" }, "/run", "/worktree")).toEqual([
     "pi",
+    "--model",
+    "openai-codex/gpt-5.6-sol",
+    "--thinking",
+    "xhigh",
     "-p",
     "--mode",
     "json",
