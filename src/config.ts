@@ -1,6 +1,7 @@
 import { chmodSync, mkdirSync, realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { readJsonFile, writeJsonAtomic } from "./json.ts";
+import type { AgentName, RunRole } from "./types.ts";
 
 export interface BridgeWorker {
   name: string;
@@ -30,6 +31,9 @@ export interface OrchWorkspace {
 export interface OrchConfig {
   version: 1;
   workspaces: Record<string, OrchWorkspace>;
+  // Per-role default agents: `orch run create` falls back to these when
+  // --agent is omitted. Recommended profile: implementer -> pi (see README).
+  defaults?: { agents?: Partial<Record<RunRole, AgentName>> };
 }
 
 export interface MailAgentDefinition {

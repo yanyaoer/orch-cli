@@ -40,6 +40,16 @@ Shipped on `main` (v0.0.8, see [CHANGELOG.md](CHANGELOG.md)):
 - Permissions match the role: the read-only `reviewer` role launches each provider without write access (claude plan mode, codex `--sandbox read-only`, pi and omp read-only tools). `verifier` and write roles keep write-capable access.
 - claude model/effort match the role too: `reviewer` runs `--model opus --effort high`; `implementer` stays on the default model at `--effort medium`; `verifier` stays on the default model at `--effort low`.
 - `orch run create --model <ref>` records a provider model override in `spec.json` and passes it through to model-aware drivers such as pi, omp, codex, and claude.
+- Recommended default profile (`~/.config/orch/config.json`): set `defaults.agents.implementer` to `pi`, so `orch run create --role implementer` works without `--agent` and the mail roster auto-invites `pi-implementer`. In a same-model harness pilot (SWE-bench Verified subset, gpt-5.6-sol frozen across codex/omp/pi), resolve rates were indistinguishable while pi used ~45% of omp's and ~56% of codex's cache-read traffic — the cheapest implementer at equal quality:
+
+```json
+{
+  "version": 1,
+  "workspaces": {},
+  "defaults": { "agents": { "implementer": "pi" } }
+}
+```
+
 - `omp` (oh-my-pi) defaults to `openai-codex/gpt-5.6-sol` at `--thinking=xhigh` and falls back to `zenmux/anthropic/claude-fable-5`, then `google-antigravity/gemini-3.1-pro` when the active model's quota/rate limit is exhausted; an explicit `--model <ref>` becomes the primary and the rest of the chain stays as fallbacks.
 - `orch chatgpt-bridge` deploys a Cloudflare Worker (no tunnel) and connects ChatGPT (Developer Mode, e.g. `gpt-5.5-pro`) to a read-only view of the worktree.
 - Role result schemas exist for `implementer`, `reviewer`, `verifier`, `researcher` (read-only plan-not-code research, `orch.result/researcher/v1`), and `controller` (the `orch mailctl` mail controller; claude-only, orchestrate-not-edit).

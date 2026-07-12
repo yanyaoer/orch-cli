@@ -67,13 +67,29 @@ export function defaultMailAgents(now: string): MailAgentDefinition[] {
       updated_at: now,
     },
     {
+      id: "pi-implementer",
+      address: "orch+pi.implementer@local.orch",
+      provider: "pi",
+      roles: ["implementer"],
+      capabilities: ["code-edit", "debug", "tests"],
+      trust: "internal",
+      // Default implementer: the harness pilot (orch-bench/REPORT.md) showed
+      // equal resolve rates at roughly half omp's cache traffic and 56% of
+      // codex's, at the same frozen model.
+      auto_invite: true,
+      work_mode: "implement",
+      provider_session_mode: "fresh_persistent",
+      updated_at: now,
+    },
+    {
       id: "codex-implementer",
       address: "orch+codex.implementer@local.orch",
       provider: "codex",
       roles: ["implementer"],
       capabilities: ["code-edit", "debug", "tests"],
       trust: "internal",
-      auto_invite: true,
+      // Kept for explicit --to-agent use; pi-implementer is the auto-invited default.
+      auto_invite: false,
       work_mode: "implement",
       provider_session_mode: "fresh_persistent",
       updated_at: now,

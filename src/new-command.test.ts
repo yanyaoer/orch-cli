@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { sha256 } from "./hash.ts";
@@ -217,4 +217,39 @@ test("run create --task - reads the task text from stdin", async () => {
   );
   expect(empty.exitCode).not.toBe(0);
   expect(empty.stderr).toContain("--task - received empty stdin");
+});
+
+test("run create falls back to config.json defaults.agents when --agent is omitted", async () => {
+  const root = tempDir();
+  const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
+  await initRepo(worktree, "git@github.com:example/repo.git");
+  const configHome = join(root, "config");
+  mkdirSync(join(configHome, "orch"), { recursive: true });
+  writeFileSync(
+    join(configHome, "orch", "config.json"),
+    JSON.stringify({ version: 1, workspaces: {}, defaults: { agents: { implementer: "pi" } } }),
+  );
+  const env = { XDG_STATE_HOME: join(root, "state"), XDG_CONFIG_HOME: configHome };
+
+  const dry = await runOrch(
+    ["run", "create", "--mr", "88", "--role", "implementer", "--worktree", worktree, "--dry-run", "--json"],
+    env,
+  );
+  expect(dry.exitCode).toBe(0);
+  expect(JSON.parse(dry.stdout)).toMatchObject({ agent: "pi" });
+
+  // Explicit --agent still wins over the configured default.
+  const explicit = await runOrch(
+    ["run", "create", "--mr", "88", "--role", "implementer", "--agent", "codex", "--worktree", worktree, "--dry-run", "--json"],
+    env,
+  );
+  expect(JSON.parse(explicit.stdout)).toMatchObject({ agent: "codex" });
+
+  // A role without a configured default keeps the required-flag error.
+  const missing = await runOrch(
+    ["run", "create", "--mr", "88", "--role", "reviewer", "--worktree", worktree, "--dry-run"],
+    env,
+  );
+  expect(missing.exitCode).not.toBe(0);
+  expect(missing.stderr).toContain("missing --agent");
 });
