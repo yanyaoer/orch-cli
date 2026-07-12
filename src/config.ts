@@ -63,6 +63,7 @@ export interface MailControlConfig {
   require_auth_results: boolean;
   controller: { agent: "claude"; model: string | null; timeout_sec: number; max_spawns_per_hour: number };
   reports: { policy: "auto" | "always" | "never"; max_per_hour: number; max_body_bytes: number };
+  notify: { enabled: boolean; to?: string; max_per_hour: number; since?: string };
 }
 
 const DEFAULT_MAIL_CONTROL_CONFIG: MailControlConfig = {
@@ -78,6 +79,7 @@ const DEFAULT_MAIL_CONTROL_CONFIG: MailControlConfig = {
   require_auth_results: true,
   controller: { agent: "claude", model: null, timeout_sec: 1800, max_spawns_per_hour: 6 },
   reports: { policy: "auto", max_per_hour: 4, max_body_bytes: 16384 },
+  notify: { enabled: false, max_per_hour: 30 },
 };
 
 export function configHome(): string {
@@ -128,7 +130,12 @@ export function writeMailAgentsConfig(cfg: MailAgentsConfig): void {
 }
 
 export function readMailControlConfig(): MailControlConfig {
-  return readJsonFile<MailControlConfig>(mailControlConfigPath(), DEFAULT_MAIL_CONTROL_CONFIG);
+  const cfg = readJsonFile<Partial<MailControlConfig> | null>(mailControlConfigPath(), null);
+  if (!cfg) return { ...DEFAULT_MAIL_CONTROL_CONFIG, notify: { ...DEFAULT_MAIL_CONTROL_CONFIG.notify } };
+  let notify = cfg.notify as unknown;
+  if (notify === null || notify === undefined) notify = { ...DEFAULT_MAIL_CONTROL_CONFIG.notify };
+  else if (typeof notify === "object" && !Array.isArray(notify)) notify = { ...DEFAULT_MAIL_CONTROL_CONFIG.notify, ...notify };
+  return { ...cfg, notify } as MailControlConfig;
 }
 
 export function writeMailControlConfig(cfg: MailControlConfig): void {
@@ -194,6 +201,24 @@ export function validateMailControlConfig(cfg: MailControlConfig): void {
   }
   assertPositiveFiniteNumber(cfg.reports.max_per_hour, "reports.max_per_hour");
   assertPositiveFiniteNumber(cfg.reports.max_body_bytes, "reports.max_body_bytes");
+
+  assertObject(cfg.notify, "notify");
+  if (typeof cfg.notify.enabled !== "boolean") {
+    throw new Error("mail control notify.enabled must be a boolean");
+  }
+  if (cfg.notify.to !== undefined) {
+    const to = cfg.notify.to;
+    const at = to.indexOf("@");
+    // Exactly one bare addr-spec: a comma/semicolon-separated list would fan
+    // the progress email out to every listed address via the To header.
+    if (!to || to !== to.toLowerCase() || /[<>,;\s]/.test(to) || at <= 0 || at !== to.lastIndexOf("@") || at === to.length - 1) {
+      throw new Error("mail control notify.to must be a single lower-cased bare address when set");
+    }
+  }
+  assertPositiveFiniteNumber(cfg.notify.max_per_hour, "notify.max_per_hour");
+  if (cfg.notify.since !== undefined && (typeof cfg.notify.since !== "string" || !Number.isFinite(Date.parse(cfg.notify.since)))) {
+    throw new Error("mail control notify.since must be an ISO-8601 timestamp when set");
+  }
 }
 
 export async function resolveMailPassword(cfg: MailControlConfig): Promise<string> {

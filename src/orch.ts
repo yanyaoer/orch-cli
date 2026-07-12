@@ -97,6 +97,7 @@ import {
   mailctlPoll,
   mailctlReply,
   mailctlStatus,
+  mailctlSync,
   mailctlWatch,
   renderMailctlAttachments,
   renderMailctlGuidance,
@@ -1528,9 +1529,32 @@ export async function mailctl(args: ParsedArgs, context: MailCliContext): Promis
       assertKnownFlags(args, "mailctl poll", ["json", "dry-run"]);
       const dryRun = flagBool(args, "dry-run");
       const ctx = mailctlContext(context, dryRun ? dryRunMailTransport() : undefined);
-      const result = await mailctlPoll(ctx, { reconcile: !dryRun });
+      const result = await mailctlPoll(ctx, { reconcile: !dryRun, sync: !dryRun });
       if (flagBool(args, "json")) printJson(result);
       else process.stdout.write(pollSummary(result, dryRun));
+      return 0;
+    }
+
+    if (mode === "sync") {
+      assertKnownFlags(args, "mailctl sync", ["mr", "execute", "json"]);
+      const result = await mailctlSync(mailctlContext(context), {
+        mr: args.flags.has("mr") ? flagString(args, "mr") : undefined,
+        execute: flagBool(args, "execute"),
+      });
+      if (flagBool(args, "json")) printJson({ mailctl: "sync", ...result });
+      else {
+        const reportKeys = result.mrs.flatMap((mr) => mr.report_keys);
+        const roots = result.mrs.filter((mr) => mr.create_root).map((mr) => mr.mr);
+        process.stdout.write(
+          [
+            `mailctl sync${result.dry_run ? " dry-run" : ""}: skipped=${result.skipped}`,
+            `would_create_roots: ${roots.join(", ") || "none"}`,
+            `report_keys: ${reportKeys.join(", ") || "none"}`,
+            `sent: ${result.sent.length}`,
+            `pending: ${result.pending.length}`,
+          ].join("\n") + "\n",
+        );
+      }
       return 0;
     }
 
@@ -1627,7 +1651,7 @@ export async function mailctl(args: ParsedArgs, context: MailCliContext): Promis
     throw new CliError(error instanceof Error ? error.message : String(error));
   }
 
-  process.stderr.write("usage: orch mailctl init|poll|watch|status|reply|ack|guidance|attachments|attachment [flags]\n");
+  process.stderr.write("usage: orch mailctl init|poll|watch|status|sync|reply|ack|guidance|attachments|attachment [flags]\n");
   return 2;
 }
 

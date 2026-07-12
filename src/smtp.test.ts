@@ -134,4 +134,24 @@ describe("buildReplyMessage", () => {
     expect(reply.raw).toContain("References: <root@example.com> <last@Example.COM>\r\n");
     expect(reply.raw.slice(reply.raw.indexOf("\r\n\r\n") + 4).startsWith("[orch:progress:abc]\r\n\r\ndone")).toBe(true);
   });
+
+  it("builds a root message without reply headers and strips CRLF from its subject", () => {
+    const root = buildReplyMessage({
+      from: "orch@example.com",
+      to: "owner@example.com",
+      subject: "[orch][42\r\nBcc: attacker@example.com] sync",
+      reportKey: "sync:42:root",
+      body: "root body",
+      inReplyTo: "<ignored@example.com>",
+      references: ["<ignored@example.com>"],
+      messageId: "<root@orch.example>",
+      date: new Date("2026-07-04T06:00:00.000Z"),
+      root: true,
+    });
+    expect(root.raw).toContain("Subject: [orch][42 Bcc: attacker@example.com] sync\r\n");
+    expect(root.raw).not.toContain("Subject: Re:");
+    expect(root.raw).not.toContain("In-Reply-To:");
+    expect(root.raw).not.toContain("References:");
+    expect(root.raw).not.toContain("\r\nBcc:");
+  });
 });

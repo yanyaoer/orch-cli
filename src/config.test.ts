@@ -48,6 +48,7 @@ function validMailControlConfig(): MailControlConfig {
     require_auth_results: true,
     controller: { agent: "claude", model: null, timeout_sec: 1800, max_spawns_per_hour: 6 },
     reports: { policy: "auto", max_per_hour: 4, max_body_bytes: 16384 },
+    notify: { enabled: false, max_per_hour: 30 },
   };
 }
 
@@ -182,6 +183,49 @@ test("mail control config round-trips with 0600 permissions", () => {
   }
 });
 
+test("mail control config fills the notify default for legacy files", () => {
+  const prev = process.env.XDG_CONFIG_HOME;
+  process.env.XDG_CONFIG_HOME = tempDir();
+  try {
+    const legacy = validMailControlConfig() as Partial<MailControlConfig>;
+    delete legacy.notify;
+    mkdirSync(dirname(mailControlConfigPath()), { recursive: true });
+    writeFileSync(mailControlConfigPath(), JSON.stringify(legacy));
+
+    const loaded = readMailControlConfig();
+    expect(loaded.notify).toEqual({ enabled: false, max_per_hour: 30 });
+    expect(() => validateMailControlConfig(loaded)).not.toThrow();
+  } finally {
+    if (prev === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = prev;
+  }
+});
+
+test("mail control config fills missing fields in partial notify objects", () => {
+  const prev = process.env.XDG_CONFIG_HOME;
+  process.env.XDG_CONFIG_HOME = tempDir();
+  try {
+    const partial = { ...validMailControlConfig(), notify: { enabled: true } };
+    mkdirSync(dirname(mailControlConfigPath()), { recursive: true });
+    writeFileSync(mailControlConfigPath(), JSON.stringify(partial));
+
+    const loaded = readMailControlConfig();
+    expect(loaded.notify).toEqual({ enabled: true, max_per_hour: 30 });
+    expect(() => validateMailControlConfig(loaded)).not.toThrow();
+
+    writeFileSync(mailControlConfigPath(), JSON.stringify({ ...validMailControlConfig(), notify: { max_per_hour: 7 } }));
+    const loadedWithoutEnabled = readMailControlConfig();
+    expect(loadedWithoutEnabled.notify).toEqual({ enabled: false, max_per_hour: 7 });
+    expect(() => validateMailControlConfig(loadedWithoutEnabled)).not.toThrow();
+
+    writeFileSync(mailControlConfigPath(), JSON.stringify({ ...validMailControlConfig(), notify: "invalid" }));
+    expect(() => validateMailControlConfig(readMailControlConfig())).toThrow(/notify.*object/);
+  } finally {
+    if (prev === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = prev;
+  }
+});
+
 test("mail control config validation rejects invalid required fields", () => {
   const missing = validMailControlConfig() as Partial<MailControlConfig>;
   delete missing.workspace;
@@ -221,6 +265,15 @@ test("mail control config validation rejects invalid required fields", () => {
       reports: { policy: "sometimes" as MailControlConfig["reports"]["policy"], max_per_hour: 4, max_body_bytes: 16384 },
     }),
   ).toThrow(/reports\.policy/);
+  for (const to of ["Owner@example.com", "owner @example.com", "<owner@example.com>"]) {
+    expect(() => validateMailControlConfig({ ...validMailControlConfig(), notify: { enabled: true, to, max_per_hour: 30 } })).toThrow(/notify\.to/);
+  }
+  expect(() =>
+    validateMailControlConfig({ ...validMailControlConfig(), notify: { enabled: "yes" as unknown as boolean, max_per_hour: 30 } }),
+  ).toThrow(/notify\.enabled/);
+  for (const max_per_hour of [0, -1, Number.NaN]) {
+    expect(() => validateMailControlConfig({ ...validMailControlConfig(), notify: { enabled: true, max_per_hour } })).toThrow(/notify\.max_per_hour/);
+  }
 });
 
 test("resolveMailPassword prefers password_cmd argv without shell evaluation", async () => {
@@ -248,5 +301,16 @@ test("orch config records project workspaces by id", () => {
   } finally {
     if (prev === undefined) delete process.env.XDG_CONFIG_HOME;
     else process.env.XDG_CONFIG_HOME = prev;
+  }
+});
+
+test("mail control notify.to must be a single lower-cased bare address", () => {
+  const withTo = (to: string): MailControlConfig => ({
+    ...validMailControlConfig(),
+    notify: { enabled: true, to, max_per_hour: 5 },
+  });
+  expect(() => validateMailControlConfig(withTo("owner@example.com"))).not.toThrow();
+  for (const bad of ["a@x.com,c@evil.com", "a@x.com;c@evil.com", "nodomain", "a@@x.com", "a@", "@x.com", "Owner@example.com"]) {
+    expect(() => validateMailControlConfig(withTo(bad))).toThrow("single lower-cased bare address");
   }
 });

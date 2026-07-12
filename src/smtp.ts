@@ -52,6 +52,7 @@ export interface BuildReplyMessageOptions {
   messageId?: string;
   messageIdDomain?: string;
   date?: Date;
+  root?: boolean;
 }
 
 function stripCrlf(value: string): string {
@@ -237,13 +238,15 @@ export function buildReplyMessage(options: BuildReplyMessageOptions): { raw: str
   const headers = [
     `From: ${stripCrlf(options.from)}`,
     `To: ${stripCrlf(options.to)}`,
-    `Subject: ${replySubject(options.subject)}`,
+    `Subject: ${options.root ? stripCrlf(options.subject) || "(no subject)" : replySubject(options.subject)}`,
     `Date: ${(options.date ?? new Date()).toUTCString()}`,
     `Message-ID: ${normalizeMessageId(messageId)}`,
   ];
-  if (options.inReplyTo) headers.push(`In-Reply-To: ${normalizeMessageId(options.inReplyTo)}`);
-  const references = dedupeReferences(options.references ?? [], options.inReplyTo);
-  if (references.length > 0) headers.push(`References: ${references.join(" ")}`);
+  if (!options.root) {
+    if (options.inReplyTo) headers.push(`In-Reply-To: ${normalizeMessageId(options.inReplyTo)}`);
+    const references = dedupeReferences(options.references ?? [], options.inReplyTo);
+    if (references.length > 0) headers.push(`References: ${references.join(" ")}`);
+  }
   headers.push("MIME-Version: 1.0");
   headers.push("Content-Type: text/plain; charset=utf-8");
   headers.push("Content-Transfer-Encoding: 8bit");

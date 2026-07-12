@@ -30,10 +30,10 @@ import {
 } from "./mime.ts";
 import { ImapClient, filterNewUids, planUidScan } from "./imap.ts";
 import { isTerminal, looksStale, collectMrRuns } from "./overview.ts";
-import { getRepoIdentity, mailControlStateDir, mrStateDir, statePathSegment } from "./paths.ts";
+import { getRepoIdentity, mailControlStateDir, mrStateDir, orchStateRoot, statePathSegment } from "./paths.ts";
 import { assertNoPrivateLeak } from "./leak.ts";
 import { buildReplyMessage, submitSmtpMessage } from "./smtp.ts";
-import type { RunStatus } from "./types.ts";
+import type { RunSpec, RunStatus } from "./types.ts";
 import { assertKnownFlags, CliError, collectFlags, flagBool, flagNumber, flagString, type ParsedArgs } from "./cli.ts";
 
 export interface MailCursor {
@@ -146,6 +146,7 @@ export type PollFault = "publish-before-marker" | "attention-before-marker" | "m
 export interface PollOptions {
   fault?: PollFault;
   reconcile?: boolean;
+  sync?: boolean;
 }
 
 export interface ReplyOptions {
@@ -153,6 +154,31 @@ export interface ReplyOptions {
   reportKey: string;
   body: string;
   dryRun?: boolean;
+  root?: boolean;
+  messageId?: string;
+  inReplyTo?: string | null;
+  references?: string[];
+  deferOnRateLimit?: boolean;
+}
+
+export interface SyncOptions {
+  mr?: string;
+  execute?: boolean;
+}
+
+export interface SyncMrPlan {
+  mr: string;
+  create_root: boolean;
+  report_keys: string[];
+}
+
+export interface SyncResult {
+  dry_run: boolean;
+  skipped: boolean;
+  repo_key: string;
+  mrs: SyncMrPlan[];
+  sent: string[];
+  pending: string[];
 }
 
 export interface WatchOptions {
@@ -246,7 +272,7 @@ interface ControllerGeneration {
   payload: unknown;
 }
 
-interface MailctlThreadState {
+export interface MailctlThreadState {
   schema: "orch.mailctl/thread/v1";
   thread: string;
   threadId: string;
@@ -333,6 +359,9 @@ interface PendingReplyRecord {
   schema: "orch.mailctl/outbox-email/v1";
   report_key: string;
   thread: string;
+  // Recipient the raw message was serialized for; sync retries compare it
+  // against the CURRENT notify recipient and drop the record on mismatch.
+  to?: string;
   body: string;
   raw: string;
   message_id: string;
@@ -354,6 +383,10 @@ export function ingestLockPath(): string {
 
 export function watchLockPath(): string {
   return `${mailControlStateDir()}/watch.lock`;
+}
+
+export function mailctlSyncLockPath(): string {
+  return `${mailControlStateDir()}/mailctl-sync.lock`;
 }
 
 export function cursorPath(): string {
@@ -826,6 +859,7 @@ export function mailctlInit(args: ParsedArgs): InitResult {
       max_per_hour: optionalPositiveNumber(args, "max-reports-per-hour") ?? 4,
       max_body_bytes: optionalPositiveNumber(args, "max-body-bytes") ?? 16384,
     },
+    notify: { enabled: false, max_per_hour: 30 },
   };
   try {
     validateMailControlConfig(cfg);
@@ -1940,6 +1974,17 @@ export async function mailctlPoll(ctx: MailctlContext, opts: PollOptions = {}): 
     try {
       const result = await mailctlPollUnlocked(ctx, opts);
       if (opts.reconcile !== false) result.reconciled = await mailctlReconcileUnlocked(ctx);
+      if (ctx.config.notify.enabled && opts.sync !== false) {
+        try {
+          await mailctlSync(ctx, { execute: true });
+        } catch (error) {
+          try {
+            appendAudit("sync_failed", { error: errorMessage(error), ts: nowIso(ctx) });
+          } catch {
+            // Projector failures, including audit failures, never break poll.
+          }
+        }
+      }
       return result;
     } catch (error) {
       recordMailctlPollFailure(ctx, error);
@@ -2250,15 +2295,15 @@ function reportFileName(reportKey: string): string {
   return `${statePathSegment(reportKey, "report")}-${sha12(reportKey)}.json`;
 }
 
-function pendingReplyPath(reportKey: string): string {
+export function pendingReplyPath(reportKey: string): string {
   return `${outboxEmailPendingDir()}/${reportFileName(reportKey)}`;
 }
 
-function sentReplyPath(reportKey: string): string {
+export function sentReplyPath(reportKey: string): string {
   return `${outboxEmailSentDir()}/${reportFileName(reportKey)}`;
 }
 
-function droppedReplyPath(reportKey: string): string {
+export function droppedReplyPath(reportKey: string): string {
   return `${outboxEmailDroppedDir()}/${reportFileName(reportKey)}`;
 }
 
@@ -2266,15 +2311,15 @@ function assertMailReplyPolicy(ctx: MailctlContext, body: string): void {
   if (Buffer.byteLength(body, "utf8") > ctx.config.reports.max_body_bytes) {
     throw new Error(`mail reply body exceeds max_body_bytes (${ctx.config.reports.max_body_bytes})`);
   }
-  if (process.env.ORCH_MAILCTL_ALLOW_PRIVATE === "1") return;
-
-  const previousMirrorAllow = process.env.ORCH_MIRROR_ALLOW_PRIVATE;
-  try {
-    delete process.env.ORCH_MIRROR_ALLOW_PRIVATE;
-    assertNoPrivateLeak(body);
-  } finally {
-    if (previousMirrorAllow === undefined) delete process.env.ORCH_MIRROR_ALLOW_PRIVATE;
-    else process.env.ORCH_MIRROR_ALLOW_PRIVATE = previousMirrorAllow;
+  if (process.env.ORCH_MAILCTL_ALLOW_PRIVATE !== "1") {
+    const previousMirrorAllow = process.env.ORCH_MIRROR_ALLOW_PRIVATE;
+    try {
+      delete process.env.ORCH_MIRROR_ALLOW_PRIVATE;
+      assertNoPrivateLeak(body);
+    } finally {
+      if (previousMirrorAllow === undefined) delete process.env.ORCH_MIRROR_ALLOW_PRIVATE;
+      else process.env.ORCH_MIRROR_ALLOW_PRIVATE = previousMirrorAllow;
+    }
   }
 
   const secretPatterns: Array<[RegExp, string]> = [
@@ -2288,8 +2333,8 @@ function assertMailReplyPolicy(ctx: MailctlContext, body: string): void {
 }
 
 function assertSafeReportKey(reportKey: string): void {
-  if (!/^(?:progress|settled|reply):[A-Za-z0-9:._-]+$/.test(reportKey)) {
-    throw new Error("mail reply report key must be progress:<run_id>, settled:<gen>, or reply:<msg_sha> using only [A-Za-z0-9:._-]");
+  if (!/^(?:progress|settled|reply|sync):[A-Za-z0-9:._-]+$/.test(reportKey)) {
+    throw new Error("mail reply report key must use a progress:, settled:, reply:, or sync: prefix and only [A-Za-z0-9:._-]");
   }
 }
 
@@ -2297,11 +2342,82 @@ function replyWireBody(reportKey: string, body: string): string {
   return `[orch:${reportKey}]\n\n${body}`.replace(/\s+$/g, "");
 }
 
-function sentInLastHour(nowMs: number): number {
+function pathUnder(path: string, prefix: string): string | null {
+  if (path === prefix) return "";
+  return path.startsWith(`${prefix}/`) ? path.slice(prefix.length) : null;
+}
+
+function syncPathTemplate(path: string, workspaceId: string, workspacePath: string): string {
+  const stateSuffix = pathUnder(path, orchStateRoot());
+  if (stateSuffix !== null) return `$ORCH_STATE${stateSuffix}`;
+  const workspaceSuffix = pathUnder(path, workspacePath);
+  if (workspaceSuffix !== null) return `$WORKSPACE${workspaceSuffix} (id: ${workspaceId})`;
+  const home = process.env.HOME;
+  const homeSuffix = home ? pathUnder(path, home) : null;
+  return homeSuffix !== null ? `~${homeSuffix}` : path;
+}
+
+function truncateSyncBody(ctx: MailctlContext, reportKey: string, body: string, fullContentPath: string): string {
+  if (Buffer.byteLength(replyWireBody(reportKey, body), "utf8") <= ctx.config.reports.max_body_bytes) return body;
+  const tail = `\n\ntruncated; full content: ${fullContentPath}`;
+  const available =
+    ctx.config.reports.max_body_bytes -
+    Buffer.byteLength(replyWireBody(reportKey, ""), "utf8") -
+    Buffer.byteLength(tail, "utf8");
+  if (available < 0) {
+    // max_body_bytes smaller than the truncation note itself (pathological
+    // config): degrade to a clamped note instead of throwing — this runs in
+    // dry-run/plan projection AND ahead of the execute-time policy check, so
+    // shrink until the WIRE body fits. (A max smaller than the bare
+    // `[orch:<key>]` prefix itself still fails the policy check downstream.)
+    let note = tail.trimStart();
+    while (note && Buffer.byteLength(replyWireBody(reportKey, note), "utf8") > ctx.config.reports.max_body_bytes) {
+      note = note.slice(0, -1);
+    }
+    return note;
+  }
+  let prefix = Buffer.from(body, "utf8").subarray(0, available).toString("utf8").replace(/\uFFFD$/g, "");
+  while (prefix && Buffer.byteLength(replyWireBody(reportKey, `${prefix}${tail}`), "utf8") > ctx.config.reports.max_body_bytes) {
+    prefix = prefix.slice(0, -1);
+  }
+  return `${prefix.replace(/\s+$/g, "")}${tail}`;
+}
+
+function sentInLastHour(nowMs: number, sync: boolean): number {
   const cutoff = nowMs - 60 * 60 * 1000;
   return safeJsonFiles(outboxEmailSentDir())
-    .map((path) => readJsonFile<{ sent_at?: unknown } | null>(path, null))
-    .filter((record) => typeof record?.sent_at === "string" && Date.parse(record.sent_at) >= cutoff).length;
+    .map((path) => readJsonFile<{ report_key?: unknown; sent_at?: unknown } | null>(path, null))
+    .filter(
+      (record) =>
+        typeof record?.report_key === "string" &&
+        record.report_key.startsWith("sync:") === sync &&
+        typeof record.sent_at === "string" &&
+        Date.parse(record.sent_at) >= cutoff,
+    ).length;
+}
+
+function syncRetryAfterRateLimit(ctx: MailctlContext): string {
+  const cutoff = ctx.now() - 60 * 60 * 1000;
+  const oldest = safeJsonFiles(outboxEmailSentDir())
+    .map((path) => readJsonFile<{ report_key?: unknown; sent_at?: unknown } | null>(path, null))
+    .filter(
+      (record): record is { report_key: string; sent_at: string } =>
+        typeof record?.report_key === "string" &&
+        record.report_key.startsWith("sync:") &&
+        typeof record.sent_at === "string" &&
+        Date.parse(record.sent_at) >= cutoff,
+    )
+    .map((record) => Date.parse(record.sent_at))
+    .sort((a, b) => a - b)[0];
+  return new Date(Math.max(ctx.now() + 1000, (oldest ?? ctx.now()) + 60 * 60 * 1000 + 1)).toISOString();
+}
+
+function assertReplyRateLimit(ctx: MailctlContext, reportKey: string): void {
+  const sync = reportKey.startsWith("sync:");
+  const maxPerHour = sync ? ctx.config.notify.max_per_hour : ctx.config.reports.max_per_hour;
+  if (sentInLastHour(ctx.now(), sync) >= maxPerHour) {
+    throw new Error(`mail reply rate limit exceeded (${maxPerHour}/hour)`);
+  }
 }
 
 function replyMessageId(ctx: MailctlContext, thread: string, reportKey: string): string {
@@ -2339,6 +2455,7 @@ function writeSentReply(record: PendingReplyRecord, ts: string): string {
     schema: "orch.mailctl/outbox-email-sent/v1",
     report_key: record.report_key,
     thread: record.thread,
+    to: record.to,
     message_id: record.message_id,
     sent_at: ts,
     raw: record.raw,
@@ -2350,35 +2467,518 @@ function writeSentReply(record: PendingReplyRecord, ts: string): string {
 
 async function retryDuePendingReplies(ctx: MailctlContext): Promise<number> {
   let retried = 0;
-  for (const path of safeJsonFiles(outboxEmailPendingDir())) {
-    const record = readJsonFile<PendingReplyRecord | null>(path, null);
-    if (!record || record.schema !== "orch.mailctl/outbox-email/v1") continue;
-    if (record.dropped_at || Date.parse(record.next_attempt_at) > ctx.now()) continue;
-    if (record.attempts >= 8) {
-      writeJsonAtomic(droppedReplyPath(record.report_key), { ...record, dropped_at: nowIso(ctx), updated_at: nowIso(ctx) });
-      rmSync(path, { force: true });
-      continue;
+  // Sync sends happen on two paths (new projections under the sync lock,
+  // retries here under the ingest flow); the hourly budget check-and-send
+  // must be single-flight, so sync records are only retried while holding
+  // the same sync lock. Non-blocking: if a sync runs concurrently, its
+  // retries simply wait for the next poll.
+  let syncLock: ReturnType<typeof acquirePidfileLock> | null | undefined;
+  try {
+    for (const path of safeJsonFiles(outboxEmailPendingDir())) {
+      const record = readJsonFile<PendingReplyRecord | null>(path, null);
+      if (!record || record.schema !== "orch.mailctl/outbox-email/v1") continue;
+      if (record.dropped_at || Date.parse(record.next_attempt_at) > ctx.now()) continue;
+      if (record.report_key.startsWith("sync:")) {
+        if (syncLock === undefined) {
+          try {
+            syncLock = acquirePidfileLock(mailctlSyncLockPath(), process.pid, "mailctl-sync-retry");
+          } catch (error) {
+            if (!(error instanceof LockHeldError)) throw error;
+            syncLock = null;
+          }
+        }
+        if (syncLock === null) continue;
+        // Queued sync mail was serialized for the recipient configured at
+        // queue time; a changed or revoked notify target must never keep
+        // receiving progress mail. Drop the record — the report key frees up
+        // and the next sync re-queues the update for the current recipient.
+        const currentTo = syncRecipient(ctx);
+        if (!currentTo || record.to !== currentTo) {
+          writeJsonAtomic(droppedReplyPath(record.report_key), {
+            ...record,
+            dropped_at: nowIso(ctx),
+            updated_at: nowIso(ctx),
+            last_error: "notify recipient changed or revoked since queueing",
+          });
+          rmSync(path, { force: true });
+          appendAudit("reply_retry_dropped_stale_recipient", { report_key: record.report_key, ts: nowIso(ctx) });
+          continue;
+        }
+        if (sentInLastHour(ctx.now(), true) >= ctx.config.notify.max_per_hour) {
+          const next = syncRetryAfterRateLimit(ctx);
+          writeJsonAtomic(path, {
+            ...record,
+            updated_at: nowIso(ctx),
+            next_attempt_at: next,
+            last_error: `mail reply rate limit exceeded (${ctx.config.notify.max_per_hour}/hour)`,
+          });
+          appendAudit("reply_retry_deferred", { report_key: record.report_key, next_attempt_at: next, ts: nowIso(ctx) });
+          continue;
+        }
+      }
+      if (record.attempts >= 8) {
+        writeJsonAtomic(droppedReplyPath(record.report_key), { ...record, dropped_at: nowIso(ctx), updated_at: nowIso(ctx) });
+        rmSync(path, { force: true });
+        continue;
+      }
+      try {
+        await ctx.transport.sendReply(record.raw);
+        const sentPath = writeSentReply(record, nowIso(ctx));
+        rmSync(path, { force: true });
+        appendAudit("reply_retry_sent", { report_key: record.report_key, sent_path: sentPath, ts: nowIso(ctx) });
+        retried += 1;
+      } catch (error) {
+        const attempts = record.attempts + 1;
+        const next = new Date(ctx.now() + nextBackoffMs(attempts)).toISOString();
+        writeJsonAtomic(path, {
+          ...record,
+          attempts,
+          updated_at: nowIso(ctx),
+          next_attempt_at: next,
+          last_error: errorMessage(error),
+        });
+        appendAudit("reply_retry_failed", { report_key: record.report_key, attempts, error: errorMessage(error), ts: nowIso(ctx) });
+      }
     }
-    try {
-      await ctx.transport.sendReply(record.raw);
-      const sentPath = writeSentReply(record, nowIso(ctx));
-      rmSync(path, { force: true });
-      appendAudit("reply_retry_sent", { report_key: record.report_key, sent_path: sentPath, ts: nowIso(ctx) });
-      retried += 1;
-    } catch (error) {
-      const attempts = record.attempts + 1;
-      const next = new Date(ctx.now() + nextBackoffMs(attempts)).toISOString();
-      writeJsonAtomic(path, {
-        ...record,
-        attempts,
-        updated_at: nowIso(ctx),
-        next_attempt_at: next,
-        last_error: errorMessage(error),
-      });
-      appendAudit("reply_retry_failed", { report_key: record.report_key, attempts, error: errorMessage(error), ts: nowIso(ctx) });
-    }
+  } finally {
+    syncLock?.release();
   }
   return retried;
+}
+
+interface SyncUpdate {
+  reportKey: string;
+  runId: string;
+  kind: "dispatched" | "result" | "decision";
+  body: string;
+}
+
+interface SyncMrProjection {
+  mr: string;
+  taskText: string;
+  taskRunDir: string;
+  updates: SyncUpdate[];
+}
+
+function syncThreadName(mr: string): string {
+  const base = `sync-${statePathSegment(mr, "mr")}`;
+  return base.length <= 128 ? base : `${base.slice(0, 115)}-${sha12(mr)}`;
+}
+
+// Sync (MR progress) mail must always target the CURRENT notify recipient:
+// thread state and queued raw messages may carry an address that has since
+// been changed or revoked in the config.
+function syncRecipient(ctx: MailctlContext): string | null {
+  return ctx.config.notify.to ?? ctx.config.allowed_senders[0] ?? null;
+}
+
+function syncRootReportKey(mr: string): string {
+  return `sync:${statePathSegment(mr, "mr")}:root`;
+}
+
+// Per-recipient root delivery key: after a notify.to rotation the current
+// recipient gets the anchoring root exactly once, without disturbing the
+// primary root marker (audit history stays intact).
+function syncRootRotationKey(mr: string, to: string): string {
+  return `${syncRootReportKey(mr)}:${sha12(to)}`;
+}
+
+// Recipient a root outbox record was serialized for; null when no record
+// exists or it predates the `to` field.
+function rootRecipient(reportKey: string): string | null {
+  const record =
+    readJsonFile<{ to?: unknown } | null>(sentReplyPath(reportKey), null) ??
+    readJsonFile<{ to?: unknown } | null>(pendingReplyPath(reportKey), null);
+  return typeof record?.to === "string" ? record.to : null;
+}
+
+function syncRunReportKey(mr: string, runId: string, kind: SyncUpdate["kind"]): string {
+  return `sync:${statePathSegment(mr, "mr")}:${statePathSegment(runId, "run")}:${kind}`;
+}
+
+function syncTaskText(runDir: string, spec: RunSpec | null): string {
+  const taskPath = `${runDir}/task.md`;
+  return existsSync(taskPath) ? readFileSync(taskPath, "utf8") : (spec?.task_text ?? "");
+}
+
+function valueString(record: Record<string, unknown>, key: string, fallback = "none"): string {
+  const value = record[key];
+  return typeof value === "string" && value ? value : fallback;
+}
+
+function arrayCount(record: Record<string, unknown>, key: string): number | null {
+  const value = record[key];
+  return Array.isArray(value) ? value.length : null;
+}
+
+function syncResultDetails(result: Record<string, unknown>): string[] {
+  const keysBySchema: Record<string, string[]> = {
+    "orch.result/implementer/v1": ["changed_files", "tests", "acceptance", "risks"],
+    "orch.result/reviewer/v1": ["blocking_findings", "non_blocking_findings", "suggested_tests"],
+    "orch.result/verifier/v1": ["commands", "acceptance"],
+    "orch.result/controller/v1": ["actions"],
+    "orch.result/researcher/v1": ["alternatives", "sources", "open_questions", "risks"],
+  };
+  const schema = valueString(result, "schema", "unknown");
+  const lines = (keysBySchema[schema] ?? [])
+    .map((key) => [key, arrayCount(result, key)] as const)
+    .filter((entry): entry is readonly [string, number] => entry[1] !== null)
+    .map(([key, count]) => `${key}_count: ${count}`);
+  for (const key of ["reviews_run_id", "verifies_run_id"]) {
+    if (typeof result[key] === "string") lines.push(`${key}: ${result[key]}`);
+  }
+  return lines;
+}
+
+function dispatchedSyncBody(args: {
+  taskText: string;
+  spec: RunSpec;
+  workspaceId: string;
+  workspacePath: string;
+  runDir: string;
+}): string {
+  const workspace = syncPathTemplate(args.workspacePath, args.workspaceId, args.workspacePath);
+  return [
+    args.taskText,
+    "",
+    `role: ${args.spec.role}`,
+    `agent: ${args.spec.agent}`,
+    `provider: ${args.spec.agent}`,
+    `model: ${args.spec.model ?? "default"}`,
+    `workspace_id: ${args.workspaceId}`,
+    `workspace_path: ${workspace}`,
+    `worktree: ${syncPathTemplate(args.spec.worktree, args.workspaceId, args.workspacePath)}`,
+    `base_sha: ${args.spec.base_sha}`,
+    `run_state_dir: ${syncPathTemplate(args.runDir, args.workspaceId, args.workspacePath)}`,
+  ].join("\n");
+}
+
+function resultSyncBody(result: Record<string, unknown>, runDir: string): string {
+  return [
+    `verdict: ${valueString(result, "verdict", "unknown")}`,
+    `summary: ${valueString(result, "summary")}`,
+    ...syncResultDetails(result),
+    `evidence: ${runDir}`,
+  ].join("\n");
+}
+
+function decisionSyncBody(decision: Record<string, unknown>): string {
+  return [
+    `verdict: ${valueString(decision, "verdict", "unknown")}`,
+    `reason: ${valueString(decision, "reason")}`,
+    `ts: ${valueString(decision, "ts", "unknown")}`,
+  ].join("\n");
+}
+
+function listSyncMrs(repoKey: string, onlyMr?: string): string[] {
+  if (onlyMr !== undefined) {
+    const mr = statePathSegment(onlyMr, "mr");
+    return existsSync(mrStateDir(repoKey, mr)) ? [mr] : [];
+  }
+  const root = `${orchStateRoot()}/${repoKey}/mrs`;
+  if (!existsSync(root)) return [];
+  return readdirSync(root, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name)
+    .sort();
+}
+
+function buildSyncProjection(
+  ctx: MailctlContext,
+  args: { repoKey: string; workspaceId: string; workspacePath: string; mr: string },
+): SyncMrProjection | null {
+  const runsRoot = `${mrStateDir(args.repoKey, args.mr)}/runs`;
+  if (!existsSync(runsRoot)) return null;
+  const runs = readdirSync(runsRoot, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => {
+      const runDir = `${runsRoot}/${entry.name}`;
+      const spec = readJsonFile<RunSpec | null>(`${runDir}/spec.json`, null);
+      const status = readJsonFile<RunStatus | null>(`${runDir}/status.json`, null);
+      const taskText = syncTaskText(runDir, spec);
+      return { runId: entry.name, runDir, spec, status, taskText };
+    })
+    .sort(
+      (a, b) =>
+        (a.spec?.created_at ?? a.status?.started_at ?? "").localeCompare(b.spec?.created_at ?? b.status?.started_at ?? "") ||
+        a.runId.localeCompare(b.runId),
+    );
+  const taskRun = runs.find((run) => run.taskText);
+  const updates: SyncUpdate[] = [];
+  // First-enable cutoff: runs created before notify.since never backfill.
+  // Without it, enabling notify on a repo with history floods the mailbox
+  // with rate-limited catch-up mail for long-finished work.
+  const sinceMs = ctx.config.notify.since ? Date.parse(ctx.config.notify.since) : null;
+  for (const run of runs) {
+    if (sinceMs !== null) {
+      const createdAt = Date.parse(run.spec?.created_at ?? run.status?.started_at ?? "");
+      if (!Number.isFinite(createdAt) || createdAt < sinceMs) continue;
+    }
+    const displayRunDir = syncPathTemplate(run.runDir, args.workspaceId, args.workspacePath);
+    if (run.spec) {
+      const reportKey = syncRunReportKey(args.mr, run.runId, "dispatched");
+      updates.push({
+        reportKey,
+        runId: run.runId,
+        kind: "dispatched",
+        body: pendingOrSent(reportKey)
+          ? ""
+          : truncateSyncBody(
+              ctx,
+              reportKey,
+              dispatchedSyncBody({
+                taskText: run.taskText,
+                spec: run.spec,
+                workspaceId: args.workspaceId,
+                workspacePath: args.workspacePath,
+                runDir: run.runDir,
+              }),
+              displayRunDir,
+            ),
+      });
+    }
+    if (
+      run.status &&
+      (run.status.state === "done" || run.status.state === "failed" || run.status.state === "timeout") &&
+      existsSync(`${run.runDir}/result.json`)
+    ) {
+      const result = readJsonFile<Record<string, unknown> | null>(`${run.runDir}/result.json`, null);
+      if (result) {
+        const reportKey = syncRunReportKey(args.mr, run.runId, "result");
+        updates.push({
+          reportKey,
+          runId: run.runId,
+          kind: "result",
+          body: pendingOrSent(reportKey)
+            ? ""
+            : truncateSyncBody(ctx, reportKey, resultSyncBody(result, displayRunDir), displayRunDir),
+        });
+      }
+    }
+    if (existsSync(`${run.runDir}/decision.json`)) {
+      const decision = readJsonFile<Record<string, unknown> | null>(`${run.runDir}/decision.json`, null);
+      if (decision) {
+        const reportKey = syncRunReportKey(args.mr, run.runId, "decision");
+        updates.push({
+          reportKey,
+          runId: run.runId,
+          kind: "decision",
+          body: pendingOrSent(reportKey) ? "" : truncateSyncBody(ctx, reportKey, decisionSyncBody(decision), displayRunDir),
+        });
+      }
+    }
+  }
+  if (updates.length === 0) return null;
+  return {
+    mr: args.mr,
+    taskText: taskRun?.taskText ?? "",
+    taskRunDir: syncPathTemplate(taskRun?.runDir ?? mrStateDir(args.repoKey, args.mr), args.workspaceId, args.workspacePath),
+    updates,
+  };
+}
+
+function pendingOrSent(reportKey: string): boolean {
+  return existsSync(pendingReplyPath(reportKey)) || existsSync(sentReplyPath(reportKey));
+}
+
+function syncPlan(projection: SyncMrProjection): SyncMrPlan {
+  const reportKeys = projection.updates.map((update) => update.reportKey).filter((reportKey) => !pendingOrSent(reportKey));
+  return {
+    mr: projection.mr,
+    // Keyed on the root's own outbox marker (not thread-state existence): a
+    // thread whose root send was lost to a crash still owes the root.
+    create_root: reportKeys.length > 0 && !pendingOrSent(syncRootReportKey(projection.mr)),
+    report_keys: reportKeys,
+  };
+}
+
+export async function mailctlSync(ctx: MailctlContext, opts: SyncOptions = {}): Promise<SyncResult> {
+  if (opts.execute && !ctx.config.notify.enabled) {
+    throw new Error(`mailctl sync requires notify.enabled=true; enable it in ${mailControlConfigPath()} before using --execute`);
+  }
+  const workspace = workspaceById(ctx.config.workspace);
+  const repo = await getRepoIdentity(workspace.path);
+  let lock;
+  if (opts.execute) {
+    try {
+      lock = acquirePidfileLock(mailctlSyncLockPath(), process.pid, "mailctl-sync");
+    } catch (error) {
+      if (error instanceof LockHeldError) {
+        return { dry_run: false, skipped: true, repo_key: repo.repo_key, mrs: [], sent: [], pending: [] };
+      }
+      throw error;
+    }
+  }
+  try {
+    const projections = listSyncMrs(repo.repo_key, opts.mr)
+      .map((mr) => buildSyncProjection(ctx, { repoKey: repo.repo_key, workspaceId: workspace.id, workspacePath: workspace.path, mr }))
+      .filter((projection): projection is SyncMrProjection => projection !== null);
+    const plans = projections.map(syncPlan);
+    const result: SyncResult = { dry_run: !opts.execute, skipped: false, repo_key: repo.repo_key, mrs: plans, sent: [], pending: [] };
+    if (!opts.execute) return result;
+
+    for (const [index, projection] of projections.entries()) {
+      const plan = plans[index]!;
+      if (plan.report_keys.length === 0) continue;
+      const state = await ensureSyncThreadState(ctx, {
+        mr: projection.mr,
+        repoKey: repo.repo_key,
+        workspaceId: workspace.id,
+        workspacePath: workspace.path,
+        taskText: projection.taskText,
+        origin: "mailctl-sync",
+        fullContentPath: projection.taskRunDir,
+        deferOnRateLimit: true,
+      });
+      const rootKey = syncRootReportKey(projection.mr);
+      if (plan.create_root && existsSync(sentReplyPath(rootKey))) result.sent.push(rootKey);
+      // Children are held while any root the current recipient depends on is
+      // still pending — the primary root or, after a notify.to rotation, the
+      // per-recipient rotation root queued by ensureSyncThreadState above.
+      const currentTo = syncRecipient(ctx);
+      const rotationRootPending = currentTo !== null && existsSync(pendingReplyPath(syncRootRotationKey(projection.mr, currentTo)));
+      if (existsSync(pendingReplyPath(rootKey)) || rotationRootPending) {
+        if (plan.create_root) result.pending.push(rootKey);
+        continue;
+      }
+
+      for (const update of projection.updates) {
+        if (!plan.report_keys.includes(update.reportKey)) continue;
+        if (pendingOrSent(update.reportKey)) continue;
+        const dispatchedKey = syncRunReportKey(projection.mr, update.runId, "dispatched");
+        const dispatchedReply =
+          readJsonFile<{ message_id?: unknown } | null>(sentReplyPath(dispatchedKey), null) ??
+          readJsonFile<{ message_id?: unknown } | null>(pendingReplyPath(dispatchedKey), null);
+        const dispatchedMessageId = typeof dispatchedReply?.message_id === "string" ? dispatchedReply.message_id : null;
+        const reply = await mailctlReply(ctx, {
+          thread: state.thread,
+          reportKey: update.reportKey,
+          body: update.body,
+          inReplyTo: update.kind === "dispatched" ? state.root_message_id : (dispatchedMessageId ?? state.root_message_id),
+          references: [state.root_message_id],
+          deferOnRateLimit: true,
+        });
+        if (reply.sent) result.sent.push(update.reportKey);
+        if (reply.pending) result.pending.push(update.reportKey);
+      }
+    }
+    return result;
+  } finally {
+    lock?.release();
+  }
+}
+
+export async function ensureSyncThreadState(
+  ctx: MailctlContext,
+  args: {
+    mr: string;
+    repoKey: string;
+    workspaceId: string;
+    workspacePath: string;
+    taskText: string;
+    origin: string;
+    fullContentPath?: string;
+    deferOnRateLimit?: boolean;
+  },
+): Promise<MailctlThreadState> {
+  ensureMailctlStateDirs();
+  const mrSegment = statePathSegment(args.mr, "mr");
+  const thread = syncThreadName(args.mr);
+  const reportKey = `sync:${mrSegment}:root`;
+  const replyTo = syncRecipient(ctx);
+  if (!replyTo) throw new Error("mailctl sync thread has no configured recipient");
+  // The root send is gated by its own outbox marker, not by thread-state
+  // existence: a crash between the state write and the root send would
+  // otherwise orphan the thread permanently (children referencing a
+  // Message-ID that was never transmitted, no retry path). Root delivery is
+  // also recipient-aware: after a notify.to rotation the CURRENT recipient
+  // still needs the anchoring root once (same Message-ID so every child
+  // threads under it), tracked by a per-recipient rotation key.
+  const existing = readThreadState(thread);
+  const rootDeliveredTo = rootRecipient(reportKey);
+  const rotated = rootDeliveredTo !== null && rootDeliveredTo !== replyTo;
+  const sendKey = rotated ? syncRootRotationKey(args.mr, replyTo) : reportKey;
+  if (existing && pendingOrSent(reportKey) && (!rotated || pendingOrSent(sendKey))) return existing;
+
+  const workspace = syncPathTemplate(args.workspacePath, args.workspaceId, args.workspacePath);
+  const fullBody = [
+    args.taskText,
+    "",
+    "source:",
+    `origin: ${args.origin}`,
+    `workspace_id: ${args.workspaceId}`,
+    `workspace_path: ${workspace}`,
+    `repo_key: ${args.repoKey}`,
+    `mr_state_dir: ${syncPathTemplate(mrStateDir(args.repoKey, args.mr), args.workspaceId, args.workspacePath)}`,
+  ].join("\n");
+  const body = truncateSyncBody(
+    ctx,
+    sendKey,
+    fullBody,
+    syncPathTemplate(args.fullContentPath ?? mrStateDir(args.repoKey, args.mr), args.workspaceId, args.workspacePath),
+  );
+  assertSafeReportKey(sendKey);
+  assertMailReplyPolicy(ctx, replyWireBody(sendKey, body));
+  if (!args.deferOnRateLimit) assertReplyRateLimit(ctx, sendKey);
+
+  if (existing) {
+    // Repair/rotation path: thread state exists but the current recipient has
+    // no root delivery (crash in the window below, or notify.to changed).
+    // Re-send with the persisted Message-ID so every child — past and future —
+    // threads under the same root; mailctlReply is a no-op when the marker
+    // exists (duplicate-safe).
+    await mailctlReply(ctx, { thread, reportKey: sendKey, body, root: true, messageId: existing.root_message_id, deferOnRateLimit: args.deferOnRateLimit });
+    return existing;
+  }
+
+  const ts = nowIso(ctx);
+  const messageId = replyMessageId(ctx, thread, reportKey);
+  const created: MailctlThreadState = {
+    schema: "orch.mailctl/thread/v1",
+    thread,
+    threadId: thread,
+    thread_sha: sha12(thread),
+    status: "active",
+    workspace_id: args.workspaceId,
+    workspace_path: args.workspacePath,
+    repo_key: args.repoKey,
+    thread_dir: mailThreadDir(args.repoKey, thread),
+    root_message_id: messageId,
+    message_ids: [messageId],
+    references: [],
+    subject: `[orch][${mailHeaderValue(args.mr)}] sync`,
+    reply_to: replyTo,
+    last_instruction_event_id: null,
+    controller: {
+      current_run_id: null,
+      generations: [],
+      last_trigger_fp: null,
+    },
+    created_at: ts,
+    updated_at: ts,
+  };
+  try {
+    writeJsonExclusive(mailctlThreadStatePath(thread), created);
+  } catch (error) {
+    if (isEexist(error)) {
+      const raced = readThreadState(thread);
+      if (raced) {
+        // The raced loser must converge through the same root guarantee: the
+        // winner may crash before queueing the root, and callers treat a
+        // returned state as "root pending or sent". mailctlReply's exclusive
+        // pending-marker creation makes the double call race-safe (the loser
+        // sees EEXIST and returns duplicate without transmitting).
+        if (!pendingOrSent(reportKey)) {
+          await mailctlReply(ctx, { thread, reportKey, body, root: true, messageId: raced.root_message_id, deferOnRateLimit: args.deferOnRateLimit });
+        }
+        return raced;
+      }
+    }
+    throw error;
+  }
+
+  await mailctlReply(ctx, { thread, reportKey, body, root: true, messageId, deferOnRateLimit: args.deferOnRateLimit });
+  return created;
 }
 
 export async function mailctlReply(ctx: MailctlContext, opts: ReplyOptions): Promise<ReplyResult> {
@@ -2394,11 +2994,12 @@ export async function mailctlReply(ctx: MailctlContext, opts: ReplyOptions): Pro
     if (existsSync(sentPath) && opts.reportKey.startsWith("settled:")) settleThreadIfReady(ctx, state.thread);
     return { dryRun: Boolean(opts.dryRun), duplicate: true, sent: existsSync(sentPath), pending: existsSync(pendingPath), sentPath, pendingPath };
   }
-  if (sentInLastHour(ctx.now()) >= ctx.config.reports.max_per_hour) {
-    throw new Error(`mail reply rate limit exceeded (${ctx.config.reports.max_per_hour}/hour)`);
-  }
 
-  const to = state.reply_to ?? ctx.config.allowed_senders[0];
+  // Sync mail resolves the recipient from the CURRENT config on every send;
+  // state.reply_to is only authoritative for real inbound-mail threads.
+  const to = opts.reportKey.startsWith("sync:")
+    ? syncRecipient(ctx)
+    : (state.reply_to ?? ctx.config.allowed_senders[0]);
   if (!to) throw new Error("mailctl reply has no recipient");
   const built = buildReplyMessage({
     from: ctx.config.smtp.from ?? ctx.config.account.user,
@@ -2406,11 +3007,47 @@ export async function mailctlReply(ctx: MailctlContext, opts: ReplyOptions): Pro
     subject: state.subject || `orch ${state.thread}`,
     body: opts.body,
     reportKey: opts.reportKey,
-    inReplyTo: state.message_ids.at(-1) ?? null,
-    references: state.message_ids,
-    messageId: replyMessageId(ctx, state.thread, opts.reportKey),
+    inReplyTo: opts.inReplyTo !== undefined ? opts.inReplyTo : (state.message_ids.at(-1) ?? null),
+    references: opts.references ?? state.message_ids,
+    messageId: opts.messageId ?? replyMessageId(ctx, state.thread, opts.reportKey),
     date: new Date(ctx.now()),
+    root: opts.root,
   });
+  try {
+    assertReplyRateLimit(ctx, opts.reportKey);
+  } catch (error) {
+    if (!opts.deferOnRateLimit) throw error;
+    const ts = nowIso(ctx);
+    const nextAttemptAt = new Date(ctx.now() + nextBackoffMs(1)).toISOString();
+    const pending: PendingReplyRecord = {
+      schema: "orch.mailctl/outbox-email/v1",
+      report_key: opts.reportKey,
+      thread: state.thread,
+      to,
+      body: opts.body,
+      raw: built.raw,
+      message_id: built.messageId,
+      attempts: 1,
+      created_at: ts,
+      updated_at: ts,
+      next_attempt_at: nextAttemptAt,
+      last_error: errorMessage(error),
+    };
+    try {
+      writeJsonExclusive(pendingPath, pending);
+    } catch (writeError) {
+      if (isEexist(writeError)) return { dryRun: false, duplicate: true, sent: false, pending: true, pendingPath };
+      throw writeError;
+    }
+    appendAudit("reply_pending", {
+      report_key: opts.reportKey,
+      thread: state.thread,
+      error: pending.last_error,
+      next_attempt_at: nextAttemptAt,
+      ts,
+    });
+    return { dryRun: false, duplicate: false, sent: false, pending: true, rawMessage: built.raw, messageId: built.messageId, pendingPath, nextAttemptAt };
+  }
   if (opts.dryRun) {
     return { dryRun: true, duplicate: false, sent: false, pending: false, rawMessage: built.raw, messageId: built.messageId };
   }
@@ -2420,6 +3057,7 @@ export async function mailctlReply(ctx: MailctlContext, opts: ReplyOptions): Pro
     schema: "orch.mailctl/outbox-email/v1",
     report_key: opts.reportKey,
     thread: state.thread,
+    to,
     body: opts.body,
     raw: built.raw,
     message_id: built.messageId,

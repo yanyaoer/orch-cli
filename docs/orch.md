@@ -34,6 +34,7 @@ permissions, model/effort tiers, result schemas — live in the CLI:
 - **Drive orch by email** → `orch mailctl`: poll ingests an allowlisted,
   authenticated sender's task and spawns a claude controller that fans work out
   and replies in-thread; the controller orchestrates, it never edits code.
+  MR progress email is synced by `orch mailctl sync` (or automatically by poll); configure `notify` first.
   Setup + security detail: README.
 - **Watch a live worker** → `orch events tail --run <id> --native -f`
   (provider-independent progress stream). Run-state authority stays with

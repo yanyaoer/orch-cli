@@ -152,9 +152,11 @@ test("command help exposes flags and runnable examples", () => {
   expect(mirrorSync).toContain("outbox/sent");
 
   const mailctl = mailctlHelp();
-  for (const command of ["init", "poll", "watch", "status", "reply", "ack", "guidance"]) {
+  for (const command of ["init", "poll", "watch", "status", "sync", "reply", "ack", "guidance"]) {
     expect(mailctl).toContain(`mailctl ${command}`);
   }
+  for (const flag of ["--mr <id>", "--execute", "--json"]) expect(mailctl).toContain(flag);
+  expect(mailctl).toContain("one email thread per MR");
   expect(mailctl).toContain("Authentication-Results");
   expect(mailctl).toContain("trusted authserv-id");
   expect(mailctl).toContain("DKIM and DMARC pass");
