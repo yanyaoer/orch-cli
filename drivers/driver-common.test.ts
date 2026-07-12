@@ -190,6 +190,8 @@ test("buildProviderArgv keeps defaults fresh and only resumes exact sessions", (
     "/worktree",
     "--output-last-message",
     "/run/last_message.txt",
+    "--sandbox",
+    "workspace-write",
     "-",
   ]);
   expect(buildProviderArgv("pi", { ...base, provider_session_mode: "ephemeral" }, "/run", "/worktree")).toEqual([
@@ -240,7 +242,7 @@ test("buildProviderArgv keeps defaults fresh and only resumes exact sessions", (
       "/run",
       "/worktree",
     ),
-  ).toEqual(["codex", "exec", "resume", "--json", "--output-last-message", "/run/last_message.txt", "thread-123", "-"]);
+  ).toEqual(["codex", "exec", "--sandbox", "workspace-write", "resume", "--json", "--output-last-message", "/run/last_message.txt", "thread-123", "-"]);
   expect(
     buildProviderArgv(
       "pi",

@@ -253,7 +253,10 @@ export function buildProviderArgv(
       // `codex exec resume` has no --sandbox flag (exit 2 if passed); the
       // sandbox rides the parent `exec` level, accepted before the subcommand.
       const resume = ["codex", "exec"];
-      if (readOnly) resume.push("--sandbox", "read-only");
+      // codex exec DEFAULTS to the read-only sandbox (verified live: writes
+      // blocked without an explicit -s); write-capable roles must ask for
+      // workspace-write explicitly or implementers cannot edit anything.
+      resume.push("--sandbox", readOnly ? "read-only" : "workspace-write");
       resume.push("resume", "--json", "--output-last-message", lastMessagePath);
       if (model) resume.push("--model", model);
       resume.push(...researcherFlags);
@@ -263,7 +266,8 @@ export function buildProviderArgv(
     const argv = ["codex", "exec", "--json", "--cd", worktree, "--output-last-message", lastMessagePath];
     if (model) argv.push("--model", model);
     argv.push(...researcherFlags);
-    if (readOnly) argv.push("--sandbox", "read-only");
+    // See resume path above: codex exec defaults to read-only.
+    argv.push("--sandbox", readOnly ? "read-only" : "workspace-write");
     if (spec.provider_session_mode === "ephemeral") argv.push("--ephemeral");
     argv.push("-");
     return argv;
