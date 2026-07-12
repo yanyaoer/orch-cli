@@ -26,7 +26,7 @@ Shipped on `main` (v0.0.8, see [CHANGELOG.md](CHANGELOG.md)):
 - `orch run list`, `orch status`, `orch events tail`, and `orch result` read local run state; omitting `--mr` aggregates across all MRs in the repo. `orch result --wait` blocks until the run reaches a terminal state; reviewer results render findings, verifier results render commands and acceptance.
 - `orch events tail --native` renders the provider-native stream (`native.jsonl`) as normalized progress events — `session`, `assistant`, `tool_use`, `tool_result`, `usage`, `final`, `raw` — so a controller can see what a worker is doing without parsing per-provider formats. The same normalizer (`src/native-events.ts`) backs result extraction and resume-id detection. `-f/--follow` streams appended lines live: with `--run` it exits once the run is terminal (or stale) and drained; without `--run` it multiplexes every active run in the repo (`--all`: every repo) with tail-style `==> mr/run <==` headers, picks up runs created while following, and announces its scope on stderr up front.
 - `orch search` regex-scans the current repo's local run files (`result.json`, `events.jsonl`, `native.jsonl`, `artifacts/*.{txt,log,patch}`) plus mail `mail-events.jsonl` diagnostics; `orch usage run|thread|daily` aggregates token maps from normalized native usage events and reports missing token data as `has_token_data=false`.
-- Non-terminal runs whose supervisor pid is gone show as `stale?`; `orch run reap` persists them as `stale`. A provider that exits 0 without any output fails its run instead of quietly reporting done.
+- Non-terminal runs whose supervisor pid is gone show as `stale?`; `orch run reap` persists them as `stale`. A provider that exits 0 without any output fails its run instead of quietly reporting done. `orch run cancel --run <id> [--reason <text>]` stops a running worker mid-flight: it signals the driver's process group and the live supervisor finalizes the run with a `canceled: <reason>` result.
 - `orch decision` records `accept` or `rework` locally and queues a mirror comment.
 - `orch mail` provides the local message bus: signed mail events, Maildir delivery, router dispatch, atomic task claim, and result-driven review/verify follow-ups.
 - `orch cross-review`, `orch fanout`, and `orch investigate` fan one task across several agents in a single command. They route through the mail layer, so a `--thread <id>` supplies the mr and workspace context (no `--mr` needed).
@@ -409,6 +409,7 @@ orch verdict       Aggregate one thread's verdicts and suggest a decision (--wai
 orch wait          Block until the next run in a thread needs attention (wait-any)
 orch run create    Start one headless worker run for an MR task
 orch run list      List local runs for an MR (dead-pid runs show as stale?)
+orch run cancel    Stop a running worker (supervisor finalizes it as failed)
 orch run reap      Persist stale for non-terminal runs whose supervisor died
 orch search        Regex-search run files and mail event diagnostics
 orch usage         Summarize token usage by run, thread, or day

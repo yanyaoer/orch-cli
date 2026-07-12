@@ -2,10 +2,16 @@
 
 All notable user-facing changes are recorded here.
 
-## [Unreleased]
+## [0.0.9] - 2026-07-13
+
+### Features
+
+- `orch run cancel --run <id> [--reason <text>] [--force]` — stop a running worker by signaling its driver process group; the live supervisor then finalizes the run as `failed`, and the fallback `result.json` (and any synced result mail) carries `canceled: <reason>` instead of a bare exit code. Cancel on a terminal run is a no-op; a gone process group exits 1 and points at `orch run reap`.
 
 ### Changes
 
+- The mail controller now re-checks `orch mailctl guidance` once before emitting its final JSON, so instructions that arrive mid-batch are consumed by the same controller generation instead of waiting for the next spawn — and it cancels dispatched runs that a new instruction invalidates before re-dispatching.
+- codex driver: `codex exec` without a sandbox flag blocks all writes (the old comment assumed workspace-write was the default), so implementer/verifier runs now pass `--sandbox workspace-write` explicitly on both the fresh and resume paths; read-only roles stay read-only. Surfaced by SWE-bench pilot runs finishing with zero-line diffs.
 - `mailctl sync` now isolates outbound policy failures per report instead of poisoning an entire MR: path-shaped private markers are redacted and revalidated with an audited fingerprint, genuinely unsafe reports are quarantined once while safe siblings continue, and sync-only threads no longer inflate active controller counts. SMTP state now distinguishes exhausted from recipient-superseded records, removes historical dropped markers after successful delivery, and recovers a pending+sent crash window without retransmitting.
 - `orch new` now validates a strict, inspectable Markdown plan contract before execution, resolves recommended defaults into one self-contained final plan, blocks `--yes` when no safe default exists, pins the default planning/resumed-controller model to Fable, and derives completion from persisted worker status/result/decision files. A controller that dispatches nothing or leaves failed, undecided, or closed workers now returns `needs_attention` even if it claims `completed`.
 - `config.json` gains `defaults.agents.<role>`: `orch run create` falls back to it when `--agent` is omitted (explicit flag still wins). Role values accept a bare agent name or an object with default args (`agent`, `model`, `timeout_sec`). Recommended profile: implementer/verifier -> pi, reviewer/controller -> claude, researcher -> codex.
