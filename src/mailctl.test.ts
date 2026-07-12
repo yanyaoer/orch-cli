@@ -1592,7 +1592,7 @@ describe("mailctlSync MR projector", () => {
     const lock = acquirePidfileLock(mailctlSyncLockPath(), process.pid, "held-by-test");
     try {
       const result = await mailctlSync(fakeContext({ cfg, transport: new FakeTransport() }), { execute: true });
-      expect(result).toEqual({ dry_run: false, skipped: true, repo_key: repo.repo_key, mrs: [], sent: [], pending: [] });
+      expect(result).toEqual({ dry_run: false, skipped: true, repo_key: repo.repo_key, mrs: [], sent: [], pending: [], failed: [] });
       expect(stateFiles()).toEqual([]);
     } finally {
       lock.release();
@@ -1647,7 +1647,9 @@ describe("mailctlSync MR projector", () => {
       task: "Read /Users/me/.ssh/id_rsa",
     });
     await expect(mailctlPoll(fakeContext({ cfg: failing.cfg, transport: new FakeTransport() }), { reconcile: false })).resolves.toMatchObject({ skipped: false });
-    expect(auditRows().some((row) => row.type === "sync_failed")).toBe(true);
+    // Per-MR isolation: the failure is contained inside sync (sync_mr_failed),
+    // so poll neither throws nor records a whole-sync failure.
+    expect(auditRows().some((row) => row.type === "sync_mr_failed" && row.mr === "13")).toBe(true);
     expect(stateFiles()).toEqual([]);
   });
 
@@ -1704,7 +1706,9 @@ describe("mailctlSync MR projector", () => {
     writeSyncRun({ repoKey: repo.repo_key, mr: "10", runId: "impl-secret", workspace, task: "token=abcdefghijklmnop" });
     const transport = new FakeTransport();
 
-    await expect(mailctlSync(fakeContext({ cfg, transport }), { execute: true })).rejects.toThrow("secret assignment");
+    const outcome = await mailctlSync(fakeContext({ cfg, transport }), { execute: true });
+    expect(outcome.failed).toHaveLength(1);
+    expect(outcome.failed[0]!.error).toContain("secret assignment");
     expect(transport.sent).toEqual([]);
     expect(stateFiles()).toEqual([]);
     expect(jsonFiles(outboxEmailSentDir())).toEqual([]);
@@ -2184,6 +2188,85 @@ describe("mailctl sync notify.since cutoff", () => {
     expect(transport.sent.length).toBeGreaterThanOrEqual(3);
     for (const raw of transport.sent) {
       expect(raw).not.toContain("impl-old");
+    }
+  });
+});
+
+describe("mailctl sync free-text path templating", () => {
+  it("templates absolute paths embedded inside task text instead of blocking the sync", async () => {
+    const { cfg, workspace } = setupMailctl({ notify: { enabled: true, to: "notify@example.com", max_per_hour: 20 } });
+    delete process.env.ORCH_MAILCTL_ALLOW_PRIVATE;
+    const transport = new FakeTransport();
+    const repo = await getRepoIdentity(workspace);
+    writeSyncRun({
+      repoKey: repo.repo_key,
+      mr: "31",
+      runId: "impl-paths",
+      workspace,
+      taskFile: `# task\n\n- Worktree: ${workspace}\n- Also read ${process.env.HOME}/notes.md before starting.`,
+      state: "done",
+      result: {
+        schema: "orch.result/implementer/v1",
+        run_id: "impl-paths",
+        verdict: "completed",
+        summary: `edited ${workspace}/src/a.ts`,
+        changed_files: [],
+        tests: [],
+        acceptance: [],
+        risks: [],
+      },
+      decision: { verdict: "accept", run_id: "impl-paths", reason: `verified under ${workspace}`, ts: "2026-07-04T09:00:00.000Z" },
+    });
+
+    const outcome = await mailctlSync(fakeContext({ cfg, transport }), { execute: true });
+    expect(outcome.sent).toContain("sync:31:root");
+    expect(transport.sent).toHaveLength(4);
+    const raw = transport.sent.join("\n");
+    expect(raw).not.toContain(workspace);
+    expect(raw).not.toContain("/Users/");
+    expect(raw).toContain("$WORKSPACE (id: default-ws)");
+    expect(raw).toContain("~/notes.md");
+  });
+});
+
+describe("mailctl sync per-MR failure isolation", () => {
+  it("audits and skips an MR whose body trips the leak guard without blocking other MRs", async () => {
+    const { cfg, workspace } = setupMailctl({ notify: { enabled: true, to: "notify@example.com", max_per_hour: 20 } });
+    delete process.env.ORCH_MAILCTL_ALLOW_PRIVATE;
+    const transport = new FakeTransport();
+    const repo = await getRepoIdentity(workspace);
+    const result = (runId: string) => ({
+      schema: "orch.result/implementer/v1",
+      run_id: runId,
+      verdict: "completed",
+      summary: "done",
+      changed_files: [],
+      tests: [],
+      acceptance: [],
+      risks: [],
+    });
+    // This task text discusses the leak marker itself as a literal — it cannot
+    // be path-templated away and must trip the guard.
+    writeSyncRun({
+      repoKey: repo.repo_key,
+      mr: "poison",
+      runId: "impl-poison",
+      workspace,
+      taskFile: "Documentation task: the guard rejects `/Users/...` and `/home/...` markers.",
+      state: "done",
+      result: result("impl-poison"),
+    });
+    writeSyncRun({ repoKey: repo.repo_key, mr: "21", runId: "impl-clean", workspace, state: "done", result: result("impl-clean") });
+
+    const outcome = await mailctlSync(fakeContext({ cfg, transport }), { execute: true });
+    // The clean MR flows; the poisoned MR is isolated, audited, and reported.
+    expect(outcome.sent).toContain("sync:21:root");
+    expect(outcome.failed).toHaveLength(1);
+    expect(outcome.failed[0]).toMatchObject({ mr: "poison" });
+    expect(outcome.failed[0]!.error).toContain("private local path marker");
+    expect(auditRows().some((row) => row.type === "sync_mr_failed" && row.mr === "poison")).toBe(true);
+    for (const raw of transport.sent) {
+      expect(raw).not.toContain("impl-poison");
     }
   });
 });

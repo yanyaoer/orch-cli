@@ -179,6 +179,9 @@ export interface SyncResult {
   mrs: SyncMrPlan[];
   sent: string[];
   pending: string[];
+  // MRs whose sync raised (e.g. leak-guard refusal): skipped for this pass,
+  // audited, and retried next sync — they must never block other MRs.
+  failed: Array<{ mr: string; error: string }>;
 }
 
 export interface WatchOptions {
@@ -2357,6 +2360,19 @@ function syncPathTemplate(path: string, workspaceId: string, workspacePath: stri
   return homeSuffix !== null ? `~${homeSuffix}` : path;
 }
 
+// Free text (task text, result summaries, decision reasons) can embed absolute
+// paths anywhere in the string — syncPathTemplate only handles whole-string
+// paths. Template them in place so the leak guard sees $ORCH_STATE /
+// $WORKSPACE / ~ instead of private prefixes; without this, one absolute path
+// in a task file permanently blocks the whole MR's sync.
+function syncTextTemplate(text: string, workspaceId: string, workspacePath: string): string {
+  let out = text.split(orchStateRoot()).join("$ORCH_STATE");
+  if (workspacePath) out = out.split(workspacePath).join(`$WORKSPACE (id: ${workspaceId})`);
+  const home = process.env.HOME;
+  if (home) out = out.split(home).join("~");
+  return out;
+}
+
 function truncateSyncBody(ctx: MailctlContext, reportKey: string, body: string, fullContentPath: string): string {
   if (Buffer.byteLength(replyWireBody(reportKey, body), "utf8") <= ctx.config.reports.max_body_bytes) return body;
   const tail = `\n\ntruncated; full content: ${fullContentPath}`;
@@ -2639,7 +2655,7 @@ function dispatchedSyncBody(args: {
 }): string {
   const workspace = syncPathTemplate(args.workspacePath, args.workspaceId, args.workspacePath);
   return [
-    args.taskText,
+    syncTextTemplate(args.taskText, args.workspaceId, args.workspacePath),
     "",
     `role: ${args.spec.role}`,
     `agent: ${args.spec.agent}`,
@@ -2751,7 +2767,7 @@ function buildSyncProjection(
           kind: "result",
           body: pendingOrSent(reportKey)
             ? ""
-            : truncateSyncBody(ctx, reportKey, resultSyncBody(result, displayRunDir), displayRunDir),
+            : truncateSyncBody(ctx, reportKey, syncTextTemplate(resultSyncBody(result, displayRunDir), args.workspaceId, args.workspacePath), displayRunDir),
         });
       }
     }
@@ -2763,7 +2779,7 @@ function buildSyncProjection(
           reportKey,
           runId: run.runId,
           kind: "decision",
-          body: pendingOrSent(reportKey) ? "" : truncateSyncBody(ctx, reportKey, decisionSyncBody(decision), displayRunDir),
+          body: pendingOrSent(reportKey) ? "" : truncateSyncBody(ctx, reportKey, syncTextTemplate(decisionSyncBody(decision), args.workspaceId, args.workspacePath), displayRunDir),
         });
       }
     }
@@ -2804,7 +2820,7 @@ export async function mailctlSync(ctx: MailctlContext, opts: SyncOptions = {}): 
       lock = acquirePidfileLock(mailctlSyncLockPath(), process.pid, "mailctl-sync");
     } catch (error) {
       if (error instanceof LockHeldError) {
-        return { dry_run: false, skipped: true, repo_key: repo.repo_key, mrs: [], sent: [], pending: [] };
+        return { dry_run: false, skipped: true, repo_key: repo.repo_key, mrs: [], sent: [], pending: [], failed: [] };
       }
       throw error;
     }
@@ -2814,52 +2830,59 @@ export async function mailctlSync(ctx: MailctlContext, opts: SyncOptions = {}): 
       .map((mr) => buildSyncProjection(ctx, { repoKey: repo.repo_key, workspaceId: workspace.id, workspacePath: workspace.path, mr }))
       .filter((projection): projection is SyncMrProjection => projection !== null);
     const plans = projections.map(syncPlan);
-    const result: SyncResult = { dry_run: !opts.execute, skipped: false, repo_key: repo.repo_key, mrs: plans, sent: [], pending: [] };
+    const result: SyncResult = { dry_run: !opts.execute, skipped: false, repo_key: repo.repo_key, mrs: plans, sent: [], pending: [], failed: [] };
     if (!opts.execute) return result;
 
     for (const [index, projection] of projections.entries()) {
       const plan = plans[index]!;
       if (plan.report_keys.length === 0) continue;
-      const state = await ensureSyncThreadState(ctx, {
-        mr: projection.mr,
-        repoKey: repo.repo_key,
-        workspaceId: workspace.id,
-        workspacePath: workspace.path,
-        taskText: projection.taskText,
-        origin: "mailctl-sync",
-        fullContentPath: projection.taskRunDir,
-        deferOnRateLimit: true,
-      });
-      const rootKey = syncRootReportKey(projection.mr);
-      if (plan.create_root && existsSync(sentReplyPath(rootKey))) result.sent.push(rootKey);
-      // Children are held while any root the current recipient depends on is
-      // still pending — the primary root or, after a notify.to rotation, the
-      // per-recipient rotation root queued by ensureSyncThreadState above.
-      const currentTo = syncRecipient(ctx);
-      const rotationRootPending = currentTo !== null && existsSync(pendingReplyPath(syncRootRotationKey(projection.mr, currentTo)));
-      if (existsSync(pendingReplyPath(rootKey)) || rotationRootPending) {
-        if (plan.create_root) result.pending.push(rootKey);
-        continue;
-      }
-
-      for (const update of projection.updates) {
-        if (!plan.report_keys.includes(update.reportKey)) continue;
-        if (pendingOrSent(update.reportKey)) continue;
-        const dispatchedKey = syncRunReportKey(projection.mr, update.runId, "dispatched");
-        const dispatchedReply =
-          readJsonFile<{ message_id?: unknown } | null>(sentReplyPath(dispatchedKey), null) ??
-          readJsonFile<{ message_id?: unknown } | null>(pendingReplyPath(dispatchedKey), null);
-        const dispatchedMessageId = typeof dispatchedReply?.message_id === "string" ? dispatchedReply.message_id : null;
-        const reply = await mailctlReply(ctx, {
-          thread: state.thread,
-          reportKey: update.reportKey,
-          body: update.body,
-          inReplyTo: update.kind === "dispatched" ? state.root_message_id : (dispatchedMessageId ?? state.root_message_id),
-          references: [state.root_message_id],
+      // One MR's failure (e.g. a leak-guard refusal on its body) must never
+      // block every other MR's progress mail: isolate, audit, move on.
+      try {
+        const state = await ensureSyncThreadState(ctx, {
+          mr: projection.mr,
+          repoKey: repo.repo_key,
+          workspaceId: workspace.id,
+          workspacePath: workspace.path,
+          taskText: projection.taskText,
+          origin: "mailctl-sync",
+          fullContentPath: projection.taskRunDir,
           deferOnRateLimit: true,
         });
-        if (reply.sent) result.sent.push(update.reportKey);
-        if (reply.pending) result.pending.push(update.reportKey);
+        const rootKey = syncRootReportKey(projection.mr);
+        if (plan.create_root && existsSync(sentReplyPath(rootKey))) result.sent.push(rootKey);
+        // Children are held while any root the current recipient depends on is
+        // still pending — the primary root or, after a notify.to rotation, the
+        // per-recipient rotation root queued by ensureSyncThreadState above.
+        const currentTo = syncRecipient(ctx);
+        const rotationRootPending = currentTo !== null && existsSync(pendingReplyPath(syncRootRotationKey(projection.mr, currentTo)));
+        if (existsSync(pendingReplyPath(rootKey)) || rotationRootPending) {
+          if (plan.create_root) result.pending.push(rootKey);
+          continue;
+        }
+
+        for (const update of projection.updates) {
+          if (!plan.report_keys.includes(update.reportKey)) continue;
+          if (pendingOrSent(update.reportKey)) continue;
+          const dispatchedKey = syncRunReportKey(projection.mr, update.runId, "dispatched");
+          const dispatchedReply =
+            readJsonFile<{ message_id?: unknown } | null>(sentReplyPath(dispatchedKey), null) ??
+            readJsonFile<{ message_id?: unknown } | null>(pendingReplyPath(dispatchedKey), null);
+          const dispatchedMessageId = typeof dispatchedReply?.message_id === "string" ? dispatchedReply.message_id : null;
+          const reply = await mailctlReply(ctx, {
+            thread: state.thread,
+            reportKey: update.reportKey,
+            body: update.body,
+            inReplyTo: update.kind === "dispatched" ? state.root_message_id : (dispatchedMessageId ?? state.root_message_id),
+            references: [state.root_message_id],
+            deferOnRateLimit: true,
+          });
+          if (reply.sent) result.sent.push(update.reportKey);
+          if (reply.pending) result.pending.push(update.reportKey);
+        }
+      } catch (error) {
+        result.failed.push({ mr: projection.mr, error: errorMessage(error) });
+        appendAudit("sync_mr_failed", { mr: projection.mr, error: errorMessage(error), ts: nowIso(ctx) });
       }
     }
     return result;
@@ -2902,7 +2925,7 @@ export async function ensureSyncThreadState(
 
   const workspace = syncPathTemplate(args.workspacePath, args.workspaceId, args.workspacePath);
   const fullBody = [
-    args.taskText,
+    syncTextTemplate(args.taskText, args.workspaceId, args.workspacePath),
     "",
     "source:",
     `origin: ${args.origin}`,
