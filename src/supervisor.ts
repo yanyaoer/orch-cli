@@ -131,6 +131,9 @@ function readProviderResumeId(runDir: string): string | null {
 function ensureResult(runDir: string, spec: RunSpec, reason: string): void {
   const resultPath = runDirFile(runDir, "result.json");
   if (!existsSync(resultPath)) {
+    // `orch run cancel` drops canceled.json before signaling the driver; the
+    // fallback summary then names the cancellation instead of a bare exit code.
+    const canceled = readJsonFile<{ reason?: unknown } | null>(runDirFile(runDir, "canceled.json"), null);
     writeJsonAtomic(
       resultPath,
       fallbackResult({
@@ -138,7 +141,7 @@ function ensureResult(runDir: string, spec: RunSpec, reason: string): void {
         run_id: spec.run_id,
         base_sha: spec.base_sha,
         head_sha: spec.base_sha,
-        summary: reason,
+        summary: canceled ? `canceled: ${typeof canceled.reason === "string" ? canceled.reason : reason}` : reason,
       }),
     );
   }

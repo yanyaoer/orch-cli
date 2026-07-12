@@ -7,6 +7,7 @@ import {
   mirrorSyncHelp,
   mailctlHelp,
   resultCommandHelp,
+  runCancelHelp,
   runCreateHelp,
   runHelp,
   runListHelp,
@@ -95,6 +96,14 @@ test("command help exposes flags and runnable examples", () => {
   const run = runHelp();
   expect(run).toContain("orch run create");
   expect(run).toContain("orch run list");
+  expect(run).toContain("orch run cancel");
+
+  const runCancel = runCancelHelp();
+  for (const flag of ["--run", "--mr", "--worktree", "--reason", "--force"]) {
+    expect(runCancel).toContain(flag);
+  }
+  expect(runCancel).toContain("canceled: <reason>");
+  expect(runCancel).toContain("orch run cancel --run impl-a-");
 
   const search = searchHelp();
   for (const flag of ["--mr", "--run", "--thread", "--worktree", "--json"]) {

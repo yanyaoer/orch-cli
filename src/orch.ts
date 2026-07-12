@@ -65,6 +65,7 @@ import {
   newHelp,
   workspaceHelp,
   resultCommandHelp,
+  runCancelHelp,
   runCreateHelp,
   runHelp,
   runListHelp,
@@ -81,7 +82,7 @@ import { runClaudeDriver } from "../drivers/claude-headless.ts";
 import { deployWorker, locateBridgeDir, runChatgptBridge } from "../drivers/chatgpt-bridge.ts";
 import { runPiDriver } from "../drivers/pi-headless.ts";
 import { runOmpDriver } from "../drivers/omp-headless.ts";
-import { addWorkspace, chatgptBridgeConfigPath, readBridgeConfig, readMailAgentsConfig, readMailControlConfig, readOrchConfig, validateMailControlConfig, writeBridgeConfig } from "./config.ts";
+import { addWorkspace, chatgptBridgeConfigPath, readBridgeConfig, readMailAgentsConfig, readMailControlConfig, readOrchConfig, validateMailControlConfig, writeBridgeConfig, type RoleDefaults } from "./config.ts";
 import { createInterface, type Interface as ReadlineInterface, type ReadLineOptions } from "node:readline";
 import { buildBundle, type BundleOptions } from "./handoff-pro.ts";
 import { mail, mailFanout, type MailCliContext, type MailFanoutOutcome } from "./mail-cli.ts";
@@ -110,6 +111,7 @@ import {
 import { workspace } from "./workspace-cli.ts";
 import { assertKnownFlags, CliError, collectFlags, flagBool, flagNumber, flagString, hasHelp, parseArgs, printJson, readStdinText, type ParsedArgs } from "./cli.ts";
 import { buildPrompt, buildProviderArgv } from "../drivers/driver-common.ts";
+import { classifyNewOpenQuestions, evaluateNewExecution, validateNewPlanMarkdown, type NewExecutionRun } from "./new-flow.ts";
 
 type IdempotencyRecord = {
   run_id: string;
@@ -243,14 +245,14 @@ type ProviderSessionConfig = Pick<
   "provider_session_name" | "provider_session_id" | "provider_session_mode" | "model"
 >;
 
-function providerSessionConfig(args: ParsedArgs, agent: AgentName): ProviderSessionConfig {
+function providerSessionConfig(args: ParsedArgs, agent: AgentName, defaultModel: string | null = null): ProviderSessionConfig {
   const modeValue = flagString(args, "session-mode", defaultProviderSessionMode(agent));
   if (!isProviderSessionMode(modeValue)) {
     throw new CliError("--session-mode must be ephemeral|fresh_persistent|resume_exact");
   }
   const name = args.flags.has("session-name") ? flagString(args, "session-name").trim() : null;
   const id = args.flags.has("session-id") ? flagString(args, "session-id").trim() : null;
-  const model = args.flags.has("model") ? flagString(args, "model").trim() : null;
+  const model = args.flags.has("model") ? flagString(args, "model").trim() : defaultModel;
 
   if (name === "") throw new CliError("--session-name must not be empty");
   if (id === "") throw new CliError("--session-id must not be empty");
@@ -1148,11 +1150,26 @@ async function resolveResumeFrom(args: ParsedArgs): Promise<ResumeContext> {
   };
 }
 
+// Per-role defaults from config.json (defaults.agents); bare string = agent.
+function configuredRoleDefaults(role: RunRole): RoleDefaults {
+  const raw = readOrchConfig().defaults?.agents?.[role];
+  if (!raw) return {};
+  return typeof raw === "string" ? { agent: raw } : raw;
+}
+
 async function createRun(args: ParsedArgs): Promise<number> {
   assertKnownFlags(args, "run create", RUN_CREATE_FLAGS);
   const resume = args.flags.has("resume-from") ? await resolveResumeFrom(args) : null;
   const role = resume && !args.flags.has("role") ? resume.role : (flagString(args, "role") as RunRole);
-  const agent = resume ? resume.agent : (flagString(args, "agent") as AgentName);
+  // --agent/--model/--timeout-sec fall back to the per-role defaults in
+  // config.json (defaults.agents) when omitted; explicit flags always win and
+  // without either source the original "missing --agent" error stands.
+  const roleDefaults = configuredRoleDefaults(role);
+  const agent = resume
+    ? resume.agent
+    : args.flags.has("agent") || !roleDefaults.agent
+      ? (flagString(args, "agent") as AgentName)
+      : roleDefaults.agent;
   const tag = flagString(args, "tag", role);
   const worktree = resume ? resume.worktree : resolve(flagString(args, "worktree", process.cwd()));
   const taskFlag = args.flags.has("task") ? flagString(args, "task") : null;
@@ -1163,14 +1180,15 @@ async function createRun(args: ParsedArgs): Promise<number> {
     resume && !args.flags.has("mr") ? { mr: resume.mr, source: "resume-from" as const } : await resolveMr(args, taskText, worktree);
   // Reviewer runs finish in minutes in practice (52/67 recorded runs override
   // the old 4h default); keep the long default only for roles that build/test.
-  const timeoutSec = Number(flagString(args, "timeout-sec", role === "reviewer" ? "3600" : "14400"));
+  const builtinTimeout = role === "reviewer" ? "3600" : "14400";
+  const timeoutSec = Number(flagString(args, "timeout-sec", String(roleDefaults.timeout_sec ?? builtinTimeout)));
 
   if (!isRunRole(role)) {
     throw new CliError(`unsupported role: ${role} (valid: implementer, reviewer, verifier, controller, researcher)`);
   }
   validateRunAgent(agent, role);
   if (!Number.isFinite(timeoutSec) || timeoutSec <= 0) throw new CliError("--timeout-sec must be positive");
-  const providerSession = resume ? resume.session : providerSessionConfig(args, agent);
+  const providerSession = resume ? resume.session : providerSessionConfig(args, agent, roleDefaults.model ?? null);
 
   const repo = await getRepoIdentity(worktree);
   const mrDir = mrStateDir(repo.repo_key, mr);
@@ -1731,98 +1749,89 @@ function newPlanTask(mr: string, description: string): string {
   return [
     "# orch new — planning phase",
     "",
-    "You are the planning phase of `orch new`. A human reads your result in a",
-    "terminal, answers your open questions, and then a controller session resumed",
-    "from this one dispatches the work. Plan only — change nothing.",
-    "",
+    "Inspect the actual repository and return a self-contained execution plan; change nothing.",
     `Thread/MR for the eventual runs: ${mr}`,
     "",
     "## Task request",
     description,
     "",
     "## Deliverable (orch.result/researcher/v1)",
-    "- recommendation: an executable plan grounded in the actual repo (read it",
-    "  first), written as markdown under these exact headings:",
-    "  ## Destination",
-    "  Settle this FIRST because the destination fixes the scope. In 1-2 lines,",
-    '  describe what "done" looks like.',
-    "  ## Out of scope",
-    "  List work consciously ruled out of this effort.",
-    "  ## Tasks (now)",
-    "  Include at least one task, and only tasks that can be specified precisely",
-    "  NOW. For each task, give a kebab-case short name, role",
-    "  (implementer|reviewer|verifier), a one-paragraph spec, and acceptance",
-    "  checks. If nothing can be specified precisely yet, the request is not",
-    "  ready — say so up front and apply the abort/direct-run guidance below.",
-    "  ## Later (not yet specified)",
-    "  Give only coarse-grained notes on work that depends on earlier results and",
-    '  cannot be phrased precisely yet. Never pre-slice it into tasks. The test is:',
-    '  "can you state it precisely now?" (not "can you answer it now?").',
-    "- If the whole request fits in a single worker run, say so up front and",
-    "  recommend that the human abort (`q`) and use `orch run create` directly",
-    "  instead of `orch new`.",
-    "- open_questions: numbered questions the human must answer before execution,",
-    '  each ending with "— recommended: <your default>". Empty when unambiguous.',
-    "- risks / alternatives as applicable.",
+    "Put the plan in recommendation using exactly this Markdown grammar:",
+    "",
+    "## Destination",
+    "1-2 lines describing the observable finished state.",
+    "",
+    "## Out of scope",
+    "Explicit exclusions, or `None`.",
+    "",
+    "## Tasks (now)",
+    "### kebab-case-task-name",
+    "- Role: implementer|reviewer|verifier",
+    "- After: none|earlier-task-name[, earlier-task-name]",
+    "- Spec: one self-contained paragraph with prerequisites and constraints",
+    "- Acceptance:",
+    "  - one observable check",
+    "",
+    "## Later (not yet specified)",
+    "Optional follow-up outside this Destination, or `None`. Anything required",
+    "to reach Destination must be a Tasks (now) item, even when it has prerequisites.",
+    "",
+    "Rules:",
+    "- Include at least one task. After may name only earlier tasks; use `none`",
+    "  for the initial frontier. Order tasks by execution dependency.",
+    "- Keep implementation choices open unless the repo or request makes them constraints.",
+    "- recommendation is the current source of truth: no historical commentary or superseded choices.",
+    "- Each open_questions entry must end with either `— recommended: <safe default>`",
+    "  or `— blocking: <why execution cannot safely choose>`. Use blocking only when",
+    "  no defensible default exists. Leave open_questions empty when unambiguous.",
+    "- Put risks and alternatives in their schema fields, not extra recommendation headings.",
   ].join("\n");
 }
 
-function newPlanRevisionTask(answer: string): string {
+function newPlanRevisionTask(answer: string, acceptDefaults = false): string {
   return [
-    "# orch new — plan revision",
+    "# orch new — final plan revision",
     "",
-    "Human answers / amendments to your plan and open questions:",
+    acceptDefaults ? "The human accepted every recommended default below:" : "Human answer / amendment:",
     "",
     answer,
     "",
-    "Update the plan (same orch.result/researcher/v1 contract). Keep only the",
-    "open_questions that remain genuinely ambiguous after these answers. The",
-    "revised recommendation must keep the same heading structure: Destination /",
-    "Out of scope / Tasks (now) / Later (not yet specified).",
+    "Return a new self-contained orch.result/researcher/v1 result. Integrate these",
+    "choices directly into recommendation, remove superseded choices and historical",
+    "commentary, and remove every resolved item from open_questions. Keep the exact",
+    "Destination / Out of scope / Tasks (now) / Later (not yet specified) grammar",
+    "from the planning request. Do not merely append an answers section.",
   ].join("\n");
 }
 
-function newExecTask(mr: string, worktree: string, plan: string, notes: string[]): string {
+function newExecTask(mr: string, worktree: string, plan: string): string {
   return [
     "# orch new — execution controller",
     "",
-    "## Execution mode",
-    "- You are running HEADLESS and NON-INTERACTIVE; no human approves anything mid-run.",
-    "- Do NOT enter plan mode. Execute your `orch ...` commands directly, then output the orch.result/controller/v1 JSON.",
-    "- Tools: Bash restricted to `orch *` plus read-only Read/Grep/Glob/LS. No Edit/Write — dispatch workers to change code.",
+    "You are HEADLESS and NON-INTERACTIVE. Execute `orch ...` commands directly.",
+    "You may inspect files but never edit them; dispatch workers for all changes.",
+    `Thread/MR: ${mr}`,
+    `Worktree: ${worktree}`,
     "",
-    "## Context",
-    `- Thread/MR: ${mr}`,
-    `- Worktree: ${worktree}`,
-    "",
-    "## Confirmed plan (human-approved)",
+    "## Final resolved plan (sole execution authority)",
     plan,
     "",
-    "## Human clarifications",
-    notes.length > 0 ? notes.map((note, index) => `${index + 1}. ${note}`).join("\n") : "(recommended answers accepted as-is)",
-    "",
-    "## Rules",
-    "- Author every task inline via stdin (`--task -` reads the task text from a heredoc):",
+    "## Protocol",
+    "- Dispatch only tasks whose `After` dependencies have accepted results. Later",
+    "  is explicitly outside this run's Destination: do not dispatch it.",
+    "- Author every worker task inline; workers do not share your context:",
     `    orch fanout --thread ${mr} --role <role> --task - <<'EOF' ... EOF`,
-    `    orch cross-review --thread ${mr} --task - <<'EOF' ... EOF   (review pass)`,
+    `    orch cross-review --thread ${mr} --task - <<'EOF' ... EOF`,
     `    orch run create --mr ${mr} --role <role> --agent <codex|claude|pi|omp> --tag <name> --task - <<'EOF' ... EOF`,
-    "    orch run create --resume-from <run_id> --tag <name> --task - <<'EOF' ... EOF   (rework)",
-    "- Dispatch only the tasks under `## Tasks (now)` first. Specify items under",
-    "  `## Later (not yet specified)` yourself, in your own controller context,",
-    "  as concrete tasks only after the earlier results land — never dispatch",
-    "  them as-is and never send them back to a researcher.",
-    "- If `## Tasks (now)` is empty, report it as a blocker in your summary",
-    "  instead of looping.",
-    "- Tag every `orch run create` dispatch (including `--resume-from` reworks)",
-    "  with the task's kebab-case short name via `--tag <name>` so",
-    "  overview/events read by name; fanout/cross-review runs auto-tag as",
-    "  `mail-<role>-<agent>`.",
-    "- Inline each task's acceptance checks into the worker task text, and use",
-    "  them as the accept/rework criteria when recording decisions.",
-    "- Inline every constraint a worker needs (relevant docs/adr + docs/specs excerpts); workers never see this controller's context.",
-    `- After dispatching, loop: orch wait --thread ${mr} -> read orch result --mr ${mr} --run <id> -> record orch decision accept|rework --mr ${mr} --run <id> --reason '...'; repeat until it returns settled.`,
-    "- At most 2 rework cycles per task; report the blocker in your summary instead of looping further.",
-    "- Final output must be orch.result/controller/v1 JSON; list dispatched runs and decisions in actions[].",
+    "    orch run create --resume-from <run_id> --tag <name> --task - <<'EOF' ... EOF",
+    "- Put the complete Spec, constraints, relevant ADR/spec excerpts, and Acceptance",
+    "  checks into each worker task. Tag direct/rework runs with the plan task name;",
+    "  fanout/cross-review auto-tag their runs.",
+    `- Reconcile persisted evidence: orch wait --thread ${mr}; inspect each result;`,
+    `  record orch decision accept|rework --mr ${mr} --run <id> --reason '...'.`,
+    "- Use semantic judgment for decisions, but stop after 2 reworks for one task.",
+    "- Finish only after every dispatched run is terminal and has a decision. Report",
+    "  unresolved blockers instead of claiming success. Return only controller result JSON.",
   ].join("\n");
 }
 
@@ -1925,6 +1934,12 @@ function newReadPlanResult(handle: NewRunHandle, status: RunStatus): ResearcherR
       `plan run ${handle.run_id} ended ${status.state}${result ? ` (${resultVerdict(result)})` : ""}; inspect: orch result --mr ${status.mr} --run ${handle.run_id}`,
     );
   }
+  const validation = validateNewPlanMarkdown(result.recommendation);
+  if (!validation.ok) {
+    throw new CliError(
+      `plan run ${handle.run_id} returned an invalid orch new plan:\n${validation.errors.map((error) => `- ${error}`).join("\n")}\ninspect: orch result --mr ${status.mr} --run ${handle.run_id}`,
+    );
+  }
   return result;
 }
 
@@ -1944,6 +1959,32 @@ function newRenderPlan(result: ResearcherResult): void {
     for (const risk of result.risks) write(`- ${risk}`);
   }
   write("");
+}
+
+function newRecommendedDefaults(result: ResearcherResult): { text: string; blocking: string[] } {
+  const questions = classifyNewOpenQuestions(result.open_questions);
+  return {
+    text: questions.defaults.map((item, index) => `${index + 1}. ${item.question}\n   Accepted default: ${item.value}`).join("\n"),
+    blocking: questions.blocking,
+  };
+}
+
+function newExecutionRuns(repoKey: string, mr: string, baseline: Set<string>, execRunId: string): NewExecutionRun[] {
+  return collectMrRuns(repoKey, mr)
+    .filter((run) => !baseline.has(run.run_id) && run.run_id !== execRunId)
+    .map((run) => {
+      const decision = readJsonFile<DecisionRecord | null>(`${mrStateDir(repoKey, mr)}/runs/${run.run_id}/decision.json`, null);
+      return {
+        run_id: run.run_id,
+        role: run.role,
+        state: run.state,
+        stale: run.stale,
+        verdict: run.verdict,
+        decision: decision && decision.run_id === run.run_id && (decision.verdict === "accept" || decision.verdict === "rework" || decision.verdict === "close")
+          ? decision.verdict
+          : null,
+      };
+    });
 }
 
 async function newCommand(args: ParsedArgs): Promise<number> {
@@ -1980,8 +2021,7 @@ async function newCommand(args: ParsedArgs): Promise<number> {
     if ((await seeded.exited) !== 0) throw new CliError(`orch mail agent defaults failed: ${await new Response(seeded.stderr).text()}`);
   }
 
-  const passthrough: string[] = [];
-  if (args.flags.has("model")) passthrough.push("--model", flagString(args, "model"));
+  const passthrough: string[] = ["--model", args.flags.has("model") ? flagString(args, "model") : "fable"];
   if (args.flags.has("timeout-sec")) passthrough.push("--timeout-sec", flagString(args, "timeout-sec"));
 
   const planTaskPath = `${mrDir}/tasks/plan.md`;
@@ -1996,8 +2036,30 @@ async function newCommand(args: ParsedArgs): Promise<number> {
   let plan = newReadPlanResult(handle, await newWaitRun(handle, "plan"));
   newRenderPlan(plan);
 
-  const notes: string[] = [];
-  if (!yes) {
+  let revision = 1;
+  const revisePlan = async (answer: string, acceptDefaults = false): Promise<void> => {
+    revision += 1;
+    const revisionPath = `${mrDir}/tasks/plan-round-${revision}.md`;
+    writeTextAtomic(revisionPath, newPlanRevisionTask(answer, acceptDefaults));
+    handle = await newSpawnRunCreate(
+      ["--resume-from", handle.run_id, "--tag", `plan-r${revision}`, "--task", revisionPath],
+      worktree,
+    );
+    planRuns.push(handle.run_id);
+    plan = newReadPlanResult(handle, await newWaitRun(handle, "plan"));
+    newRenderPlan(plan);
+  };
+
+  if (yes) {
+    const defaults = newRecommendedDefaults(plan);
+    if (defaults.blocking.length > 0) {
+      throw new CliError(`orch new --yes cannot answer blocking plan questions:\n${defaults.blocking.map((question) => `- ${question}`).join("\n")}`);
+    }
+    if (defaults.text) await revisePlan(defaults.text, true);
+    if (plan.open_questions.length > 0) {
+      throw new CliError(`final plan still has unresolved questions after applying recommended defaults:\n${plan.open_questions.map((question) => `- ${question}`).join("\n")}`);
+    }
+  } else {
     const rl = newReadline();
     try {
       for (;;) {
@@ -2010,17 +2072,20 @@ async function newCommand(args: ParsedArgs): Promise<number> {
         }
         const answer = raw.toLowerCase() === "e" ? await newEditAnswer(mrDir, rl, plan.open_questions) : raw;
         if (answer === null) continue;
-        if (answer === "") break;
-        notes.push(answer);
-        const revisionPath = `${mrDir}/tasks/plan-round-${notes.length + 1}.md`;
-        writeTextAtomic(revisionPath, newPlanRevisionTask(answer));
-        handle = await newSpawnRunCreate(
-          ["--resume-from", handle.run_id, "--tag", `plan-r${notes.length + 1}`, "--task", revisionPath],
-          worktree,
-        );
-        planRuns.push(handle.run_id);
-        plan = newReadPlanResult(handle, await newWaitRun(handle, "plan"));
-        newRenderPlan(plan);
+        if (answer !== "") {
+          await revisePlan(answer);
+          continue;
+        }
+        const defaults = newRecommendedDefaults(plan);
+        if (defaults.blocking.length > 0) {
+          process.stderr.write(`[orch new] execution blocked; answer or amend these questions:\n${defaults.blocking.map((question) => `  - ${question}`).join("\n")}\n`);
+          continue;
+        }
+        if (defaults.text) {
+          await revisePlan(defaults.text, true);
+          if (plan.open_questions.length > 0) continue;
+        }
+        break;
       }
     } finally {
       rl.close();
@@ -2028,7 +2093,8 @@ async function newCommand(args: ParsedArgs): Promise<number> {
   }
 
   const execTaskPath = `${mrDir}/tasks/exec.md`;
-  writeTextAtomic(execTaskPath, newExecTask(mr, worktree, plan.recommendation, notes));
+  writeTextAtomic(execTaskPath, newExecTask(mr, worktree, plan.recommendation));
+  const baselineRuns = new Set(collectMrRuns(repo.repo_key, mr).map((run) => run.run_id));
   const execHandle = await newSpawnRunCreate(
     ["--resume-from", handle.run_id, "--role", "controller", "--tag", "exec", "--task", execTaskPath],
     worktree,
@@ -2041,18 +2107,30 @@ async function newCommand(args: ParsedArgs): Promise<number> {
     for (const action of execResult.actions) process.stderr.write(`  - ${action}\n`);
   }
 
-  const ok = execStatus.state === "done" && execResult !== null && resultVerdict(execResult) === "completed";
+  const controllerOk =
+    execStatus.state === "done" &&
+    execResult?.schema === "orch.result/controller/v1" &&
+    execResult.verdict === "completed";
+  const workers = evaluateNewExecution(controllerOk, newExecutionRuns(repo.repo_key, mr, baselineRuns, execHandle.run_id));
   printJson({
     new: mr,
     worktree,
-    state: ok ? "completed" : "needs_attention",
+    state: workers.ok ? "completed" : "needs_attention",
     plan_runs: planRuns,
     exec_run: execHandle.run_id,
     exec_state: execStatus.state,
     exec_verdict: execResult ? resultVerdict(execResult) : null,
+    workers: {
+      total: workers.total,
+      handled: workers.handled,
+      failed: workers.failed,
+      undecided: workers.undecided,
+      closed: workers.closed,
+      rework_pending: workers.rework_pending,
+    },
     follow_up: [`orch verdict --thread ${mr}`, `orch result --mr ${mr} --run ${execHandle.run_id}`, "orch"],
   });
-  return ok ? 0 : 1;
+  return workers.ok ? 0 : 1;
 }
 
 function runIdOfClaim(run: unknown): string | null {
@@ -2319,6 +2397,50 @@ async function runReap(args: ParsedArgs): Promise<number> {
     }
   }
   printJson({ reaped, still_running: running });
+  return 0;
+}
+
+async function runCancel(args: ParsedArgs): Promise<number> {
+  assertKnownFlags(args, "run cancel", ["run", "mr", "worktree", "reason", "force"]);
+  const runId = flagString(args, "run");
+  const worktree = resolve(flagString(args, "worktree", process.cwd()));
+  const repo = await getRepoIdentity(worktree);
+  const located = locateRun(repo.repo_key, runId, args.flags.has("mr") ? flagString(args, "mr") : undefined);
+  const status = readJsonFile<RunStatus | null>(`${located.run_dir}/status.json`, null);
+  if (!status) throw new CliError(`status.json not found for run: ${runId}`);
+  if (!nonTerminalStates.has(status.state)) {
+    printJson({ canceled: false, run_id: runId, state: status.state, reason: "already terminal" });
+    return 0;
+  }
+  if (status.pgid === null) {
+    throw new CliError(
+      `run ${runId} has no process group yet (state: ${status.state}); retry once it is running, or: orch run reap --mr ${located.mr}`,
+    );
+  }
+  // The marker lands before the signal so the supervisor's fallback result
+  // (and the synced result mail) reports the cancellation, not a bare exit code.
+  writeJsonAtomic(`${located.run_dir}/canceled.json`, {
+    schema: "orch.run/canceled/v1",
+    run_id: runId,
+    reason: flagString(args, "reason", "canceled via orch run cancel"),
+    ts: new Date().toISOString(),
+  });
+  // Kill the driver's process group; the live supervisor then drives the run
+  // to its normal failed terminal state (fallback result, events, status).
+  const signal = flagBool(args, "force") ? "SIGKILL" : "SIGTERM";
+  try {
+    process.kill(-status.pgid, signal);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+    printJson({
+      canceled: false,
+      run_id: runId,
+      state: status.state,
+      reason: `process group ${status.pgid} is gone; run: orch run reap --mr ${located.mr}`,
+    });
+    return 1;
+  }
+  printJson({ canceled: true, run_id: runId, mr: located.mr, signal, pgid: status.pgid });
   return 0;
 }
 
@@ -3316,6 +3438,10 @@ async function main(): Promise<number> {
       process.stdout.write(runListHelp());
       return 0;
     }
+    if (first === "run" && second === "cancel") {
+      process.stdout.write(runCancelHelp());
+      return 0;
+    }
     if (first === "run") {
       process.stdout.write(runHelp());
       return 0;
@@ -3407,6 +3533,7 @@ async function main(): Promise<number> {
   if (first === "run" && second === "create") return createRun(args);
   if (first === "run" && second === "list") return runList(args);
   if (first === "run" && second === "reap") return runReap(args);
+  if (first === "run" && second === "cancel") return runCancel(args);
   if (first === "search") return searchCommand(args);
   if (first === "usage") return usageCommand(args);
   if (first === "cross-review") return crossReview(args);

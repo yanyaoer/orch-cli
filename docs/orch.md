@@ -16,14 +16,15 @@ permissions, model/effort tiers, result schemas — live in the CLI:
   the next run needs attention; `orch verdict --thread <id> --wait` suggests a
   whole-thread outcome.
 - **Start a brand-new task from one sentence** → `orch new '<description>'
-  [--workspace <id>]`: a researcher drafts the plan, you confirm/amend it in the
-  terminal, then a controller session dispatches and drives the work.
+  [--workspace <id>]`: Fable drafts a validated plan, you confirm/amend it, then
+  the resumed controller drives workers; persisted worker decisions determine success.
 - **Implement / review / verify / research one task** → `orch run create`
   (agent = codex|claude|pi|omp, role = implementer|reviewer|verifier|researcher).
   Follow with `orch status` / `orch result`; record `orch decision`, then
   `orch mirror` it to the PR/MR. Dispatching a rework? `orch run create
   --resume-from <run_id> --task rework.md` keeps the worker's provider session
-  instead of re-reading the repo from zero.
+  instead of re-reading the repo from zero. Wrong direction mid-run?
+  `orch run cancel --run <id>` stops it and records a canceled result.
 - **Need a plan/architecture decision, not code?** → `--role researcher`:
   read-only, web-research capable, returns a recommendation — or fan it out
   (below) for a second opinion.
@@ -48,6 +49,6 @@ permissions, model/effort tiers, result schemas — live in the CLI:
 
 ## Division of labor
 Strong model plans (via handoff-pro); tool-capable workers (codex / pi)
-execute; omp (gemini-3.1-pro, quota fallback claude-fable-5 → gpt-5.6) covers
-review / research; claude escalates by role (reviewer opus/high, researcher
+execute; omp (gpt-5.6-sol at xhigh thinking, quota fallback claude-fable-5 →
+gemini-3.1-pro) covers review / research; claude escalates by role (reviewer opus/high, researcher
 fable/xhigh). orch orchestrates and keeps all run state auditable under XDG_STATE.

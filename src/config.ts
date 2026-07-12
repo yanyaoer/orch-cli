@@ -1,6 +1,7 @@
 import { chmodSync, mkdirSync, realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { readJsonFile, writeJsonAtomic } from "./json.ts";
+import type { AgentName, RunRole } from "./types.ts";
 
 export interface BridgeWorker {
   name: string;
@@ -27,9 +28,21 @@ export interface OrchWorkspace {
   added_at: string;
 }
 
+// Per-role run defaults. A bare string is shorthand for { agent }. Explicit
+// run create flags always win; model here becomes spec.model (careful: for
+// claude that also overrides the role's model tier, e.g. reviewer/opus).
+export interface RoleDefaults {
+  agent?: AgentName;
+  model?: string;
+  timeout_sec?: number;
+}
+
 export interface OrchConfig {
   version: 1;
   workspaces: Record<string, OrchWorkspace>;
+  // `orch run create` falls back to these when the corresponding flag is
+  // omitted. Recommended profile: implementer -> pi (see README).
+  defaults?: { agents?: Partial<Record<RunRole, AgentName | RoleDefaults>> };
 }
 
 export interface MailAgentDefinition {

@@ -26,12 +26,12 @@ Shipped on `main` (v0.0.8, see [CHANGELOG.md](CHANGELOG.md)):
 - `orch run list`, `orch status`, `orch events tail`, and `orch result` read local run state; omitting `--mr` aggregates across all MRs in the repo. `orch result --wait` blocks until the run reaches a terminal state; reviewer results render findings, verifier results render commands and acceptance.
 - `orch events tail --native` renders the provider-native stream (`native.jsonl`) as normalized progress events — `session`, `assistant`, `tool_use`, `tool_result`, `usage`, `final`, `raw` — so a controller can see what a worker is doing without parsing per-provider formats. The same normalizer (`src/native-events.ts`) backs result extraction and resume-id detection. `-f/--follow` streams appended lines live: with `--run` it exits once the run is terminal (or stale) and drained; without `--run` it multiplexes every active run in the repo (`--all`: every repo) with tail-style `==> mr/run <==` headers, picks up runs created while following, and announces its scope on stderr up front.
 - `orch search` regex-scans the current repo's local run files (`result.json`, `events.jsonl`, `native.jsonl`, `artifacts/*.{txt,log,patch}`) plus mail `mail-events.jsonl` diagnostics; `orch usage run|thread|daily` aggregates token maps from normalized native usage events and reports missing token data as `has_token_data=false`.
-- Non-terminal runs whose supervisor pid is gone show as `stale?`; `orch run reap` persists them as `stale`. A provider that exits 0 without any output fails its run instead of quietly reporting done.
+- Non-terminal runs whose supervisor pid is gone show as `stale?`; `orch run reap` persists them as `stale`. A provider that exits 0 without any output fails its run instead of quietly reporting done. `orch run cancel --run <id> [--reason <text>]` stops a running worker mid-flight: it signals the driver's process group and the live supervisor finalizes the run with a `canceled: <reason>` result.
 - `orch decision` records `accept` or `rework` locally and queues a mirror comment.
 - `orch mail` provides the local message bus: signed mail events, Maildir delivery, router dispatch, atomic task claim, and result-driven review/verify follow-ups.
 - `orch cross-review`, `orch fanout`, and `orch investigate` fan one task across several agents in a single command. They route through the mail layer, so a `--thread <id>` supplies the mr and workspace context (no `--mr` needed).
 - The `researcher` role (architect / deep research) is read-only and web-research capable: it delivers a plan, not code, and takes no worktree lock. claude runs `fable` at `xhigh` effort under a `dontAsk` whitelist (`jina`/`tvly` CLIs + WebSearch/WebFetch + read-only repo tools, no Edit/Write); codex defaults to `gpt-5.6-sol` at `xhigh` reasoning with native `web_search` inside the read-only sandbox; omp rides its gemini quota-fallback chain read-only (repo-internal research, no web); pi is not supported.
-- `orch new '<task description>'` — one-sentence task intake: a read-only researcher run drafts the plan, the plan renders in the terminal for confirmation (answer/amend to replan, Enter to accept, `q` to abort, `--yes` for non-interactive), then the same provider session resumes as a controller that dispatches workers.
+- `orch new '<task description>'` — one-sentence task intake: a read-only Fable/xhigh researcher drafts a mechanically validated Destination / Out of scope / Tasks / Later plan. Enter or `--yes` resolves safe recommended defaults into one self-contained final plan; questions without a safe default block execution. The same Fable session resumes at controller/medium effort to dispatch workers, while final success is derived from persisted worker status/result/decision files rather than the controller's claim alone.
 - `--task -` on `orch run create` and the fanout commands reads the task text from stdin.
 - The `challenger`, `rework`, and `debugger` roles are removed: `implementer` is the only write role; rework/debug follow-ups are implementer runs dispatched via `--resume-from`.
 - `orch mailctl` drives orch by real email over IMAP/SMTP: an allowlisted, authenticated sender emails a task, `orch mailctl poll` ingests it, auto-spawns a claude **controller** run that decomposes/dispatches the work and replies progress in the same thread. Daemonless (`poll` is the cron/launchd contract; `watch` is a foreground IMAP-IDLE convenience), zero npm deps, any IMAP/SMTP provider (Gmail via app password). Inbound email is treated as an authentication boundary (allowlist + trusted-authserv-id Authentication-Results, fail-closed; text/plain-only task body). The controller result schema is `orch.result/controller/v1`.
@@ -40,7 +40,27 @@ Shipped on `main` (v0.0.8, see [CHANGELOG.md](CHANGELOG.md)):
 - Permissions match the role: the read-only `reviewer` role launches each provider without write access (claude plan mode, codex `--sandbox read-only`, pi and omp read-only tools). `verifier` and write roles keep write-capable access.
 - claude model/effort match the role too: `reviewer` runs `--model opus --effort high`; `implementer` stays on the default model at `--effort medium`; `verifier` stays on the default model at `--effort low`.
 - `orch run create --model <ref>` records a provider model override in `spec.json` and passes it through to model-aware drivers such as pi, omp, codex, and claude.
-- `omp` (oh-my-pi) defaults to `google-antigravity/gemini-3.1-pro` and falls back to `zenmux/anthropic/claude-fable-5`, then `openai-codex/gpt-5.6` when the active model's quota/rate limit is exhausted; an explicit `--model <ref>` becomes the primary and the rest of the chain stays as fallbacks.
+- Recommended default profile (`~/.config/orch/config.json`): set `defaults.agents.implementer` to `pi`, so `orch run create --role implementer` works without `--agent` and the mail roster auto-invites `pi-implementer`. In a same-model harness pilot (SWE-bench Verified subset, gpt-5.6-sol frozen across codex/omp/pi), resolve rates were indistinguishable while pi used ~45% of omp's and ~56% of codex's cache-read traffic — the cheapest implementer at equal quality:
+
+```json
+{
+  "version": 1,
+  "workspaces": {},
+  "defaults": {
+    "agents": {
+      "implementer": "pi",
+      "reviewer": "claude",
+      "verifier": "pi",
+      "controller": "claude",
+      "researcher": "codex"
+    }
+  }
+}
+```
+
+Each role value is either a bare agent name or an object carrying default args, e.g. `{"agent": "omp", "model": "openai-codex/gpt-5.6", "timeout_sec": 1800}` — explicit `orch run create` flags always win. Leave `model` unset unless you mean to override the driver's role tier (a configured model becomes `spec.model`, which for claude also replaces the reviewer/researcher model escalation).
+
+- `omp` (oh-my-pi) defaults to `openai-codex/gpt-5.6-sol` at `--thinking=xhigh` and falls back to `zenmux/anthropic/claude-fable-5`, then `google-antigravity/gemini-3.1-pro` when the active model's quota/rate limit is exhausted; an explicit `--model <ref>` becomes the primary and the rest of the chain stays as fallbacks.
 - `orch chatgpt-bridge` deploys a Cloudflare Worker (no tunnel) and connects ChatGPT (Developer Mode, e.g. `gpt-5.5-pro`) to a read-only view of the worktree.
 - Role result schemas exist for `implementer`, `reviewer`, `verifier`, `researcher` (read-only plan-not-code research, `orch.result/researcher/v1`), and `controller` (the `orch mailctl` mail controller; claude-only, orchestrate-not-edit).
 - Provider session/model controls are explicit: defaults avoid latest-session resume, exact resume requires `--session-mode resume_exact --session-id <id>`, `--model <ref>` selects a provider model when supported, and idempotency keys include session/model settings.
@@ -253,8 +273,8 @@ $ orch mailctl attachment promote --id att-<id> [--dest <dir>]       # copy a st
 
 Notifications default to `{"enabled": false, "max_per_hour": 30}`; set `"to": "owner@example.com"` if needed.
 `orch mailctl sync [--mr <id>] [--json]` previews MR progress email; `--execute` requires notifications enabled, while `poll` and `watch` sync automatically.
-Each MR gets one subject root with dispatched/result/decision replies, with idempotency and backoff across retries.
-Delivery is **at-least-once**: outbox markers dedupe re-sends, but a crash in the window between SMTP acceptance and the sent-marker write can deliver the same progress email twice (stable Message-IDs let mail clients collapse the duplicate). Changing or removing `notify.to` also invalidates queued progress mail — stale retries are dropped and re-queued for the current recipient on the next sync, and the new recipient receives the thread's anchoring root once before further updates.
+Each MR gets one subject root with dispatched/result/decision replies, with idempotency and backoff across retries. Policy checks are isolated per report: path-shaped private markers are redacted and revalidated, while genuinely unsafe bodies are fingerprint-quarantined once without blocking safe sibling updates.
+Delivery is **at-least-once**: outbox markers dedupe re-sends, but a crash in the window between SMTP acceptance and the sent-marker write can deliver the same progress email twice (stable Message-IDs let mail clients collapse the duplicate). Changing or removing `notify.to` also invalidates queued progress mail — stale retries are marked superseded and re-queued for the current recipient on the next sync, and the new recipient receives the thread's anchoring root once before further updates.
 Note: the first sync after enabling notifications backfills every existing MR under the repo (rate-limited by `max_per_hour`), so a repo with history produces a burst of catch-up mail. Set `"since": "<ISO-8601>"` in `notify` to cut the backfill: runs created before that timestamp are never projected.
 Body paths may use `$ORCH_STATE`, `$WORKSPACE`, or `~`; the `secretPatterns` leak guard always runs, and `max_per_hour` limits delivery.
 
@@ -389,6 +409,7 @@ orch verdict       Aggregate one thread's verdicts and suggest a decision (--wai
 orch wait          Block until the next run in a thread needs attention (wait-any)
 orch run create    Start one headless worker run for an MR task
 orch run list      List local runs for an MR (dead-pid runs show as stale?)
+orch run cancel    Stop a running worker (supervisor finalizes it as failed)
 orch run reap      Persist stale for non-terminal runs whose supervisor died
 orch search        Regex-search run files and mail event diagnostics
 orch usage         Summarize token usage by run, thread, or day

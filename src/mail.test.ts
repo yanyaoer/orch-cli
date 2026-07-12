@@ -585,10 +585,12 @@ test("mail submit to router routes default codex claude pi agents", async () => 
     "omp-researcher",
     "omp-reviewer",
     "orch-router",
+    "pi-implementer",
     "pi-verifier",
   ]);
   expect(defaultAgents.map((agent) => [agent.provider, agent.work_mode])).toContainEqual(["omp", "review"]);
   expect(defaultAgents.map((agent) => [agent.provider, agent.work_mode])).toContainEqual(["codex", "implement"]);
+  expect(defaultAgents.map((agent) => [agent.provider, agent.work_mode])).toContainEqual(["pi", "implement"]);
   expect(defaultAgents.map((agent) => [agent.provider, agent.work_mode])).toContainEqual(["claude", "review"]);
   expect(defaultAgents.map((agent) => [agent.provider, agent.work_mode])).toContainEqual(["pi", "verify"]);
   expect(defaultAgents.map((agent) => [agent.provider, agent.work_mode])).toContainEqual(["codex", "research"]);
@@ -627,7 +629,7 @@ test("mail submit to router routes default codex claude pi agents", async () => 
   const routed = await runOrch(["mail", "route", "--thread", thread, "--worktree", worktree], env);
   expect(routed).toMatchObject({ exitCode: 0, stderr: "" });
   const routedPayload = JSON.parse(routed.stdout) as { assigned: Array<{ role: string; agent_id: string; source_event_id: string; event_id: string }> };
-  expect(routedPayload.assigned.map((item) => [item.role, item.agent_id])).toEqual([["implementer", "codex-implementer"]]);
+  expect(routedPayload.assigned.map((item) => [item.role, item.agent_id])).toEqual([["implementer", "pi-implementer"]]);
   expect(routedPayload.assigned.every((item) => item.source_event_id === submittedPayload.event_id)).toBe(true);
   const implementerTaskEventId = routedPayload.assigned[0]!.event_id;
   const routedAgainBeforeDelivery = await runOrch(["mail", "route", "--thread", thread, "--worktree", worktree], env);
@@ -648,21 +650,21 @@ test("mail submit to router routes default codex claude pi agents", async () => 
     .trim()
     .split("\n")
     .map((line) => JSON.parse(line));
-  expect(routedEvents.find((event) => event.assigned_agent?.id === "codex-implementer")).toMatchObject({ mr: "123", workspace: { id: "orch-cli", path: worktree } });
-  const claimed = await runOrch(["mail", "claim", "--thread", thread, "--agent", "codex-implementer", "--dry-run", "--worktree", worktree], env);
+  expect(routedEvents.find((event) => event.assigned_agent?.id === "pi-implementer")).toMatchObject({ mr: "123", workspace: { id: "orch-cli", path: worktree } });
+  const claimed = await runOrch(["mail", "claim", "--thread", thread, "--agent", "pi-implementer", "--dry-run", "--worktree", worktree], env);
   expect(claimed).toMatchObject({ exitCode: 0, stderr: "" });
   const claimedPayload = JSON.parse(claimed.stdout) as { claimed: Array<{ mr: string; role: string; agent_id: string; run: { dry_run: boolean; role: string; agent: string } }> };
   expect(claimedPayload.claimed).toHaveLength(1);
-  expect(claimedPayload.claimed[0]).toMatchObject({ mr: "123", role: "implementer", agent_id: "codex-implementer", run: { dry_run: true, role: "implementer", agent: "codex" } });
+  expect(claimedPayload.claimed[0]).toMatchObject({ mr: "123", role: "implementer", agent_id: "pi-implementer", run: { dry_run: true, role: "implementer", agent: "pi" } });
 
-  const claimedReal = await runOrch(["mail", "claim", "--thread", thread, "--agent", "codex-implementer", "--worktree", worktree], { ...env, ORCH_DRIVER_FAKE_RESULT: "1" });
+  const claimedReal = await runOrch(["mail", "claim", "--thread", thread, "--agent", "pi-implementer", "--worktree", worktree], { ...env, ORCH_DRIVER_FAKE_RESULT: "1" });
   expect(claimedReal).toMatchObject({ exitCode: 0, stderr: "" });
   const claimedRealPayload = JSON.parse(claimedReal.stdout) as { claimed: Array<{ event_id: string; run: { run_id: string; dry_run?: boolean } }> };
   expect(claimedRealPayload.claimed).toHaveLength(1);
   expect(claimedRealPayload.claimed[0]!.event_id).toBe(implementerTaskEventId);
-  expect(claimedRealPayload.claimed[0]!.run.run_id).toContain("mail-implementer-codex-implementer");
+  expect(claimedRealPayload.claimed[0]!.run.run_id).toContain("mail-implementer-pi-implementer");
   const claimRecord = JSON.parse(readFileSync(join(stateHome, "orch", repoKeyFromRemote("git@github.com:example/repo.git", worktree), "mail", "threads", thread, "claims", `${implementerTaskEventId}.claim.json`), "utf8"));
-  expect(claimRecord).toMatchObject({ state: "acked", event_id: implementerTaskEventId, agent_id: "codex-implementer" });
+  expect(claimRecord).toMatchObject({ state: "acked", event_id: implementerTaskEventId, agent_id: "pi-implementer" });
   const claimedAgain = await runOrch(["mail", "claim", "--thread", thread, "--agent", "codex-implementer", "--worktree", worktree], { ...env, ORCH_DRIVER_FAKE_RESULT: "1" });
   expect(claimedAgain).toMatchObject({ exitCode: 0, stderr: "" });
   expect(JSON.parse(claimedAgain.stdout).claimed).toEqual([]);
@@ -707,7 +709,7 @@ test("mail submit to router routes default codex claude pi agents", async () => 
   const sentPayload = JSON.parse(sent.stdout) as { mail: string; thread: string; router_event_id: string; assigned: Array<{ role: string; agent_id: string }>; delivered: Array<{ to: string }> };
   expect(sentPayload).toMatchObject({ mail: "sent-local", thread });
   expect(sentPayload.router_event_id).toMatch(/^evt_/);
-  expect(sentPayload.assigned.map((item) => [item.role, item.agent_id])).toEqual([["implementer", "codex-implementer"]]);
+  expect(sentPayload.assigned.map((item) => [item.role, item.agent_id])).toEqual([["implementer", "pi-implementer"]]);
   expect(sentPayload.delivered.length).toBeGreaterThanOrEqual(2);
 });
 
@@ -740,7 +742,7 @@ test("mail route serializes concurrent routers and derives routed state from out
   ]);
   for (const result of routed) expect(result).toMatchObject({ exitCode: 0, stderr: "" });
   const assigned = routed.flatMap((result) => (JSON.parse(result.stdout) as { assigned: Array<{ role: string; agent_id: string; source_event_id: string }> }).assigned);
-  expect(assigned.map((item) => [item.role, item.agent_id, item.source_event_id])).toEqual([["implementer", "codex-implementer", submittedPayload.event_id]]);
+  expect(assigned.map((item) => [item.role, item.agent_id, item.source_event_id])).toEqual([["implementer", "pi-implementer", submittedPayload.event_id]]);
 
   const routedAgainWhilePending = await runOrch(["mail", "route", "--thread", thread, "--worktree", worktree], env);
   expect(routedAgainWhilePending).toMatchObject({ exitCode: 0, stderr: "" });

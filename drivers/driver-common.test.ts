@@ -190,10 +190,16 @@ test("buildProviderArgv keeps defaults fresh and only resumes exact sessions", (
     "/worktree",
     "--output-last-message",
     "/run/last_message.txt",
+    "--sandbox",
+    "workspace-write",
     "-",
   ]);
   expect(buildProviderArgv("pi", { ...base, provider_session_mode: "ephemeral" }, "/run", "/worktree")).toEqual([
     "pi",
+    "--model",
+    "openai-codex/gpt-5.6-sol",
+    "--thinking",
+    "xhigh",
     "-p",
     "--mode",
     "json",
@@ -236,7 +242,7 @@ test("buildProviderArgv keeps defaults fresh and only resumes exact sessions", (
       "/run",
       "/worktree",
     ),
-  ).toEqual(["codex", "exec", "resume", "--json", "--output-last-message", "/run/last_message.txt", "thread-123", "-"]);
+  ).toEqual(["codex", "exec", "--sandbox", "workspace-write", "resume", "--json", "--output-last-message", "/run/last_message.txt", "thread-123", "-"]);
   expect(
     buildProviderArgv(
       "pi",
@@ -244,7 +250,7 @@ test("buildProviderArgv keeps defaults fresh and only resumes exact sessions", (
       "/run",
       "/worktree",
     ),
-  ).toEqual(["pi", "-p", "--mode", "json", "--session-id", "pi-session"]);
+  ).toEqual(["pi", "--model", "openai-codex/gpt-5.6-sol", "--thinking", "xhigh", "-p", "--mode", "json", "--session-id", "pi-session"]);
 });
 
 test("buildProviderArgv passes explicit model overrides to supporting providers", () => {
@@ -255,6 +261,8 @@ test("buildProviderArgv passes explicit model overrides to supporting providers"
     "pi",
     "--model",
     model,
+    "--thinking",
+    "xhigh",
     "-p",
     "--mode",
     "json",
@@ -323,7 +331,8 @@ test("buildProviderArgv runs omp with the default model chain and @file prompt",
   expect(buildProviderArgv("omp", { ...base, provider_session_mode: "ephemeral" }, "/run", "/worktree", "do review")).toEqual([
     "omp",
     "--model",
-    "google-antigravity/gemini-3.1-pro",
+    "openai-codex/gpt-5.6-sol",
+    "--thinking=xhigh",
     "--config",
     "/run/omp-fallback.yml",
     "-p",
@@ -346,7 +355,8 @@ test("buildProviderArgv runs omp with the default model chain and @file prompt",
   ).toEqual([
     "omp",
     "--model",
-    "google-antigravity/gemini-3.1-pro",
+    "openai-codex/gpt-5.6-sol",
+    "--thinking=xhigh",
     "--config",
     "/run/omp-fallback.yml",
     "-p",
@@ -365,7 +375,8 @@ test("buildProviderArgv runs omp with the default model chain and @file prompt",
   ).toEqual([
     "omp",
     "--model",
-    "google-antigravity/gemini-3.1-pro",
+    "openai-codex/gpt-5.6-sol",
+    "--thinking=xhigh",
     "--config",
     "/run/omp-fallback.yml",
     "-p",
@@ -378,12 +389,12 @@ test("buildProviderArgv runs omp with the default model chain and @file prompt",
 
 test("ompModelChain puts the requested model first and keeps the rest as quota fallbacks", () => {
   expect(ompModelChain(null)).toEqual({
-    primary: "google-antigravity/gemini-3.1-pro",
-    fallbacks: ["zenmux/anthropic/claude-fable-5", "openai-codex/gpt-5.6"],
+    primary: "openai-codex/gpt-5.6-sol",
+    fallbacks: ["zenmux/anthropic/claude-fable-5", "google-antigravity/gemini-3.1-pro"],
   });
   expect(ompModelChain("zenmux/anthropic/claude-fable-5")).toEqual({
     primary: "zenmux/anthropic/claude-fable-5",
-    fallbacks: ["google-antigravity/gemini-3.1-pro", "openai-codex/gpt-5.6"],
+    fallbacks: ["openai-codex/gpt-5.6-sol", "google-antigravity/gemini-3.1-pro"],
   });
   // A model outside the chain keeps the full chain as fallbacks.
   expect(ompModelChain("openai/gpt-5.5-pro")).toEqual({
@@ -437,6 +448,10 @@ test("buildProviderArgv matches read-only posture to the reviewer role per provi
   // pi reviewer is restricted to read-only tools.
   expect(buildProviderArgv("pi", { ...base, provider_session_mode: "ephemeral" }, "/run", "/worktree")).toEqual([
     "pi",
+    "--model",
+    "openai-codex/gpt-5.6-sol",
+    "--thinking",
+    "xhigh",
     "-p",
     "--mode",
     "json",
@@ -526,7 +541,8 @@ test("buildProviderArgv gives researcher a read-only web-research posture on cla
   expect(buildProviderArgv("omp", { ...base, provider_session_mode: "ephemeral" }, "/run", "/worktree")).toEqual([
     "omp",
     "--model",
-    "google-antigravity/gemini-3.1-pro",
+    "openai-codex/gpt-5.6-sol",
+    "--thinking=xhigh",
     "--config",
     "/run/omp-fallback.yml",
     "-p",

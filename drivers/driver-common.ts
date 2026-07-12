@@ -103,11 +103,19 @@ export function buildWorkerEnv(baseEnv: NodeJS.ProcessEnv = process.env): Record
 // recovery consumes it — `retry.modelFallback` (on by default) permits the
 // switch — advancing to the next model when the provider reports
 // quota/rate-limit exhaustion.
+// Primary is gpt-5.6-sol at xhigh thinking; gemini sits at the tail because
+// its provider intermittently geo-rejects behind the corporate VPN.
 export const OMP_MODEL_CHAIN: readonly string[] = [
-  "google-antigravity/gemini-3.1-pro",
+  "openai-codex/gpt-5.6-sol",
   "zenmux/anthropic/claude-fable-5",
-  "openai-codex/gpt-5.6",
+  "google-antigravity/gemini-3.1-pro",
 ];
+
+export const OMP_THINKING = "--thinking=xhigh";
+
+// pi default mirrors omp's primary: gpt-5.6-sol at xhigh thinking. pi has no
+// quota-fallback chain; an explicit --model overrides the default.
+export const PI_DEFAULT_MODEL = "openai-codex/gpt-5.6-sol";
 
 export function ompModelChain(model: string | null | undefined): { primary: string; fallbacks: string[] } {
   const primary = model ?? OMP_MODEL_CHAIN[0]!;
@@ -142,11 +150,12 @@ export const CLAUDE_CONTROLLER_ALLOWED_TOOLS = "Bash(orch *),Read,Grep,Glob,LS";
 export const CLAUDE_RESEARCHER_ALLOWED_TOOLS = "Bash(jina *),Bash(tvly *),WebSearch,WebFetch,Read,Grep,Glob,LS";
 
 // Researcher model per provider: codex pins gpt-5.6-sol and claude pins fable,
-// both at xhigh effort; omp rides its normal gemini quota-fallback chain.
+// both at xhigh effort; omp rides its default quota-fallback chain
+// (gpt-5.6-sol primary at xhigh thinking).
 export const CODEX_RESEARCHER_MODEL = "gpt-5.6-sol";
 
 // claude model tier by role: reviewer escalates to opus (deep critique, paired
-// with omp's gemini-3.1-pro as a distinct model family in cross-review);
+// with omp's gpt-5.6-sol as a distinct model family in cross-review);
 // researcher escalates further to fable (deep research/architecture);
 // implementer/verifier stay on the claude CLI's default model (sonnet) and only dial --effort.
 const CLAUDE_ROLE_MODEL: Partial<Record<RunSpec["role"], string>> = {
@@ -179,14 +188,14 @@ export function buildProviderArgv(
     throw new Error("controller role only supports claude provider");
   }
   // pi is excluded: no strong-reasoning model and no web path. omp researcher
-  // runs the gemini chain with read-only tools (repo-internal research, no web).
+  // runs the default chain with read-only tools (repo-internal research, no web).
   if (spec.role === "researcher" && provider === "pi") {
     throw new Error("researcher role only supports claude, codex, and omp providers");
   }
 
   if (provider === "omp") {
     const { primary, fallbacks } = ompModelChain(spec.model);
-    const argv = ["omp", "--model", primary];
+    const argv = ["omp", "--model", primary, OMP_THINKING];
     // The quota fallback chain rides a per-run config overlay written by
     // runProviderDriver before spawn (omp native retry.fallbackChains).
     if (fallbacks.length > 0) argv.push("--config", ompFallbackConfigPath(runDir));
@@ -244,7 +253,10 @@ export function buildProviderArgv(
       // `codex exec resume` has no --sandbox flag (exit 2 if passed); the
       // sandbox rides the parent `exec` level, accepted before the subcommand.
       const resume = ["codex", "exec"];
-      if (readOnly) resume.push("--sandbox", "read-only");
+      // codex exec DEFAULTS to the read-only sandbox (verified live: writes
+      // blocked without an explicit -s); write-capable roles must ask for
+      // workspace-write explicitly or implementers cannot edit anything.
+      resume.push("--sandbox", readOnly ? "read-only" : "workspace-write");
       resume.push("resume", "--json", "--output-last-message", lastMessagePath);
       if (model) resume.push("--model", model);
       resume.push(...researcherFlags);
@@ -254,14 +266,14 @@ export function buildProviderArgv(
     const argv = ["codex", "exec", "--json", "--cd", worktree, "--output-last-message", lastMessagePath];
     if (model) argv.push("--model", model);
     argv.push(...researcherFlags);
-    if (readOnly) argv.push("--sandbox", "read-only");
+    // See resume path above: codex exec defaults to read-only.
+    argv.push("--sandbox", readOnly ? "read-only" : "workspace-write");
     if (spec.provider_session_mode === "ephemeral") argv.push("--ephemeral");
     argv.push("-");
     return argv;
   }
 
-  const argv = ["pi"];
-  if (spec.model) argv.push("--model", spec.model);
+  const argv = ["pi", "--model", spec.model ?? PI_DEFAULT_MODEL, "--thinking", "xhigh"];
   argv.push("-p", "--mode", "json");
   if (readOnly) argv.push("--tools", "read,grep,find,ls");
   if (spec.provider_session_mode === "ephemeral") {
@@ -672,6 +684,40 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function fakeResearchValue(spec: RunSpec, field: "RECOMMENDATION" | "OPEN_QUESTIONS"): string | undefined {
+  const revision = spec.tag.startsWith("plan-r") ? process.env[`ORCH_DRIVER_FAKE_RESEARCH_REVISION_${field}`] : undefined;
+  return revision ?? process.env[`ORCH_DRIVER_FAKE_RESEARCH_${field}`];
+}
+
+function fakeResearchQuestions(spec: RunSpec): string[] {
+  const raw = fakeResearchValue(spec, "OPEN_QUESTIONS");
+  if (!raw) return [];
+  const value = JSON.parse(raw) as unknown;
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
+    throw new Error("ORCH_DRIVER_FAKE_RESEARCH[_REVISION]_OPEN_QUESTIONS must be a JSON string array");
+  }
+  return value;
+}
+
+const FAKE_RESEARCH_PLAN = [
+  "## Destination",
+  "Complete one fake worker task.",
+  "",
+  "## Out of scope",
+  "None.",
+  "",
+  "## Tasks (now)",
+  "### fake-task",
+  "- Role: implementer",
+  "- After: none",
+  "- Spec: Execute the fake task without external side effects.",
+  "- Acceptance:",
+  "  - the fake worker reaches done",
+  "",
+  "## Later (not yet specified)",
+  "None.",
+].join("\n");
+
 export async function maybeWriteFakeResult(runDir: string, spec: RunSpec, provider: string): Promise<boolean> {
   if (process.env.ORCH_DRIVER_FAKE_RESULT !== "1") return false;
   const sleepMs = Number(process.env.ORCH_DRIVER_FAKE_SLEEP_MS ?? "0");
@@ -719,10 +765,10 @@ export async function maybeWriteFakeResult(runDir: string, spec: RunSpec, provid
             run_id: spec.run_id,
             verdict: "completed",
             summary: `fake ${provider} research completed`,
-            recommendation: "fake recommendation",
+            recommendation: fakeResearchValue(spec, "RECOMMENDATION") ?? FAKE_RESEARCH_PLAN,
             alternatives: [],
             sources: [],
-            open_questions: [],
+            open_questions: fakeResearchQuestions(spec),
             risks: [],
           }
         : {
