@@ -81,7 +81,7 @@ import { runClaudeDriver } from "../drivers/claude-headless.ts";
 import { deployWorker, locateBridgeDir, runChatgptBridge } from "../drivers/chatgpt-bridge.ts";
 import { runPiDriver } from "../drivers/pi-headless.ts";
 import { runOmpDriver } from "../drivers/omp-headless.ts";
-import { addWorkspace, chatgptBridgeConfigPath, readBridgeConfig, readMailAgentsConfig, readMailControlConfig, readOrchConfig, validateMailControlConfig, writeBridgeConfig } from "./config.ts";
+import { addWorkspace, chatgptBridgeConfigPath, readBridgeConfig, readMailAgentsConfig, readMailControlConfig, readOrchConfig, validateMailControlConfig, writeBridgeConfig, type RoleDefaults } from "./config.ts";
 import { createInterface, type Interface as ReadlineInterface, type ReadLineOptions } from "node:readline";
 import { buildBundle, type BundleOptions } from "./handoff-pro.ts";
 import { mail, mailFanout, type MailCliContext, type MailFanoutOutcome } from "./mail-cli.ts";
@@ -244,14 +244,14 @@ type ProviderSessionConfig = Pick<
   "provider_session_name" | "provider_session_id" | "provider_session_mode" | "model"
 >;
 
-function providerSessionConfig(args: ParsedArgs, agent: AgentName): ProviderSessionConfig {
+function providerSessionConfig(args: ParsedArgs, agent: AgentName, defaultModel: string | null = null): ProviderSessionConfig {
   const modeValue = flagString(args, "session-mode", defaultProviderSessionMode(agent));
   if (!isProviderSessionMode(modeValue)) {
     throw new CliError("--session-mode must be ephemeral|fresh_persistent|resume_exact");
   }
   const name = args.flags.has("session-name") ? flagString(args, "session-name").trim() : null;
   const id = args.flags.has("session-id") ? flagString(args, "session-id").trim() : null;
-  const model = args.flags.has("model") ? flagString(args, "model").trim() : null;
+  const model = args.flags.has("model") ? flagString(args, "model").trim() : defaultModel;
 
   if (name === "") throw new CliError("--session-name must not be empty");
   if (id === "") throw new CliError("--session-id must not be empty");
@@ -1149,18 +1149,26 @@ async function resolveResumeFrom(args: ParsedArgs): Promise<ResumeContext> {
   };
 }
 
+// Per-role defaults from config.json (defaults.agents); bare string = agent.
+function configuredRoleDefaults(role: RunRole): RoleDefaults {
+  const raw = readOrchConfig().defaults?.agents?.[role];
+  if (!raw) return {};
+  return typeof raw === "string" ? { agent: raw } : raw;
+}
+
 async function createRun(args: ParsedArgs): Promise<number> {
   assertKnownFlags(args, "run create", RUN_CREATE_FLAGS);
   const resume = args.flags.has("resume-from") ? await resolveResumeFrom(args) : null;
   const role = resume && !args.flags.has("role") ? resume.role : (flagString(args, "role") as RunRole);
-  // --agent falls back to the per-role default in config.json (defaults.agents)
-  // when omitted; without either, the original "missing --agent" error stands.
-  const configuredAgent = readOrchConfig().defaults?.agents?.[role];
+  // --agent/--model/--timeout-sec fall back to the per-role defaults in
+  // config.json (defaults.agents) when omitted; explicit flags always win and
+  // without either source the original "missing --agent" error stands.
+  const roleDefaults = configuredRoleDefaults(role);
   const agent = resume
     ? resume.agent
-    : args.flags.has("agent") || !configuredAgent
+    : args.flags.has("agent") || !roleDefaults.agent
       ? (flagString(args, "agent") as AgentName)
-      : configuredAgent;
+      : roleDefaults.agent;
   const tag = flagString(args, "tag", role);
   const worktree = resume ? resume.worktree : resolve(flagString(args, "worktree", process.cwd()));
   const taskFlag = args.flags.has("task") ? flagString(args, "task") : null;
@@ -1171,14 +1179,15 @@ async function createRun(args: ParsedArgs): Promise<number> {
     resume && !args.flags.has("mr") ? { mr: resume.mr, source: "resume-from" as const } : await resolveMr(args, taskText, worktree);
   // Reviewer runs finish in minutes in practice (52/67 recorded runs override
   // the old 4h default); keep the long default only for roles that build/test.
-  const timeoutSec = Number(flagString(args, "timeout-sec", role === "reviewer" ? "3600" : "14400"));
+  const builtinTimeout = role === "reviewer" ? "3600" : "14400";
+  const timeoutSec = Number(flagString(args, "timeout-sec", String(roleDefaults.timeout_sec ?? builtinTimeout)));
 
   if (!isRunRole(role)) {
     throw new CliError(`unsupported role: ${role} (valid: implementer, reviewer, verifier, controller, researcher)`);
   }
   validateRunAgent(agent, role);
   if (!Number.isFinite(timeoutSec) || timeoutSec <= 0) throw new CliError("--timeout-sec must be positive");
-  const providerSession = resume ? resume.session : providerSessionConfig(args, agent);
+  const providerSession = resume ? resume.session : providerSessionConfig(args, agent, roleDefaults.model ?? null);
 
   const repo = await getRepoIdentity(worktree);
   const mrDir = mrStateDir(repo.repo_key, mr);

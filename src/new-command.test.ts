@@ -252,4 +252,25 @@ test("run create falls back to config.json defaults.agents when --agent is omitt
   );
   expect(missing.exitCode).not.toBe(0);
   expect(missing.stderr).toContain("missing --agent");
+
+  // Object form carries args: agent + model + timeout_sec, flags still win.
+  writeFileSync(
+    join(configHome, "orch", "config.json"),
+    JSON.stringify({
+      version: 1,
+      workspaces: {},
+      defaults: { agents: { researcher: { agent: "omp", model: "openai-codex/gpt-5.6", timeout_sec: 1800 } } },
+    }),
+  );
+  const objForm = await runOrch(
+    ["run", "create", "--mr", "88", "--role", "researcher", "--worktree", worktree, "--dry-run", "--json"],
+    env,
+  );
+  expect(objForm.exitCode).toBe(0);
+  expect(JSON.parse(objForm.stdout)).toMatchObject({ agent: "omp", model: "openai-codex/gpt-5.6", timeout_sec: 1800 });
+  const flagWins = await runOrch(
+    ["run", "create", "--mr", "88", "--role", "researcher", "--model", "openai-codex/gpt-5.6-sol", "--timeout-sec", "900", "--worktree", worktree, "--dry-run", "--json"],
+    env,
+  );
+  expect(JSON.parse(flagWins.stdout)).toMatchObject({ agent: "omp", model: "openai-codex/gpt-5.6-sol", timeout_sec: 900 });
 });
