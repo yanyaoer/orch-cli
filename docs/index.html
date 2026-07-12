@@ -505,12 +505,15 @@
           <h2 data-lang="en">Permissions and models match the role.</h2>
           <h2 data-lang="zh">权限与模型随角色匹配。</h2>
           <p class="sec-lead" data-lang="en">
-            The reviewer role launches every provider read-only; write roles and the verifier keep
-            write-capable access. The claude driver also picks model and effort per role.
+            The reviewer and researcher roles launch every provider read-only — researcher runs
+            claude, codex, and omp without the worktree lock, with web research on claude and codex
+            only; write roles and the verifier keep write-capable access. The claude driver also
+            picks model and effort per role.
           </p>
           <p class="sec-lead" data-lang="zh">
-            reviewer 角色下所有 provider 都以只读方式启动；写角色与 verifier 保留写权限。claude driver
-            还会按角色选择模型与推理力度。
+            reviewer 与 researcher 角色下所有 provider 都以只读方式启动——researcher 支持 claude、codex
+            与 omp，不占 worktree 锁，联网检索仅限 claude 与 codex；写角色与 verifier 保留写权限。
+            claude driver 还会按角色选择模型与推理力度。
           </p>
         </div>
 
@@ -521,6 +524,7 @@
                 <th>DRIVER</th>
                 <th><span data-lang="en">IMPLEMENTER · write</span><span data-lang="zh">IMPLEMENTER · 写</span></th>
                 <th><span data-lang="en">REVIEWER · read-only</span><span data-lang="zh">REVIEWER · 只读</span></th>
+                <th><span data-lang="en">RESEARCHER · read-only · web on claude/codex</span><span data-lang="zh">RESEARCHER · 只读 · 仅 claude/codex 联网</span></th>
                 <th><span data-lang="en">VERIFIER · runs tests</span><span data-lang="zh">VERIFIER · 跑测试</span></th>
               </tr>
             </thead>
@@ -529,24 +533,28 @@
                 <td>codex</td>
                 <td><span class="yes">✓</span> default write</td>
                 <td><span class="ro">✓</span> --sandbox read-only</td>
+                <td><span class="ro">✓</span> gpt-5.6-sol · xhigh · web_search</td>
                 <td><span class="yes">✓</span></td>
               </tr>
               <tr>
                 <td>claude</td>
                 <td><span class="yes">✓</span> sonnet · effort medium</td>
                 <td><span class="ro">✓</span> plan mode · opus · effort high</td>
+                <td><span class="ro">✓</span> fable · xhigh · jina/tvly + web tools</td>
                 <td><span class="yes">✓</span> sonnet · effort low</td>
               </tr>
               <tr>
                 <td>pi</td>
                 <td><span class="yes">✓</span> default write</td>
                 <td><span class="ro">✓</span> tools: read · grep · find · ls</td>
+                <td>—</td>
                 <td><span class="yes">✓</span></td>
               </tr>
               <tr>
-                <td>omp · gemini 3.1 pro → fable 5 → gpt-5.5</td>
+                <td>omp · gemini 3.1 pro → fable 5 → gpt-5.6</td>
                 <td><span class="yes">✓</span> default write</td>
                 <td><span class="ro">✓</span> tools: read · grep · find · ls</td>
+                <td><span class="ro">✓</span> read-only · no web</td>
                 <td><span class="yes">✓</span></td>
               </tr>
             </tbody>
@@ -626,6 +634,9 @@
 <span class="p">$</span> <span class="c">orch mail agent defaults</span>                    <span class="cm"># once</span>
 <span class="p">$</span> <span class="c">orch workspace add</span> <span class="f">--id</span> my-repo <span class="f">--path</span> .
 
+<span class="cm"># one sentence in: a researcher drafts the plan, you confirm, a controller executes</span>
+<span class="p">$</span> <span class="c">orch new</span> 'add rate limiting to the public API'
+
 <span class="cm"># one-shot fan-out: publish + claim + run per agent</span>
 <span class="p">$</span> <span class="c">orch cross-review</span> <span class="f">--thread</span> review-123 <span class="f">--task</span> review.md
 <span class="p">$</span> <span class="c">orch fanout</span> <span class="f">--thread</span> verify-1 <span class="f">--role</span> verifier <span class="f">--task</span> verify.md
@@ -665,11 +676,12 @@
             <h3 data-lang="en">Commands</h3>
             <h3 data-lang="zh">命令</h3>
             <ul>
-              <li>bare <code>orch</code> (overview) · <code>verdict --wait</code> · <code>wait</code></li>
-              <li><code>run create</code> · <code>run list</code> · <code>run reap</code> · <code>status</code></li>
-              <li><code>cross-review</code> · <code>fanout</code> · <code>investigate</code></li>
+              <li>bare <code>orch</code> (overview) · <code>new</code> · <code>verdict --wait</code> · <code>wait</code></li>
+              <li><code>run create [--resume-from]</code> · <code>run list</code> · <code>run reap</code> · <code>status</code></li>
+              <li><code>cross-review [--auto]</code> · <code>fanout</code> · <code>investigate</code></li>
+              <li><code>search</code> · <code>usage</code></li>
               <li><code>mail submit</code> · <code>mail route</code> · <code>mail claim</code> · <code>mail reply result</code></li>
-              <li><code>mailctl init</code> · <code>poll</code> · <code>watch</code> · <code>status</code> · <code>reply</code> · <code>ack</code> · <code>guidance</code></li>
+              <li><code>mailctl init</code> · <code>poll</code> · <code>watch</code> · <code>sync</code> · <code>status</code> · <code>reply</code> · <code>ack</code> · <code>guidance</code></li>
               <li><code>events tail [--native]</code> · <code>result --wait</code></li>
               <li><code>decision</code> · <code>mirror</code> · <code>mirror sync</code> · <code>workspace</code></li>
               <li><code>chatgpt-bridge</code> · <code>handoff-pro</code></li>

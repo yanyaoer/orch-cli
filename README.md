@@ -8,7 +8,7 @@ Daemonless multi-agent orchestration for coding work.
 
 Project page: `docs/index.html` is ready for GitHub Pages and includes a bilingual animated overview.
 
-Latest release: `v0.0.7` ([CHANGELOG.md](CHANGELOG.md)).
+Latest release: `v0.0.8` ([CHANGELOG.md](CHANGELOG.md)).
 
 ## Current Scope
 
@@ -18,7 +18,7 @@ This repository is the v2 MVP described in [docs/orch-mvp-spec.md](docs/orch-mvp
 
 Durable architecture decisions live in [docs/adr/](docs/adr/README.md); task and feature specs live in [docs/specs/](docs/specs/README.md). When those constraints shape an `orch --task` file, inline the binding excerpts so the run remains replayable from `spec.json`.
 
-Shipped on `main` (v0.0.7, see [CHANGELOG.md](CHANGELOG.md)):
+Shipped on `main` (v0.0.8, see [CHANGELOG.md](CHANGELOG.md)):
 
 - `orch run create` starts one supervised headless worker run. `--mr` is optional: it resolves from an `MR: <id-or-url>` line in the task's leading header block, a merge-request/pull URL in the task text, or the current branch name (`mr_source` reports which).
 - Bare `orch` prints the overview: active runs plus every pending action (undecided terminal runs, stale runs, pending outbox) expressed as a runnable orch command line — the same contract humans copy and agents execute from `--json`. `--all` scans every repo under the state root. The overview is a notification center, not a debt ledger: items idle beyond `--attention-days` (default 14, `0` disables) age out, and mrs matching a local branch already merged into HEAD are archived wholesale. `orch decision close` acks a run without queueing a comment; `orch decision sweep --execute` batch-acks the whole backlog by the overview's own rubric.
@@ -30,6 +30,10 @@ Shipped on `main` (v0.0.7, see [CHANGELOG.md](CHANGELOG.md)):
 - `orch decision` records `accept` or `rework` locally and queues a mirror comment.
 - `orch mail` provides the local message bus: signed mail events, Maildir delivery, router dispatch, atomic task claim, and result-driven review/verify follow-ups.
 - `orch cross-review`, `orch fanout`, and `orch investigate` fan one task across several agents in a single command. They route through the mail layer, so a `--thread <id>` supplies the mr and workspace context (no `--mr` needed).
+- The `researcher` role (architect / deep research) is read-only and web-research capable: it delivers a plan, not code, and takes no worktree lock. claude runs `fable` at `xhigh` effort under a `dontAsk` whitelist (`jina`/`tvly` CLIs + WebSearch/WebFetch + read-only repo tools, no Edit/Write); codex defaults to `gpt-5.6-sol` at `xhigh` reasoning with native `web_search` inside the read-only sandbox; omp rides its gemini quota-fallback chain read-only (repo-internal research, no web); pi is not supported.
+- `orch new '<task description>'` — one-sentence task intake: a read-only researcher run drafts the plan, the plan renders in the terminal for confirmation (answer/amend to replan, Enter to accept, `q` to abort, `--yes` for non-interactive), then the same provider session resumes as a controller that dispatches workers.
+- `--task -` on `orch run create` and the fanout commands reads the task text from stdin.
+- The `challenger`, `rework`, and `debugger` roles are removed: `implementer` is the only write role; rework/debug follow-ups are implementer runs dispatched via `--resume-from`.
 - `orch mailctl` drives orch by real email over IMAP/SMTP: an allowlisted, authenticated sender emails a task, `orch mailctl poll` ingests it, auto-spawns a claude **controller** run that decomposes/dispatches the work and replies progress in the same thread. Daemonless (`poll` is the cron/launchd contract; `watch` is a foreground IMAP-IDLE convenience), zero npm deps, any IMAP/SMTP provider (Gmail via app password). Inbound email is treated as an authentication boundary (allowlist + trusted-authserv-id Authentication-Results, fail-closed; text/plain-only task body). The controller result schema is `orch.result/controller/v1`.
 - `orch mirror` and `orch mirror sync` dry-run by default, then use `gh` or `glab` only with `--execute`.
 - Drivers exist for `codex`, `claude`, `pi`, and `omp`.
@@ -38,7 +42,7 @@ Shipped on `main` (v0.0.7, see [CHANGELOG.md](CHANGELOG.md)):
 - `orch run create --model <ref>` records a provider model override in `spec.json` and passes it through to model-aware drivers such as pi, omp, codex, and claude.
 - `omp` (oh-my-pi) defaults to `google-antigravity/gemini-3.1-pro` and falls back to `zenmux/anthropic/claude-fable-5`, then `openai-codex/gpt-5.6` when the active model's quota/rate limit is exhausted; an explicit `--model <ref>` becomes the primary and the rest of the chain stays as fallbacks.
 - `orch chatgpt-bridge` deploys a Cloudflare Worker (no tunnel) and connects ChatGPT (Developer Mode, e.g. `gpt-5.5-pro`) to a read-only view of the worktree.
-- Role result schemas exist for `implementer`, `reviewer`, `verifier`, and `controller` (the `orch mailctl` mail controller; claude-only, orchestrate-not-edit).
+- Role result schemas exist for `implementer`, `reviewer`, `verifier`, `researcher` (read-only plan-not-code research, `orch.result/researcher/v1`), and `controller` (the `orch mailctl` mail controller; claude-only, orchestrate-not-edit).
 - Provider session/model controls are explicit: defaults avoid latest-session resume, exact resume requires `--session-mode resume_exact --session-id <id>`, `--model <ref>` selects a provider model when supported, and idempotency keys include session/model settings.
 
 Not shipped yet:
@@ -56,7 +60,7 @@ One line (downloads the latest release binary for your platform into `~/.local/b
 $ curl -fsSL https://raw.githubusercontent.com/yanyaoer/orch-cli/main/install.sh | sh
 ```
 
-Override the target with `ORCH_INSTALL_DIR=/somewhere` or pin a tag with `ORCH_VERSION=v0.0.7`. Upgrade later with:
+Override the target with `ORCH_INSTALL_DIR=/somewhere` or pin a tag with `ORCH_VERSION=v0.0.8`. Upgrade later with:
 
 ```sh
 $ orch update          # self-replace with the latest release (--check to only compare)
@@ -216,7 +220,7 @@ $ orch status --mr review-123                     # follow the runs (mr == threa
 
 - `cross-review`: reviewer role; default agents `claude-reviewer` (opus, high effort) + `omp-reviewer` (distinct model families).
 - `fanout`: any result role via `--role`; default agents are the auto-invited agents for that role.
-- `investigate`: reviewer role for read-only research; default agents `omp-reviewer` + `claude-reviewer`.
+- `investigate`: researcher role for read-only research; default agents `omp-researcher` + `claude-researcher`.
 - `--to-agent <mail-agent-id>` (repeatable) overrides the default roster; `--dry-run` prints the resolved agents without publishing; `--model <ref>` forwards a provider model override to every spawned run.
 - Re-running the same thread with the same task is idempotent: already-acked assignments are reused and not run again; nacked or expired assignments can be claimed without publishing duplicates.
 - `cross-review --auto` inlines the follow-up ritual: it waits for this fan-out's runs to settle (`--wait-sec`, default 900), records the unambiguous decisions (approve + 0 blocking → accept, real blocking findings → rework), and queues ONE merged comment covering every run instead of one per run. The comment stays a dry-run preview in the outbox until you pass `--execute` (same A5 posture as `orch mirror sync`). Runs whose result can't be trusted are surfaced with the exact follow-up command, never auto-decided: driver schema fallbacks get their raw review text recovered from `result.raw.md` into the comment body (the synthetic `orch-driver-result` placeholder is never mirrored), and failed/timeout/stale runs are listed under `attention`. Rework dispatch stays a human/controller call — `--auto` does not loop implementers.
@@ -371,6 +375,7 @@ Implemented schemas:
 - `orch.result/implementer/v1`: `verdict`, `summary`, `base_sha`, `head_sha`, `changed_files`, `tests`, `acceptance`, `risks`, `rollback`
 - `orch.result/reviewer/v1`: `verdict`, `reviews_run_id`, `blocking_findings`, `non_blocking_findings`, `suggested_tests`
 - `orch.result/verifier/v1`: `verdict`, `verifies_run_id`, `commands`, `acceptance`
+- `orch.result/researcher/v1`: `verdict` (completed|failed), `summary`, `recommendation`, `alternatives[]`, `sources[]`, `open_questions[]`, `risks[]`
 - `orch.result/controller/v1`: `verdict`, `summary`, `actions` (the `orch mailctl` controller; claude-only, not in `writeRoles`, launched with a `Bash(orch *)` + read-only allowed-tools whitelist)
 
 The driver prompt asks the provider to return exactly one JSON object. The driver then extracts that object (coercing benign schema deviations such as verdict synonyms and object-vs-string array items), writes `result.json`, and the supervisor validates it. When extraction fails, the worker's raw final message is preserved as `result.raw.md` in the run dir and excerpted in the fallback summary; a provider that exits 0 with no output at all fails the run.
@@ -379,6 +384,7 @@ The driver prompt asks the provider to return exactly one JSON object. The drive
 
 ```text
 orch               Overview: active runs + pending actions as runnable commands
+orch new           One-sentence task: plan -> confirm in terminal -> controller executes
 orch verdict       Aggregate one thread's verdicts and suggest a decision (--wait)
 orch wait          Block until the next run in a thread needs attention (wait-any)
 orch run create    Start one headless worker run for an MR task
@@ -388,7 +394,7 @@ orch search        Regex-search run files and mail event diagnostics
 orch usage         Summarize token usage by run, thread, or day
 orch cross-review  Review one diff in parallel with several agents (via mail thread)
 orch fanout        Run one task across several agents, any result role (via mail thread)
-orch investigate   Read-only research/analysis, defaults to gemini-3.1-pro (via mail thread)
+orch investigate   Read-only research via the researcher role; default agents omp-researcher + claude-researcher (via mail thread)
 orch events tail   Print a run's local events.jsonl (--native: normalized provider progress;
                    -f: follow live, without --run multiplexing every active run, --all every repo)
 orch result        Print a run's local result.json

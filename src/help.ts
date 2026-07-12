@@ -22,7 +22,7 @@ export function topLevelHelp(): string {
     "  orch usage         Summarize token usage by run, thread, or day",
     "  orch cross-review  Review one diff/run in parallel with several agents",
     "  orch fanout        Run one task across several agents (any result role)",
-    "  orch investigate   Read-only research/analysis (defaults to gemini-3.1-pro)",
+    "  orch investigate   Researcher-role research (defaults: omp-researcher + claude-researcher)",
     "  orch events tail   Print a run's local events.jsonl (--native: provider progress)",
     "  orch result        Print a run's local result.json",
     "  orch status        Read local run status for an MR",
