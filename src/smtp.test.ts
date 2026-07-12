@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import {
   buildReplyMessage,
+  createBunSmtpConnection,
   parseSmtpReplies,
   prepareSmtpDataBlock,
   submitSmtpMessage,
@@ -153,5 +154,22 @@ describe("buildReplyMessage", () => {
     expect(root.raw).not.toContain("In-Reply-To:");
     expect(root.raw).not.toContain("References:");
     expect(root.raw).not.toContain("\r\nBcc:");
+  });
+});
+
+describe("SMTP socket timeouts", () => {
+  it("times out a read on a silent peer instead of hanging forever", async () => {
+    const server = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data() {} } });
+    const previous = process.env.ORCH_MAIL_SOCKET_TIMEOUT_MS;
+    process.env.ORCH_MAIL_SOCKET_TIMEOUT_MS = "200";
+    try {
+      const connection = await createBunSmtpConnection({ host: "127.0.0.1", port: server.port, mode: "starttls" });
+      await expect(connection.readLine()).rejects.toThrow("SMTP read timed out after 200ms");
+      await connection.close?.();
+    } finally {
+      if (previous === undefined) delete process.env.ORCH_MAIL_SOCKET_TIMEOUT_MS;
+      else process.env.ORCH_MAIL_SOCKET_TIMEOUT_MS = previous;
+      server.stop(true);
+    }
   });
 });

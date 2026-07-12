@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { waitWithTimeout } from "./socket-wait.ts";
 
 export type SmtpMode = "implicit" | "starttls";
 
@@ -305,7 +306,7 @@ class BunSmtpConnection implements SmtpConnection {
 
   private async waitUntilOpen(): Promise<void> {
     if (!this.opened && !this.error) {
-      await new Promise<void>((resolve) => this.openWaiters.push(resolve));
+      await waitWithTimeout(this.openWaiters, "SMTP connect");
     }
     if (this.error) throw this.error;
   }
@@ -324,7 +325,7 @@ class BunSmtpConnection implements SmtpConnection {
         return line;
       }
       if (this.error) throw this.error;
-      await new Promise<void>((resolve) => this.waiters.push(resolve));
+      await waitWithTimeout(this.waiters, "SMTP read");
     }
   }
 

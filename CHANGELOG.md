@@ -17,6 +17,12 @@ All notable user-facing changes are recorded here.
 - Removed the never-dispatchable `challenger`, `rework`, and `debugger` roles: both the run gate and the mail claim path always rejected them, so they existed only in types, roster bindings, and controller guidance. `implementer` is now the only write role; rework/debug follow-ups are implementer runs dispatched with `--resume-from` and a tag. Run `orch mail agent defaults` to refresh roster bindings.
 - omp quota-fallback chain tail bumped from `openai-codex/gpt-5.5` to `openai-codex/gpt-5.6`.
 
+### Fixes
+
+- Every IMAP/SMTP socket wait now carries a deadline (`ORCH_MAIL_SOCKET_TIMEOUT_MS`, default 120s), and `mailctl poll` has a 15-minute watchdog that exits the process so the next scheduled poll can reclaim the lock. Root cause: a half-open IMAP connection once kept a poll alive ~20h holding the ingest lock, silently stalling the whole mail pipeline. The IDLE long wait in `watch` is unaffected (it sleeps outside the socket reads).
+- `codex exec resume` has no `--sandbox` flag; read-only resumes (reviewer/researcher `--resume-from`) now pass the sandbox at the parent `exec` level instead of failing with exit 2.
+- `mailctl sync` free-text bodies (task text, result summaries, decision reasons) are path-templated in place (`$ORCH_STATE` / `$WORKSPACE` / `~`), so an absolute path inside a task file no longer trips the leak guard and permanently blocks that MR's mail; an MR whose body still trips the guard is isolated per MR (`sync_mr_failed` audit + `SyncResult.failed`) instead of blocking every other MR's progress email.
+
 ## [0.0.7] - 2026-07-07
 
 ### Features

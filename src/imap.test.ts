@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import {
+  createBunImapConnection,
   ImapClient,
   filterFetchedMessages,
   filterNewUids,
@@ -184,5 +185,25 @@ describe("ImapClient", () => {
     await expect(
       ImapClient.connect({ host: "imap.example.com", port: 993 }, async () => connection),
     ).rejects.toThrow(/refused/i);
+  });
+});
+
+describe("IMAP socket timeouts", () => {
+  it("times out a read on a silent peer instead of hanging forever", async () => {
+    // A server that accepts the connection and never sends the greeting is the
+    // half-open shape that once kept `mailctl poll` alive ~20h holding the
+    // ingest lock.
+    const server = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data() {} } });
+    const previous = process.env.ORCH_MAIL_SOCKET_TIMEOUT_MS;
+    process.env.ORCH_MAIL_SOCKET_TIMEOUT_MS = "200";
+    try {
+      const connection = await createBunImapConnection({ host: "127.0.0.1", port: server.port, tls: false });
+      await expect(connection.readLine()).rejects.toThrow("IMAP read timed out after 200ms");
+      await connection.close?.();
+    } finally {
+      if (previous === undefined) delete process.env.ORCH_MAIL_SOCKET_TIMEOUT_MS;
+      else process.env.ORCH_MAIL_SOCKET_TIMEOUT_MS = previous;
+      server.stop(true);
+    }
   });
 });

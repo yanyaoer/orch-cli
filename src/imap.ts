@@ -1,3 +1,4 @@
+import { waitWithTimeout } from "./socket-wait.ts";
 export const IMAP_IDLE_REISSUE_MS = 29 * 60 * 1000;
 
 export interface ImapResponse {
@@ -351,7 +352,7 @@ class BunImapConnection implements ImapConnection {
 
   private async waitUntilOpen(): Promise<void> {
     if (!this.opened && !this.error) {
-      await new Promise<void>((resolve) => this.openWaiters.push(resolve));
+      await waitWithTimeout(this.openWaiters, "IMAP connect");
     }
     if (this.error) throw this.error;
   }
@@ -370,7 +371,7 @@ class BunImapConnection implements ImapConnection {
         return line;
       }
       if (this.error) throw this.error;
-      await new Promise<void>((resolve) => this.waiters.push(resolve));
+      await waitWithTimeout(this.waiters, "IMAP read");
     }
   }
 
@@ -382,7 +383,7 @@ class BunImapConnection implements ImapConnection {
         return bytes;
       }
       if (this.error) throw this.error;
-      await new Promise<void>((resolve) => this.waiters.push(resolve));
+      await waitWithTimeout(this.waiters, "IMAP read");
     }
   }
 

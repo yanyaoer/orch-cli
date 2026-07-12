@@ -241,10 +241,13 @@ export function buildProviderArgv(
       spec.role === "researcher" ? ["-c", "model_reasoning_effort=xhigh", "-c", "tools.web_search=true"] : [];
     const model = spec.model ?? (spec.role === "researcher" ? CODEX_RESEARCHER_MODEL : null);
     if (spec.provider_session_mode === "resume_exact" && spec.provider_session_id) {
-      const resume = ["codex", "exec", "resume", "--json", "--output-last-message", lastMessagePath];
+      // `codex exec resume` has no --sandbox flag (exit 2 if passed); the
+      // sandbox rides the parent `exec` level, accepted before the subcommand.
+      const resume = ["codex", "exec"];
+      if (readOnly) resume.push("--sandbox", "read-only");
+      resume.push("resume", "--json", "--output-last-message", lastMessagePath);
       if (model) resume.push("--model", model);
       resume.push(...researcherFlags);
-      if (readOnly) resume.push("--sandbox", "read-only");
       resume.push(spec.provider_session_id, "-");
       return resume;
     }

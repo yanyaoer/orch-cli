@@ -1527,9 +1527,20 @@ export async function mailctl(args: ParsedArgs, context: MailCliContext): Promis
 
     if (mode === "poll") {
       assertKnownFlags(args, "mailctl poll", ["json", "dry-run"]);
+      // Watchdog: poll is a bounded one-shot contract (cron/launchd drive it).
+      // Anything that still hangs past the socket timeouts (2026-07-11: a
+      // half-open IMAP connection held the ingest lock ~20h and stalled the
+      // whole mail pipeline) must terminate so the next poll can take over —
+      // a dead pid's pidfile lock is reclaimed on the next acquire.
+      const watchdog = setTimeout(() => {
+        process.stderr.write("mailctl poll watchdog: still running after 15m; exiting so the next scheduled poll can take over\n");
+        process.exit(1);
+      }, 15 * 60 * 1000);
+      watchdog.unref?.();
       const dryRun = flagBool(args, "dry-run");
       const ctx = mailctlContext(context, dryRun ? dryRunMailTransport() : undefined);
       const result = await mailctlPoll(ctx, { reconcile: !dryRun, sync: !dryRun });
+      clearTimeout(watchdog);
       if (flagBool(args, "json")) printJson(result);
       else process.stdout.write(pollSummary(result, dryRun));
       return 0;

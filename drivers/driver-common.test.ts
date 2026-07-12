@@ -304,14 +304,14 @@ test("buildProviderArgv passes explicit model overrides to supporting providers"
   ).toEqual([
     "codex",
     "exec",
+    "--sandbox",
+    "read-only",
     "resume",
     "--json",
     "--output-last-message",
     "/run/last_message.txt",
     "--model",
     model,
-    "--sandbox",
-    "read-only",
     "thread-123",
     "-",
   ]);
@@ -506,6 +506,8 @@ test("buildProviderArgv gives researcher a read-only web-research posture on cla
   ).toEqual([
     "codex",
     "exec",
+    "--sandbox",
+    "read-only",
     "resume",
     "--json",
     "--output-last-message",
@@ -516,8 +518,6 @@ test("buildProviderArgv gives researcher a read-only web-research posture on cla
     "model_reasoning_effort=xhigh",
     "-c",
     "tools.web_search=true",
-    "--sandbox",
-    "read-only",
     "sess-1",
     "-",
   ]);
