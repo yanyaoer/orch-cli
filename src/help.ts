@@ -18,6 +18,7 @@ export function topLevelHelp(): string {
     "  orch new           One-sentence task: plan -> confirm in terminal -> controller executes",
     "  orch run create    Start one headless worker run for an MR task",
     "  orch run list      List local runs for an MR",
+    "  orch run cancel    Stop a running worker (supervisor finalizes it as failed)",
     "  orch search        Regex-search repo run files and mail event diagnostics",
     "  orch usage         Summarize token usage by run, thread, or day",
     "  orch cross-review  Review one diff/run in parallel with several agents",
@@ -153,6 +154,33 @@ export function newHelp(): string {
     "Examples:",
     "  orch new 'add rate limiting to the public API' --workspace api",
     "  orch new '重构邮件轮询的错误处理' --worktree ~/Projects/x --yes",
+  ]);
+}
+
+export function runCancelHelp(): string {
+  return lines([
+    "orch run cancel: stop a running worker by signaling its process group",
+    "",
+    "Usage:",
+    "  orch run cancel --run <id> [--mr <id>] [--worktree <path>] [--reason <text>] [--force]",
+    "",
+    "The live supervisor then drives the run to its normal failed terminal state;",
+    "the fallback result.json (and any synced result mail) carries 'canceled: <reason>'.",
+    "Typical use: an instruction arrives that invalidates in-flight work — cancel the",
+    "run, then re-dispatch with the corrected task.",
+    "",
+    "Flags:",
+    "  --run <id>            Run id to cancel (required)",
+    "  --mr <id>             MR or task id; omitted searches all MRs in this repo",
+    "  --worktree <path>     Git worktree used to derive repo_key; defaults to the current directory",
+    "  --reason <text>       Recorded in canceled.json and the fallback result summary",
+    "  --force               Send SIGKILL instead of SIGTERM",
+    "  --help                Show this help",
+    "",
+    "Exit: 0 canceled or already terminal (no-op); 1 process group already gone (use orch run reap).",
+    "",
+    "Example:",
+    "  orch run cancel --run impl-a-20260713T090000-abc123 --mr 123 --reason 'direction changed'",
   ]);
 }
 
@@ -878,11 +906,13 @@ export function runHelp(): string {
     "orch run commands:",
     "  orch run create    Start one headless worker run for an MR task",
     "  orch run list      List local runs for an MR (dead-pid runs show as 'stale?')",
+    "  orch run cancel    Stop a running worker (SIGTERM its process group; supervisor finalizes)",
     "  orch run reap      Persist 'stale' for non-terminal runs whose supervisor pid is gone",
     "",
     "Use:",
     "  orch run create --help",
     "  orch run list --help",
+    "  orch run cancel --help",
     "  orch run reap [--mr <id>] [--worktree <path>]   # omitted --mr reaps across all MRs in this repo",
   ]);
 }

@@ -1640,6 +1640,99 @@ test("write-role worktree lock is shared within an MR and across MRs", async () 
   await expectOneDoneOneLockHeld({ firstMr: "mr-a", secondMr: "mr-b" });
 });
 
+test("run cancel signals the driver group and the supervisor finalizes with a canceled result", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orch-cancel-test-"));
+  const stateHome = join(root, "state");
+  const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
+  await initGitWorktree(worktree);
+  const taskPath = join(root, "task.md");
+  writeFileSync(taskPath, "run long enough to be canceled\n", "utf8");
+  const env = { XDG_STATE_HOME: stateHome };
+  const mr = "cancel-mr";
+
+  const run = await createWriteRun({
+    mr,
+    key: "cancel-first",
+    stateHome,
+    worktree,
+    taskPath,
+    extraEnv: { ORCH_DRIVER_FAKE_RESULT: "1", ORCH_DRIVER_FAKE_SLEEP_MS: "15000" },
+  });
+  await waitForRunState(run.status_path, ["running"]);
+
+  const cancel = await runOrch(
+    ["run", "cancel", "--run", run.run_id, "--mr", mr, "--worktree", worktree, "--reason", "direction changed"],
+    env,
+  );
+  expect(cancel).toMatchObject({ exitCode: 0, stderr: "" });
+  expect(JSON.parse(cancel.stdout)).toMatchObject({ canceled: true, run_id: run.run_id, mr, signal: "SIGTERM" });
+
+  const finalStatus = await waitForRunFinal(run.status_path);
+  expect(finalStatus.state).toBe("failed");
+  expect(existsSync(join(run.run_dir, "canceled.json"))).toBe(true);
+  expect(JSON.stringify(readResult(run.result_path))).toContain("canceled: direction changed");
+
+  const again = await runOrch(["run", "cancel", "--run", run.run_id, "--mr", mr, "--worktree", worktree], env);
+  expect(again.exitCode).toBe(0);
+  expect(JSON.parse(again.stdout)).toMatchObject({ canceled: false, reason: "already terminal" });
+});
+
+test("run cancel rejects unstarted runs and reports gone process groups", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orch-cancel-edge-test-"));
+  const stateHome = join(root, "state");
+  const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
+  const repoKey = repoKeyFromRemote(worktree, worktree);
+  const mr = "cancel-edge";
+  const env = { XDG_STATE_HOME: stateHome };
+  const baseStatus = (runId: string, patch: Partial<RunStatus>): RunStatus => ({
+    run_id: runId,
+    mr,
+    role: "implementer",
+    agent: "codex",
+    tag: "impl",
+    provider_session_name: null,
+    provider_session_id: null,
+    provider_session_mode: "fresh_persistent",
+    state: "running",
+    pid: null,
+    pgid: null,
+    started_at: "2026-07-13T12:00:00.000Z",
+    updated_at: new Date().toISOString(),
+    exit_code: null,
+    timeout_sec: 3600,
+    last_event_seq: 1,
+    native_event_count: 0,
+    provider_resume_id: null,
+    worktree,
+    base_sha: "base",
+    head_sha: null,
+    ...patch,
+  });
+  const writeRun = (runId: string, patch: Partial<RunStatus>): void => {
+    const runDir = join(stateHome, "orch", repoKey, "mrs", mr, "runs", runId);
+    mkdirSync(runDir, { recursive: true });
+    writeFileSync(join(runDir, "status.json"), `${JSON.stringify(baseStatus(runId, patch))}\n`, "utf8");
+  };
+
+  // No process group yet: refuse with a retry/reap hint.
+  const unstartedId = "impl-unstarted-20260713T120000-aaaaaa";
+  writeRun(unstartedId, { state: "created" });
+  const unstarted = await runOrch(["run", "cancel", "--run", unstartedId, "--mr", mr, "--worktree", worktree], env);
+  expect(unstarted.exitCode).toBe(1);
+  expect(unstarted.stderr).toContain("no process group yet");
+
+  // Recorded pgid no longer exists: report it and point at reap.
+  const deadProc = Bun.spawn(["true"], { stdout: "ignore" });
+  await deadProc.exited;
+  const goneId = "impl-gone-20260713T120000-bbbbbb";
+  writeRun(goneId, { pid: deadProc.pid, pgid: deadProc.pid });
+  const gone = await runOrch(["run", "cancel", "--run", goneId, "--mr", mr, "--worktree", worktree], env);
+  expect(gone.exitCode).toBe(1);
+  const payload = JSON.parse(gone.stdout) as { canceled: boolean; reason: string };
+  expect(payload.canceled).toBe(false);
+  expect(payload.reason).toContain("orch run reap");
+});
+
 test("stale runs are flagged and reaped, result --wait returns, reviewer findings render", async () => {
   const root = mkdtempSync(join(tmpdir(), "orch-lifecycle-test-"));
   const stateHome = join(root, "state");

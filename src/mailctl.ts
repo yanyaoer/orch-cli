@@ -699,6 +699,8 @@ export function buildControllerTask(input: BuildControllerTaskInput): string {
     "- When authoring a debugging task (implementer role; there is no separate debugger role), require the worker to build a red-capable reproduction command and paste its run output as evidence in the result tests[] field BEFORE attempting a fix, list 3-5 ranked falsifiable hypotheses first, and tag temporary instrumentation with a unique [DEBUG-xxxx] prefix then grep it away before finishing.",
     "- Decide completed worker runs with orch decision accept|rework after reading their results.",
     `- After consuming an instruction, acknowledge it with orch mailctl ack --thread ${thread} --attention <id>.`,
+    `- Before emitting your final JSON, run orch mailctl guidance --thread ${thread} once more; if it lists new unacked instructions, handle them in this batch (classify, act or reply, ack) instead of leaving them to the next controller.`,
+    "- If a new instruction invalidates work a dispatched run is still doing, stop it with orch run cancel --run <id> --reason <why>, then re-dispatch with the corrected task.",
     "- Report only for milestones, blockers, and final results via orch mailctl reply --report-key <progress:<run_id>|settled:<gen>|reply:<msg_sha>>.",
     "- Each meaningful state change gets at most one report. Reply bodies must not contain local paths or secrets.",
     "- Put any durable cross-batch handoff notes into the summary field of your orch.result/controller/v1 output (you cannot write files).",

@@ -65,6 +65,7 @@ import {
   newHelp,
   workspaceHelp,
   resultCommandHelp,
+  runCancelHelp,
   runCreateHelp,
   runHelp,
   runListHelp,
@@ -2399,6 +2400,50 @@ async function runReap(args: ParsedArgs): Promise<number> {
   return 0;
 }
 
+async function runCancel(args: ParsedArgs): Promise<number> {
+  assertKnownFlags(args, "run cancel", ["run", "mr", "worktree", "reason", "force"]);
+  const runId = flagString(args, "run");
+  const worktree = resolve(flagString(args, "worktree", process.cwd()));
+  const repo = await getRepoIdentity(worktree);
+  const located = locateRun(repo.repo_key, runId, args.flags.has("mr") ? flagString(args, "mr") : undefined);
+  const status = readJsonFile<RunStatus | null>(`${located.run_dir}/status.json`, null);
+  if (!status) throw new CliError(`status.json not found for run: ${runId}`);
+  if (!nonTerminalStates.has(status.state)) {
+    printJson({ canceled: false, run_id: runId, state: status.state, reason: "already terminal" });
+    return 0;
+  }
+  if (status.pgid === null) {
+    throw new CliError(
+      `run ${runId} has no process group yet (state: ${status.state}); retry once it is running, or: orch run reap --mr ${located.mr}`,
+    );
+  }
+  // The marker lands before the signal so the supervisor's fallback result
+  // (and the synced result mail) reports the cancellation, not a bare exit code.
+  writeJsonAtomic(`${located.run_dir}/canceled.json`, {
+    schema: "orch.run/canceled/v1",
+    run_id: runId,
+    reason: flagString(args, "reason", "canceled via orch run cancel"),
+    ts: new Date().toISOString(),
+  });
+  // Kill the driver's process group; the live supervisor then drives the run
+  // to its normal failed terminal state (fallback result, events, status).
+  const signal = flagBool(args, "force") ? "SIGKILL" : "SIGTERM";
+  try {
+    process.kill(-status.pgid, signal);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+    printJson({
+      canceled: false,
+      run_id: runId,
+      state: status.state,
+      reason: `process group ${status.pgid} is gone; run: orch run reap --mr ${located.mr}`,
+    });
+    return 1;
+  }
+  printJson({ canceled: true, run_id: runId, mr: located.mr, signal, pgid: status.pgid });
+  return 0;
+}
+
 async function runList(args: ParsedArgs): Promise<number> {
   const worktree = resolve(flagString(args, "worktree", process.cwd()));
   const repo = await getRepoIdentity(worktree);
@@ -3393,6 +3438,10 @@ async function main(): Promise<number> {
       process.stdout.write(runListHelp());
       return 0;
     }
+    if (first === "run" && second === "cancel") {
+      process.stdout.write(runCancelHelp());
+      return 0;
+    }
     if (first === "run") {
       process.stdout.write(runHelp());
       return 0;
@@ -3484,6 +3533,7 @@ async function main(): Promise<number> {
   if (first === "run" && second === "create") return createRun(args);
   if (first === "run" && second === "list") return runList(args);
   if (first === "run" && second === "reap") return runReap(args);
+  if (first === "run" && second === "cancel") return runCancel(args);
   if (first === "search") return searchCommand(args);
   if (first === "usage") return usageCommand(args);
   if (first === "cross-review") return crossReview(args);

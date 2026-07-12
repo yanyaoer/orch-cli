@@ -23,7 +23,8 @@ permissions, model/effort tiers, result schemas — live in the CLI:
   Follow with `orch status` / `orch result`; record `orch decision`, then
   `orch mirror` it to the PR/MR. Dispatching a rework? `orch run create
   --resume-from <run_id> --task rework.md` keeps the worker's provider session
-  instead of re-reading the repo from zero.
+  instead of re-reading the repo from zero. Wrong direction mid-run?
+  `orch run cancel --run <id>` stops it and records a canceled result.
 - **Need a plan/architecture decision, not code?** → `--role researcher`:
   read-only, web-research capable, returns a recommendation — or fan it out
   (below) for a second opinion.

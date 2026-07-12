@@ -722,6 +722,8 @@ describe("buildControllerTask", () => {
     expect(task).toContain("grep it away before finishing");
     expect(task).toContain("orch decision accept|rework");
     expect(task).toContain("orch mailctl ack --thread em-abc123");
+    expect(task).toContain("orch mailctl guidance --thread em-abc123 once more");
+    expect(task).toContain("orch run cancel --run <id>");
     expect(task).toContain("orch mailctl reply --report-key");
     expect(task).toContain("summary field");
     expect(task).toContain("Please implement the parser");
