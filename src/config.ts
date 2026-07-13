@@ -43,6 +43,9 @@ export interface OrchConfig {
   // `orch run create` falls back to these when the corresponding flag is
   // omitted. Recommended profile: implementer -> pi (see README).
   defaults?: { agents?: Partial<Record<RunRole, AgentName | RoleDefaults>> };
+  // Publication language for MR/PR comment bodies and worker result prose:
+  // "中文" or "english". Missing or any other value behaves as english.
+  language?: string;
 }
 
 export interface MailAgentDefinition {
@@ -259,6 +262,15 @@ export function readOrchConfig(): OrchConfig {
   return readJsonFile<OrchConfig>(orchConfigPath(), { version: 1, workspaces: {} });
 }
 
+export type OrchLanguage = "中文" | "english";
+
+// Lenient on purpose: only the exact string 中文 flips the language; a missing
+// field, "english", or a typo all fall back to english rather than failing a
+// command over config spelling.
+export function orchLanguage(): OrchLanguage {
+  return readOrchConfig().language === "中文" ? "中文" : "english";
+}
+
 export function writeOrchConfig(cfg: OrchConfig): void {
   const path = orchConfigPath();
   mkdirSync(orchConfigDir(), { recursive: true });
@@ -270,7 +282,8 @@ export function upsertWorkspace(cfg: OrchConfig, id: string, path: string, now: 
   const resolved = canonicalPath(path);
   const workspaces = Object.fromEntries(Object.entries(cfg.workspaces).filter(([, workspace]) => canonicalPath(workspace.path) !== resolved));
   workspaces[id] = { id, path: resolved, added_at: now };
-  return { version: 1, workspaces };
+  // Spread first: workspace registration must not drop defaults/language.
+  return { ...cfg, version: 1, workspaces };
 }
 
 export function upsertMailAgent(cfg: MailAgentsConfig, agent: MailAgentDefinition): MailAgentsConfig {

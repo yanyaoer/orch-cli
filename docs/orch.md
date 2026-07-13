@@ -47,6 +47,14 @@ permissions, model/effort tiers, result schemas — live in the CLI:
   `orch handoff-pro` packs the repo into one markdown blob to paste in;
   execute the returned plan via `orch run create`.
 
+## Publication language
+Optional `language` in `~/.config/orch/config.json`: `中文` or `english`
+(default; any other value falls back to english). Rule: when set to `中文`,
+review/wiki/comment content published to GitLab (or GitHub) is written in
+Chinese — orch enforces it for mirror/decision/cross-review comments and worker
+result prose; agents posting wiki or other content on orch's behalf must follow
+the same setting. Code, commands, file paths, and identifiers stay as-is.
+
 ## Division of labor
 Strong model plans (via handoff-pro); tool-capable workers (codex / pi)
 execute; omp (gpt-5.6-sol at xhigh thinking, quota fallback claude-fable-5 →

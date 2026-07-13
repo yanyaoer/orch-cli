@@ -60,6 +60,8 @@ Shipped on `main` (v0.0.8, see [CHANGELOG.md](CHANGELOG.md)):
 
 Each role value is either a bare agent name or an object carrying default args, e.g. `{"agent": "omp", "model": "openai-codex/gpt-5.6", "timeout_sec": 1800}` — explicit `orch run create` flags always win. Leave `model` unset unless you mean to override the driver's role tier (a configured model becomes `spec.model`, which for claude also replaces the reviewer/researcher model escalation).
 
+An optional top-level `"language": "中文"` switches everything orch publishes to the MR/PR (mirror/decision/cross-review comments and worker result prose) to Chinese; code, commands, paths, and identifiers stay as-is. Missing or any other value (including `"english"`) keeps the current English output.
+
 - `omp` (oh-my-pi) defaults to `openai-codex/gpt-5.6-sol` at `--thinking=xhigh` and falls back to `zenmux/anthropic/claude-fable-5`, then `google-antigravity/gemini-3.1-pro` when the active model's quota/rate limit is exhausted; an explicit `--model <ref>` becomes the primary and the rest of the chain stays as fallbacks.
 - `orch chatgpt-bridge` deploys a Cloudflare Worker (no tunnel) and connects ChatGPT (Developer Mode, e.g. `gpt-5.5-pro`) to a read-only view of the worktree.
 - Role result schemas exist for `implementer`, `reviewer`, `verifier`, `researcher` (read-only plan-not-code research, `orch.result/researcher/v1`), and `controller` (the `orch mailctl` mail controller; claude-only, orchestrate-not-edit).

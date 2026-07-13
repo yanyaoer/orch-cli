@@ -44,6 +44,10 @@ export interface RunSpec {
   base_sha: string;
   timeout_sec: number;
   created_at: string;
+  // Snapshot of config.json `language` at spec creation, present only when it
+  // was 中文: the driver must not depend on live global config, and the spec
+  // stays auditable. Absent (legacy specs, english config) means english.
+  language?: "中文";
 }
 
 export interface RunStatus {

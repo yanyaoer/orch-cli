@@ -460,6 +460,45 @@ test("cross-review --auto records decisions and queues one merged mirror comment
   expect(readdirSync(join(mrDir, "outbox", "pending"))).toHaveLength(1);
 });
 
+test("cross-review --auto renders the merged comment in Chinese when config language is 中文", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orch-cross-review-zh-"));
+  const stateHome = join(root, "state");
+  const configHome = join(root, "config");
+  const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
+  const remote = "git@github.com:example/repo.git";
+  await initRepo(worktree, remote);
+  const env = { XDG_STATE_HOME: stateHome, XDG_CONFIG_HOME: configHome, ORCH_DRIVER_FAKE_RESULT: "1" };
+  const thread = "review-zh-1";
+  const taskPath = join(root, "review.md");
+  writeFileSync(taskPath, "Review the pending diff.\n", "utf8");
+  await runOrch(["mail", "agent", "defaults"], env);
+  mkdirSync(join(configHome, "orch"), { recursive: true });
+  writeFileSync(join(configHome, "orch", "config.json"), JSON.stringify({ version: 1, workspaces: {}, language: "中文" }), "utf8");
+
+  const auto = await runOrch(["cross-review", "--thread", thread, "--task", taskPath, "--worktree", worktree, "--auto"], env);
+  expect(auto).toMatchObject({ exitCode: 0, stderr: "" });
+
+  const mrDir = join(stateHome, "orch", repoKeyFromRemote(remote, worktree), "mrs", thread);
+  const pending = readdirSync(join(mrDir, "outbox", "pending"));
+  expect(pending).toHaveLength(1);
+  const comment = JSON.parse(readFileSync(join(mrDir, "outbox", "pending", pending[0]!), "utf8")) as { body: string };
+  expect(comment.body).toContain("### orch 交叉评审");
+  expect(comment.body.match(/### orch 运行结果/g)).toHaveLength(2);
+  expect(comment.body).toContain("- 结论: approve");
+  expect(comment.body).not.toContain("### orch cross-review");
+  expect(comment.body).not.toContain("### orch run result");
+
+  // The 中文 config is snapshotted into each run spec so the driver prompt
+  // carries the Chinese prose rule without reading global config.
+  const runsRoot = join(mrDir, "runs");
+  const runDirs = readdirSync(runsRoot);
+  expect(runDirs).toHaveLength(2);
+  for (const dir of runDirs) {
+    const spec = JSON.parse(readFileSync(join(runsRoot, dir, "spec.json"), "utf8")) as { language?: string };
+    expect(spec.language).toBe("中文");
+  }
+});
+
 test("concurrent cross-review fan-outs publish exactly one task per agent", async () => {
   const root = mkdtempSync(join(tmpdir(), "orch-cross-review-race-"));
   const stateHome = join(root, "state");

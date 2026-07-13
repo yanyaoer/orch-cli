@@ -4,6 +4,7 @@
 // decisions and queueing comments stays in orch.ts.
 
 import { existsSync, readFileSync } from "node:fs";
+import { orchLanguage } from "./config.ts";
 import type { RoleResult } from "./types.ts";
 import { isGoodVerdict, isTerminal, type OverviewRun } from "./overview.ts";
 
@@ -55,15 +56,18 @@ export function sanitizeCommentBody(text: string, worktree: string, home: string
 // quoting it would re-trigger the guard on the merged body — a reviewer
 // finding that QUOTED the marker list is exactly how this was discovered.
 export function withheldSection(mr: string, runId: string, state: string, verdict: string): string {
+  const zh = orchLanguage() === "中文";
   return [
-    "### orch run result",
+    zh ? "### orch 运行结果" : "### orch run result",
     "",
     `- MR/PR: ${mr}`,
-    `- Run: ${runId}`,
-    `- State: ${state}`,
-    `- Verdict: ${verdict}`,
+    `- ${zh ? "运行" : "Run"}: ${runId}`,
+    `- ${zh ? "状态" : "State"}: ${state}`,
+    `- ${zh ? "结论" : "Verdict"}: ${verdict}`,
     "",
-    `Content withheld: contains a private local path; read it with \`orch result --run ${runId}\`.`,
+    zh
+      ? `内容已隐去:包含本地私有路径;请运行 \`orch result --run ${runId}\` 查看。`
+      : `Content withheld: contains a private local path; read it with \`orch result --run ${runId}\`.`,
   ].join("\n");
 }
 

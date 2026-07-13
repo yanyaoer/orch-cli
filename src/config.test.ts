@@ -7,6 +7,8 @@ import {
   buildBridgeUrls,
   mailAgentsConfigPath,
   mailControlConfigPath,
+  orchConfigPath,
+  orchLanguage,
   parseWorkersUrl,
   readBridgeConfig,
   readMailControlConfig,
@@ -302,6 +304,39 @@ test("orch config records project workspaces by id", () => {
     if (prev === undefined) delete process.env.XDG_CONFIG_HOME;
     else process.env.XDG_CONFIG_HOME = prev;
   }
+});
+
+test("orchLanguage is 中文 only for the exact config value and falls back to english otherwise", () => {
+  const prev = process.env.XDG_CONFIG_HOME;
+  process.env.XDG_CONFIG_HOME = tempDir();
+  try {
+    // Missing config file: english.
+    expect(orchLanguage()).toBe("english");
+    mkdirSync(dirname(orchConfigPath()), { recursive: true });
+    const cases: Array<[string | undefined, string]> = [
+      ["中文", "中文"],
+      ["english", "english"],
+      [undefined, "english"], // field absent in an existing config
+      ["chinese", "english"], // lenient fallback: typos must not break commands
+      ["English", "english"],
+      ["zh", "english"],
+    ];
+    for (const [value, expected] of cases) {
+      writeFileSync(orchConfigPath(), JSON.stringify({ version: 1, workspaces: {}, ...(value === undefined ? {} : { language: value }) }));
+      expect(orchLanguage()).toBe(expected as "中文" | "english");
+    }
+  } finally {
+    if (prev === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = prev;
+  }
+});
+
+test("upsertWorkspace preserves defaults and language", () => {
+  const dir = tempDir();
+  const cfg = upsertWorkspace({ version: 1, workspaces: {}, defaults: { agents: { implementer: "pi" } }, language: "中文" }, "ws", dir, "2026-07-13T00:00:00.000Z");
+  expect(cfg.language).toBe("中文");
+  expect(cfg.defaults).toEqual({ agents: { implementer: "pi" } });
+  expect(cfg.workspaces["ws"]).toMatchObject({ id: "ws", path: dir });
 });
 
 test("mail control notify.to must be a single lower-cased bare address", () => {
