@@ -423,7 +423,7 @@ function readForgeRef(mrDir: string): string | null {
 }
 
 function writeForgeRef(mrDir: string, ref: string): void {
-  writeFileSync(forgeRefPath(mrDir), `${ref}\n`, "utf8");
+  writeTextAtomic(forgeRefPath(mrDir), `${ref}\n`);
 }
 
 function forgeRefFor(mrDir: string, mr: string): string {
