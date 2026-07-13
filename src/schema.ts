@@ -123,6 +123,19 @@ export const ROLE_VERDICTS: Record<RunRole, readonly [string, string]> = {
   verifier: ["pass", "fail"],
 };
 
+// Required scalar fields per role, shared by validateRoleResult and
+// buildPrompt: models cannot guess the field list from the schema name alone
+// (live runs dropped verdict, then summary), so the prompt must spell it out
+// from the same source the validator enforces. Arrays and the *_run_id
+// strings self-heal in coerceRoleResult and are deliberately not listed.
+export const ROLE_REQUIRED_FIELDS: Record<RunRole, readonly string[]> = {
+  implementer: ["verdict", "summary", "base_sha", "head_sha", "rollback"],
+  reviewer: ["verdict"],
+  controller: ["verdict", "summary"],
+  researcher: ["verdict", "summary", "recommendation"],
+  verifier: ["verdict"],
+};
+
 export function validateRoleResult(role: RunRole, value: unknown): ValidationResult {
   if (!isRunRole(role)) {
     return { ok: false, errors: [`role ${role} has no result schema`] };
@@ -138,36 +151,38 @@ export function validateRoleResult(role: RunRole, value: unknown): ValidationRes
   if (!verdicts.includes(obj.verdict as string)) errors.push(`verdict must be ${verdicts.join("|")}`);
 
   if (role === "implementer") {
-    const missing = requireFields(obj, ["verdict", "summary", "base_sha", "head_sha", "rollback"]);
+    const missing = requireFields(obj, [...ROLE_REQUIRED_FIELDS.implementer]);
     errors.push(...missing.map((field) => `${field} is required`));
     validateStringArray(obj, "changed_files", errors);
     validateCommands(obj, "tests", errors);
     validateAcceptance(obj, "acceptance", errors, true);
     validateStringArray(obj, "risks", errors);
   } else if (role === "reviewer") {
-    const missing = requireFields(obj, ["verdict"]);
+    const missing = requireFields(obj, [...ROLE_REQUIRED_FIELDS.reviewer]);
     errors.push(...missing.map((field) => `${field} is required`));
     if (typeof obj.reviews_run_id !== "string") errors.push("reviews_run_id must be a string");
     validateFindings(obj, "blocking_findings", errors, true);
     validateFindings(obj, "non_blocking_findings", errors, false);
     validateStringArray(obj, "suggested_tests", errors);
   } else if (role === "controller") {
-    const missing = requireFields(obj, ["verdict", "summary"]);
+    const missing = requireFields(obj, [...ROLE_REQUIRED_FIELDS.controller]);
     errors.push(...missing.map((field) => `${field} is required`));
     validateStringArray(obj, "actions", errors);
   } else if (role === "researcher") {
-    const missing = requireFields(obj, ["verdict", "summary", "recommendation"]);
+    const missing = requireFields(obj, [...ROLE_REQUIRED_FIELDS.researcher]);
     errors.push(...missing.map((field) => `${field} is required`));
     validateStringArray(obj, "alternatives", errors);
     validateStringArray(obj, "sources", errors);
     validateStringArray(obj, "open_questions", errors);
     validateStringArray(obj, "risks", errors);
   } else {
-    const missing = requireFields(obj, ["verdict"]);
+    const missing = requireFields(obj, [...ROLE_REQUIRED_FIELDS.verifier]);
     errors.push(...missing.map((field) => `${field} is required`));
     if (typeof obj.verifies_run_id !== "string") errors.push("verifies_run_id must be a string");
     validateCommands(obj, "commands", errors);
-    validateAcceptance(obj, "acceptance", errors, false);
+    // A verifier's whole deliverable is evidence-backed checks; rejecting the
+    // evidence field discarded an otherwise complete live result.
+    validateAcceptance(obj, "acceptance", errors, true);
   }
 
   return { ok: errors.length === 0, errors };

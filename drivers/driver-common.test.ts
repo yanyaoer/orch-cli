@@ -189,6 +189,37 @@ test("buildPrompt demands a role-appropriate verdict from every role", () => {
   expect(buildPrompt(spec("reviewer", "verdict-honesty-r"), "claude")).not.toContain("could not genuinely be completed");
 });
 
+test("buildPrompt spells out every validator-required field per role", () => {
+  // Models cannot infer the field list from the schema name alone: live plan
+  // runs dropped verdict, then summary. The prompt and the validator must
+  // share one field list (ROLE_REQUIRED_FIELDS).
+  const requiredLine: Record<string, string> = {
+    implementer: '"verdict", "summary", "base_sha", "head_sha", "rollback"',
+    reviewer: '"verdict"',
+    controller: '"verdict", "summary"',
+    researcher: '"verdict", "summary", "recommendation"',
+    verifier: '"verdict"',
+  };
+  for (const [role, fields] of Object.entries(requiredLine)) {
+    const prompt = buildPrompt(spec(role as RunSpec["role"], `fields-${role}`), "claude");
+    expect(prompt).toContain(`Required top-level fields — omitting any of them fails the run: ${fields}.`);
+  }
+});
+
+test("buildPrompt adds the Chinese prose rule only when the spec language is 中文", () => {
+  const zhSpec: RunSpec = { ...spec("reviewer", "lang-zh"), language: "中文" };
+  const zhPrompt = buildPrompt(zhSpec, "claude");
+  expect(zhPrompt).toContain("必须用中文书写");
+  expect(zhPrompt).toContain("代码、命令、文件路径、标识符保持原样");
+
+  // Legacy specs without the field and any non-中文 value stay byte-identical
+  // to the current english prompt.
+  const plain = buildPrompt(spec("reviewer", "lang-zh"), "claude");
+  expect(plain).not.toContain("中文");
+  expect(buildPrompt({ ...spec("reviewer", "lang-zh"), language: "english" as unknown as "中文" }, "claude")).toBe(plain);
+  expect(buildPrompt({ ...spec("reviewer", "lang-zh"), language: "chinese" as unknown as "中文" }, "claude")).toBe(plain);
+});
+
 test("buildProviderArgv keeps defaults fresh and only resumes exact sessions", () => {
   const base = spec("implementer", "impl-session");
 
@@ -605,6 +636,37 @@ test("extractResultFromText coerces researcher alias fields and missing arrays",
     open_questions: [],
     risks: [],
   });
+});
+
+test("extractResultFromText derives a missing researcher summary from the recommendation", () => {
+  // Real plan-run failure shape (MR 3440): verdict and a full recommendation
+  // present, summary omitted. summary is descriptive, not control flow, so it
+  // is derived instead of discarding the result.
+  const result = extractResultFromText(
+    JSON.stringify({
+      schema: "orch.result/researcher/v1",
+      verdict: "completed",
+      recommendation: "## Destination\nMR 3440 完成 claude+omp 交叉评审:合并评审意见以一条评论发布。\n\n## Tasks (now)\n### review-a",
+      risks: ["评审重复已有评论"],
+      alternatives: [],
+      open_questions: [],
+    }),
+    spec("researcher", "research-no-summary"),
+  );
+  expect(result).toMatchObject({
+    schema: "orch.result/researcher/v1",
+    run_id: "research-no-summary",
+    verdict: "completed",
+    summary: "MR 3440 完成 claude+omp 交叉评审:合并评审意见以一条评论发布。",
+  });
+
+  // No recommendation prose at all -> nothing to derive from, still rejected.
+  expect(
+    extractResultFromText(
+      JSON.stringify({ schema: "orch.result/researcher/v1", verdict: "completed", recommendation: "### only-headings" }),
+      spec("researcher", "research-headings-only"),
+    ),
+  ).toBeNull();
 });
 
 test("extractResultFromText fails closed on any missing or blank researcher verdict", () => {

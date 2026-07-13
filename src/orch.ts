@@ -82,7 +82,7 @@ import { runClaudeDriver } from "../drivers/claude-headless.ts";
 import { deployWorker, locateBridgeDir, runChatgptBridge } from "../drivers/chatgpt-bridge.ts";
 import { runPiDriver } from "../drivers/pi-headless.ts";
 import { runOmpDriver } from "../drivers/omp-headless.ts";
-import { addWorkspace, chatgptBridgeConfigPath, readBridgeConfig, readMailAgentsConfig, readMailControlConfig, readOrchConfig, validateMailControlConfig, writeBridgeConfig, type RoleDefaults } from "./config.ts";
+import { addWorkspace, chatgptBridgeConfigPath, orchLanguage, readBridgeConfig, readMailAgentsConfig, readMailControlConfig, readOrchConfig, validateMailControlConfig, writeBridgeConfig, type RoleDefaults } from "./config.ts";
 import { createInterface, type Interface as ReadlineInterface, type ReadLineOptions } from "node:readline";
 import { buildBundle, type BundleOptions } from "./handoff-pro.ts";
 import { mail, mailFanout, type MailCliContext, type MailFanoutOutcome } from "./mail-cli.ts";
@@ -409,11 +409,32 @@ function pendingOutboxFiles(mrDir: string): string[] {
     .sort();
 }
 
+// The orch mr id is a local thread name (an `orch new` slug like
+// new-<slug>-<hex> is never a valid gh/glab ref); when the originating task
+// named a real MR/PR URL, its number is recorded here and wins as the forge
+// ref for every mirrored comment.
+function forgeRefPath(mrDir: string): string {
+  return `${mrDir}/forge_ref`;
+}
+
+function readForgeRef(mrDir: string): string | null {
+  const ref = readTextFile(forgeRefPath(mrDir))?.trim();
+  return ref ? ref : null;
+}
+
+function writeForgeRef(mrDir: string, ref: string): void {
+  writeFileSync(forgeRefPath(mrDir), `${ref}\n`, "utf8");
+}
+
+function forgeRefFor(mrDir: string, mr: string): string {
+  return readForgeRef(mrDir) ?? mr;
+}
+
 function enqueueComment(mrDir: string, payload: OutboxCommentPayload): string {
   assertMirrorBodySafe(payload.body);
   const filename = `${utcCompact()}-${randomHex(4)}.json`;
   const path = `${pendingOutboxDir(mrDir)}/${filename}`;
-  writeJsonAtomic(path, payload);
+  writeJsonAtomic(path, { ...payload, mr: forgeRefFor(mrDir, payload.mr) });
   return path;
 }
 
@@ -915,13 +936,18 @@ function statusState(record: IdempotencyRecord): RunState | null {
 
 function resultSummary(result: RoleResult): string {
   if ("summary" in result && typeof result.summary === "string") return result.summary;
+  const zh = zhComments();
   if (result.schema === "orch.result/reviewer/v1") {
-    return `${result.blocking_findings.length} blocking finding(s), ${result.non_blocking_findings.length} non-blocking finding(s).`;
+    return zh
+      ? `阻断性发现 ${result.blocking_findings.length} 条,非阻断性发现 ${result.non_blocking_findings.length} 条。`
+      : `${result.blocking_findings.length} blocking finding(s), ${result.non_blocking_findings.length} non-blocking finding(s).`;
   }
   if (result.schema === "orch.result/verifier/v1") {
-    return `${result.commands.length} command(s), ${result.acceptance.length} acceptance item(s).`;
+    return zh
+      ? `命令 ${result.commands.length} 条,验收项 ${result.acceptance.length} 项。`
+      : `${result.commands.length} command(s), ${result.acceptance.length} acceptance item(s).`;
   }
-  return "No summary in result.json.";
+  return zh ? "result.json 中无摘要。" : "No summary in result.json.";
 }
 
 function resultVerdict(result: RoleResult): string {
@@ -954,6 +980,13 @@ function readMirrorResult(runsRoot: string, runId: string): { result: RoleResult
 const MIRROR_BODY_MAX_CHARS = 60_000;
 const MIRROR_FINDING_MAX_CHARS = 4_000;
 
+// Comment-skeleton language, read at assembly time (mirror, decision outbox,
+// cross-review --auto). The english branch must stay byte-identical to the
+// historical output; only the exact config value 中文 flips the labels.
+function zhComments(): boolean {
+  return orchLanguage() === "中文";
+}
+
 function mirrorListLines(title: string, items: string[]): string[] {
   if (items.length === 0) return [];
   return [`${title} (${items.length}):`, "", ...items.map((item) => `- ${item}`), ""];
@@ -966,7 +999,8 @@ function mirrorFindingLines(title: string, findings: Array<{ id: string; severit
   const lines = [`${title} (${findings.length}):`, ""];
   for (const finding of findings) {
     const meta = [finding.severity, finding.id, finding.file].filter(Boolean).join(" | ");
-    const body = finding.body.length > MIRROR_FINDING_MAX_CHARS ? `${finding.body.slice(0, MIRROR_FINDING_MAX_CHARS)}…(finding truncated)` : finding.body;
+    const truncated = zhComments() ? "…(该条发现已截断)" : "…(finding truncated)";
+    const body = finding.body.length > MIRROR_FINDING_MAX_CHARS ? `${finding.body.slice(0, MIRROR_FINDING_MAX_CHARS)}${truncated}` : finding.body;
     lines.push(`**[${meta}]**`, body, "");
   }
   return lines;
@@ -979,36 +1013,38 @@ function commandLine(command: { cmd: string; exit_code: number; summary: string 
 // The comment is the human-facing mirror of result.json: every structured
 // field a decision was based on belongs in it, not just the summary line.
 function resultDetailLines(result: RoleResult): string[] {
+  const zh = zhComments();
+  const t = (en: string, cn: string): string => (zh ? cn : en);
   switch (result.schema) {
     case "orch.result/reviewer/v1":
       return [
-        ...mirrorFindingLines("Blocking findings", result.blocking_findings),
-        ...mirrorFindingLines("Non-blocking findings", result.non_blocking_findings),
-        ...mirrorListLines("Suggested tests", result.suggested_tests),
+        ...mirrorFindingLines(t("Blocking findings", "阻断性发现"), result.blocking_findings),
+        ...mirrorFindingLines(t("Non-blocking findings", "非阻断性发现"), result.non_blocking_findings),
+        ...mirrorListLines(t("Suggested tests", "建议测试"), result.suggested_tests),
       ];
     case "orch.result/verifier/v1":
       return [
-        ...mirrorListLines("Commands", result.commands.map(commandLine)),
-        ...mirrorListLines("Acceptance", result.acceptance.map((item) => `${item.id}: ${item.status}`)),
+        ...mirrorListLines(t("Commands", "命令"), result.commands.map(commandLine)),
+        ...mirrorListLines(t("Acceptance", "验收"), result.acceptance.map((item) => `${item.id}: ${item.status}`)),
       ];
     case "orch.result/implementer/v1":
       return [
-        ...mirrorListLines("Tests", result.tests.map(commandLine)),
-        ...mirrorListLines("Acceptance", result.acceptance.map((item) => `${item.id}: ${item.status}${item.evidence ? ` — ${item.evidence}` : ""}`)),
-        ...mirrorListLines("Risks", result.risks),
+        ...mirrorListLines(t("Tests", "测试"), result.tests.map(commandLine)),
+        ...mirrorListLines(t("Acceptance", "验收"), result.acceptance.map((item) => `${item.id}: ${item.status}${item.evidence ? ` — ${item.evidence}` : ""}`)),
+        ...mirrorListLines(t("Risks", "风险"), result.risks),
       ];
     case "orch.result/controller/v1":
-      return mirrorListLines("Actions", result.actions);
+      return mirrorListLines(t("Actions", "动作"), result.actions);
     case "orch.result/researcher/v1":
       return [
-        "Recommendation:",
+        t("Recommendation:", "建议方案:"),
         "",
         result.recommendation,
         "",
-        ...mirrorListLines("Alternatives considered", result.alternatives),
-        ...mirrorListLines("Sources", result.sources),
-        ...mirrorListLines("Open questions", result.open_questions),
-        ...mirrorListLines("Risks", result.risks),
+        ...mirrorListLines(t("Alternatives considered", "备选方案"), result.alternatives),
+        ...mirrorListLines(t("Sources", "来源"), result.sources),
+        ...mirrorListLines(t("Open questions", "未决问题"), result.open_questions),
+        ...mirrorListLines(t("Risks", "风险"), result.risks),
       ];
     default:
       return [];
@@ -1016,15 +1052,16 @@ function resultDetailLines(result: RoleResult): string[] {
 }
 
 function mirrorBody(mr: string, runId: string, result: RoleResult, status: RunStatus | null): string {
+  const zh = zhComments();
   const lines = [
-    "### orch run result",
+    zh ? "### orch 运行结果" : "### orch run result",
     "",
     `- MR/PR: ${mr}`,
-    `- Run: ${runId}`,
-    `- State: ${status?.state ?? "unknown"}`,
-    `- Verdict: ${resultVerdict(result)}`,
+    `- ${zh ? "运行" : "Run"}: ${runId}`,
+    `- ${zh ? "状态" : "State"}: ${status?.state ?? "unknown"}`,
+    `- ${zh ? "结论" : "Verdict"}: ${resultVerdict(result)}`,
     "",
-    "Summary:",
+    zh ? "摘要:" : "Summary:",
     "",
     resultSummary(result),
   ];
@@ -1032,7 +1069,10 @@ function mirrorBody(mr: string, runId: string, result: RoleResult, status: RunSt
   if (detail.length > 0) lines.push("", ...detail);
   const body = lines.join("\n").replace(/\n{3,}/g, "\n\n").trimEnd();
   if (body.length <= MIRROR_BODY_MAX_CHARS) return body;
-  return `${body.slice(0, MIRROR_BODY_MAX_CHARS)}\n\n…(comment truncated; run \`orch result --run ${runId}\` for the full result)`;
+  const truncated = zh
+    ? `…(评论已截断;完整结果请运行 \`orch result --run ${runId}\` 查看)`
+    : `…(comment truncated; run \`orch result --run ${runId}\` for the full result)`;
+  return `${body.slice(0, MIRROR_BODY_MAX_CHARS)}\n\n${truncated}`;
 }
 
 function decisionBody(
@@ -1042,14 +1082,15 @@ function decisionBody(
   result: RoleResult,
   status: RunStatus | null,
 ): string {
+  const zh = zhComments();
   return [
-    "### orch decision",
+    zh ? "### orch 决策" : "### orch decision",
     "",
     `- MR/PR: ${mr}`,
-    `- Run: ${runId}`,
-    `- Decision: ${decision.verdict}`,
-    `- Reason: ${decision.reason ?? "none"}`,
-    `- Created: ${decision.ts}`,
+    `- ${zh ? "运行" : "Run"}: ${runId}`,
+    `- ${zh ? "决策" : "Decision"}: ${decision.verdict}`,
+    `- ${zh ? "理由" : "Reason"}: ${decision.reason ?? (zh ? "无" : "none")}`,
+    `- ${zh ? "创建时间" : "Created"}: ${decision.ts}`,
     "",
     mirrorBody(mr, runId, result, status),
   ].join("\n");
@@ -1215,6 +1256,7 @@ async function createRun(args: ParsedArgs): Promise<number> {
       role,
       agent,
       tag,
+      ...(orchLanguage() === "中文" ? { language: "中文" as const } : {}),
       ...effectiveSession,
       idempotency_key: idempotencyKey,
       repo_key: repo.repo_key,
@@ -1405,6 +1447,7 @@ async function startRun(input: StartRunInput): Promise<Record<string, unknown>> 
       role,
       agent,
       tag,
+      ...(orchLanguage() === "中文" ? { language: "中文" as const } : {}),
       ...providerSession,
       idempotency_key: idempotencyKey,
       repo_key: repo.repo_key,
@@ -2012,6 +2055,10 @@ async function newCommand(args: ParsedArgs): Promise<number> {
   const mr = args.flags.has("mr") ? flagString(args, "mr") : `new-${newMrSlug(description)}-${randomHex(2)}`;
   const mrDir = mrStateDir(repo.repo_key, mr);
   mkdirSync(`${mrDir}/tasks`, { recursive: true });
+  // A task naming a real MR/PR URL pins the forge ref now, so mirrored
+  // comments later land on that MR instead of failing on the local slug.
+  const forgeRef = mrFromForgeUrl(description);
+  if (forgeRef && forgeRef !== mr) writeForgeRef(mrDir, forgeRef);
 
   // The exec controller dispatches through the mail layer; seed the default
   // roster on first use only (a non-empty roster may carry user customization).
@@ -2143,17 +2190,18 @@ function runIdOfClaim(run: unknown): string | null {
 // A fallback result's synthetic finding is a driver error message, not a
 // review; the comment carries the recovered raw review text instead.
 function unparsedRunSection(mr: string, runId: string, state: string, raw: string): string {
-  const text =
-    raw.length > MIRROR_BODY_MAX_CHARS
-      ? `${raw.slice(0, MIRROR_BODY_MAX_CHARS)}\n\n…(raw review truncated; run \`orch result --run ${runId}\` for the rest)`
-      : raw;
+  const zh = zhComments();
+  const truncated = zh
+    ? `…(原始评审已截断;其余内容请运行 \`orch result --run ${runId}\` 查看)`
+    : `…(raw review truncated; run \`orch result --run ${runId}\` for the rest)`;
+  const text = raw.length > MIRROR_BODY_MAX_CHARS ? `${raw.slice(0, MIRROR_BODY_MAX_CHARS)}\n\n${truncated}` : raw;
   return [
-    "### orch run result",
+    zh ? "### orch 运行结果" : "### orch run result",
     "",
     `- MR/PR: ${mr}`,
-    `- Run: ${runId}`,
-    `- State: ${state}`,
-    "- Verdict: unparsed (driver schema fallback — raw review below)",
+    `- ${zh ? "运行" : "Run"}: ${runId}`,
+    `- ${zh ? "状态" : "State"}: ${state}`,
+    zh ? "- 结论: unparsed(driver schema 回退 — 原始评审见下)" : "- Verdict: unparsed (driver schema fallback — raw review below)",
     "",
     text,
   ].join("\n");
@@ -2200,6 +2248,7 @@ async function crossReviewAuto(args: ParsedArgs, outcome: MailFanoutOutcome): Pr
   // written until the merged body has passed the leak guard, mirroring
   // decision()'s ordering: a body that can't be mirrored must never leave
   // decided-but-unmirrored runs behind (recovery would hit EEXIST).
+  const zh = zhComments();
   const sections: string[] = [];
   const attention: string[] = [];
   const reportRuns: Array<Record<string, unknown>> = [];
@@ -2219,7 +2268,14 @@ async function crossReviewAuto(args: ParsedArgs, outcome: MailFanoutOutcome): Pr
     const verdict = result === null ? null : raw !== null ? "unparsed" : run.verdict;
     let section =
       result === null
-        ? ["### orch run result", "", `- MR/PR: ${mr}`, `- Run: ${run.run_id}`, `- State: ${run.state}`, "- Verdict: none (no result.json)"].join("\n")
+        ? [
+            zh ? "### orch 运行结果" : "### orch run result",
+            "",
+            `- MR/PR: ${mr}`,
+            `- ${zh ? "运行" : "Run"}: ${run.run_id}`,
+            `- ${zh ? "状态" : "State"}: ${run.state}`,
+            zh ? "- 结论: 无(缺少 result.json)" : "- Verdict: none (no result.json)",
+          ].join("\n")
         : raw !== null
           ? unparsedRunSection(mr, run.run_id, run.state, raw)
           : mirrorBody(mr, run.run_id, result, status);
@@ -2250,16 +2306,19 @@ async function crossReviewAuto(args: ParsedArgs, outcome: MailFanoutOutcome): Pr
   }
 
   const header = [
-    "### orch cross-review",
+    zh ? "### orch 交叉评审" : "### orch cross-review",
     "",
     `- MR/PR: ${mr}`,
-    `- Thread: ${outcome.thread}`,
-    `- Runs: ${tracked.map((run) => `${run.agent}/${run.run_id}`).join(", ")}`,
+    `- ${zh ? "线程" : "Thread"}: ${outcome.thread}`,
+    `- ${zh ? "运行" : "Runs"}: ${tracked.map((run) => `${run.agent}/${run.run_id}`).join(", ")}`,
   ].join("\n");
   let body = [header, ...sections].join("\n\n---\n\n");
   // Per-section caps don't bound the sum; GitHub rejects comments over 65536.
   if (body.length > MIRROR_BODY_MAX_CHARS) {
-    body = `${body.slice(0, MIRROR_BODY_MAX_CHARS)}\n\n…(comment truncated; run \`orch result --run <run_id>\` for the full results)`;
+    const truncated = zh
+      ? "…(评论已截断;完整结果请运行 `orch result --run <run_id>` 查看)"
+      : "…(comment truncated; run `orch result --run <run_id>` for the full results)";
+    body = `${body.slice(0, MIRROR_BODY_MAX_CHARS)}\n\n${truncated}`;
   }
   assertMirrorBodySafe(body); // before any write: a leaky body aborts cleanly with nothing recorded
 
@@ -2287,7 +2346,7 @@ async function crossReviewAuto(args: ParsedArgs, outcome: MailFanoutOutcome): Pr
     }
     comment = { outbox_path: outboxPath, mode: "queued", forge };
     if (adapter) {
-      const command = await adapter.postComment(mr, body);
+      const command = await adapter.postComment(forgeRefFor(mrDir, mr), body);
       const success = command.exit_code === 0;
       let finalPath = outboxPath;
       if (execute && success) {
@@ -2951,7 +3010,7 @@ async function mirror(args: ParsedArgs): Promise<number> {
   const { result, status } = readMirrorResult(runsRoot, runId);
   const body = mirrorBody(mr, runId, result, status);
   assertMirrorBodySafe(body);
-  const command = await adapter.postComment(mr, body);
+  const command = await adapter.postComment(forgeRefFor(root, mr), body);
 
   printJson({
     mirror: execute ? "executed" : "dry-run",

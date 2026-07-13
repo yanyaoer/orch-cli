@@ -1,6 +1,6 @@
 import { closeSync, existsSync, openSync, readFileSync, writeFileSync, writeSync } from "node:fs";
 import { isRunRole, type AgentName, type ResultCoercion, type RunSpec, type RoleResult } from "../src/types.ts";
-import { fallbackResult, resultSchemaName, ROLE_VERDICTS, validateRoleResult } from "../src/schema.ts";
+import { fallbackResult, resultSchemaName, ROLE_REQUIRED_FIELDS, ROLE_VERDICTS, validateRoleResult } from "../src/schema.ts";
 import { appendJsonLine, countLines, writeJsonAtomic } from "../src/json.ts";
 import { normalizeNativeText, type NativeEvent } from "../src/native-events.ts";
 
@@ -32,6 +32,7 @@ export function buildPrompt(spec: RunSpec, provider: string): string {
   const schemaName = resultSchemaName(role);
   const verdicts = ROLE_VERDICTS[role];
   const failure = verdicts.find((verdict) => verdict === "failed" || verdict === "fail");
+  const required = ROLE_REQUIRED_FIELDS[role];
   return [
     `You are running under orch provider driver: ${provider}.`,
     `Run id: ${spec.run_id}`,
@@ -42,9 +43,17 @@ export function buildPrompt(spec: RunSpec, provider: string): string {
     "",
     "Execute the task below. Your final answer must be a single JSON object matching this orch schema.",
     `The top-level JSON object must include: "schema": "${schemaName}".`,
+    // Models cannot infer the field list from the schema name: live runs
+    // dropped verdict, then summary. Spell out every validator-required field.
+    `Required top-level fields — omitting any of them fails the run: ${required.map((field) => `"${field}"`).join(", ")}.`,
     `It must also include "verdict", exactly one of: ${verdicts.map((verdict) => `"${verdict}"`).join(" | ")}. Never omit "verdict".` +
       (failure ? ` Use "${failure}" when the task could not genuinely be completed; never claim success for ungrounded or partial work.` : ""),
     "Do not wrap the JSON in Markdown. Do not create or edit result files in the worktree; return the JSON as your final answer only.",
+    ...(spec.language === "中文"
+      ? [
+          "结果 JSON 中人类可读的 prose 字段(summary、blocking/non_blocking findings 的 body、suggested_tests、recommendation、risks、acceptance evidence、rollback)必须用中文书写;代码、命令、文件路径、标识符保持原样。",
+        ]
+      : []),
     "",
     "Task:",
     spec.task_text || "(no task text supplied)",
@@ -546,6 +555,21 @@ function coerceRoleResult(role: RunSpec["role"], obj: Record<string, unknown>, c
       if (alias) {
         recordCoercion(coercions, "recommendation", obj.recommendation, alias, "recommendation alias");
         obj.recommendation = alias;
+      }
+    }
+    // summary is descriptive, not control flow: when it is missing but the
+    // deliverable exists, derive it from the recommendation's first prose line
+    // instead of discarding an otherwise valid result (a live plan run omitted
+    // summary while including verdict and a full recommendation).
+    if ((typeof obj.summary !== "string" || !obj.summary.trim()) && typeof obj.recommendation === "string") {
+      const firstProse = obj.recommendation
+        .split("\n")
+        .map((line) => line.trim())
+        .find((line) => line.length > 0 && !line.startsWith("#"));
+      if (firstProse) {
+        const derived = firstProse.length > 200 ? `${firstProse.slice(0, 197)}...` : firstProse;
+        recordCoercion(coercions, "summary", obj.summary, derived, "summary derived from recommendation");
+        obj.summary = derived;
       }
     }
     // Verdict is deliberately never defaulted: completed and failed require

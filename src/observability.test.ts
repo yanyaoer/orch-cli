@@ -1379,6 +1379,79 @@ test("decision records local verdict and queues mirror outbox payload", async ()
   expect(readdirSync(sentDir).filter((file) => file.endsWith(".json"))).toHaveLength(0);
 });
 
+test("a recorded forge_ref replaces the local mr id in queued outbox payloads", async () => {
+  // orch new slugs (new-<slug>-<hex>) are local thread names, not gh/glab
+  // refs; two live publishes needed hand-patched payloads before forge_ref.
+  const root = mkdtempSync(join(tmpdir(), "orch-forge-ref-test-"));
+  const stateHome = join(root, "state");
+  const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
+  const remote = "git@github.com:example/repo.git";
+  await runCmd(["git", "init"], worktree);
+  await runCmd(["git", "remote", "add", "origin", remote], worktree);
+
+  const repoKey = repoKeyFromRemote(remote, worktree);
+  const mr = "new-crocs-review-https-git-n-3ebd";
+  const runId = "impl-a-20260619T120000Z-abc123";
+  const mrDir = join(stateHome, "orch", repoKey, "mrs", mr);
+  const runDir = join(mrDir, "runs", runId);
+  mkdirSync(runDir, { recursive: true });
+  writeFileSync(join(mrDir, "forge_ref"), "4245\n", "utf8");
+
+  const status: RunStatus = {
+    run_id: runId,
+    mr,
+    role: "implementer",
+    agent: "codex",
+    tag: "impl-a",
+    provider_session_name: null,
+    provider_session_id: null,
+    provider_session_mode: "fresh_persistent",
+    state: "done",
+    pid: null,
+    pgid: null,
+    started_at: "2026-06-19T12:00:00.000Z",
+    updated_at: "2026-06-19T12:01:00.000Z",
+    exit_code: 0,
+    timeout_sec: 3600,
+    last_event_seq: 1,
+    native_event_count: 0,
+    provider_resume_id: null,
+    worktree,
+    base_sha: "base",
+    head_sha: "head",
+  };
+  const result: ImplementerResult = {
+    schema: "orch.result/implementer/v1",
+    run_id: runId,
+    verdict: "completed",
+    summary: "implemented forge ref routing",
+    base_sha: "base",
+    head_sha: "head",
+    changed_files: ["src/orch.ts"],
+    tests: [{ cmd: "bun test", exit_code: 0, summary: "passed" }],
+    acceptance: [],
+    risks: [],
+    rollback: "revert the CLI changes",
+  };
+  writeFileSync(join(runDir, "status.json"), `${JSON.stringify(status, null, 2)}\n`, "utf8");
+  writeFileSync(join(runDir, "result.json"), `${JSON.stringify(result, null, 2)}\n`, "utf8");
+
+  const env = { XDG_STATE_HOME: stateHome };
+  const decision = await runOrch(["decision", "accept", "--mr", mr, "--run", runId, "--worktree", worktree, "--reason", "ok"], env);
+  expect(decision).toMatchObject({ exitCode: 0, stderr: "" });
+
+  const pendingDir = join(mrDir, "outbox", "pending");
+  const pending = readdirSync(pendingDir).filter((file) => file.endsWith(".json"));
+  expect(pending).toHaveLength(1);
+  const payload = JSON.parse(readFileSync(join(pendingDir, pending[0]!), "utf8"));
+  // The queued payload targets the real MR; the body keeps the local id for traceability.
+  expect(payload.mr).toBe("4245");
+
+  const sync = await runOrch(["mirror", "sync", "--mr", mr, "--worktree", worktree], env);
+  expect(sync).toMatchObject({ exitCode: 0 });
+  expect(sync.stdout).toContain("gh pr comment 4245 --body");
+});
+
 test("reviewer decision mirrors full findings detail and caps oversized bodies", async () => {
   const root = mkdtempSync(join(tmpdir(), "orch-decision-findings-test-"));
   const stateHome = join(root, "state");
@@ -1452,6 +1525,117 @@ test("reviewer decision mirrors full findings detail and caps oversized bodies",
   expect(body).toContain("Suggested tests (1):");
   expect(body).toContain("- cover empty docs response");
   expect(body.length).toBeLessThanOrEqual(60_000 + 200);
+});
+
+test("decision mirror body renders the Chinese skeleton for language 中文 and stays english otherwise", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orch-decision-language-test-"));
+  const stateHome = join(root, "state");
+  const configHome = join(root, "config");
+  const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
+  const remote = "git@github.com:example/repo.git";
+  await runCmd(["git", "init"], worktree);
+  await runCmd(["git", "remote", "add", "origin", remote], worktree);
+
+  const repoKey = repoKeyFromRemote(remote, worktree);
+  const mr = "88";
+  const mrDir = join(stateHome, "orch", repoKey, "mrs", mr);
+  const pendingDir = join(mrDir, "outbox", "pending");
+
+  const seedRun = (runId: string): void => {
+    const runDir = join(mrDir, "runs", runId);
+    mkdirSync(runDir, { recursive: true });
+    const status: RunStatus = {
+      run_id: runId,
+      mr,
+      role: "reviewer",
+      agent: "claude",
+      tag: "rev-a",
+      provider_session_name: null,
+      provider_session_id: null,
+      provider_session_mode: "fresh_persistent",
+      state: "done",
+      pid: null,
+      pgid: null,
+      started_at: "2026-07-13T12:00:00.000Z",
+      updated_at: "2026-07-13T12:01:00.000Z",
+      exit_code: 0,
+      timeout_sec: 3600,
+      last_event_seq: 1,
+      native_event_count: 0,
+      provider_resume_id: null,
+      worktree,
+      base_sha: "base",
+      head_sha: "head",
+    };
+    const result: ReviewerResult = {
+      schema: "orch.result/reviewer/v1",
+      run_id: runId,
+      verdict: "request_changes",
+      reviews_run_id: "impl-a",
+      blocking_findings: [{ id: "B1", severity: "high", file: "src/a.ts:1", body: "missing await" }],
+      non_blocking_findings: [{ id: "NB1", body: "duplicated timeout" }],
+      suggested_tests: ["cover empty response"],
+    };
+    writeFileSync(join(runDir, "status.json"), `${JSON.stringify(status, null, 2)}\n`, "utf8");
+    writeFileSync(join(runDir, "result.json"), `${JSON.stringify(result, null, 2)}\n`, "utf8");
+  };
+
+  const decideAndReadBody = async (runId: string): Promise<string> => {
+    seedRun(runId);
+    const decision = await runOrch(
+      ["decision", "rework", "--mr", mr, "--run", runId, "--worktree", worktree, "--reason", "blocking findings"],
+      { XDG_STATE_HOME: stateHome, XDG_CONFIG_HOME: configHome },
+    );
+    expect(decision).toMatchObject({ exitCode: 0, stderr: "" });
+    for (const file of readdirSync(pendingDir)) {
+      const body = JSON.parse(readFileSync(join(pendingDir, file), "utf8")).body as string;
+      if (body.includes(runId)) return body;
+    }
+    throw new Error(`no queued comment found for ${runId}`);
+  };
+
+  // Comparable across configs: the run id and decision timestamp are the only
+  // legitimate differences between the english bodies.
+  const normalize = (body: string, runId: string): string =>
+    body.replaceAll(runId, "RUN").replace(/^- Created: .*$/m, "- Created: TS");
+
+  const orchConfigDir = join(configHome, "orch");
+  mkdirSync(orchConfigDir, { recursive: true });
+  const configPath = join(orchConfigDir, "config.json");
+
+  // Default: no language field.
+  writeFileSync(configPath, JSON.stringify({ version: 1, workspaces: {} }), "utf8");
+  const defaultBody = await decideAndReadBody("rev-a-20260713T120000Z-aaa111");
+  expect(defaultBody).toContain("### orch decision");
+  expect(defaultBody).toContain("- Decision: rework");
+  expect(defaultBody).toContain("### orch run result");
+  expect(defaultBody).toContain("Summary:");
+  expect(defaultBody).toContain("Blocking findings (1):");
+  expect(defaultBody).toContain("Non-blocking findings (1):");
+  expect(defaultBody).toContain("Suggested tests (1):");
+
+  // Explicit english and an invalid value produce the same english body.
+  writeFileSync(configPath, JSON.stringify({ version: 1, workspaces: {}, language: "english" }), "utf8");
+  const englishBody = await decideAndReadBody("rev-a-20260713T120000Z-bbb222");
+  writeFileSync(configPath, JSON.stringify({ version: 1, workspaces: {}, language: "chinese" }), "utf8");
+  const invalidBody = await decideAndReadBody("rev-a-20260713T120000Z-ccc333");
+  expect(normalize(englishBody, "rev-a-20260713T120000Z-bbb222")).toBe(normalize(defaultBody, "rev-a-20260713T120000Z-aaa111"));
+  expect(normalize(invalidBody, "rev-a-20260713T120000Z-ccc333")).toBe(normalize(defaultBody, "rev-a-20260713T120000Z-aaa111"));
+
+  // 中文 flips the whole skeleton.
+  writeFileSync(configPath, JSON.stringify({ version: 1, workspaces: {}, language: "中文" }), "utf8");
+  const zhBody = await decideAndReadBody("rev-a-20260713T120000Z-ddd444");
+  expect(zhBody).toContain("### orch 决策");
+  expect(zhBody).toContain("- 决策: rework");
+  expect(zhBody).toContain("- 理由: blocking findings");
+  expect(zhBody).toContain("### orch 运行结果");
+  expect(zhBody).toContain("- 结论: request_changes");
+  expect(zhBody).toContain("摘要:");
+  expect(zhBody).toContain("阻断性发现 (1):");
+  expect(zhBody).toContain("非阻断性发现 (1):");
+  expect(zhBody).toContain("建议测试 (1):");
+  expect(zhBody).not.toContain("Blocking findings");
+  expect(zhBody).not.toContain("### orch decision");
 });
 
 test("decision refuses unsafe mirror body before writing outbox payload", async () => {

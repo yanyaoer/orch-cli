@@ -78,6 +78,19 @@ test("result validators reject malformed collection items", () => {
     }).ok,
   ).toBe(false);
 
+  // A verifier's deliverable is evidence-backed checks: acceptance items may
+  // carry evidence (a live codex verifier lost a complete result to this).
+  expect(
+    validateRoleResult("verifier", {
+      schema: "orch.result/verifier/v1",
+      run_id: "verify-evidence",
+      verdict: "pass",
+      verifies_run_id: "impl-a",
+      commands: [],
+      acceptance: [{ id: "f1", status: "CONFIRMED", evidence: "McpServerKey.kt:16-22 摘要忽略 scheme/端口" }],
+    }),
+  ).toEqual({ ok: true, errors: [] });
+
   expect(
     validateRoleResult("controller", {
       schema: "orch.result/controller/v1",
