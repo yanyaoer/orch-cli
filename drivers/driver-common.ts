@@ -543,6 +543,12 @@ function coerceRoleResult(role: RunSpec["role"], obj: Record<string, unknown>, c
         obj.recommendation = alias;
       }
     }
+    // Neither buildPrompt nor the plan task grammar asks researchers for a
+    // verdict, so a substantive recommendation with no verdict means completed.
+    if (obj.verdict === undefined && typeof obj.recommendation === "string" && obj.recommendation.trim()) {
+      recordCoercion(coercions, "verdict", obj.verdict, "completed", "missing verdict with recommendation");
+      obj.verdict = "completed";
+    }
   } else if (role === "verifier") {
     coerceMissingArrays(obj, ["commands", "acceptance"], coercions);
     if (typeof obj.verifies_run_id !== "string") {

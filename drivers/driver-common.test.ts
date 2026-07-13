@@ -584,6 +584,38 @@ test("extractResultFromText coerces researcher alias fields and missing arrays",
   });
 });
 
+test("extractResultFromText defaults a missing researcher verdict when a recommendation exists", () => {
+  // Real plan-run failure shape: prose preamble, then a schema-complete result
+  // that omits verdict (no prompt ever asks researchers for one).
+  const runSpec = spec("researcher", "research-no-verdict");
+  const result = extractResultFromText(
+    `调研完成，以下为计划 JSON。\n\n${JSON.stringify({
+      schema: "orch.result/researcher/v1",
+      summary: "cross-review MR 4245",
+      recommendation: "## Destination\nreview lands as one merged comment",
+      risks: ["reviewers may repeat settled findings"],
+      alternatives: [],
+      open_questions: [],
+    })}`,
+    runSpec,
+  );
+  expect(result).toMatchObject({
+    schema: "orch.result/researcher/v1",
+    run_id: "research-no-verdict",
+    verdict: "completed",
+    recommendation: "## Destination\nreview lands as one merged comment",
+    sources: [],
+  });
+
+  // No recommendation to stand on -> still rejected, not silently completed.
+  expect(
+    extractResultFromText(
+      JSON.stringify({ schema: "orch.result/researcher/v1", summary: "looked around" }),
+      spec("researcher", "research-empty"),
+    ),
+  ).toBeNull();
+});
+
 test("buildProviderArgv picks claude model/effort by role", () => {
   const argv = (role: RunSpec["role"], runId: string) =>
     buildProviderArgv("claude", spec(role, runId), "/run", "/worktree");
