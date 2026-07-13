@@ -131,7 +131,7 @@ export interface VerifierResult {
   verdict: "pass" | "fail";
   verifies_run_id: string;
   commands: CommandResult[];
-  acceptance: Array<{ id: string; status: string }>;
+  acceptance: AcceptanceResult[];
 }
 
 export interface ControllerResult {

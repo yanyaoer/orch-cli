@@ -562,10 +562,24 @@ function coerceRoleResult(role: RunSpec["role"], obj: Record<string, unknown>, c
     // instead of discarding an otherwise valid result (a live plan run omitted
     // summary while including verdict and a full recommendation).
     if ((typeof obj.summary !== "string" || !obj.summary.trim()) && typeof obj.recommendation === "string") {
-      const firstProse = obj.recommendation
-        .split("\n")
-        .map((line) => line.trim())
-        .find((line) => line.length > 0 && !line.startsWith("#"));
+      // First prose line: headings and fenced code blocks (including their
+      // contents) are skipped, list markers are stripped so a bullet-only
+      // plan still yields readable content.
+      let firstProse: string | undefined;
+      let inFence = false;
+      for (const raw of obj.recommendation.split("\n")) {
+        const line = raw.trim();
+        if (line.startsWith("```")) {
+          inFence = !inFence;
+          continue;
+        }
+        if (inFence || !line || line.startsWith("#")) continue;
+        const stripped = line.replace(/^(?:[-*+]|\d+\.)\s+/, "");
+        if (stripped) {
+          firstProse = stripped;
+          break;
+        }
+      }
       if (firstProse) {
         const derived = firstProse.length > 200 ? `${firstProse.slice(0, 197)}...` : firstProse;
         recordCoercion(coercions, "summary", obj.summary, derived, "summary derived from recommendation");

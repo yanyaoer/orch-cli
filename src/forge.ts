@@ -41,6 +41,37 @@ export function detectForge(remoteUrl: string): ForgeKind {
   return "gitlab";
 }
 
+function repoPathFromRemote(remoteUrl: string): string | null {
+  const cleaned = remoteUrl.trim().replace(/\.git$/, "");
+  const ssh = cleaned.match(/^git@[^:]+:(.+)$/);
+  if (ssh?.[1]) return ssh[1].toLowerCase();
+  try {
+    const url = new URL(cleaned);
+    const path = url.pathname.replace(/^\/+|\/+$/g, "").toLowerCase();
+    return path || null;
+  } catch {
+    return null;
+  }
+}
+
+// The MR/PR number a free-text task unambiguously targets. External comments
+// must never ride on a guessed destination, so this is deliberately strict:
+// only URLs on the worktree's own remote (host + repo path) count as targets —
+// cross-repo links are references, not targets — and more than one distinct
+// same-repo number is ambiguous. Anything else returns null (fail closed).
+export function mrRefFromText(text: string, remoteUrl: string): string | null {
+  const host = hostFromRemote(remoteUrl);
+  const path = repoPathFromRemote(remoteUrl);
+  if (!host || !path) return null;
+  const refs = new Set<string>();
+  for (const match of text.matchAll(/https?:\/\/([^\s/]+)\/([^\s?#]*?)\/(?:-\/merge_requests|pull)\/(\d+)/g)) {
+    if (match[1]!.toLowerCase() !== host) continue;
+    if (match[2]!.replace(/\.git$/, "").toLowerCase() !== path) continue;
+    refs.add(match[3]!);
+  }
+  return refs.size === 1 ? [...refs][0]! : null;
+}
+
 async function runArgv(
   forge: Exclude<ForgeKind, "none">,
   argv: string[],

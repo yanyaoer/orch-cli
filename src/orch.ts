@@ -31,7 +31,7 @@ import {
   writeJsonExclusive,
   writeTextAtomic,
 } from "./json.ts";
-import { argvForDisplay, createForgeAdapter, detectForge } from "./forge.ts";
+import { argvForDisplay, createForgeAdapter, detectForge, mrRefFromText } from "./forge.ts";
 import { findPrivateLeak, privateLeakAllowed, privateLeakErrorMessage } from "./leak.ts";
 import { runSupervisor, writeInitialRunFiles } from "./supervisor.ts";
 import { createNativeNormalizer, normalizeNativeLine } from "./native-events.ts";
@@ -845,7 +845,9 @@ function printResultSummary(result: RoleResult): void {
     if (verifier.acceptance.length === 0) {
       process.stdout.write("  - none\n");
     } else {
-      for (const item of verifier.acceptance) process.stdout.write(`  - ${item.id}: ${item.status}\n`);
+      for (const item of verifier.acceptance) {
+        process.stdout.write(`  - ${item.id}: ${item.status}${item.evidence ? ` — ${item.evidence}` : ""}\n`);
+      }
     }
     return;
   }
@@ -1025,7 +1027,7 @@ function resultDetailLines(result: RoleResult): string[] {
     case "orch.result/verifier/v1":
       return [
         ...mirrorListLines(t("Commands", "命令"), result.commands.map(commandLine)),
-        ...mirrorListLines(t("Acceptance", "验收"), result.acceptance.map((item) => `${item.id}: ${item.status}`)),
+        ...mirrorListLines(t("Acceptance", "验收"), result.acceptance.map((item) => `${item.id}: ${item.status}${item.evidence ? ` — ${item.evidence}` : ""}`)),
       ];
     case "orch.result/implementer/v1":
       return [
@@ -2055,10 +2057,15 @@ async function newCommand(args: ParsedArgs): Promise<number> {
   const mr = args.flags.has("mr") ? flagString(args, "mr") : `new-${newMrSlug(description)}-${randomHex(2)}`;
   const mrDir = mrStateDir(repo.repo_key, mr);
   mkdirSync(`${mrDir}/tasks`, { recursive: true });
-  // A task naming a real MR/PR URL pins the forge ref now, so mirrored
-  // comments later land on that MR instead of failing on the local slug.
-  const forgeRef = mrFromForgeUrl(description);
-  if (forgeRef && forgeRef !== mr) writeForgeRef(mrDir, forgeRef);
+  // Pin the forge ref only when the generated slug is the local id (an
+  // explicit --mr is the user-stated target and is never second-guessed from
+  // free text), the description names exactly one same-repo MR/PR URL, and no
+  // ref was recorded before. Mirrored comments are outward side effects; an
+  // ambiguous or cross-repo URL fails closed to the old slug behavior.
+  if (!args.flags.has("mr") && !existsSync(forgeRefPath(mrDir))) {
+    const forgeRef = mrRefFromText(description, repo.remote_url);
+    if (forgeRef) writeForgeRef(mrDir, forgeRef);
+  }
 
   // The exec controller dispatches through the mail layer; seed the default
   // roster on first use only (a non-empty roster may carry user customization).
@@ -3232,12 +3239,16 @@ async function mirrorSyncPending(
       failed += 1;
       continue;
     }
-    const command = await adapter.postComment(payload.mr, payload.body);
+    // Payloads queued before forge_ref existed still carry the local thread
+    // id; resolve those at send time. A payload already recording a real ref
+    // keeps its destination untouched.
+    const target = payload.mr === mr ? forgeRefFor(mrDir, payload.mr) : payload.mr;
+    const command = await adapter.postComment(target, payload.body);
     const success = command.exit_code === 0;
     printJson({
       mirror: execute ? (success ? "sent" : "failed") : "dry-run",
       forge,
-      mr: payload.mr,
+      mr: target,
       outbox_path: pendingPath,
       argv: command.argv,
       command: argvForDisplay(command.argv),

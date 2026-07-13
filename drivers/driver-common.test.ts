@@ -660,6 +660,18 @@ test("extractResultFromText derives a missing researcher summary from the recomm
     summary: "MR 3440 完成 claude+omp 交叉评审:合并评审意见以一条评论发布。",
   });
 
+  // Bullet-only plans derive the first item's content without the marker;
+  // code fences are skipped like headings.
+  const bulletResult = extractResultFromText(
+    JSON.stringify({
+      schema: "orch.result/researcher/v1",
+      verdict: "completed",
+      recommendation: "## Tasks\n```ts\nignored()\n```\n- 先修 serverKey 归一化\n- 再补 eval",
+    }),
+    spec("researcher", "research-bullets"),
+  );
+  expect((bulletResult as { summary?: string } | null)?.summary).toBe("先修 serverKey 归一化");
+
   // No recommendation prose at all -> nothing to derive from, still rejected.
   expect(
     extractResultFromText(

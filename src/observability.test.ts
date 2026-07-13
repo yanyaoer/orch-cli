@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { sha256 } from "./hash.ts";
 import { repoKeyFromRemote } from "./paths.ts";
-import type { ControllerResult, ImplementerResult, ReviewerResult, RoleResult, RunStatus } from "./types.ts";
+import type { ControllerResult, ImplementerResult, ReviewerResult, RoleResult, RunStatus, VerifierResult } from "./types.ts";
 
 async function runOrch(args: string[], env: Record<string, string>): Promise<{ stdout: string; stderr: string; exitCode: number }> {
   const proc = Bun.spawn([process.execPath, "src/orch.ts", ...args], {
@@ -1447,9 +1447,79 @@ test("a recorded forge_ref replaces the local mr id in queued outbox payloads", 
   // The queued payload targets the real MR; the body keeps the local id for traceability.
   expect(payload.mr).toBe("4245");
 
+  // A payload queued before forge_ref existed still carries the local slug;
+  // sync must resolve it at send time instead of handing gh/glab the slug.
+  writeFileSync(
+    join(pendingDir, "00000000T000000-legacy.json"),
+    `${JSON.stringify({ kind: "comment", mr, body: "legacy queued comment", created_at: "2026-06-19T12:00:00.000Z" })}\n`,
+    "utf8",
+  );
+
   const sync = await runOrch(["mirror", "sync", "--mr", mr, "--worktree", worktree], env);
   expect(sync).toMatchObject({ exitCode: 0 });
-  expect(sync.stdout).toContain("gh pr comment 4245 --body");
+  expect(sync.stdout.match(/gh pr comment 4245 --body/g)).toHaveLength(2);
+  expect(sync.stdout).not.toContain(`gh pr comment ${mr}`);
+});
+
+test("verifier acceptance evidence reaches the mirrored decision comment", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orch-verifier-evidence-test-"));
+  const stateHome = join(root, "state");
+  const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
+  const remote = "git@github.com:example/repo.git";
+  await runCmd(["git", "init"], worktree);
+  await runCmd(["git", "remote", "add", "origin", remote], worktree);
+
+  const repoKey = repoKeyFromRemote(remote, worktree);
+  const mr = "321";
+  const runId = "verify-a-20260619T120000Z-fed321";
+  const mrDir = join(stateHome, "orch", repoKey, "mrs", mr);
+  const runDir = join(mrDir, "runs", runId);
+  mkdirSync(runDir, { recursive: true });
+
+  const status: RunStatus = {
+    run_id: runId,
+    mr,
+    role: "verifier",
+    agent: "codex",
+    tag: "verify-a",
+    provider_session_name: null,
+    provider_session_id: null,
+    provider_session_mode: "fresh_persistent",
+    state: "done",
+    pid: null,
+    pgid: null,
+    started_at: "2026-06-19T12:00:00.000Z",
+    updated_at: "2026-06-19T12:01:00.000Z",
+    exit_code: 0,
+    timeout_sec: 3600,
+    last_event_seq: 1,
+    native_event_count: 0,
+    provider_resume_id: null,
+    worktree,
+    base_sha: "base",
+    head_sha: "head",
+  };
+  const result: VerifierResult = {
+    schema: "orch.result/verifier/v1",
+    run_id: runId,
+    verdict: "pass",
+    verifies_run_id: "impl-a",
+    commands: [],
+    acceptance: [{ id: "f1", status: "CONFIRMED", evidence: "McpServerKey.kt:16-22 digest ignores scheme and port" }],
+  };
+  writeFileSync(join(runDir, "status.json"), `${JSON.stringify(status, null, 2)}\n`, "utf8");
+  writeFileSync(join(runDir, "result.json"), `${JSON.stringify(result, null, 2)}\n`, "utf8");
+
+  const env = { XDG_STATE_HOME: stateHome };
+  const decision = await runOrch(["decision", "accept", "--mr", mr, "--run", runId, "--worktree", worktree, "--reason", "verified"], env);
+  expect(decision).toMatchObject({ exitCode: 0, stderr: "" });
+
+  const pendingDir = join(mrDir, "outbox", "pending");
+  const pending = readdirSync(pendingDir).filter((file) => file.endsWith(".json"));
+  expect(pending).toHaveLength(1);
+  const payload = JSON.parse(readFileSync(join(pendingDir, pending[0]!), "utf8"));
+  // The mirror is the human-facing copy of result.json: evidence must ride along.
+  expect(payload.body).toContain("f1: CONFIRMED — McpServerKey.kt:16-22 digest ignores scheme and port");
 });
 
 test("reviewer decision mirrors full findings detail and caps oversized bodies", async () => {
