@@ -566,14 +566,21 @@ function coerceRoleResult(role: RunSpec["role"], obj: Record<string, unknown>, c
       // contents) are skipped, list markers are stripped so a bullet-only
       // plan still yields readable content.
       let firstProse: string | undefined;
-      let inFence = false;
+      // Only the fence kind that opened a block closes it; the other kind is
+      // ordinary content inside (and gets skipped with the rest of the block).
+      let fence: "```" | "~~~" | null = null;
       for (const raw of obj.recommendation.split("\n")) {
         const line = raw.trim();
-        if (line.startsWith("```") || line.startsWith("~~~")) {
-          inFence = !inFence;
+        const mark = line.startsWith("```") ? "```" : line.startsWith("~~~") ? "~~~" : null;
+        if (mark && fence === null) {
+          fence = mark;
           continue;
         }
-        if (inFence || !line || line.startsWith("#")) continue;
+        if (mark && mark === fence) {
+          fence = null;
+          continue;
+        }
+        if (fence !== null || !line || line.startsWith("#")) continue;
         // Both `1.` and `1)` list styles; a line that is only a marker is noise.
         const stripped = line.replace(/^(?:[-*+]|\d+[.)])(?:\s+|$)/, "");
         if (stripped) {

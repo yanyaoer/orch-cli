@@ -682,6 +682,8 @@ test("extractResultFromText derives a missing researcher summary from the recomm
       ) as { summary?: string } | null
     )?.summary;
   expect(derive("~~~ts\nignored()\n~~~\n1) 实际计划")).toBe("实际计划");
+  // A backtick fence is only closed by backticks: the ~~~ inside is content.
+  expect(derive("```\n~~~\nstill code\n```\n真 prose")).toBe("真 prose");
   expect(derive("-\n\n1.\n- 真内容")).toBe("真内容");
   expect(derive("~~~ts\nnever closed")).toBeUndefined();
 

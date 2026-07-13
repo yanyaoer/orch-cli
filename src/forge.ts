@@ -54,14 +54,31 @@ function repoPathFromRemote(remoteUrl: string): string | null {
   }
 }
 
-// The forge's MR/PR route inside a URL pathname. The number must be a whole
-// path segment: a word character after it (or after a lone dot) means a typo
-// or a different object, never a target — `/pull/12abc` and `/pull/12O` must
-// not resolve to 12. Explicit `.diff`/`.patch` views of the same MR are fine.
+// The forge's MR/PR route, anchored over the whole URL pathname (query and
+// fragment never reach pathname). The number must be a whole path segment:
+// only end-of-path or a `/` may follow it, and the MR's own `.diff`/`.patch`
+// views must end the path — `/pull/12abc`, `/pull/12-foo`, `/pull/12..diff`,
+// `/pull/12%61bc`, and `/pull/12.diff/files` are typos or other objects,
+// never targets.
 const MR_ROUTES: Record<Exclude<ForgeKind, "none">, RegExp> = {
-  github: /^\/(.+?)\/pull\/(\d+)(?:\.(?:diff|patch))?(?!\.?\w)/,
-  gitlab: /^\/(.+?)\/-\/merge_requests\/(\d+)(?:\.(?:diff|patch))?(?!\.?\w)/,
+  github: /^\/(.+?)\/pull\/(\d+)(?:\.(?:diff|patch)$|(?=\/|$))/,
+  gitlab: /^\/(.+?)\/-\/merge_requests\/(\d+)(?:\.(?:diff|patch)$|(?=\/|$))/,
 };
+
+// Candidate URLs in free text: each starts at its own `https?://` and may
+// never run into the next URL's start (adjacent URLs separated only by CJK
+// punctuation are a normal Chinese-text input, and swallowing the second one
+// would hide an ambiguity). The candidate then ends at the first character
+// outside the RFC 3986 set, and trailing sentence punctuation is trimmed.
+function candidateUrls(text: string): string[] {
+  const starts = [...text.matchAll(/https?:\/\//gi)].map((match) => match.index!);
+  return starts.map((start, index) => {
+    const hardEnd = index + 1 < starts.length ? starts[index + 1]! : text.length;
+    let candidate = text.slice(start, hardEnd);
+    candidate = /^[A-Za-z0-9\-._~:/?#[\]@!$&'()*+,;=%]*/.exec(candidate)![0];
+    return candidate.replace(/[.,;:!?)\]'"]+$/, "");
+  });
+}
 
 // The MR/PR number a free-text task unambiguously targets. External comments
 // must never ride on a guessed destination, so this is deliberately strict:
@@ -76,10 +93,10 @@ export function mrRefFromText(text: string, remoteUrl: string): string | null {
   if (!host || !path || forge === "none") return null;
   const route = MR_ROUTES[forge];
   const refs = new Set<string>();
-  for (const candidate of text.matchAll(/https?:\/\/\S+/gi)) {
+  for (const candidate of candidateUrls(text)) {
     let url: URL;
     try {
-      url = new URL(candidate[0]!);
+      url = new URL(candidate);
     } catch {
       continue;
     }

@@ -57,6 +57,36 @@ test("mrRefFromText requires the number to be a whole path segment", () => {
   }
   // A .diff view of something else entirely stays rejected.
   expect(mrRefFromText(url("12.diff.txt"), remote)).toBeNull();
+
+  // Round-6 leak table: none of these are whole-segment MR numbers.
+  for (const bad of ["12..diff", "12-foo", "12+foo", "12.diff/files", "12.patch/extra", "12%61bc", "12.patch5"]) {
+    expect(mrRefFromText(url(bad), remote)).toBeNull();
+  }
+});
+
+test("mrRefFromText sees adjacent URLs as separate candidates", () => {
+  const remote = "https://github.com/o/r.git";
+  const twelve = "https://github.com/o/r/pull/12";
+  const thirteen = "https://github.com/o/r/pull/13";
+
+  // Two distinct MRs glued by CJK or ASCII punctuation are ambiguous, never
+  // silently resolved to the first number.
+  for (const sep of ["\u3001", "\uFF0C", ",", ")"]) {
+    expect(mrRefFromText(`${twelve}${sep}${thirteen}`, remote)).toBeNull();
+  }
+  // The same MR glued twice still dedups to one target.
+  expect(mrRefFromText(`${twelve}\u3001${twelve}`, remote)).toBe("12");
+  // Markdown link wrapping resolves after trailing punctuation trimming.
+  expect(mrRefFromText(`review (${twelve}) today`, remote)).toBe("12");
+});
+
+test("mrRefFromText survives malformed and userinfo URLs", () => {
+  const remote = "https://github.com/o/r.git";
+  // Malformed authority: constructor throws, candidate skipped, no crash.
+  expect(mrRefFromText("https://:80/o/r/pull/12", remote)).toBeNull();
+  // userinfo before the real host is fine; a lookalike host in userinfo is not.
+  expect(mrRefFromText("https://user@github.com/o/r/pull/12", remote)).toBe("12");
+  expect(mrRefFromText("https://github.com@evil.com/o/r/pull/12", remote)).toBeNull();
 });
 
 test("mrRefFromText only accepts the remote forge's own route", () => {
