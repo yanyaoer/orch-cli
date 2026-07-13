@@ -111,6 +111,18 @@ export function resultSchemaName(role: RunRole): RoleResult["schema"] {
   return "orch.result/verifier/v1";
 }
 
+// Verdict is the only field that distinguishes success from failure for most
+// roles (completed and failed require identical content fields), so it can
+// never be inferred or defaulted — it must be demanded from the model
+// (buildPrompt) and validated here.
+export const ROLE_VERDICTS: Record<RunRole, readonly [string, string]> = {
+  implementer: ["completed", "failed"],
+  reviewer: ["approve", "request_changes"],
+  controller: ["completed", "failed"],
+  researcher: ["completed", "failed"],
+  verifier: ["pass", "fail"],
+};
+
 export function validateRoleResult(role: RunRole, value: unknown): ValidationResult {
   if (!isRunRole(role)) {
     return { ok: false, errors: [`role ${role} has no result schema`] };
@@ -122,11 +134,12 @@ export function validateRoleResult(role: RunRole, value: unknown): ValidationRes
   const errors: string[] = [];
   if (obj.schema !== resultSchemaName(role)) errors.push(`schema must be ${resultSchemaName(role)}`);
   if (!nonEmptyString(obj.run_id)) errors.push("run_id is required");
+  const verdicts = ROLE_VERDICTS[role];
+  if (!verdicts.includes(obj.verdict as string)) errors.push(`verdict must be ${verdicts.join("|")}`);
 
   if (role === "implementer") {
     const missing = requireFields(obj, ["verdict", "summary", "base_sha", "head_sha", "rollback"]);
     errors.push(...missing.map((field) => `${field} is required`));
-    if (obj.verdict !== "completed" && obj.verdict !== "failed") errors.push("verdict must be completed|failed");
     validateStringArray(obj, "changed_files", errors);
     validateCommands(obj, "tests", errors);
     validateAcceptance(obj, "acceptance", errors, true);
@@ -135,21 +148,16 @@ export function validateRoleResult(role: RunRole, value: unknown): ValidationRes
     const missing = requireFields(obj, ["verdict"]);
     errors.push(...missing.map((field) => `${field} is required`));
     if (typeof obj.reviews_run_id !== "string") errors.push("reviews_run_id must be a string");
-    if (obj.verdict !== "approve" && obj.verdict !== "request_changes") {
-      errors.push("verdict must be approve|request_changes");
-    }
     validateFindings(obj, "blocking_findings", errors, true);
     validateFindings(obj, "non_blocking_findings", errors, false);
     validateStringArray(obj, "suggested_tests", errors);
   } else if (role === "controller") {
     const missing = requireFields(obj, ["verdict", "summary"]);
     errors.push(...missing.map((field) => `${field} is required`));
-    if (obj.verdict !== "completed" && obj.verdict !== "failed") errors.push("verdict must be completed|failed");
     validateStringArray(obj, "actions", errors);
   } else if (role === "researcher") {
     const missing = requireFields(obj, ["verdict", "summary", "recommendation"]);
     errors.push(...missing.map((field) => `${field} is required`));
-    if (obj.verdict !== "completed" && obj.verdict !== "failed") errors.push("verdict must be completed|failed");
     validateStringArray(obj, "alternatives", errors);
     validateStringArray(obj, "sources", errors);
     validateStringArray(obj, "open_questions", errors);
@@ -158,7 +166,6 @@ export function validateRoleResult(role: RunRole, value: unknown): ValidationRes
     const missing = requireFields(obj, ["verdict"]);
     errors.push(...missing.map((field) => `${field} is required`));
     if (typeof obj.verifies_run_id !== "string") errors.push("verifies_run_id must be a string");
-    if (obj.verdict !== "pass" && obj.verdict !== "fail") errors.push("verdict must be pass|fail");
     validateCommands(obj, "commands", errors);
     validateAcceptance(obj, "acceptance", errors, false);
   }

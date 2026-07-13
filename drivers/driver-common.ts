@@ -1,6 +1,6 @@
 import { closeSync, existsSync, openSync, readFileSync, writeFileSync, writeSync } from "node:fs";
 import { isRunRole, type AgentName, type ResultCoercion, type RunSpec, type RoleResult } from "../src/types.ts";
-import { fallbackResult, resultSchemaName, validateRoleResult } from "../src/schema.ts";
+import { fallbackResult, resultSchemaName, ROLE_VERDICTS, validateRoleResult } from "../src/schema.ts";
 import { appendJsonLine, countLines, writeJsonAtomic } from "../src/json.ts";
 import { normalizeNativeText, type NativeEvent } from "../src/native-events.ts";
 
@@ -28,7 +28,10 @@ export function readSpec(path: string): RunSpec {
 }
 
 export function buildPrompt(spec: RunSpec, provider: string): string {
-  const schemaName = isRunRole(spec.role) ? resultSchemaName(spec.role) : "orch.result/implementer/v1";
+  const role = isRunRole(spec.role) ? spec.role : "implementer";
+  const schemaName = resultSchemaName(role);
+  const verdicts = ROLE_VERDICTS[role];
+  const failure = verdicts.find((verdict) => verdict === "failed" || verdict === "fail");
   return [
     `You are running under orch provider driver: ${provider}.`,
     `Run id: ${spec.run_id}`,
@@ -39,6 +42,8 @@ export function buildPrompt(spec: RunSpec, provider: string): string {
     "",
     "Execute the task below. Your final answer must be a single JSON object matching this orch schema.",
     `The top-level JSON object must include: "schema": "${schemaName}".`,
+    `It must also include "verdict", exactly one of: ${verdicts.map((verdict) => `"${verdict}"`).join(" | ")}. Never omit "verdict".` +
+      (failure ? ` Use "${failure}" when the task could not genuinely be completed; never claim success for ungrounded or partial work.` : ""),
     "Do not wrap the JSON in Markdown. Do not create or edit result files in the worktree; return the JSON as your final answer only.",
     "",
     "Task:",
@@ -543,12 +548,11 @@ function coerceRoleResult(role: RunSpec["role"], obj: Record<string, unknown>, c
         obj.recommendation = alias;
       }
     }
-    // Neither buildPrompt nor the plan task grammar asks researchers for a
-    // verdict, so a substantive recommendation with no verdict means completed.
-    if (obj.verdict === undefined && typeof obj.recommendation === "string" && obj.recommendation.trim()) {
-      recordCoercion(coercions, "verdict", obj.verdict, "completed", "missing verdict with recommendation");
-      obj.verdict = "completed";
-    }
+    // Verdict is deliberately never defaulted: completed and failed require
+    // identical content fields, so a missing verdict is genuinely ambiguous
+    // and coercing it would let failed research dispatch write-role workers
+    // (orch new gates on completed). buildPrompt demands the field instead;
+    // a result without it fails closed with the raw output preserved.
   } else if (role === "verifier") {
     coerceMissingArrays(obj, ["commands", "acceptance"], coercions);
     if (typeof obj.verifies_run_id !== "string") {

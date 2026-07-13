@@ -166,6 +166,29 @@ test("buildPrompt names schema property and forbids worktree result files", () =
   expect(controllerPrompt).toContain('"schema": "orch.result/controller/v1"');
 });
 
+test("buildPrompt demands a role-appropriate verdict from every role", () => {
+  // Verdict is the only success/failure signal and can never be coerced
+  // (completed and failed share identical content fields), so the prompt
+  // contract is the layer that must demand it.
+  const verdictLine: Record<string, string> = {
+    implementer: '"completed" | "failed"',
+    reviewer: '"approve" | "request_changes"',
+    controller: '"completed" | "failed"',
+    researcher: '"completed" | "failed"',
+    verifier: '"pass" | "fail"',
+  };
+  for (const [role, verdicts] of Object.entries(verdictLine)) {
+    const prompt = buildPrompt(spec(role as RunSpec["role"], `verdict-${role}`), "claude");
+    expect(prompt).toContain(`It must also include "verdict", exactly one of: ${verdicts}.`);
+    expect(prompt).toContain('Never omit "verdict".');
+  }
+  // Roles with a failure verdict get the honesty clause; reviewer's two
+  // verdicts are both valid review outcomes, so it must not.
+  expect(buildPrompt(spec("researcher", "verdict-honesty"), "claude")).toContain('Use "failed" when the task could not genuinely be completed');
+  expect(buildPrompt(spec("verifier", "verdict-honesty-v"), "claude")).toContain('Use "fail" when the task could not genuinely be completed');
+  expect(buildPrompt(spec("reviewer", "verdict-honesty-r"), "claude")).not.toContain("could not genuinely be completed");
+});
+
 test("buildProviderArgv keeps defaults fresh and only resumes exact sessions", () => {
   const base = spec("implementer", "impl-session");
 
@@ -584,36 +607,38 @@ test("extractResultFromText coerces researcher alias fields and missing arrays",
   });
 });
 
-test("extractResultFromText defaults a missing researcher verdict when a recommendation exists", () => {
-  // Real plan-run failure shape: prose preamble, then a schema-complete result
-  // that omits verdict (no prompt ever asks researchers for one).
-  const runSpec = spec("researcher", "research-no-verdict");
-  const result = extractResultFromText(
-    `调研完成，以下为计划 JSON。\n\n${JSON.stringify({
-      schema: "orch.result/researcher/v1",
-      summary: "cross-review MR 4245",
-      recommendation: "## Destination\nreview lands as one merged comment",
-      risks: ["reviewers may repeat settled findings"],
-      alternatives: [],
-      open_questions: [],
-    })}`,
-    runSpec,
-  );
-  expect(result).toMatchObject({
+test("extractResultFromText fails closed on any missing or blank researcher verdict", () => {
+  // Completed and failed require identical content fields, so a missing
+  // verdict is genuinely ambiguous: coercing it to completed would let failed
+  // research dispatch write-role workers (orch new gates on completed). The
+  // result must be rejected, whatever the missing-value spelling.
+  const researcherBody = {
     schema: "orch.result/researcher/v1",
-    run_id: "research-no-verdict",
-    verdict: "completed",
+    summary: "cross-review MR 4245",
     recommendation: "## Destination\nreview lands as one merged comment",
-    sources: [],
-  });
+    risks: ["reviewers may repeat settled findings"],
+    alternatives: [],
+    open_questions: [],
+  };
+  for (const verdict of [undefined, null, "", "   "]) {
+    const body = verdict === undefined ? researcherBody : { ...researcherBody, verdict };
+    // Prose preamble reproduces the real plan-run failure shape.
+    const text = `调研完成，以下为计划 JSON。\n\n${JSON.stringify(body)}`;
+    expect(extractResultFromText(text, spec("researcher", "research-no-verdict"))).toBeNull();
+  }
 
-  // No recommendation to stand on -> still rejected, not silently completed.
-  expect(
-    extractResultFromText(
-      JSON.stringify({ schema: "orch.result/researcher/v1", summary: "looked around" }),
-      spec("researcher", "research-empty"),
-    ),
-  ).toBeNull();
+  // An explicit verdict extracts through the same prose preamble — failed is
+  // preserved, never rewritten to completed.
+  for (const verdict of ["completed", "failed"]) {
+    const text = `调研完成，以下为计划 JSON。\n\n${JSON.stringify({ ...researcherBody, verdict })}`;
+    expect(extractResultFromText(text, spec("researcher", `research-${verdict}`))).toMatchObject({
+      schema: "orch.result/researcher/v1",
+      run_id: `research-${verdict}`,
+      verdict,
+      recommendation: researcherBody.recommendation,
+      sources: [],
+    });
+  }
 });
 
 test("buildProviderArgv picks claude model/effort by role", () => {
