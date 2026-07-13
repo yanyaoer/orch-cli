@@ -51,10 +51,13 @@ test("mrRefFromText requires the number to be a whole path segment", () => {
   for (const bad of ["12abc", "12O", "12_foo", "12.5"]) {
     expect(mrRefFromText(url(bad), remote)).toBeNull();
   }
-  // Segment boundaries and the MR's own .diff/.patch views resolve.
-  for (const good of ["12", "12/files", "12?x=1", "12#discussion", "12.diff", "12.patch", "12,然后发布"]) {
+  // Segment boundaries and the MR's own .diff/.patch views resolve; query
+  // and fragment never reach the pathname grammar.
+  for (const good of ["12", "12/files", "12?x=1", "12#discussion", "12.diff", "12.patch", "12.diff?x=1", "12,然后发布"]) {
     expect(mrRefFromText(url(good), remote)).toBe("12");
   }
+  // Autolink angle brackets sit outside the RFC set and are trimmed away.
+  expect(mrRefFromText("see <https://github.com/o/r/pull/12> now", remote)).toBe("12");
   // A .diff view of something else entirely stays rejected.
   expect(mrRefFromText(url("12.diff.txt"), remote)).toBeNull();
 

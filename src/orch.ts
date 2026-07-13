@@ -20,7 +20,7 @@ import type {
 import { isRunRole, writeRoles } from "./types.ts";
 import { acquirePidfileLock, acquirePidfileLockWait, isPidAlive, LockHeldError } from "./locks.ts";
 import { randomHex, sha256 } from "./hash.ts";
-import { ensureStateLayout, getRepoIdentity, lockPathForWorktree, mrStateDir, orchStateRoot, type RepoIdentity } from "./paths.ts";
+import { claimNewMrDir, ensureStateLayout, getRepoIdentity, lockPathForWorktree, mrStateDir, orchStateRoot, type RepoIdentity } from "./paths.ts";
 import {
   appendJsonLine,
   countLines,
@@ -2054,18 +2054,25 @@ async function newCommand(args: ParsedArgs): Promise<number> {
   }
 
   const repo = await getRepoIdentity(worktree);
-  const mr = args.flags.has("mr") ? flagString(args, "mr") : `new-${newMrSlug(description)}-${randomHex(2)}`;
-  const mrDir = mrStateDir(repo.repo_key, mr);
-  mkdirSync(`${mrDir}/tasks`, { recursive: true });
-  // Pin the forge ref only when the generated slug is the local id (an
-  // explicit --mr is the user-stated target and is never second-guessed from
-  // free text), the description names exactly one same-repo MR/PR URL, and no
-  // ref was recorded before. Mirrored comments are outward side effects; an
-  // ambiguous or cross-repo URL fails closed to the old slug behavior.
-  if (!args.flags.has("mr") && !existsSync(forgeRefPath(mrDir))) {
+  let mr: string;
+  let mrDir: string;
+  if (args.flags.has("mr")) {
+    // Explicit --mr keeps its reuse semantics and never gets a guessed ref.
+    mr = flagString(args, "mr");
+    mrDir = mrStateDir(repo.repo_key, mr);
+  } else {
+    // Exclusive claim: a suffix collision (concurrent orch new or a
+    // historical id) must regenerate, never share the other task's state —
+    // an inherited forge_ref would publish comments to the other task's MR.
+    ({ mr, mrDir } = claimNewMrDir(repo.repo_key, newMrSlug(description)));
+    // Pin the forge ref only for the freshly claimed local id, and only when
+    // the description names exactly one same-repo MR/PR URL. Mirrored
+    // comments are outward side effects; an ambiguous or cross-repo URL
+    // fails closed to the plain slug behavior.
     const forgeRef = mrRefFromText(description, repo.remote_url);
     if (forgeRef) writeForgeRef(mrDir, forgeRef);
   }
+  mkdirSync(`${mrDir}/tasks`, { recursive: true });
 
   // The exec controller dispatches through the mail layer; seed the default
   // roster on first use only (a non-empty roster may carry user customization).

@@ -2,7 +2,32 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { canonicalWorktreeRoot, getRepoIdentity, lockPathForWorktree, mailControlStateDir, mrStateDir, orchStateRoot, repoKeyFromRemote } from "./paths.ts";
+import { canonicalWorktreeRoot, claimNewMrDir, getRepoIdentity, lockPathForWorktree, mailControlStateDir, mrStateDir, orchStateRoot, repoKeyFromRemote } from "./paths.ts";
+
+test("claimNewMrDir regenerates on suffix collisions instead of sharing state", () => {
+  const stateHome = mkdtempSync(join(tmpdir(), "orch-claim-"));
+  tempDirs.push(stateHome);
+  const previous = process.env.XDG_STATE_HOME;
+  process.env.XDG_STATE_HOME = stateHome;
+  try {
+    // Deterministic collision: the second claim's first candidate repeats the
+    // first claim's suffix and must be rejected by the exclusive mkdir — a
+    // shared dir would inherit the other task's forge_ref and outbox.
+    const suffixes = ["aaaa", "aaaa", "bbbb"];
+    const random = (): string => suffixes.shift()!;
+    const first = claimNewMrDir("local/repo-x", "crocs-review", random);
+    const second = claimNewMrDir("local/repo-x", "crocs-review", random);
+    expect(first.mr).toBe("new-crocs-review-aaaa");
+    expect(second.mr).toBe("new-crocs-review-bbbb");
+    expect(second.mrDir).not.toBe(first.mrDir);
+
+    // A random source that never yields a fresh suffix fails loudly.
+    expect(() => claimNewMrDir("local/repo-x", "crocs-review", () => "aaaa")).toThrow("after 100 attempts");
+  } finally {
+    if (previous === undefined) delete process.env.XDG_STATE_HOME;
+    else process.env.XDG_STATE_HOME = previous;
+  }
+});
 
 const tempDirs: string[] = [];
 

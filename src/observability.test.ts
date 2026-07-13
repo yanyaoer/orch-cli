@@ -1461,6 +1461,42 @@ test("a recorded forge_ref replaces the local mr id in queued outbox payloads", 
   expect(sync.stdout).not.toContain(`gh pr comment ${mr}`);
 });
 
+test("orch new claims a fresh mr dir and pins forge_ref before the plan run", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orch-new-forge-ref-test-"));
+  const stateHome = join(root, "state");
+  const configHome = join(root, "config");
+  const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
+  const binDir = join(root, "bin");
+  mkdirSync(binDir, { recursive: true });
+  // A provider that dies immediately: forge_ref must land before any provider
+  // work, so the ReferenceError-class regression fails this test even when
+  // the plan run itself cannot succeed.
+  writeFileSync(join(binDir, "claude"), "#!/bin/sh\nexit 1\n", "utf8");
+  chmodSync(join(binDir, "claude"), 0o755);
+  const remote = "https://github.com/o/r.git";
+  await runCmd(["git", "init"], worktree);
+  await runCmd(["git", "remote", "add", "origin", remote], worktree);
+
+  const env = { XDG_STATE_HOME: stateHome, XDG_CONFIG_HOME: configHome, PATH: `${binDir}:${process.env.PATH}` };
+  const auto = await runOrch(["new", "crocs-review https://github.com/o/r/pull/12", "--worktree", worktree, "--yes", "--timeout-sec", "5"], env);
+  expect(auto.exitCode).not.toBe(0);
+
+  const repoKey = repoKeyFromRemote(remote, worktree);
+  const mrsDir = join(stateHome, "orch", repoKey, "mrs");
+  const claimed = readdirSync(mrsDir).filter((name) => name.startsWith("new-"));
+  expect(claimed).toHaveLength(1);
+  expect(readFileSync(join(mrsDir, claimed[0]!, "forge_ref"), "utf8").trim()).toBe("12");
+
+  // Explicit --mr keeps reuse semantics and never gets a guessed ref.
+  const explicit = await runOrch(
+    ["new", "crocs-review https://github.com/o/r/pull/12", "--worktree", worktree, "--mr", "my-thread", "--yes", "--timeout-sec", "5"],
+    env,
+  );
+  expect(explicit.exitCode).not.toBe(0);
+  expect(existsSync(join(mrsDir, "my-thread"))).toBe(true);
+  expect(existsSync(join(mrsDir, "my-thread", "forge_ref"))).toBe(false);
+});
+
 test("verifier acceptance evidence reaches the mirrored decision comment", async () => {
   const root = mkdtempSync(join(tmpdir(), "orch-verifier-evidence-test-"));
   const stateHome = join(root, "state");

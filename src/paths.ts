@@ -1,7 +1,7 @@
-import { basename, resolve } from "node:path";
+import { basename, dirname, resolve } from "node:path";
 import { mkdirSync, realpathSync } from "node:fs";
 import { $ } from "bun";
-import { sha256, shortHash } from "./hash.ts";
+import { randomHex, sha256, shortHash } from "./hash.ts";
 
 export interface RepoIdentity {
   repo_root: string;
@@ -35,6 +35,26 @@ export function ensureStateLayout(mrDir: string): void {
   for (const rel of ["locks", "outbox/pending", "outbox/sent", "runs"]) {
     mkdirSync(`${mrDir}/${rel}`, { recursive: true });
   }
+}
+
+// Atomically claim a fresh mr dir for an auto-generated id. A non-recursive
+// mkdir is the claim: EEXIST — a concurrent orch new or a historical id that
+// happened to collide — regenerates the suffix instead of silently sharing
+// the other task's state (its forge_ref would publish comments to the other
+// task's MR). Suffix entropy only tunes retry frequency, not correctness.
+export function claimNewMrDir(repoKey: string, slug: string, random: () => string = () => randomHex(4)): { mr: string; mrDir: string } {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const mr = `new-${slug}-${random()}`;
+    const mrDir = mrStateDir(repoKey, mr);
+    mkdirSync(dirname(mrDir), { recursive: true });
+    try {
+      mkdirSync(mrDir);
+      return { mr, mrDir };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+  }
+  throw new Error(`could not claim a fresh mr dir for slug ${slug} after 100 attempts`);
 }
 
 export function repoKeyFromRemote(remoteUrl: string, repoRoot: string): string {
