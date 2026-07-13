@@ -99,6 +99,12 @@ test("planAutoDecision never decides fallback, failed, stale, or decided runs", 
   expect(failed.decision).toBeNull();
   expect(failed.attention).toContain("run failed");
 
+  // Unparseable answers now fail the run, but the raw review is in the
+  // comment: failed + fallback keeps the manual-decision guidance.
+  const failedFallback = planAutoDecision({ ...baseRun, state: "failed", verdict: null }, true);
+  expect(failedFallback.decision).toBeNull();
+  expect(failedFallback.attention).toContain("decide manually");
+
   const stale = planAutoDecision({ ...baseRun, state: "running", stale: true }, false);
   expect(stale.decision).toBeNull();
   expect(stale.attention).toContain("orch run reap");

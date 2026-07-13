@@ -65,7 +65,7 @@ function writeFakeCodex(binDir: string, output: unknown): void {
   chmodSync(path, 0o755);
 }
 
-async function runFakeCodexResult(output: unknown): Promise<{ runDir: string; exitCode: number }> {
+async function runFakeCodexResult(output: unknown, role: RunSpec["role"] = "reviewer"): Promise<{ runDir: string; exitCode: number }> {
   const root = tempDir();
   const runDir = join(root, "run");
   const binDir = join(root, "bin");
@@ -75,7 +75,7 @@ async function runFakeCodexResult(output: unknown): Promise<{ runDir: string; ex
   mkdirSync(worktree, { recursive: true });
   writeFakeCodex(binDir, output);
 
-  const runSpec = spec("reviewer", "review-coercion-event");
+  const runSpec = spec(role, "review-coercion-event");
   const specPath = join(runDir, "spec.json");
   writeFileSync(specPath, `${JSON.stringify(runSpec, null, 2)}\n`, "utf8");
 
@@ -791,6 +791,31 @@ test("runProviderDriver does not record result_coercion events for conforming re
 
   expect(exitCode).toBe(0);
   expect(readRunEvents(runDir).some((event) => event.type === "result_coercion")).toBe(false);
+});
+
+test("runProviderDriver exits nonzero when a zero-exit provider returns no valid result", async () => {
+  // Codex-review B1: provider exits 0 with a schema-complete researcher
+  // answer that omits verdict. The driver must fail the run (nonzero exit so
+  // the supervisor marks it failed, never done), write the failed fallback,
+  // and preserve the raw answer.
+  const { runDir, exitCode } = await runFakeCodexResult(
+    {
+      schema: "orch.result/researcher/v1",
+      summary: "Repository access failed",
+      recommendation: "## Destination\ngeneric ungrounded plan",
+      risks: ["plan was not grounded in live code"],
+      alternatives: [],
+      sources: [],
+      open_questions: [],
+    },
+    "researcher",
+  );
+
+  expect(exitCode).toBe(1);
+  const result = JSON.parse(readFileSync(join(runDir, "result.json"), "utf8"));
+  expect(result.verdict).toBe("failed");
+  expect(result.summary).toContain("did not return a valid orch result JSON");
+  expect(readFileSync(join(runDir, "result.raw.md"), "utf8")).toContain("generic ungrounded plan");
 });
 
 test("rawResultText returns the final-message candidate and null when empty", () => {

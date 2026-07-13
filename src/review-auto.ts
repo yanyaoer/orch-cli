@@ -87,15 +87,19 @@ export function planAutoDecision(run: AutoRun, fallback: boolean): AutoDecisionP
     return { decision: null, reason: null, attention: `still ${run.state}` };
   }
   if (run.decided) return { decision: null, reason: null, attention: null };
-  if (run.state !== "done") {
-    return { decision: null, reason: null, attention: `run ${run.state}; inspect: orch events tail --run ${run.run_id} --native` };
-  }
+  // Fallback outranks the state check: the driver exits nonzero when the
+  // answer doesn't parse, so these runs arrive `failed` — but the raw review
+  // is already in the comment, and manual-decision guidance beats a bare
+  // inspect hint.
   if (fallback) {
     return {
       decision: null,
       reason: null,
       attention: `result schema fallback — raw review recovered into the comment; decide manually: orch decision accept|rework --run ${run.run_id}`,
     };
+  }
+  if (run.state !== "done") {
+    return { decision: null, reason: null, attention: `run ${run.state}; inspect: orch events tail --run ${run.run_id} --native` };
   }
   // decision sweep treats done-without-verdict as a close, not a rework; keep
   // the rubrics aligned but stay conservative — --auto only surfaces it.

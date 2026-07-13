@@ -855,14 +855,16 @@ export async function runProviderDriver(provider: AgentName, argv: string[]): Pr
   const raw = rawResultText(args.runDir);
   if (raw) writeFileSync(`${args.runDir}/result.raw.md`, raw, "utf8");
 
-  // A provider that exits 0 with no output at all did no work (broken auth,
-  // silent CLI failure); report that as a failed run, not a quiet `done`.
-  const silent = code === 0 && !raw;
-  const summary = silent
-    ? `${provider} exited 0 but produced no output; check the provider CLI auth/session (run \`${provider}\` interactively once)`
-    : code === 0
-      ? `${provider} did not return a valid orch result JSON; raw output saved to result.raw.md. Excerpt: ${raw!.slice(0, 400)}`
-      : `${provider} exited ${code}${raw ? "; raw output saved to result.raw.md" : ""}`;
+  const summary =
+    code === 0 && !raw
+      ? `${provider} exited 0 but produced no output; check the provider CLI auth/session (run \`${provider}\` interactively once)`
+      : code === 0
+        ? `${provider} did not return a valid orch result JSON; raw output saved to result.raw.md. Excerpt: ${raw!.slice(0, 400)}`
+        : `${provider} exited ${code}${raw ? "; raw output saved to result.raw.md" : ""}`;
   writeResult(args.runDir, spec, synthesizeResult(spec, summary));
-  return silent ? 1 : code;
+  // No valid result is a failed run whatever the provider exit code claims:
+  // exit 0 here would let the supervisor mark a protocol failure `done`, and
+  // run-state consumers (overview, wait, retries) would read it as success.
+  // The raw answer stays reachable via result.raw.md either way.
+  return code || 1;
 }
