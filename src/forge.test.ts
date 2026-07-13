@@ -42,6 +42,42 @@ test("mrRefFromText only accepts a unique same-repo MR/PR URL", () => {
   expect(mrRefFromText("https://git.n.xiaomi.com/ai-framework/osbot/-/merge_requests/1", "")).toBeNull();
 });
 
+test("mrRefFromText requires the number to be a whole path segment", () => {
+  const remote = "https://github.com/o/r.git";
+  const url = (tail: string): string => `see https://github.com/o/r/pull/${tail}`;
+
+  // A word character after the digits is a typo or another object — the
+  // original blocker: /pull/12O (letter O for zero) must never target 12.
+  for (const bad of ["12abc", "12O", "12_foo", "12.5"]) {
+    expect(mrRefFromText(url(bad), remote)).toBeNull();
+  }
+  // Segment boundaries and the MR's own .diff/.patch views resolve.
+  for (const good of ["12", "12/files", "12?x=1", "12#discussion", "12.diff", "12.patch", "12,然后发布"]) {
+    expect(mrRefFromText(url(good), remote)).toBe("12");
+  }
+  // A .diff view of something else entirely stays rejected.
+  expect(mrRefFromText(url("12.diff.txt"), remote)).toBeNull();
+});
+
+test("mrRefFromText only accepts the remote forge's own route", () => {
+  // A GitHub-style /pull/ URL on a GitLab host (or vice versa) is not a valid
+  // target route, even with matching host and repo path.
+  expect(mrRefFromText("https://git.n.xiaomi.com/ai-framework/osbot/pull/12", "git@git.n.xiaomi.com:ai-framework/osbot.git")).toBeNull();
+  expect(mrRefFromText("https://github.com/o/r/-/merge_requests/12", "https://github.com/o/r.git")).toBeNull();
+});
+
+test("mrRefFromText normalizes scheme, host case, default ports, and clone suffixes", () => {
+  const sshRemote = "git@github.com:o/r.git";
+  // WHATWG URL drops the default port and lowercases scheme/host.
+  expect(mrRefFromText("HTTPS://GitHub.com:443/o/r/pull/12", sshRemote)).toBe("12");
+  expect(mrRefFromText("http://github.com/o/r/pull/12", sshRemote)).toBe("12");
+  // Uppercase .GIT and a trailing slash on the remote still identify the repo.
+  expect(mrRefFromText("https://github.com/o/r/pull/12", "https://github.com/o/r.GIT/")).toBe("12");
+  // An explicit non-default port must match on both sides.
+  expect(mrRefFromText("https://git.corp:8443/o/r/-/merge_requests/3", "https://git.corp:8443/o/r.git")).toBe("3");
+  expect(mrRefFromText("https://git.corp:9999/o/r/-/merge_requests/3", "https://git.corp:8443/o/r.git")).toBeNull();
+});
+
 test("detectForge classifies github ssh remotes", () => {
   expect(detectForge("git@github.com:o/r.git")).toBe("github");
 });

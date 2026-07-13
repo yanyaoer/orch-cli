@@ -1520,6 +1520,11 @@ test("verifier acceptance evidence reaches the mirrored decision comment", async
   const payload = JSON.parse(readFileSync(join(pendingDir, pending[0]!), "utf8"));
   // The mirror is the human-facing copy of result.json: evidence must ride along.
   expect(payload.body).toContain("f1: CONFIRMED — McpServerKey.kt:16-22 digest ignores scheme and port");
+
+  // The terminal reader gets the same evidence as the mirror.
+  const shown = await runOrch(["result", "--mr", mr, "--run", runId, "--worktree", worktree], env);
+  expect(shown.exitCode).toBe(0);
+  expect(shown.stdout).toContain("f1: CONFIRMED — McpServerKey.kt:16-22 digest ignores scheme and port");
 });
 
 test("reviewer decision mirrors full findings detail and caps oversized bodies", async () => {

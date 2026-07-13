@@ -672,6 +672,19 @@ test("extractResultFromText derives a missing researcher summary from the recomm
   );
   expect((bulletResult as { summary?: string } | null)?.summary).toBe("先修 serverKey 归一化");
 
+  // Tilde fences and `1)` lists behave like their backtick/`1.` twins; a line
+  // that is only a marker is noise, and an unclosed fence derives nothing.
+  const derive = (recommendation: string): string | undefined =>
+    (
+      extractResultFromText(
+        JSON.stringify({ schema: "orch.result/researcher/v1", verdict: "completed", recommendation }),
+        spec("researcher", "research-derive-edge"),
+      ) as { summary?: string } | null
+    )?.summary;
+  expect(derive("~~~ts\nignored()\n~~~\n1) 实际计划")).toBe("实际计划");
+  expect(derive("-\n\n1.\n- 真内容")).toBe("真内容");
+  expect(derive("~~~ts\nnever closed")).toBeUndefined();
+
   // No recommendation prose at all -> nothing to derive from, still rejected.
   expect(
     extractResultFromText(

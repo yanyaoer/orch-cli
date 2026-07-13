@@ -569,12 +569,13 @@ function coerceRoleResult(role: RunSpec["role"], obj: Record<string, unknown>, c
       let inFence = false;
       for (const raw of obj.recommendation.split("\n")) {
         const line = raw.trim();
-        if (line.startsWith("```")) {
+        if (line.startsWith("```") || line.startsWith("~~~")) {
           inFence = !inFence;
           continue;
         }
         if (inFence || !line || line.startsWith("#")) continue;
-        const stripped = line.replace(/^(?:[-*+]|\d+\.)\s+/, "");
+        // Both `1.` and `1)` list styles; a line that is only a marker is noise.
+        const stripped = line.replace(/^(?:[-*+]|\d+[.)])(?:\s+|$)/, "");
         if (stripped) {
           firstProse = stripped;
           break;

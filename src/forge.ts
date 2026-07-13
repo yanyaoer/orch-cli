@@ -42,7 +42,7 @@ export function detectForge(remoteUrl: string): ForgeKind {
 }
 
 function repoPathFromRemote(remoteUrl: string): string | null {
-  const cleaned = remoteUrl.trim().replace(/\.git$/, "");
+  const cleaned = remoteUrl.trim().replace(/\/+$/, "").replace(/\.git$/i, "");
   const ssh = cleaned.match(/^git@[^:]+:(.+)$/);
   if (ssh?.[1]) return ssh[1].toLowerCase();
   try {
@@ -54,20 +54,42 @@ function repoPathFromRemote(remoteUrl: string): string | null {
   }
 }
 
+// The forge's MR/PR route inside a URL pathname. The number must be a whole
+// path segment: a word character after it (or after a lone dot) means a typo
+// or a different object, never a target — `/pull/12abc` and `/pull/12O` must
+// not resolve to 12. Explicit `.diff`/`.patch` views of the same MR are fine.
+const MR_ROUTES: Record<Exclude<ForgeKind, "none">, RegExp> = {
+  github: /^\/(.+?)\/pull\/(\d+)(?:\.(?:diff|patch))?(?!\.?\w)/,
+  gitlab: /^\/(.+?)\/-\/merge_requests\/(\d+)(?:\.(?:diff|patch))?(?!\.?\w)/,
+};
+
 // The MR/PR number a free-text task unambiguously targets. External comments
 // must never ride on a guessed destination, so this is deliberately strict:
-// only URLs on the worktree's own remote (host + repo path) count as targets —
+// only URLs on the worktree's own remote (host + repo path, via WHATWG URL
+// normalization) using the remote forge's own route count as targets —
 // cross-repo links are references, not targets — and more than one distinct
 // same-repo number is ambiguous. Anything else returns null (fail closed).
 export function mrRefFromText(text: string, remoteUrl: string): string | null {
   const host = hostFromRemote(remoteUrl);
   const path = repoPathFromRemote(remoteUrl);
-  if (!host || !path) return null;
+  const forge = detectForge(remoteUrl);
+  if (!host || !path || forge === "none") return null;
+  const route = MR_ROUTES[forge];
   const refs = new Set<string>();
-  for (const match of text.matchAll(/https?:\/\/([^\s/]+)\/([^\s?#]*?)\/(?:-\/merge_requests|pull)\/(\d+)/g)) {
-    if (match[1]!.toLowerCase() !== host) continue;
-    if (match[2]!.replace(/\.git$/, "").toLowerCase() !== path) continue;
-    refs.add(match[3]!);
+  for (const candidate of text.matchAll(/https?:\/\/\S+/gi)) {
+    let url: URL;
+    try {
+      url = new URL(candidate[0]!);
+    } catch {
+      continue;
+    }
+    // URL normalizes scheme/host case and drops default ports; url.host keeps
+    // an explicit non-default port, matching hostFromRemote's https handling.
+    if (url.host.toLowerCase() !== host) continue;
+    const match = url.pathname.match(route);
+    if (!match) continue;
+    if (match[1]!.replace(/\.git$/i, "").toLowerCase() !== path) continue;
+    refs.add(match[2]!);
   }
   return refs.size === 1 ? [...refs][0]! : null;
 }
