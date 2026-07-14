@@ -82,7 +82,7 @@ import { runClaudeDriver } from "../drivers/claude-headless.ts";
 import { deployWorker, locateBridgeDir, runChatgptBridge } from "../drivers/chatgpt-bridge.ts";
 import { runPiDriver } from "../drivers/pi-headless.ts";
 import { runOmpDriver } from "../drivers/omp-headless.ts";
-import { addWorkspace, chatgptBridgeConfigPath, orchLanguage, readBridgeConfig, readMailAgentsConfig, readMailControlConfig, readOrchConfig, validateMailControlConfig, writeBridgeConfig, type RoleDefaults } from "./config.ts";
+import { addWorkspace, chatgptBridgeConfigPath, orchLanguage, orchSandbox, readBridgeConfig, readMailAgentsConfig, readMailControlConfig, readOrchConfig, validateMailControlConfig, writeBridgeConfig, type RoleDefaults } from "./config.ts";
 import { createInterface, type Interface as ReadlineInterface, type ReadLineOptions } from "node:readline";
 import { buildBundle, type BundleOptions } from "./handoff-pro.ts";
 import { mail, mailFanout, type MailCliContext, type MailFanoutOutcome } from "./mail-cli.ts";
@@ -110,7 +110,8 @@ import {
 } from "./mailctl.ts";
 import { workspace } from "./workspace-cli.ts";
 import { assertKnownFlags, CliError, collectFlags, flagBool, flagNumber, flagString, hasHelp, parseArgs, printJson, readStdinText, type ParsedArgs } from "./cli.ts";
-import { buildPrompt, buildProviderArgv } from "../drivers/driver-common.ts";
+import { buildPrompt, buildProviderExecutionPlan, type ProviderExecutionPlan } from "../drivers/driver-common.ts";
+import { sandboxPosture, SEATBELT_ENGINE, seatbeltUnsupportedReason } from "../drivers/sandbox.ts";
 import { classifyNewOpenQuestions, evaluateNewExecution, validateNewPlanMarkdown, type NewExecutionRun } from "./new-flow.ts";
 
 type IdempotencyRecord = {
@@ -328,6 +329,35 @@ function assertProviderSessionCompatible(
     );
   }
   return stored;
+}
+
+// config sandbox:true resolves to the versioned engine, validated fail-closed
+// before any run state is created or reused: a platform that cannot apply the
+// sandbox must refuse the run, never silently downgrade it.
+function requestedSandboxEngine(): typeof SEATBELT_ENGINE | null {
+  if (!orchSandbox()) return null;
+  const reason = seatbeltUnsupportedReason();
+  if (reason) throw new CliError(reason);
+  return SEATBELT_ENGINE;
+}
+
+// An idempotency hit (notably an explicit --idempotency-key) must never hand
+// back a run that executed under different sandbox semantics: engine and the
+// role-derived posture both have to match. A missing spec.json (legacy run)
+// means engine none.
+function assertSandboxCompatible(existing: IdempotencyRecord, engine: typeof SEATBELT_ENGINE | null, role: RunRole): void {
+  const spec = readJsonFile<Partial<RunSpec> | null>(`${existing.run_dir}/spec.json`, null);
+  const storedEngine = spec?.sandbox_engine === SEATBELT_ENGINE ? SEATBELT_ENGINE : null;
+  const storedRole = typeof spec?.role === "string" && isRunRole(spec.role) ? spec.role : role;
+  if (storedEngine === engine && sandboxPosture(storedRole) === sandboxPosture(role)) return;
+  throw new CliError(
+    [
+      "idempotent run already exists with different sandbox settings",
+      `existing: engine=${storedEngine ?? "none"} posture=${sandboxPosture(storedRole)}`,
+      `requested: engine=${engine ?? "none"} posture=${sandboxPosture(role)}`,
+      "Pass --retry to create a new run under the requested sandbox settings.",
+    ].join("\n"),
+  );
 }
 
 async function gitHead(worktree: string): Promise<string> {
@@ -1200,6 +1230,20 @@ function configuredRoleDefaults(role: RunRole): RoleDefaults {
   return typeof raw === "string" ? { agent: raw } : raw;
 }
 
+// Dry-run view of an execution plan: argv + the effective sandbox contract.
+// plan.env is deliberately omitted — it is the worker's full environment.
+function providerPlanPayload(plan: ProviderExecutionPlan, cwd: string) {
+  return {
+    argv: plan.argv,
+    cwd,
+    spawn: false as const,
+    sandbox_engine: plan.sandboxEngine,
+    sandbox_posture: plan.sandboxPosture,
+    sandbox_profile_sha256: plan.profileSha256,
+    provider_native_sandbox: plan.providerNativeSandbox,
+  };
+}
+
 async function createRun(args: ParsedArgs): Promise<number> {
   assertKnownFlags(args, "run create", RUN_CREATE_FLAGS);
   const resume = args.flags.has("resume-from") ? await resolveResumeFrom(args) : null;
@@ -1233,10 +1277,16 @@ async function createRun(args: ParsedArgs): Promise<number> {
   if (!Number.isFinite(timeoutSec) || timeoutSec <= 0) throw new CliError("--timeout-sec must be positive");
   const providerSession = resume ? resume.session : providerSessionConfig(args, agent, roleDefaults.model ?? null);
 
+  // Validated before any run state is touched: sandbox:true on a platform
+  // that cannot apply it must fail the create, not produce a doomed run.
+  const sandboxEngine = requestedSandboxEngine();
+
   const repo = await getRepoIdentity(worktree);
   const mrDir = mrStateDir(repo.repo_key, mr);
   const taskSha = sha256(taskText);
-  const defaultIdempotencyKey = `mr${mr}:${tag}:${taskSha}:session-${providerSessionFingerprint(providerSession)}`;
+  // The engine version is part of the default fingerprint so sandboxed and
+  // unsandboxed requests can never reuse each other's runs.
+  const defaultIdempotencyKey = `mr${mr}:${tag}:${taskSha}:session-${providerSessionFingerprint(providerSession)}${sandboxEngine ? `:sandbox-${sandboxEngine}` : ""}`;
   const idempotencyKey = flagString(args, "idempotency-key", defaultIdempotencyKey);
   const idempotencyPath = `${mrDir}/idempotency.json`;
   const dryRun = flagBool(args, "dry-run");
@@ -1246,6 +1296,7 @@ async function createRun(args: ParsedArgs): Promise<number> {
     const baseSha = await gitHead(worktree);
     const existing = readIdempotency(idempotencyPath)[idempotencyKey];
     const existingSession = existing && !retry ? assertProviderSessionCompatible(existing, providerSession, agent) : null;
+    if (existing && !retry) assertSandboxCompatible(existing, sandboxEngine, role);
     const effectiveSession = existingSession ?? providerSession;
     const idempotent = Boolean(existing && !retry);
     const id = idempotent ? existing!.run_id : runId(tag);
@@ -1259,6 +1310,7 @@ async function createRun(args: ParsedArgs): Promise<number> {
       agent,
       tag,
       ...(orchLanguage() === "中文" ? { language: "中文" as const } : {}),
+      ...(sandboxEngine ? { sandbox_engine: sandboxEngine } : {}),
       ...effectiveSession,
       idempotency_key: idempotencyKey,
       repo_key: repo.repo_key,
@@ -1314,13 +1366,22 @@ async function createRun(args: ParsedArgs): Promise<number> {
             cwd: worktree,
             spawn: false,
           },
+      // Same plan builder as the real spawn (dryRun only skips host
+      // mutations), so a sandbox that would fail — wrong platform, missing
+      // provider state, hardlinked worktree — fails the dry-run too.
       provider_plan: idempotent
         ? null
-        : {
-            argv: buildProviderArgv(agent, specPreview, runDir, worktree, buildPrompt(specPreview, agent)),
-            cwd: worktree,
-            spawn: false,
-          },
+        : providerPlanPayload(
+            buildProviderExecutionPlan({
+              provider: agent,
+              spec: specPreview,
+              runDir,
+              worktree,
+              prompt: buildPrompt(specPreview, agent),
+              dryRun: true,
+            }),
+            worktree,
+          ),
     };
     if (flagBool(args, "json")) {
       printJson(payload);
@@ -1345,7 +1406,17 @@ async function createRun(args: ParsedArgs): Promise<number> {
       ];
       if (payload.supervisor_plan) lines.push(`supervisor: ${payload.supervisor_plan.argv.join(" ")}`);
       if (payload.driver_plan) lines.push(`driver: ${payload.driver_plan.argv.join(" ")}`);
-      if (payload.provider_plan) lines.push(`provider: ${payload.provider_plan.argv.join(" ")}`);
+      if (payload.provider_plan) {
+        const plan = payload.provider_plan;
+        // The multi-line SBPL profile would drown the text view; stand in its
+        // hash (the JSON payload carries the full argv).
+        const argv =
+          plan.argv[0] === "/usr/bin/sandbox-exec" && plan.argv[1] === "-p"
+            ? [plan.argv[0], plan.argv[1], `<sbpl sha256=${plan.sandbox_profile_sha256}>`, ...plan.argv.slice(3)]
+            : plan.argv;
+        lines.push(`provider: ${argv.join(" ")}`);
+        lines.push(`sandbox: ${plan.sandbox_engine}/${plan.sandbox_posture}`);
+      }
       process.stdout.write(lines.join("\n") + "\n");
     }
     return 0;
@@ -1398,6 +1469,10 @@ async function startRun(input: StartRunInput): Promise<Record<string, unknown>> 
   const { args, mr, role, agent, tag, worktree, taskPath, taskText, taskSha, timeoutSec } = input;
   const { providerSession, repo, mrDir, idempotencyKey, idempotencyPath } = input;
 
+  // Recomputed here (not passed in) so every startRun caller gets the same
+  // fail-closed platform validation before any state is written.
+  const sandboxEngine = requestedSandboxEngine();
+
   try {
     ensureStateLayout(mrDir);
   } catch (error) {
@@ -1412,6 +1487,7 @@ async function startRun(input: StartRunInput): Promise<Record<string, unknown>> 
     const existing = idempotency[idempotencyKey];
     if (existing && !flagBool(args, "retry")) {
       const existingSession = assertProviderSessionCompatible(existing, providerSession, agent);
+      assertSandboxCompatible(existing, sandboxEngine, role);
       const existingState = statusState(existing);
       if (existingState === "failed" || existingState === "timeout") {
         process.stderr.write(
@@ -1450,6 +1526,7 @@ async function startRun(input: StartRunInput): Promise<Record<string, unknown>> 
       agent,
       tag,
       ...(orchLanguage() === "中文" ? { language: "中文" as const } : {}),
+      ...(sandboxEngine ? { sandbox_engine: sandboxEngine } : {}),
       ...providerSession,
       idempotency_key: idempotencyKey,
       repo_key: repo.repo_key,

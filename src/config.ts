@@ -46,6 +46,14 @@ export interface OrchConfig {
   // Publication language for MR/PR comment bodies and worker result prose:
   // "中文" or "english". Missing or any other value behaves as english.
   language?: string;
+  // When true, every provider spawn (claude/codex/pi/omp) runs under one
+  // orch-generated macOS Seatbelt write jail (engine seatbelt-v1, see
+  // docs/sandbox-design.md): writes confined to the role's worktree posture,
+  // per-run scratch, and the selected provider's own state; reads, exec, and
+  // network stay open. Snapshotted into spec.sandbox_engine at run create;
+  // fail-closed (the run refuses to start) off darwin or whenever the sandbox
+  // cannot be applied — never a silent downgrade.
+  sandbox?: boolean;
 }
 
 export interface MailAgentDefinition {
@@ -269,6 +277,12 @@ export type OrchLanguage = "中文" | "english";
 // command over config spelling.
 export function orchLanguage(): OrchLanguage {
   return readOrchConfig().language === "中文" ? "中文" : "english";
+}
+
+// Snapshotted into the spec at run-create time (like language): the driver must
+// not depend on live global config, and the spec stays auditable.
+export function orchSandbox(): boolean {
+  return readOrchConfig().sandbox === true;
 }
 
 export function writeOrchConfig(cfg: OrchConfig): void {

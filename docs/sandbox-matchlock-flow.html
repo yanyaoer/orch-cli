@@ -1,0 +1,379 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>orch-cli × matchlock — microVM sandbox 交互流程</title>
+  <style>
+    :root {
+      --bg: #0b0f14; --panel: #10161d; --panel-2: #0e141b;
+      --line: #1d2833; --line-strong: #2c3b49;
+      --text: #dbe4ee; --muted: #8aa0b4; --faint: #5d7183;
+      --accent: #2dd4bf; --accent-dim: rgba(45,212,191,.14);
+      --amber: #f4b350; --green: #4ade80; --red: #f87171;
+      --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+      --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+    @media (prefers-color-scheme: light) {
+      :root {
+        --bg: #fbfcfd; --panel: #fff; --panel-2: #f2f5f8;
+        --line: #e2e8ee; --line-strong: #c6d2dc;
+        --text: #1a2632; --muted: #596b7d; --faint: #8496a6;
+        --accent: #0d9488; --accent-dim: rgba(13,148,136,.10);
+        --amber: #b45309; --green: #15803d; --red: #b91c1c;
+      }
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text);
+      font: 15.5px/1.65 var(--sans); -webkit-font-smoothing: antialiased; }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; text-underline-offset: 3px; }
+    code { font-family: var(--mono); font-size: .86em; background: var(--panel-2);
+      border-radius: 4px; padding: .1em .4em; }
+    .wrap { width: min(1180px, calc(100% - 40px)); margin: 0 auto; }
+
+    header { border-bottom: 1px solid var(--line); background: var(--panel-2); }
+    header .wrap { padding: 20px 20px 22px; }
+    .brand { font: 700 14px var(--mono); color: var(--text); }
+    .brand span { color: var(--accent); }
+    h1 { font-size: 22px; margin: 10px 0 6px; letter-spacing: -.01em; }
+    .sub { color: var(--muted); font-size: 13.5px; margin: 0; }
+
+    .chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0 4px; }
+    .chip { font: 600 12px var(--mono); border: 1px solid var(--line-strong);
+      border-radius: 999px; padding: 5px 11px; color: var(--muted);
+      background: var(--panel); display: inline-flex; gap: 6px; align-items: center; }
+    .chip b { color: var(--accent); font-weight: 700; }
+    .chip.warn b { color: var(--amber); }
+
+    main .wrap { padding: 22px 20px 60px; }
+
+    .toolbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
+      margin-bottom: 14px; }
+    .tabs { display: inline-flex; border: 1px solid var(--line-strong);
+      border-radius: 8px; overflow: hidden; }
+    .tabs button { font: 600 13px var(--sans); border: 0; background: transparent;
+      color: var(--muted); padding: 7px 14px; cursor: pointer; }
+    .tabs button.on { background: var(--accent-dim); color: var(--accent); }
+    .tabs button + button { border-left: 1px solid var(--line); }
+
+    .grow { flex: 1; }
+    .zoom, .btn { display: inline-flex; align-items: center; gap: 6px; }
+    .btn, .zoom button, select, input[type=text] {
+      font: 600 12.5px var(--sans); color: var(--text);
+      background: var(--panel); border: 1px solid var(--line-strong);
+      border-radius: 7px; padding: 6px 10px; cursor: pointer; }
+    .btn:hover, .zoom button:hover { border-color: var(--accent); color: var(--accent); }
+    input[type=text] { cursor: text; font-family: var(--mono); font-size: 11.5px;
+      min-width: 260px; color: var(--muted); }
+    .zoom button { padding: 6px 9px; font-family: var(--mono); }
+    label.srv { font-size: 12px; color: var(--faint); display: inline-flex;
+      gap: 6px; align-items: center; }
+
+    .canvas { border: 1px solid var(--line); border-radius: 12px; background: #fff;
+      overflow: auto; padding: 18px; min-height: 320px; position: relative; }
+    .canvas img { display: block; transform-origin: top left; }
+    .fallback { display: none; color: var(--red); font-size: 13px; padding: 8px 4px; }
+    .fallback.show { display: block; }
+
+    details.src { margin-top: 16px; border: 1px solid var(--line); border-radius: 10px;
+      background: var(--panel); }
+    details.src > summary { cursor: pointer; padding: 12px 16px; font: 600 13px var(--sans);
+      color: var(--muted); list-style: none; }
+    details.src > summary::-webkit-details-marker { display: none; }
+    details.src > summary::before { content: "▸ "; color: var(--accent); }
+    details.src[open] > summary::before { content: "▾ "; }
+    .src-body { padding: 0 16px 16px; }
+    textarea { width: 100%; min-height: 260px; resize: vertical;
+      font: 12.5px/1.5 var(--mono); color: var(--text); background: var(--panel-2);
+      border: 1px solid var(--line); border-radius: 8px; padding: 12px; }
+    .src-actions { display: flex; gap: 10px; margin-top: 10px; }
+
+    .notes { margin-top: 26px; display: grid; gap: 12px;
+      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+    .note { border: 1px solid var(--line); border-left: 3px solid var(--amber);
+      border-radius: 8px; padding: 12px 14px; background: var(--panel); }
+    .note h3 { margin: 0 0 5px; font-size: 13.5px; color: var(--amber); }
+    .note p { margin: 0; font-size: 13px; color: var(--muted); }
+    .note code { font-size: .82em; }
+
+    footer { border-top: 1px solid var(--line); color: var(--faint); font-size: 12.5px; }
+    footer .wrap { padding: 18px 20px 40px; }
+    .toast { position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%);
+      background: var(--text); color: var(--bg); font: 600 12.5px var(--sans);
+      padding: 8px 16px; border-radius: 999px; opacity: 0; transition: opacity .2s;
+      pointer-events: none; }
+    .toast.show { opacity: 1; }
+  </style>
+</head>
+<body>
+<header>
+  <div class="wrap">
+    <div class="brand">orch<span>-cli</span> × matchlock</div>
+    <h1>microVM sandbox — 交互流程（PlantUML v1）</h1>
+    <p class="sub">把 provider CLI（claude/codex/pi）塞进一次性硬件虚拟机；driver 留在宿主桥接产物；真实密钥经宿主 MITM proxy 注入，agent 全程只见 dummy key。</p>
+    <div class="chips">
+      <span class="chip"><b>①</b> 硬件虚拟化边界（mac=VZ / Linux=Firecracker）</span>
+      <span class="chip"><b>②</b> 密钥宿主侧注入 · agent 永不见真 key</span>
+      <span class="chip"><b>③</b> 出网白名单 · overlay 用后即焚</span>
+      <span class="chip warn"><b>接缝</b> driver-common.ts:878</span>
+    </div>
+  </div>
+</header>
+
+<main>
+  <div class="wrap">
+    <div class="toolbar">
+      <div class="tabs" id="tabs">
+        <button data-k="seq" class="on">交互时序</button>
+        <button data-k="comp">组件架构</button>
+      </div>
+      <div class="zoom">
+        <button data-z="-1" title="缩小">−</button>
+        <button data-z="0" title="复位">⟳</button>
+        <button data-z="1" title="放大">+</button>
+      </div>
+      <button class="btn" id="copy">复制源码</button>
+      <div class="grow"></div>
+      <label class="srv">PlantUML server
+        <input type="text" id="server" value="https://www.plantuml.com/plantuml/svg/"
+          title="兼容官方 ~h 十六进制编码的服务端；可改成自建 plantuml-server 以避免外发">
+      </label>
+    </div>
+
+    <div class="canvas" id="canvas">
+      <img id="diagram" alt="PlantUML diagram">
+    </div>
+    <div class="fallback" id="fallback">
+      ⚠ 渲染失败（离线 / 被网络策略拦截 / server 不支持 ~h 编码）。源码在下方，可粘贴到任意 PlantUML 工具，或把上方 server 改成自建实例。
+    </div>
+
+    <details class="src" open>
+      <summary>PlantUML 源码（可编辑 · 实时重渲染）</summary>
+      <div class="src-body">
+        <textarea id="editor" spellcheck="false"></textarea>
+        <div class="src-actions">
+          <button class="btn" id="rerender">重新渲染</button>
+          <button class="btn" id="reset">恢复默认</button>
+        </div>
+      </div>
+    </details>
+
+    <div class="notes">
+      <div class="note">
+        <h3>坑 1 · agent 原地跑真仓库</h3>
+        <p>现状无 worktree 副本（<code>--worktree</code> 默认 <code>cwd</code>）。VM 内以 <b>只读快照 + RW overlay</b> 挂 worktree，退出只回吐 diff，overlay 随 VM 销毁消失。</p>
+      </div>
+      <div class="note">
+        <h3>坑 2 · 运行态要桥回宿主</h3>
+        <p>driver 退出后要读 <code>native.jsonl</code> / <code>result.json</code> / <code>last_message.txt</code>（在 <code>~/.local/state/orch</code>）。故 <b>driver 留宿主</b>，用 matchlock VFS 把这几个产物桥出 guest。</p>
+      </div>
+      <div class="note">
+        <h3>坑 3 · guest 是 Linux</h3>
+        <p>claude/codex/pi + Bun 工具链、fish wrapper、<code>buildWorkerEnv</code> 都要在 Linux guest 内重放。<b>先花 15 分钟证伪</b>能否 headless 跑通，再投集成。</p>
+      </div>
+    </div>
+  </div>
+</main>
+
+<footer>
+  <div class="wrap">
+    源码内嵌本页，渲染默认走 <code>plantuml.com</code>（会把图文外发）。介意就把上方 server 改成自建
+    <code>plantuml/plantuml-server</code>（同样支持 <code>~h</code> 十六进制编码）。
+    参考：<a href="https://github.com/jingkaihe/matchlock" target="_blank" rel="noreferrer">jingkaihe/matchlock</a>。
+  </div>
+</footer>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const SRC = {
+  seq: String.raw`@startuml
+skinparam backgroundColor #ffffff
+skinparam shadowing false
+skinparam defaultFontName Menlo, monospace
+skinparam sequenceMessageAlign center
+skinparam sequence {
+  ArrowColor #2c3b49
+  LifeLineBorderColor #c6d2dc
+  ParticipantBorderColor #0d9488
+  ParticipantBackgroundColor #e6faf6
+  ParticipantFontColor #10161d
+  ActorBorderColor #0d9488
+  BoxBorderColor #b45309
+}
+skinparam note {
+  BackgroundColor #fff7e6
+  BorderColor #f4b350
+  FontColor #10161d
+}
+
+actor User as U
+participant "orch\norch run create" as ORCH
+participant "Supervisor\n(detached · host)\nsupervisor.ts:211" as SUP
+participant "Driver (host)\ndriver-common.ts:878" as DRV
+participant "SandboxRunner\nmatchlock TS SDK" as SR
+box "Matchlock · host-side (trusted)" #f6efe3
+participant "Egress Proxy\nTLS MITM · allowlist" as PX
+participant "VFS Server\nVirtioFS overlay" as VFS
+end box
+box "microVM · Linux guest (VZ, ephemeral)" #eef4fb
+participant "Provider CLI\nclaude / codex / pi" as PROV
+end box
+participant "Model API\napi.anthropic.com" as API
+database "Host secrets\nreal key · git token" as SEC
+database "~/.local/state/orch\nrun-dir" as ST
+
+U -> ORCH : orch run create --agent claude
+ORCH -> SUP : spawn detached (cwd = worktree)
+SUP -> DRV : spawn detached  __driver-claude
+
+== 启动一次性 microVM ==
+DRV -> SR : launch(image, worktree, runDir)
+SR -> PROV : boot microVM  (VZ, <1s)
+SR -> VFS : mount worktree = 只读快照 + RW overlay
+SR -> PX : egress allowlist\n[api.anthropic.com, registries]
+SR -> PROV : inject **DUMMY** env keys
+note over PROV, SEC : 真实密钥留在宿主 Proxy，永不进 guest
+
+== 执行 agent ==
+DRV -> SR : exec(providerArgv, stdin = prompt)
+SR -> PROV : run over **vsock**
+PROV -> PX : HTTPS api.anthropic.com  (dummy key)
+PX -> SEC : 取真实 key
+PX -> API : 换真实 key 转发
+API --> PX : response
+PX --> PROV : response
+PROV -> VFS : 改文件到 overlay + 写 native.jsonl
+PROV --> SR : exit code
+
+== 回收产物 + 销毁 ==
+SR -> VFS : 读回 result.json / last_message.txt / native.jsonl
+SR -> ST : 桥接产物到宿主 run-dir
+SR -> PROV : dispose microVM  (guest + overlay 消失，只留 diff)
+DRV -> DRV : schema 校验结果
+DRV --> SUP : result
+SUP --> ORCH : status / report
+@enduml`,
+
+  comp: String.raw`@startuml
+skinparam backgroundColor #ffffff
+skinparam shadowing false
+skinparam defaultFontName Menlo, monospace
+skinparam componentStyle rectangle
+skinparam rectangle {
+  BorderColor #0d9488
+  BackgroundColor #e6faf6
+  FontColor #10161d
+}
+skinparam database {
+  BorderColor #b45309
+  BackgroundColor #f6efe3
+  FontColor #10161d
+}
+skinparam folder {
+  BorderColor #596b7d
+  BackgroundColor #f2f5f8
+}
+
+rectangle "HOST  ·  macOS  ·  信任域" as HOST #f2f5f8 {
+  rectangle "orch → Supervisor → Driver" as CORE
+  rectangle "SandboxRunner\n(matchlock TS SDK)" as SR
+  rectangle "Egress Proxy\nTLS MITM + allowlist" as PX #f6efe3
+  rectangle "VFS Server\nVirtioFS overlay" as VFS #f6efe3
+  database "Host secrets\n真实 key / git token" as SEC
+  database "~/.local/state/orch" as ST
+  folder "worktree (真实仓库)" as WT
+}
+
+package "microVM  ·  Linux guest (VZ, ephemeral)" as VM #eef4fb {
+  rectangle "Provider CLI\nclaude / codex / pi" as PROV
+  rectangle "guest agent\n(vsock)" as GA
+  folder "overlay of worktree\n(用后即焚)" as OV
+  card "env: **DUMMY** keys" as DUM
+}
+
+cloud "外部" as EXT {
+  rectangle "Model API\napi.anthropic.com" as API
+  rectangle "包源 registries" as REG
+}
+
+CORE --> SR
+SR --> PX
+SR --> VFS
+SR ..> VM : boot / dispose
+SR --> GA : exec over **vsock**
+VFS --> OV : VirtioFS
+WT ..> OV : 只读快照 + RW overlay
+PROV --> DUM
+PROV --> PX : 出网仅经 Proxy
+PX --> SEC : 注真实 key
+PX --> API
+PX --> REG
+VFS --> ST : 桥接 result / native.jsonl
+
+note bottom of VM : 硬件虚拟化边界：guest 触不到宿主内核 / FS / 真实密钥
+@enduml`
+};
+
+const live = { ...SRC };        // 可编辑覆盖
+let cur = 'seq';
+let zoom = 1;
+
+const $ = id => document.getElementById(id);
+const img = $('diagram'), editor = $('editor'), fb = $('fallback');
+
+function toHex(text) {
+  const bytes = new TextEncoder().encode(text);
+  let s = '';
+  for (const b of bytes) s += b.toString(16).padStart(2, '0');
+  return s;
+}
+function serverBase() {
+  let s = $('server').value.trim();
+  if (!s.endsWith('/')) s += '/';
+  return s;
+}
+function render() {
+  fb.classList.remove('show');
+  img.src = serverBase() + '~h' + toHex(live[cur]);
+}
+function applyZoom() { img.style.transform = 'scale(' + zoom + ')'; }
+function load(k) {
+  cur = k;
+  editor.value = live[k];
+  document.querySelectorAll('#tabs button').forEach(b =>
+    b.classList.toggle('on', b.dataset.k === k));
+  render();
+}
+function toast(msg) {
+  const t = $('toast'); t.textContent = msg; t.classList.add('show');
+  clearTimeout(toast._t); toast._t = setTimeout(() => t.classList.remove('show'), 1400);
+}
+
+img.addEventListener('load', applyZoom);
+img.addEventListener('error', () => fb.classList.add('show'));
+
+document.querySelectorAll('#tabs button').forEach(b =>
+  b.addEventListener('click', () => load(b.dataset.k)));
+
+document.querySelectorAll('.zoom button').forEach(b =>
+  b.addEventListener('click', () => {
+    const z = +b.dataset.z;
+    zoom = z === 0 ? 1 : Math.min(3, Math.max(.4, zoom + z * .2));
+    applyZoom();
+  }));
+
+$('copy').addEventListener('click', async () => {
+  try { await navigator.clipboard.writeText(live[cur]); toast('已复制源码'); }
+  catch { toast('复制失败'); }
+});
+$('rerender').addEventListener('click', () => { live[cur] = editor.value; render(); toast('已重渲染'); });
+$('reset').addEventListener('click', () => { live[cur] = SRC[cur]; load(cur); toast('已恢复默认'); });
+$('server').addEventListener('change', render);
+
+load('seq');
+</script>
+</body>
+</html>

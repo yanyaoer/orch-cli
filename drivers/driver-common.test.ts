@@ -1,13 +1,15 @@
 import { afterEach, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   buildPrompt,
   buildProviderArgv,
+  buildProviderExecutionPlan,
   buildWorkerEnv,
   CLAUDE_CONTROLLER_ALLOWED_TOOLS,
   CLAUDE_RESEARCHER_ALLOWED_TOOLS,
+  CLAUDE_WRITE_ALLOWED_TOOLS,
   CODEX_RESEARCHER_MODEL,
   extractResultFromRunDir,
   extractResultFromText,
@@ -16,8 +18,9 @@ import {
   OMP_MODEL_CHAIN,
   rawResultText,
   runProviderDriver,
+  SEATBELT_ENV_MARKER,
 } from "./driver-common.ts";
-import type { RunSpec } from "../src/types.ts";
+import type { AgentName, RunSpec } from "../src/types.ts";
 
 const tempDirs: string[] = [];
 
@@ -233,8 +236,10 @@ test("buildProviderArgv keeps defaults fresh and only resumes exact sessions", (
     "text",
     "--effort",
     "medium",
+    "--allowedTools",
+    CLAUDE_WRITE_ALLOWED_TOOLS,
     "--permission-mode",
-    "bypassPermissions",
+    "dontAsk",
   ]);
   expect(buildProviderArgv("codex", base, "/run", "/worktree")).toEqual([
     "codex",
@@ -282,8 +287,10 @@ test("buildProviderArgv keeps defaults fresh and only resumes exact sessions", (
     "text",
     "--effort",
     "medium",
+    "--allowedTools",
+    CLAUDE_WRITE_ALLOWED_TOOLS,
     "--permission-mode",
-    "bypassPermissions",
+    "dontAsk",
     "--name",
     "mr123-review",
     "--resume",
@@ -762,8 +769,10 @@ test("buildProviderArgv picks claude model/effort by role", () => {
     "text",
     "--effort",
     "medium",
+    "--allowedTools",
+    CLAUDE_WRITE_ALLOWED_TOOLS,
     "--permission-mode",
-    "bypassPermissions",
+    "dontAsk",
   ]);
 
   // verifier stays on the CLI default model (sonnet), low effort (mechanical checks).
@@ -777,8 +786,10 @@ test("buildProviderArgv picks claude model/effort by role", () => {
     "text",
     "--effort",
     "low",
+    "--allowedTools",
+    CLAUDE_WRITE_ALLOWED_TOOLS,
     "--permission-mode",
-    "bypassPermissions",
+    "dontAsk",
   ]);
 
   expect(argv("controller", "role-controller")).toEqual([
@@ -802,6 +813,292 @@ test("buildProviderArgv picks claude model/effort by role", () => {
   expect(() => buildProviderArgv("codex", spec("controller", "role-controller-codex"), "/run", "/worktree")).toThrow(
     "controller role only supports claude provider",
   );
+});
+
+test("claude write roles keep guardrails: dontAsk + broad whitelist, never bypass", () => {
+  // Plan A: write roles no longer disable claude's sandbox via bypassPermissions.
+  for (const role of ["implementer", "verifier"] as const) {
+    const argv = buildProviderArgv("claude", spec(role, `guard-${role}`), "/run", "/worktree");
+    expect(argv).not.toContain("bypassPermissions");
+    expect(argv).toContain("dontAsk");
+    expect(argv).toContain(CLAUDE_WRITE_ALLOWED_TOOLS);
+  }
+  // Broad enough for real implementer/verifier work; MCP tools stay separately gated.
+  const tools = CLAUDE_WRITE_ALLOWED_TOOLS.split(",");
+  for (const tool of ["Edit", "Write", "MultiEdit", "Bash", "Read"]) expect(tools).toContain(tool);
+});
+
+// ---------------- sandbox execution plan (seatbelt-v1) ----------------
+
+// Hermetic seatbelt context: fake HOME with the provider's state initialized,
+// real worktree/run dirs. The plan builder checks the real
+// /usr/bin/sandbox-exec, so seatbelt-path tests are darwin-only.
+function seatbeltContext(role: RunSpec["role"], provider: AgentName) {
+  const root = tempDir();
+  const home = join(root, "home");
+  const worktree = join(root, "worktree");
+  const runDir = join(root, "run");
+  mkdirSync(join(home, provider === "claude" ? ".claude" : `.${provider}`), { recursive: true });
+  mkdirSync(worktree, { recursive: true });
+  mkdirSync(runDir, { recursive: true });
+  if (provider === "claude") writeFileSync(join(home, ".claude.json"), "{}", "utf8");
+  const runSpec: RunSpec = { ...spec(role, `sbx-${role}-${provider}`), agent: provider, sandbox_engine: "seatbelt-v1" };
+  const env = { PATH: "/usr/bin:/bin", HOME: home, XDG_STATE_HOME: join(home, ".local", "state") };
+  return { root, home, worktree, runDir, env, spec: runSpec };
+}
+
+test("engine none: plan argv matches buildProviderArgv, native sandboxes stay on", () => {
+  for (const provider of ["claude", "codex", "pi", "omp"] as const) {
+    const base = { ...spec("implementer", `plain-${provider}`), agent: provider };
+    const plan = buildProviderExecutionPlan({
+      provider,
+      spec: base,
+      runDir: "/run",
+      worktree: "/worktree",
+      env: { PATH: "/usr/bin", HOME: "/home/orch" },
+    });
+    expect(plan.argv).toEqual(buildProviderArgv(provider, base, "/run", "/worktree"));
+    expect(plan.sandboxEngine).toBe("none");
+    expect(plan.sandboxPosture).toBe("project-write");
+    expect(plan.profileSha256).toBeNull();
+    // codex/claude self-sandbox natively; pi/omp never had one.
+    expect(plan.providerNativeSandbox).toBe(provider === "codex" || provider === "claude");
+    expect(plan.env[SEATBELT_ENV_MARKER]).toBeUndefined();
+    // The sandbox-disabling argv must never appear without the outer wrapper.
+    expect(plan.argv).not.toContain("--dangerously-bypass-approvals-and-sandbox");
+    expect(plan.argv.join(" ")).not.toContain('"sandbox":{"enabled":false}');
+  }
+});
+
+test("unknown sandbox_engine in the spec fails closed instead of running unsandboxed", () => {
+  const base = { ...spec("implementer", "future-engine"), sandbox_engine: "seatbelt-v2" as unknown as "seatbelt-v1" };
+  expect(() =>
+    buildProviderExecutionPlan({ provider: "pi", spec: base, runDir: "/run", worktree: "/wt", env: { HOME: "/home/orch" } }),
+  ).toThrow(/unsupported sandbox_engine/);
+});
+
+test("seatbelt requested off darwin fails closed", () => {
+  const ctx = { provider: "pi" as const, spec: { ...spec("implementer", "sbx-linux"), sandbox_engine: "seatbelt-v1" as const } };
+  expect(() =>
+    buildProviderExecutionPlan({ ...ctx, runDir: "/run", worktree: "/wt", platform: "linux", env: { HOME: "/home/orch" } }),
+  ).toThrow(/requires macOS Seatbelt/);
+});
+
+test.skipIf(process.platform !== "darwin")("seatbelt plan wraps all four providers and flips native sandboxes off atomically", () => {
+  for (const provider of ["claude", "codex", "pi", "omp"] as const) {
+    const { worktree, runDir, env, spec: runSpec } = seatbeltContext("implementer", provider);
+    const plan = buildProviderExecutionPlan({ provider, spec: runSpec, runDir, worktree, env });
+    expect(plan.argv.slice(0, 2)).toEqual(["/usr/bin/sandbox-exec", "-p"]);
+    expect(plan.sandboxEngine).toBe("seatbelt-v1");
+    expect(plan.providerNativeSandbox).toBe(false);
+    expect(plan.profileSha256).toMatch(/^[0-9a-f]{64}$/);
+    // Worker env: nested-dispatch marker plus scratch redirections.
+    expect(plan.env[SEATBELT_ENV_MARKER]).toBe("seatbelt-v1");
+    expect(plan.env.TMPDIR).toBe(join(realpathSync(runDir), "scratch", "tmp"));
+    expect(plan.env.XDG_CACHE_HOME).toBe(join(realpathSync(runDir), "scratch", "cache"));
+    expect(plan.env.GIT_OPTIONAL_LOCKS).toBe("0");
+    // Host-owned scratch is created before spawn.
+    expect(existsSync(join(runDir, "scratch", "tmp"))).toBe(true);
+
+    const inner = plan.argv.slice(3);
+    if (provider === "codex") {
+      // Official external-sandbox mode; the last message lands in scratch, not
+      // in the formal run dir.
+      expect(inner).toContain("--dangerously-bypass-approvals-and-sandbox");
+      expect(inner).not.toContain("--sandbox");
+      expect(inner).toContain(`${runDir}/scratch/last_message.txt`);
+    } else if (provider === "claude") {
+      // Inner OS sandbox off; role tool permissions stay on.
+      expect(inner).toContain("--settings");
+      expect(inner).toContain('{"sandbox":{"enabled":false}}');
+      expect(inner).toContain("dontAsk");
+    } else {
+      // pi/omp have no native sandbox: same argv, outer jail only.
+      expect(inner).toEqual(buildProviderArgv(provider, runSpec, runDir, worktree));
+    }
+  }
+});
+
+test.skipIf(process.platform !== "darwin")("seatbelt profile grants the minimum write set per role and provider", () => {
+  const canonical = (path: string) => realpathSync(path);
+  const profileFor = (role: RunSpec["role"], provider: AgentName) => {
+    const ctx = seatbeltContext(role, provider);
+    const plan = buildProviderExecutionPlan({ provider, spec: ctx.spec, runDir: ctx.runDir, worktree: ctx.worktree, env: ctx.env });
+    return { profile: plan.argv[2]!, ...ctx };
+  };
+
+  const pi = profileFor("implementer", "pi");
+  expect(pi.profile).toContain("(allow default)");
+  expect(pi.profile).toContain("(deny file-write*)");
+  // project-write: canonical worktree writable, Git metadata re-denied last.
+  expect(pi.profile).toContain(`(subpath "${canonical(pi.worktree)}")`);
+  const denyBlock = pi.profile.slice(pi.profile.lastIndexOf("(deny file-write*"));
+  expect(denyBlock).toContain(`(literal "${canonical(pi.worktree)}/.git")`);
+  expect(denyBlock).toContain(`(subpath "${canonical(pi.worktree)}/.git")`);
+  // Only the selected provider's state; scratch, /private/tmp, /dev/null.
+  expect(pi.profile).toContain(`(subpath "${canonical(join(pi.home, ".pi"))}")`);
+  for (const other of [".claude", ".codex", ".omp", ".config", ".npm", ".cache"]) {
+    expect(pi.profile).not.toContain(other);
+  }
+  expect(pi.profile).toContain(`(subpath "${canonical(pi.runDir)}/scratch")`);
+  expect(pi.profile).toContain('(subpath "/private/tmp")');
+  expect(pi.profile).toContain('(literal "/dev/null")');
+  // The trial implementation's broad grants must be gone.
+  for (const broad of ['(subpath "/private/var/folders")', '(subpath "/dev")', "Library/Caches", "Library/Application Support", "Library/Preferences", ".local/state"]) {
+    expect(pi.profile).not.toContain(broad);
+  }
+
+  // Read-only roles: no worktree write rule at all.
+  const reviewer = profileFor("reviewer", "omp");
+  expect(reviewer.profile).not.toContain(`(subpath "${canonical(reviewer.worktree)}")`);
+  expect(reviewer.profile).toContain(`(subpath "${canonical(join(reviewer.home, ".omp"))}")`);
+
+  // claude: root-level state files are exact literals (backup may not exist yet).
+  const claude = profileFor("verifier", "claude");
+  expect(claude.profile).toContain(`(literal "${canonical(join(claude.home, ".claude.json"))}")`);
+  expect(claude.profile).toContain(`(literal "${canonical(claude.home)}/.claude.json.backup")`);
+
+  // controller: worktree read-only + exactly the orch state root.
+  const controller = profileFor("controller", "claude");
+  expect(controller.profile).not.toContain(`(subpath "${canonical(controller.worktree)}")`);
+  expect(controller.profile).toContain(`(subpath "${canonical(controller.home)}/.local/state/orch")`);
+});
+
+test.skipIf(process.platform !== "darwin")("seatbelt preflight fails closed: hardlinks, missing provider state, nesting, dry-run purity", () => {
+  // Pre-existing hardlink inside the worktree = probe-verified escape → fail.
+  const linked = seatbeltContext("implementer", "pi");
+  writeFileSync(join(linked.root, "outside.txt"), "outside", "utf8");
+  linkSync(join(linked.root, "outside.txt"), join(linked.worktree, "aliased.txt"));
+  expect(() =>
+    buildProviderExecutionPlan({ provider: "pi", spec: linked.spec, runDir: linked.runDir, worktree: linked.worktree, env: linked.env }),
+  ).toThrow(/hardlink-preflight[\s\S]*aliased\.txt/);
+
+  // Provider state missing → tell the user to log in, never open $HOME.
+  const uninitialized = seatbeltContext("implementer", "pi");
+  rmSync(join(uninitialized.home, ".pi"), { recursive: true, force: true });
+  expect(() =>
+    buildProviderExecutionPlan({ provider: "pi", spec: uninitialized.spec, runDir: uninitialized.runDir, worktree: uninitialized.worktree, env: uninitialized.env }),
+  ).toThrow(/provider-state.*interactively once/);
+
+  // Already inside an orch sandbox (controller dispatching a sandboxed worker)
+  // → nested sandbox_apply cannot work; fail with the specific story.
+  const nested = seatbeltContext("implementer", "pi");
+  expect(() =>
+    buildProviderExecutionPlan({
+      provider: "pi",
+      spec: nested.spec,
+      runDir: nested.runDir,
+      worktree: nested.worktree,
+      env: { ...nested.env, [SEATBELT_ENV_MARKER]: "seatbelt-v1" },
+    }),
+  ).toThrow(/nesting/);
+
+  // dry-run builds the identical plan but must not mutate the host.
+  const dry = seatbeltContext("implementer", "pi");
+  const previewRunDir = join(dry.root, "not-created-yet", "run");
+  const plan = buildProviderExecutionPlan({
+    provider: "pi",
+    spec: dry.spec,
+    runDir: previewRunDir,
+    worktree: dry.worktree,
+    env: dry.env,
+    dryRun: true,
+  });
+  expect(plan.sandboxEngine).toBe("seatbelt-v1");
+  expect(existsSync(join(previewRunDir, "scratch"))).toBe(false);
+});
+
+// Helper for the real-jail tests: skip when this test process itself already
+// runs inside a Seatbelt (e.g. a sandboxed verifier running `bun test`) —
+// nested sandbox_apply is expected to fail there (probe: exit 71).
+function insideSeatbelt(): boolean {
+  if (process.env[SEATBELT_ENV_MARKER]) return true;
+  if (process.platform !== "darwin") return false;
+  return Bun.spawnSync(["/usr/bin/sandbox-exec", "-p", "(version 1)(allow default)", "/usr/bin/true"]).exitCode !== 0;
+}
+
+// Real jail test: spawns real processes under the plan's own profile.
+test.skipIf(process.platform !== "darwin" || insideSeatbelt())(
+  "seatbelt jail enforces the boundary for real processes",
+  async () => {
+    const ctx = seatbeltContext("implementer", "pi");
+    const { worktree, runDir, home, env } = ctx;
+    // Real repo so the Git-metadata denial is exercised end to end.
+    const git = (...args: string[]) => Bun.spawnSync(["git", "-C", worktree, ...args], { env: { ...process.env } });
+    Bun.spawnSync(["git", "init"], { cwd: worktree });
+    writeFileSync(join(worktree, "tracked.txt"), "v1\n", "utf8");
+    Bun.spawnSync(["git", "-C", worktree, "add", "."], {});
+    const plan = buildProviderExecutionPlan({ provider: "pi", spec: ctx.spec, runDir, worktree, env });
+    const profile = plan.argv[2]!;
+
+    const jailed = (...argv: string[]) =>
+      Bun.spawnSync(["/usr/bin/sandbox-exec", "-p", profile, ...argv], { cwd: worktree, env: { ...process.env, ...plan.env } });
+    // Exit codes must be explicit: bun's uncaught-exception reporter itself
+    // breaks inside the jail and exits 0, so a bare throw is not a signal.
+    const tryWrite = (path: string) =>
+      jailed(
+        process.execPath,
+        "-e",
+        `try { require("node:fs").writeFileSync(${JSON.stringify(path)}, "ok") } catch { process.exit(3) }`,
+      );
+
+    // Provider-like process starts; worktree and scratch writes succeed.
+    expect(jailed(process.execPath, "--version").exitCode).toBe(0);
+    expect(tryWrite(join(worktree, "inside.txt")).exitCode).toBe(0);
+    expect(readFileSync(join(worktree, "inside.txt"), "utf8")).toBe("ok");
+    expect(tryWrite(join(runDir, "scratch", "probe.txt")).exitCode).toBe(0);
+
+    // Formal run artifacts are NOT provider-writable (scratch only).
+    expect(tryWrite(join(runDir, "native.jsonl")).exitCode).toBe(3);
+
+    // Outside writes are denied: fake home root, real macOS cache location
+    // (a trial-implementation regression guard), and Git metadata.
+    expect(tryWrite(join(home, "escape.txt")).exitCode).toBe(3);
+    expect(existsSync(join(home, "escape.txt"))).toBe(false);
+    const cacheProbe = `${process.env.HOME}/Library/Caches/orch_probe_${Date.now()}`;
+    try {
+      expect(tryWrite(cacheProbe).exitCode).toBe(3);
+      expect(existsSync(cacheProbe)).toBe(false);
+    } finally {
+      rmSync(cacheProbe, { force: true });
+    }
+    expect(tryWrite(join(worktree, ".git", "escape")).exitCode).toBe(3);
+
+    // Git reads work under GIT_OPTIONAL_LOCKS=0; git add (index.lock) fails.
+    expect(jailed("git", "status", "--porcelain").exitCode).toBe(0);
+    writeFileSync(join(worktree, "tracked.txt"), "v2\n", "utf8");
+    expect(jailed("git", "add", "tracked.txt").exitCode).not.toBe(0);
+    expect(git("status").exitCode).toBe(0);
+  },
+);
+
+test("driver fails closed when the sandbox plan cannot be built: no provider spawn, failed result", async () => {
+  const root = tempDir();
+  const runDir = join(root, "run");
+  const worktree = join(root, "worktree");
+  mkdirSync(runDir, { recursive: true });
+  mkdirSync(worktree, { recursive: true });
+  const runSpec: RunSpec = { ...spec("implementer", "sbx-fail-closed"), sandbox_engine: "seatbelt-v1" };
+  const specPath = join(runDir, "spec.json");
+  writeFileSync(specPath, JSON.stringify(runSpec), "utf8");
+
+  // Force a plan failure on any platform: the nested marker fails on darwin,
+  // the platform check fails elsewhere.
+  const prevMarker = process.env[SEATBELT_ENV_MARKER];
+  process.env[SEATBELT_ENV_MARKER] = "seatbelt-v1";
+  try {
+    const exitCode = await runProviderDriver("pi", ["--spec", specPath, "--run-dir", runDir, "--worktree", worktree]);
+    expect(exitCode).toBe(1);
+  } finally {
+    if (prevMarker === undefined) delete process.env[SEATBELT_ENV_MARKER];
+    else process.env[SEATBELT_ENV_MARKER] = prevMarker;
+  }
+  // The provider never ran: no native stream; the result is a failed verdict
+  // naming the sandbox stage.
+  expect(existsSync(join(runDir, "native.jsonl"))).toBe(false);
+  const result = JSON.parse(readFileSync(join(runDir, "result.json"), "utf8")) as { verdict: string; summary: string };
+  expect(result.verdict).toBe("failed");
+  expect(result.summary).toContain("sandbox seatbelt-v1");
 });
 
 test("extractResultFromText coerces benign schema deviations instead of discarding", () => {

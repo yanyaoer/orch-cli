@@ -1,8 +1,20 @@
-import { closeSync, existsSync, openSync, readFileSync, writeFileSync, writeSync } from "node:fs";
-import { isRunRole, type AgentName, type ResultCoercion, type RunSpec, type RoleResult } from "../src/types.ts";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync, writeSync } from "node:fs";
+import { isRunRole, type AgentName, type ResultCoercion, type RunSpec, type RoleResult, type SandboxEngine, type SandboxPosture } from "../src/types.ts";
 import { fallbackResult, resultSchemaName, ROLE_REQUIRED_FIELDS, ROLE_VERDICTS, validateRoleResult } from "../src/schema.ts";
 import { appendJsonLine, countLines, writeJsonAtomic } from "../src/json.ts";
 import { normalizeNativeText, type NativeEvent } from "../src/native-events.ts";
+import { sha256 } from "../src/hash.ts";
+import {
+  acceptableHostTmpDir,
+  canonicalizePath,
+  findWorktreeHardlinks,
+  providerStatePaths,
+  sandboxPosture,
+  scratchEnv,
+  SEATBELT_ENGINE,
+  seatbeltProfile,
+  seatbeltUnsupportedReason,
+} from "./sandbox.ts";
 
 export interface DriverArgs {
   specPath: string;
@@ -163,6 +175,16 @@ export const CLAUDE_CONTROLLER_ALLOWED_TOOLS = "Bash(orch *),Read,Grep,Glob,LS";
 // deliver plans but never code. dontAsk denies everything off this list headless.
 export const CLAUDE_RESEARCHER_ALLOWED_TOOLS = "Bash(jina *),Bash(tvly *),WebSearch,WebFetch,Read,Grep,Glob,LS";
 
+// Write roles (implementer/verifier) run headless: they must auto-run edits and
+// test/build commands with no interactive approval. dontAsk auto-runs this
+// whitelist and never prompts, while — unlike bypassPermissions — keeping
+// claude's own guardrails engaged. Broad on purpose (all core write/exec tools)
+// so implementers aren't silently denied; MCP tools stay gated by
+// CLAUDE_CODE_MCP_ALLOWLIST_ENV. OS-level write confinement is layered on top
+// via config `sandbox` (Seatbelt), not by this list.
+export const CLAUDE_WRITE_ALLOWED_TOOLS =
+  "Task,Bash,BashOutput,KillShell,Glob,Grep,LS,Read,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch,TodoWrite";
+
 // Researcher model per provider: codex pins gpt-5.6-sol and claude pins fable,
 // both at xhigh effort; omp rides its default quota-fallback chain
 // (gpt-5.6-sol primary at xhigh thinking).
@@ -189,12 +211,27 @@ const CLAUDE_ROLE_EFFORT: Partial<Record<RunSpec["role"], string>> = {
   controller: "medium",
 };
 
+// Non-sandboxed argv (engine "none"). The external-sandbox variant — the only
+// one that flips codex/claude native sandboxes off — is deliberately not
+// exported: those argv exist solely inside buildProviderExecutionPlan,
+// atomically bound to the outer Seatbelt wrapper.
 export function buildProviderArgv(
   provider: AgentName,
   spec: RunSpec,
   runDir: string,
   worktree: string,
   prompt = "",
+): string[] {
+  return providerArgv(provider, spec, runDir, worktree, prompt, false);
+}
+
+function providerArgv(
+  provider: AgentName,
+  spec: RunSpec,
+  runDir: string,
+  worktree: string,
+  prompt: string,
+  externalSandbox: boolean,
 ): string[] {
   const readOnly = isReadOnlyRole(spec.role);
 
@@ -228,6 +265,11 @@ export function buildProviderArgv(
 
   if (provider === "claude") {
     const argv = ["claude", "-p", "--verbose", "--output-format", "stream-json", "--input-format", "text"];
+    // Under the external Seatbelt, claude's internal OS sandbox must be off:
+    // nested sandbox_apply fails (probe: Bash exit 71). Tool permissions
+    // (allowedTools / permission-mode below) stay on as the intent layer; the
+    // outer Seatbelt owns the filesystem write boundary.
+    if (externalSandbox) argv.push("--settings", '{"sandbox":{"enabled":false}}');
     const model = spec.model ?? CLAUDE_ROLE_MODEL[spec.role];
     if (model) argv.push("--model", model);
     const effort = CLAUDE_ROLE_EFFORT[spec.role];
@@ -241,11 +283,12 @@ export function buildProviderArgv(
     else if (spec.role === "researcher") argv.push("--allowedTools", CLAUDE_RESEARCHER_ALLOWED_TOOLS, "--permission-mode", "dontAsk");
     else if (readOnly) argv.push("--permission-mode", "plan");
     // Write roles and verifier run headless: without an explicit mode, edits
-    // and test commands wait for interactive approval that never comes. Blast
-    // radius note: bypassPermissions disables claude's sandbox entirely, wider
-    // than codex write roles (which keep codex's default workspace-write
-    // sandbox). Role→read-only mapping is identical; sandbox strength is not.
-    else argv.push("--permission-mode", "bypassPermissions");
+    // and test commands wait for interactive approval that never comes. dontAsk
+    // + a broad write whitelist auto-runs them without prompting while keeping
+    // claude's own guardrails on (bypassPermissions would disable claude's
+    // sandbox entirely). OS-enforced write confinement is opt-in via config
+    // `sandbox`: the outer Seatbelt then jails every provider uniformly.
+    else argv.push("--allowedTools", CLAUDE_WRITE_ALLOWED_TOOLS, "--permission-mode", "dontAsk");
     if (spec.provider_session_name) argv.push("--name", spec.provider_session_name);
     if (spec.provider_session_mode === "ephemeral") {
       argv.push("--no-session-persistence");
@@ -256,7 +299,20 @@ export function buildProviderArgv(
   }
 
   if (provider === "codex") {
-    const lastMessagePath = `${runDir}/last_message.txt`;
+    // Under the external Seatbelt the provider must not write formal run
+    // artifacts: the last message lands in the provider-writable scratch and
+    // the driver reads it back after exit. Unsandboxed runs keep the run dir
+    // path so existing behavior is unchanged.
+    const lastMessagePath = externalSandbox ? `${runDir}/scratch/last_message.txt` : `${runDir}/last_message.txt`;
+    // Under the external Seatbelt, codex runs in its official "isolated by an
+    // external sandbox" mode: the bypass flag and the outer wrapper are two
+    // halves of one execution plan, never emitted separately.
+    const sandboxFlags = externalSandbox
+      ? ["--dangerously-bypass-approvals-and-sandbox"]
+      : // codex exec DEFAULTS to the read-only sandbox (verified live: writes
+        // blocked without an explicit -s); write-capable roles must ask for
+        // workspace-write explicitly or implementers cannot edit anything.
+        ["--sandbox", readOnly ? "read-only" : "workspace-write"];
     // Researcher: pin the strong-reasoning model at xhigh effort and enable
     // codex-native web search — the read-only sandbox blocks network for shell
     // commands, so web research must ride the Responses web_search tool.
@@ -266,11 +322,7 @@ export function buildProviderArgv(
     if (spec.provider_session_mode === "resume_exact" && spec.provider_session_id) {
       // `codex exec resume` has no --sandbox flag (exit 2 if passed); the
       // sandbox rides the parent `exec` level, accepted before the subcommand.
-      const resume = ["codex", "exec"];
-      // codex exec DEFAULTS to the read-only sandbox (verified live: writes
-      // blocked without an explicit -s); write-capable roles must ask for
-      // workspace-write explicitly or implementers cannot edit anything.
-      resume.push("--sandbox", readOnly ? "read-only" : "workspace-write");
+      const resume = ["codex", "exec", ...sandboxFlags];
       resume.push("resume", "--json", "--output-last-message", lastMessagePath);
       if (model) resume.push("--model", model);
       resume.push(...researcherFlags);
@@ -280,8 +332,7 @@ export function buildProviderArgv(
     const argv = ["codex", "exec", "--json", "--cd", worktree, "--output-last-message", lastMessagePath];
     if (model) argv.push("--model", model);
     argv.push(...researcherFlags);
-    // See resume path above: codex exec defaults to read-only.
-    argv.push("--sandbox", readOnly ? "read-only" : "workspace-write");
+    argv.push(...sandboxFlags);
     if (spec.provider_session_mode === "ephemeral") argv.push("--ephemeral");
     argv.push("-");
     return argv;
@@ -651,7 +702,9 @@ function candidateTexts(events: NativeEvent[], kind: NativeEvent["kind"], format
 
 function collectResultCandidates(runDir: string): string[] {
   const candidates: string[] = [];
-  for (const path of [`${runDir}/last_message.txt`, `${runDir}/stdout.log`]) {
+  // scratch/last_message.txt is the sandboxed codex location (provider-writable
+  // scratch); last_message.txt is the unsandboxed one.
+  for (const path of [`${runDir}/scratch/last_message.txt`, `${runDir}/last_message.txt`, `${runDir}/stdout.log`]) {
     if (existsSync(path)) candidates.push(readFileSync(path, "utf8"));
   }
 
@@ -860,6 +913,137 @@ export async function pipeToFile(stream: ReadableStream<Uint8Array> | null, path
   }
 }
 
+export interface ExecutionContext {
+  provider: AgentName;
+  spec: RunSpec;
+  runDir: string;
+  worktree: string;
+  prompt?: string;
+  // Dry-run previews the exact same plan (same builder, same validations) but
+  // must not mutate the host: scratch dirs are not created, and the
+  // not-yet-existing run dir canonicalizes via its deepest existing ancestor.
+  dryRun?: boolean;
+  platform?: NodeJS.Platform;
+  env?: NodeJS.ProcessEnv;
+}
+
+export interface ProviderExecutionPlan {
+  argv: string[]; // final spawnable command, outer wrapper included
+  sandboxEngine: SandboxEngine;
+  sandboxPosture: SandboxPosture;
+  profileSha256: string | null;
+  providerNativeSandbox: boolean;
+  env: Record<string, string>;
+}
+
+// Marker inherited by every descendant of a sandboxed worker. A sandboxed run
+// that dispatches another sandboxed run (controller → `orch run create` →
+// worker driver) would nest sandbox_apply, which macOS rejects (probe: exit
+// 71); the nested driver sees the marker and fails closed with a specific
+// error instead of a bare 71.
+export const SEATBELT_ENV_MARKER = "ORCH_SANDBOX_ENGINE";
+
+// The single atomic decision point for how a provider executes: engine and
+// posture, provider argv, native-sandbox opt-outs (codex bypass, claude
+// settings), env redirections, and the Seatbelt wrapper are produced together,
+// so a sandbox-disabling argv can never escape without its outer jail. Drivers
+// spawn plan.argv with plan.env, nothing else; dry-run displays the same plan.
+export function buildProviderExecutionPlan(ctx: ExecutionContext): ProviderExecutionPlan {
+  const { provider, spec, runDir, worktree } = ctx;
+  const posture = sandboxPosture(spec.role);
+  const env = buildWorkerEnv(ctx.env ?? process.env);
+  if (spec.sandbox_engine === undefined) {
+    return {
+      argv: providerArgv(provider, spec, runDir, worktree, ctx.prompt ?? "", false),
+      sandboxEngine: "none",
+      sandboxPosture: posture,
+      profileSha256: null,
+      providerNativeSandbox: provider === "codex" || provider === "claude",
+      env,
+    };
+  }
+  // A spec from a newer orch may carry an engine this build does not
+  // implement; running it unsandboxed would silently drop the boundary.
+  if (spec.sandbox_engine !== SEATBELT_ENGINE) {
+    throw new Error(`sandbox: spec requests unsupported sandbox_engine ${JSON.stringify(spec.sandbox_engine)} (this build implements ${SEATBELT_ENGINE})`);
+  }
+  const fail = (stage: string, detail: string): never => {
+    throw new Error(`sandbox ${SEATBELT_ENGINE} (provider=${provider} role=${spec.role} stage=${stage}): ${detail}`);
+  };
+
+  const unsupported = seatbeltUnsupportedReason(ctx.platform ?? process.platform);
+  if (unsupported) fail("platform", unsupported);
+  const outerEngine = env[SEATBELT_ENV_MARKER];
+  if (outerEngine) {
+    fail(
+      "nesting",
+      `already inside an orch ${outerEngine} sandbox; macOS cannot nest sandbox_apply — dispatch this run from an unsandboxed host process`,
+    );
+  }
+  const home = env.HOME;
+  if (!home) fail("paths", "HOME is not set");
+  if (!existsSync(worktree)) fail("paths", `worktree does not exist: ${worktree}`);
+  const canonicalHome = canonicalizePath(home!);
+  const canonicalWorktree = canonicalizePath(worktree);
+
+  // The selected provider reuses the host's real login/session state; a
+  // missing state dir means "log in from a normal terminal first", not "open
+  // $HOME so the provider can pick a landing spot".
+  const state = providerStatePaths(provider, canonicalHome);
+  for (const dir of state.dirs) {
+    if (!existsSync(dir)) fail("provider-state", `${dir} not found; run \`${provider}\` interactively once to initialize it`);
+  }
+
+  // Host-owned, run-scoped scratch: the only provider-writable spot inside the
+  // run dir. Formal artifacts (native.jsonl, result.json, …) stay outside it.
+  const scratchDir = `${runDir}/scratch`;
+  if (!ctx.dryRun) {
+    mkdirSync(`${scratchDir}/tmp`, { recursive: true, mode: 0o700 });
+    mkdirSync(`${scratchDir}/cache`, { recursive: true, mode: 0o700 });
+  }
+  const canonicalScratch = canonicalizePath(scratchDir);
+
+  const hardlinks = findWorktreeHardlinks(canonicalWorktree);
+  if (hardlinks.length > 0) {
+    fail(
+      "hardlink-preflight",
+      `worktree files share inodes with content that may live outside the sandbox (Seatbelt is path-based and cannot stop writes through them): ${hardlinks.join(", ")} — use a hardlink-free copy of the project or stronger isolation`,
+    );
+  }
+
+  const hostTmp = env.TMPDIR ? canonicalizePath(env.TMPDIR) : null;
+  const profile = seatbeltProfile({
+    posture,
+    worktree: canonicalWorktree,
+    scratchDir: canonicalScratch,
+    providerStateDirs: state.dirs.map(canonicalizePath),
+    providerStateFiles: state.files.map(canonicalizePath),
+    hostTmpDir: hostTmp && acceptableHostTmpDir(hostTmp, canonicalHome) ? hostTmp : null,
+    // controller dispatches via Bash(orch *): exactly the orch state root, not
+    // the whole ~/.local/state.
+    orchStateDir:
+      spec.role === "controller"
+        ? canonicalizePath(env.XDG_STATE_HOME ? `${env.XDG_STATE_HOME}/orch` : `${home}/.local/state/orch`)
+        : null,
+  });
+
+  return {
+    argv: ["/usr/bin/sandbox-exec", "-p", profile, ...providerArgv(provider, spec, runDir, worktree, ctx.prompt ?? "", true)],
+    sandboxEngine: SEATBELT_ENGINE,
+    sandboxPosture: posture,
+    profileSha256: sha256(profile),
+    providerNativeSandbox: false,
+    env: {
+      ...env,
+      ...scratchEnv(canonicalScratch),
+      // Git metadata is read-only in the jail; without this, `git status`
+      // tries to take the optional index lock to refresh stat data and fails.
+      GIT_OPTIONAL_LOCKS: "0",
+      [SEATBELT_ENV_MARKER]: SEATBELT_ENGINE,
+    },
+  };
+}
+
 export async function runProviderDriver(provider: AgentName, argv: string[]): Promise<number> {
   const args = parseDriverArgs(argv);
   const spec = readSpec(args.specPath);
@@ -875,12 +1059,33 @@ export async function runProviderDriver(provider: AgentName, argv: string[]): Pr
       writeFileSync(ompFallbackConfigPath(args.runDir), ompFallbackConfigYaml(fallbacks), "utf8");
     }
   }
-  const proc = Bun.spawn(buildProviderArgv(provider, spec, args.runDir, args.worktree, prompt), {
+  let plan: ProviderExecutionPlan;
+  try {
+    plan = buildProviderExecutionPlan({ provider, spec, runDir: args.runDir, worktree: args.worktree, prompt });
+  } catch (error) {
+    // Fail closed: a run whose sandbox cannot be built/applied must never
+    // reach the provider. The error names engine/provider/role/stage; writing
+    // result + exit_code makes the run terminally failed instead of hung.
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`${message}\n`);
+    writeExitCode(args.runDir, 1);
+    writeResult(args.runDir, spec, synthesizeResult(spec, message));
+    return 1;
+  }
+  // Audit record of the plan actually used; the supervisor folds it into
+  // status.json (the driver never writes status.json itself).
+  writeJsonAtomic(`${args.runDir}/sandbox.json`, {
+    sandbox_engine: plan.sandboxEngine,
+    sandbox_posture: plan.sandboxPosture,
+    sandbox_profile_sha256: plan.profileSha256,
+    provider_native_sandbox: plan.providerNativeSandbox,
+  });
+  const proc = Bun.spawn(plan.argv, {
     cwd: args.worktree,
     stdin: "pipe",
     stdout: "pipe",
     stderr: "inherit",
-    env: buildWorkerEnv(),
+    env: plan.env,
   });
   if (provider !== "omp") proc.stdin.write(prompt);
   proc.stdin.end();
@@ -901,12 +1106,16 @@ export async function runProviderDriver(provider: AgentName, argv: string[]): Pr
   const raw = rawResultText(args.runDir);
   if (raw) writeFileSync(`${args.runDir}/result.raw.md`, raw, "utf8");
 
+  // Exit 71 under the Seatbelt wrapper is the canonical sandbox_apply failure:
+  // the sandbox was not applied and the provider never ran (fail-closed).
+  const sandboxApplyHint =
+    plan.sandboxEngine !== "none" && code === 71 ? ` (Seatbelt sandbox_apply failed; the provider never started)` : "";
   const summary =
     code === 0 && !raw
       ? `${provider} exited 0 but produced no output; check the provider CLI auth/session (run \`${provider}\` interactively once)`
       : code === 0
         ? `${provider} did not return a valid orch result JSON; raw output saved to result.raw.md. Excerpt: ${raw!.slice(0, 400)}`
-        : `${provider} exited ${code}${raw ? "; raw output saved to result.raw.md" : ""}`;
+        : `${provider} exited ${code}${sandboxApplyHint}${raw ? "; raw output saved to result.raw.md" : ""}`;
   writeResult(args.runDir, spec, synthesizeResult(spec, summary));
   // No valid result is a failed run whatever the provider exit code claims:
   // exit 0 here would let the supervisor mark a protocol failure `done`, and

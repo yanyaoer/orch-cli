@@ -9,6 +9,7 @@ import {
   mailControlConfigPath,
   orchConfigPath,
   orchLanguage,
+  orchSandbox,
   parseWorkersUrl,
   readBridgeConfig,
   readMailControlConfig,
@@ -324,6 +325,29 @@ test("orchLanguage is 中文 only for the exact config value and falls back to e
     for (const [value, expected] of cases) {
       writeFileSync(orchConfigPath(), JSON.stringify({ version: 1, workspaces: {}, ...(value === undefined ? {} : { language: value }) }));
       expect(orchLanguage()).toBe(expected as "中文" | "english");
+    }
+  } finally {
+    if (prev === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = prev;
+  }
+});
+
+test("orchSandbox is true only for the exact boolean true and false otherwise", () => {
+  const prev = process.env.XDG_CONFIG_HOME;
+  process.env.XDG_CONFIG_HOME = tempDir();
+  try {
+    expect(orchSandbox()).toBe(false); // missing config file
+    mkdirSync(dirname(orchConfigPath()), { recursive: true });
+    const cases: Array<[unknown, boolean]> = [
+      [true, true],
+      [false, false],
+      [undefined, false], // field absent
+      ["true", false], // strict: only the boolean flips it
+      [1, false],
+    ];
+    for (const [value, expected] of cases) {
+      writeFileSync(orchConfigPath(), JSON.stringify({ version: 1, workspaces: {}, ...(value === undefined ? {} : { sandbox: value }) }));
+      expect(orchSandbox()).toBe(expected);
     }
   } finally {
     if (prev === undefined) delete process.env.XDG_CONFIG_HOME;

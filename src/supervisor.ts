@@ -8,6 +8,7 @@ import { fallbackResult, validateRoleResult } from "./schema.ts";
 import { lockPathForWorktree } from "./paths.ts";
 import { providerResumeIdFromNativeText } from "./native-events.ts";
 import { buildWorkerEnv } from "../drivers/driver-common.ts";
+import { sandboxPosture } from "../drivers/sandbox.ts";
 
 function now(): string {
   return new Date().toISOString();
@@ -40,7 +41,27 @@ function initialStatus(spec: RunSpec): RunStatus {
     worktree: spec.worktree,
     base_sha: spec.base_sha,
     head_sha: null,
+    // Engine comes from the immutable spec, posture from the immutable role;
+    // the driver's recorded plan (sandbox.json) later confirms both and adds
+    // the profile hash via sandboxStatus().
+    ...(spec.sandbox_engine ? { sandbox_engine: spec.sandbox_engine, sandbox_posture: sandboxPosture(spec.role) } : {}),
   };
+}
+
+// The driver records the execution plan it actually used in sandbox.json;
+// folding it into status.json keeps the effective sandbox auditable without
+// the driver ever writing status.json itself (one file, one writer).
+function sandboxStatus(runDir: string): Partial<RunStatus> {
+  const value = readJsonFile<Record<string, unknown> | null>(runDirFile(runDir, "sandbox.json"), null);
+  if (!value) return {};
+  const patch: Partial<RunStatus> = {};
+  if (value.sandbox_engine === "none" || value.sandbox_engine === "seatbelt-v1") patch.sandbox_engine = value.sandbox_engine;
+  if (value.sandbox_posture === "read-only" || value.sandbox_posture === "project-write") patch.sandbox_posture = value.sandbox_posture;
+  if (typeof value.sandbox_profile_sha256 === "string" || value.sandbox_profile_sha256 === null) {
+    patch.sandbox_profile_sha256 = value.sandbox_profile_sha256 as string | null;
+  }
+  if (typeof value.provider_native_sandbox === "boolean") patch.provider_native_sandbox = value.provider_native_sandbox;
+  return patch;
 }
 
 export function writeInitialRunFiles(runDir: string, spec: RunSpec): void {
@@ -57,6 +78,7 @@ function updateStatus(runDir: string, spec: RunSpec, patch: Partial<RunStatus>):
   const prev = readStatus(runDir, spec);
   const next = {
     ...prev,
+    ...sandboxStatus(runDir),
     ...patch,
     updated_at: now(),
     native_event_count: countLines(runDirFile(runDir, "native.jsonl")),
@@ -206,7 +228,16 @@ export async function runSupervisor(runDir: string, orchCommand: string[]): Prom
 
     const startedAt = now();
     updateStatus(runDir, spec, { state: "starting", started_at: startedAt });
-    appendEvent(runDir, { type: "starting", seq: nextSeq(runDir), ts: startedAt });
+    appendEvent(runDir, {
+      type: "starting",
+      seq: nextSeq(runDir),
+      ts: startedAt,
+      // Sandbox contract is auditable from the event stream too, not only
+      // from spec/status.
+      ...(spec.sandbox_engine
+        ? { message: `sandbox_engine=${spec.sandbox_engine} sandbox_posture=${sandboxPosture(spec.role)}` }
+        : {}),
+    });
 
     const proc = Bun.spawn(
       [

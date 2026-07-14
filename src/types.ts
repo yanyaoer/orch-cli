@@ -6,6 +6,15 @@ export type AgentName = "codex" | "claude" | "pi" | "omp";
 
 export type ProviderSessionMode = "ephemeral" | "fresh_persistent" | "resume_exact";
 
+// OS sandbox policy version (docs/sandbox-design.md). A semantic change to
+// the policy must ship as a new engine value (seatbelt-v2, …); the same value
+// must never silently widen.
+export type SandboxEngine = "none" | "seatbelt-v1";
+
+// Worktree write posture, derived from the immutable role: implementer and
+// verifier write the project; reviewer/researcher/controller do not.
+export type SandboxPosture = "read-only" | "project-write";
+
 export type RunState =
   | "created"
   | "starting"
@@ -48,6 +57,12 @@ export interface RunSpec {
   // was 中文: the driver must not depend on live global config, and the spec
   // stays auditable. Absent (legacy specs, english config) means english.
   language?: "中文";
+  // Snapshot of config.json `sandbox` at spec creation, present only when the
+  // run was created with the OS sandbox on: the driver must wrap the provider
+  // in this exact policy version or fail closed. Absent means no orch OS
+  // sandbox. Posture is derived from the immutable role, never stored, so the
+  // two can't contradict. Mirrors `language` snapshotting.
+  sandbox_engine?: "seatbelt-v1";
 }
 
 export interface RunStatus {
@@ -72,6 +87,13 @@ export interface RunStatus {
   worktree: string;
   base_sha: string;
   head_sha: string | null;
+  // Effective sandbox contract for audit: engine/posture snapshot from the
+  // spec at create; profile hash and native-sandbox flag flow in from the
+  // driver's recorded execution plan (sandbox.json) once the driver runs.
+  sandbox_engine?: SandboxEngine;
+  sandbox_posture?: SandboxPosture;
+  sandbox_profile_sha256?: string | null;
+  provider_native_sandbox?: boolean;
 }
 
 export interface ResultCoercion {
