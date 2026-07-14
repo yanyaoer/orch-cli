@@ -16,6 +16,7 @@ import { sha256 } from "./hash.ts";
 import { appendJsonLine, readJsonFile, writeJsonAtomic, writeJsonExclusive, writeTextAtomic } from "./json.ts";
 import { acquirePidfileLock, acquirePidfileLockWait, LockHeldError } from "./locks.ts";
 import { defaultMailAgents, type MailCliContext } from "./mail-cli.ts";
+import { reconcileDispatchOnce } from "./dispatch.ts";
 import { deliverLocalMail, ensureMailDirs, mailThreadDir } from "./mail.ts";
 import {
   decodeHeader,
@@ -2052,6 +2053,16 @@ export async function mailctlPoll(ctx: MailctlContext, opts: PollOptions = {}): 
     try {
       const result = await mailctlPollUnlocked(ctx, opts);
       if (opts.reconcile !== false) result.reconciled = await mailctlReconcileUnlocked(ctx);
+      // When config sandbox is on, the mail controller runs under Seatbelt and
+      // enqueues its dispatches (run create / decision / mail) to the host
+      // dispatch queue. Drain them here so a plain `orch mailctl poll` cron
+      // makes the controller progress; a low-latency companion is
+      // `orch dispatch reconcile --watch`. No-op when the queue is empty.
+      try {
+        await reconcileDispatchOnce(ctx.orch.orchCommand());
+      } catch {
+        // Dispatch reconciliation is best-effort; never break the poll.
+      }
       if (ctx.config.notify.enabled && opts.sync !== false) {
         try {
           await mailctlSync(ctx, { execute: true });

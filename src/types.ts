@@ -180,7 +180,13 @@ export interface ResearcherResult {
 
 export type RoleResult = ImplementerResult | ReviewerResult | VerifierResult | ControllerResult | ResearcherResult;
 
-export const writeRoles = new Set<RunRole>(["implementer"]);
+// Roles that write the worktree, and so must take the worktree lock and have
+// their uncommitted diff collected as evidence. This is exactly the set with
+// `project-write` sandbox posture: verifier runs real build/test commands that
+// create artifacts in the worktree, so it must serialize against implementers
+// on the same worktree, not race them lock-free. Kept in sync with
+// sandboxPosture by a test (src/schema.test.ts).
+export const writeRoles = new Set<RunRole>(["implementer", "verifier"]);
 
 // Runtime validator for role strings arriving from CLI flags, mail events, or
 // legacy spec.json files (which may carry retired roles such as debugger).

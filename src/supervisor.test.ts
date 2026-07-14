@@ -3,6 +3,9 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFi
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runSupervisor, writeInitialRunFiles } from "./supervisor.ts";
+import { acquirePidfileLock } from "./locks.ts";
+import { lockPathForWorktree } from "./paths.ts";
+import { dirname } from "node:path";
 import type { ReviewerResult, RunSpec, RunStatus } from "./types.ts";
 
 async function runCmd(args: string[], cwd: string): Promise<string> {
@@ -77,6 +80,15 @@ const result = spec.role === "reviewer"
       blocking_findings: [],
       non_blocking_findings: [],
       suggested_tests: [],
+    }
+  : spec.role === "verifier"
+  ? {
+      schema: "orch.result/verifier/v1",
+      run_id: spec.run_id,
+      verdict: "pass",
+      verifies_run_id: spec.run_id,
+      commands: [],
+      acceptance: [{ id: "fake", status: "pass" }],
     }
   : {
       schema: "orch.result/implementer/v1",
@@ -181,6 +193,55 @@ test("supervisor writes evidence artifacts for write-role runs with uncommitted 
   expect(diff).toContain("diff --git a/README.md b/README.md");
   expect(diff).toContain("+changed");
   expect(readFileSync(join(runDir, "artifacts", "changed-files.txt"), "utf8")).toBe("README.md\n");
+});
+
+// F4: verifier has project-write posture (real build/test commands + claude
+// Edit/Write), so it must behave like a write role — collect its diff evidence.
+test("supervisor writes evidence artifacts for verifier runs (F4 write role)", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orch-supervisor-verifier-"));
+  const runDir = join(root, "run");
+  const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
+  const baseSha = await initGitWorktree(worktree);
+  writeFileSync(join(worktree, "README.md"), "initial\nverifier build artifact\n", "utf8");
+  const spec = testSpec({ runId: "verify-evidence", role: "verifier", worktree, baseSha });
+  writeSpec(runDir, spec);
+
+  const exitCode = await runSupervisorWithState(runDir, [process.execPath, writeFakeDriver(root)], join(root, "state"));
+
+  expect(exitCode).toBe(0);
+  expect(readFileSync(join(runDir, "artifacts", "git-status.txt"), "utf8")).toContain(" M README.md");
+  expect(existsSync(join(runDir, "artifacts", "diff.patch"))).toBe(true);
+});
+
+// F4: two project-write runs (implementer + verifier) must not write the same
+// worktree concurrently lock-free. The verifier now takes the worktree lock, so
+// it fails closed (exit 75) while an implementer holds it, rather than racing.
+test("a verifier fails closed when another project-write run holds the worktree lock", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orch-supervisor-verifier-lock-"));
+  const stateHome = join(root, "state");
+  const runDir = join(root, "run");
+  const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
+  const baseSha = await initGitWorktree(worktree);
+  const spec = testSpec({ runId: "verify-blocked", role: "verifier", worktree, baseSha });
+  writeSpec(runDir, spec);
+
+  // Simulate a running implementer holding the worktree lock (same state home
+  // the supervisor will use, so the lock paths coincide).
+  const prev = process.env.XDG_STATE_HOME;
+  process.env.XDG_STATE_HOME = stateHome;
+  const lockPath = lockPathForWorktree(worktree);
+  mkdirSync(dirname(lockPath), { recursive: true });
+  const held = acquirePidfileLock(lockPath, process.pid, "impl-holding");
+  try {
+    const exitCode = await runSupervisorWithState(runDir, [process.execPath, writeFakeDriver(root)], stateHome);
+    expect(exitCode).toBe(75); // LockHeldError → the verifier does not run
+    const status = JSON.parse(readFileSync(join(runDir, "status.json"), "utf8")) as RunStatus;
+    expect(status.state).toBe("failed");
+  } finally {
+    held.release();
+    if (prev === undefined) delete process.env.XDG_STATE_HOME;
+    else process.env.XDG_STATE_HOME = prev;
+  }
 });
 
 test("supervisor does not write evidence artifacts for read-only runs", async () => {

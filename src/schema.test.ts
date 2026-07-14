@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import { fallbackResult, validateRoleResult } from "./schema.ts";
-import { writeRoles } from "./types.ts";
+import { writeRoles, type RunRole } from "./types.ts";
+import { sandboxPosture } from "../drivers/sandbox.ts";
 
 test("reviewer, verifier, controller, and researcher fallback results pass their role validators", () => {
   const reviewer = fallbackResult({
@@ -136,4 +137,16 @@ test("researcher result requires a recommendation and completed|failed verdict",
 test("controller and researcher are not write roles", () => {
   expect(writeRoles.has("controller")).toBe(false);
   expect(writeRoles.has("researcher")).toBe(false);
+});
+
+// F4: worktree lock + diff evidence must cover exactly the project-write roles.
+// verifier writes the worktree (build/test artifacts, and claude Edit/Write),
+// so it must be a write role — otherwise it races implementers on the same
+// worktree lock-free and its diff is never collected.
+test("writeRoles matches the project-write sandbox posture exactly", () => {
+  const roles: RunRole[] = ["implementer", "reviewer", "verifier", "controller", "researcher"];
+  for (const role of roles) {
+    expect(writeRoles.has(role)).toBe(sandboxPosture(role) === "project-write");
+  }
+  expect(writeRoles.has("verifier")).toBe(true);
 });

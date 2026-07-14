@@ -6,8 +6,11 @@ import {
   acceptableHostTmpDir,
   canonicalizePath,
   findWorktreeHardlinks,
+  narrowWritableDirReason,
   providerStatePaths,
+  rootLevelStateFileReason,
   sandboxPosture,
+  sandboxRunIdentity,
   sbplString,
   scratchEnv,
   seatbeltProfile,
@@ -25,6 +28,23 @@ function tempDir(): string {
   tempDirs.push(dir);
   return dir;
 }
+
+// F6 seam: the idempotency-key suffix and the spec field are derived together
+// from one resolved engine value, so they can never split across two config
+// reads. createRun resolves the engine once and threads it to both.
+test("sandboxRunIdentity derives key suffix and spec field from one engine value", () => {
+  const on = sandboxRunIdentity("seatbelt-v1");
+  expect(on.keySuffix).toBe(":sandbox-seatbelt-v1");
+  expect(on.specField).toEqual({ sandbox_engine: "seatbelt-v1" });
+  const off = sandboxRunIdentity(null);
+  expect(off.keySuffix).toBe("");
+  expect(off.specField).toEqual({});
+  // The key carries the engine iff the spec records it — the two cannot diverge.
+  for (const engine of ["seatbelt-v1", null] as const) {
+    const id = sandboxRunIdentity(engine);
+    expect(id.keySuffix !== "").toBe(id.specField.sandbox_engine !== undefined);
+  }
+});
 
 test("sandboxPosture: only implementer/verifier get project-write", () => {
   expect(sandboxPosture("implementer")).toBe("project-write");
@@ -102,12 +122,64 @@ test("scratchEnv redirects temp and caches into the run scratch", () => {
   });
 });
 
-test("acceptableHostTmpDir rejects broad shared parents and HOME ancestors", () => {
-  const home = "/Users/u";
-  expect(acceptableHostTmpDir("/private/var/folders/ab/cdef/T", home)).toBe(true);
-  for (const broad of ["/", "/tmp", "/private/tmp", "/private/var", "/private/var/folders", "/Users", home]) {
+// F1 repro: the old acceptableHostTmpDir returned true for any $TMPDIR that
+// wasn't a hardcoded broad parent, so ~/Documents, another repo, and
+// /opt/company/config all slipped into the write allow-set. Only the real
+// Darwin per-user temp (owned by the current uid) may be accepted now.
+test("acceptableHostTmpDir accepts only the real Darwin per-user temp, not arbitrary TMPDIR", () => {
+  // A real, current-uid-owned per-user temp dir under /private/var/folders is
+  // accepted (synthetic home outside the temp tree so temp is not its ancestor).
+  const realTemp = process.env.TMPDIR ? realpathSync(process.env.TMPDIR).replace(/\/$/, "") : null;
+  if (realTemp && /^(?:\/private)?\/var\/folders\/[^/]+\/[^/]+\/T$/.test(realTemp)) {
+    expect(acceptableHostTmpDir(realTemp, "/Users/synthetic-home")).toBe(true);
+  }
+  // F1 attack paths: the old impl accepted any $TMPDIR that wasn't a hardcoded
+  // broad parent, so all three slipped into the write allow-set. The Darwin
+  // per-user-temp regex now rejects them before any dir even needs to exist.
+  const home = "/Users/alice";
+  for (const attack of ["/Users/alice/Documents", "/Users/alice/other-repo", "/opt/company/config", "/Users/alice/.pi"]) {
+    expect(acceptableHostTmpDir(attack, home)).toBe(false);
+  }
+  // Broad shared parents and the var/folders root (no /T component) stay rejected.
+  for (const broad of ["/", "/tmp", "/private/tmp", "/private/var", "/private/var/folders", "/private/var/folders/ab/cdef", "/Users", home]) {
     expect(acceptableHostTmpDir(broad, home)).toBe(false);
   }
+});
+
+// F2 repro: provider/controller state dirs are realpath'd and then handed to
+// (subpath ...) allows. Without this gate, a symlinked `~/.pi -> $HOME` (or
+// `XDG_STATE_HOME -> /`) canonicalizes to HOME/root and grants a home/root-wide
+// write. narrowWritableDirReason must reject every such target.
+test("narrowWritableDirReason rejects home/root/ancestor/shared/non-owned/non-dir targets", () => {
+  const root = realpathSync(tempDir());
+  const home = join(root, "home");
+  const worktree = join(home, "proj", "repo");
+  mkdirSync(worktree, { recursive: true });
+  const good = join(home, ".pi");
+  mkdirSync(good, { recursive: true });
+
+  expect(narrowWritableDirReason(good, home, worktree)).toBeNull(); // the legit case
+  expect(narrowWritableDirReason(home, home, worktree)).toContain("home");
+  expect(narrowWritableDirReason("/", home, worktree)).toContain("shared system root");
+  expect(narrowWritableDirReason(join(home, "proj"), home, worktree)).toContain("ancestor of it"); // worktree parent
+  expect(narrowWritableDirReason(root, home, worktree)).toContain("ancestor of HOME"); // HOME's parent
+  for (const shared of ["/usr", "/etc", "/private/var/folders", "/Library", "/opt"]) {
+    expect(narrowWritableDirReason(shared, home, worktree)).toContain("shared system root");
+  }
+  // Non-directory (a symlink resolved to a file) and non-existent are rejected.
+  const file = join(home, "afile");
+  writeFileSync(file, "x", "utf8");
+  expect(narrowWritableDirReason(file, home, worktree)).toContain("not a directory");
+  expect(narrowWritableDirReason(join(home, "missing"), home, worktree)).toContain("does not exist");
+});
+
+test("rootLevelStateFileReason accepts only direct children of HOME", () => {
+  const home = "/Users/u";
+  expect(rootLevelStateFileReason("/Users/u/.claude.json", home)).toBeNull();
+  expect(rootLevelStateFileReason("/Users/u/.claude.json.backup", home)).toBeNull();
+  // A symlinked ~/.claude.json resolving off HOME (e.g. -> /etc/hosts) is rejected.
+  expect(rootLevelStateFileReason("/etc/hosts", home)).toContain("direct child of HOME");
+  expect(rootLevelStateFileReason("/Users/u/nested/x.json", home)).toContain("direct child of HOME");
 });
 
 test("seatbeltProfile: default-deny writes, minimal allows, Git denied last", () => {

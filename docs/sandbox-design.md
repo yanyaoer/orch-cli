@@ -1,6 +1,6 @@
 # orch macOS Sandbox 设计
 
-Status: Implemented (`seatbelt-v1`, 2026-07-14；实现入口 `drivers/sandbox.ts` + `buildProviderExecutionPlan`)
+Status: Implemented (`seatbelt-v1`, 2026-07-14；实现入口 `drivers/sandbox.ts` + `buildProviderExecutionPlan` + host dispatch `src/dispatch.ts`。已过一轮 review 修复：TMPDIR 白名单收窄、provider/controller state symlink 校验、host-side dispatch 边界、verifier 纳入 project-write 锁/证据、sandbox engine 单次计算。证据见 `docs/reviews/`)
 
 本文定义 `orch` 的本地 sandbox 目标设计。它解决的是个人在真实仓库中编排多个高权限 agent 时的误操作半径，不把本机 agent 包装成不可信租户，也不试图替代虚拟机。
 
@@ -86,7 +86,7 @@ orch supervisor
 
 `verifier` 需要运行会创建构建产物、测试缓存和快照的命令，因此使用 `project-write`。若将来出现纯只读 verifier，再增加显式 role，而不是猜测某条命令是否会写。
 
-`controller` 是唯一可以写 orch state 的 role，因为它需要通过 `Bash(orch *)` 派发任务、记录 decision 和回复 mail。它仍没有 Claude `Edit`/`Write` 工具，worktree 也被 Seatbelt 强制只读。只开放精确的 `${XDG_STATE_HOME:-$HOME/.local/state}/orch`，不开放整个 `~/.local/state`。
+`controller` 需要派发任务、记录 decision 和回复 mail，但一个 sandboxed controller 无法直接 spawn 可用的 worker：它 spawn 的任何进程都继承它的只读 Seatbelt，而 macOS 不能嵌套 `sandbox_apply`。因此 controller 只获得一个窄的 **dispatch outbox**（`${XDG_STATE_HOME:-$HOME/.local/state}/orch/dispatch`），不再获得整个 orch state root（否则它能覆盖任意 run 的 `spec.json`/`status.json`/`result.json`/`sandbox.json`，违反“一文件一写者”）。controller 的 state 变更类 `orch` 子命令（`run create`、`decision`、`mail` 等）被写入该 outbox，由一个 unsandboxed host reconciler 执行；reconciler spawn 的 worker 各自应用一层全新的 Seatbelt，从而获得正确 posture。`orch new` 在其 controller 生命周期内 in-process 运行该 reconciler；`orch mailctl poll` 每次 cron drain 一次；`orch dispatch reconcile --watch` 是 mail controller 的低延迟伴随进程。只读 `orch` 命令（`wait`/`result`/`status`）仍在 sandbox 内本地执行。它仍没有 Claude `Edit`/`Write` 工具，worktree 也被 Seatbelt 强制只读。
 
 ### 4.2 provider 适配
 
@@ -153,7 +153,8 @@ profile 使用以下形态：
 3. 目录通过 `realpath` 固定到真实位置，避免 symlink 别名扩大规则；
 4. 精确文件路径通过 canonical parent 加 basename 构造；
 5. 拒绝 NUL、换行和其他不能安全进入 SBPL string 的控制字符；
-6. SBPL 对反斜杠和双引号做专用转义，不能复用 shell quoting。
+6. SBPL 对反斜杠和双引号做专用转义，不能复用 shell quoting；
+7. 每一个来自 provider/controller state 的可写 subpath，canonicalize 后必须再过一道窄目录校验：拒绝 `/`、HOME、HOME/worktree 的祖先、共享系统根、非目录、以及非当前 uid 拥有的目录（否则 `~/.pi -> $HOME` 之类的 symlink 会把整个 home 变成可写）。根级 provider state 文件（`~/.claude.json*`）必须 canonicalize 到 HOME 的直属子级，否则拒绝。
 
 缺失的 provider 状态目录表示该 provider 尚未完成初始化，run 应提示用户先在普通终端登录，而不是开放整个 home 让 provider 自行寻找落点。
 
@@ -165,9 +166,9 @@ profile 使用以下形态：
 - 当前 provider 的状态路径；
 - `${runDir}/scratch/`；
 - `/private/tmp/`，用于 Claude 等 CLI 的已验证临时文件；
-- 当前进程的 canonical `TMPDIR`，仅在它不是过宽的共享父目录时；
+- 当前进程的 canonical `TMPDIR`，仅当它是真正的 Darwin per-user temp（`/private/var/folders/<hash>/<hash>/T[/...]`）且由当前 uid 拥有时；任意 `$TMPDIR`（`~/Documents`、其他 repo、`/opt/...`）一律拒绝，防止调用者用环境变量把任意目录塞进写白名单；
 - 精确的 `/dev/null`；
-- controller role 的 canonical orch state root。
+- controller role 的 canonical dispatch outbox（`${orchStateRoot}/dispatch`，非整个 orch state root）。
 
 `/private/tmp` 是有意接受的 disposable-state 例外，不应被描述成项目边界的一部分。`/private/var/folders` 整棵树、整个 `/dev`、整个 run dir 都不允许写。
 

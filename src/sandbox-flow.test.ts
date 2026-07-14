@@ -261,3 +261,139 @@ printf '%s\\n' '${JSON.stringify(result)}'
   const events = readFileSync(join(runDir, "events.jsonl"), "utf8");
   expect(events).toContain("sandbox_engine=seatbelt-v1 sandbox_posture=project-write");
 }, 30_000);
+
+// Writes inside.txt in its cwd (the worktree — project-write) and tries an
+// out-of-jail write that must be denied, then emits a valid implementer result.
+function writeFakeImplementerPi(binDir: string, outsideProbe: string): void {
+  mkdirSync(binDir, { recursive: true });
+  const result = {
+    schema: "orch.result/implementer/v1",
+    run_id: "RUN_ID",
+    verdict: "completed",
+    summary: "dispatched implementer completed",
+    base_sha: "BASE",
+    head_sha: "BASE",
+    changed_files: ["inside.txt"],
+    tests: [],
+    acceptance: [],
+    risks: [],
+    rollback: "none",
+  };
+  writeFileSync(
+    join(binDir, "pi"),
+    `#!/bin/sh
+cat >/dev/null
+echo dispatched > inside.txt || { echo WORKTREE_NOT_WRITABLE >&2; exit 9; }
+if echo escape > ${JSON.stringify(outsideProbe)} 2>/dev/null; then echo JAIL_BROKEN >&2; exit 9; fi
+printf '%s\\n' '${JSON.stringify(result)}'
+`,
+    "utf8",
+  );
+  chmodSync(join(binDir, "pi"), 0o755);
+}
+
+// F3: a state-mutating orch command issued from INSIDE the sandbox (marker set,
+// as a real controller's shelled `orch run create` would be) proxies to the
+// unsandboxed host reconciler, which spawns the worker with a FRESH sandbox so
+// the dispatched implementer actually gets project-write. Uses a real
+// `orch dispatch reconcile --watch` host process — no LLM, fully deterministic.
+test.skipIf(process.platform !== "darwin")(
+  "sandboxed dispatch: run create proxies to the host reconciler; the worker gets project-write",
+  async () => {
+    const fx = await fixture(true);
+    const binDir = join(fx.home, "bin");
+    const outsideProbe = join(fx.home, "dispatch_escape.txt");
+    writeFakeImplementerPi(binDir, outsideProbe);
+    const env = { ...fx.env, PATH: `${binDir}:${process.env.PATH ?? ""}` };
+
+    // Unsandboxed host reconciler (the role orch new / a mailctl companion
+    // plays). cwd stays the repo root so the relative `src/orch.ts` resolves.
+    const reconciler = Bun.spawn([process.execPath, "src/orch.ts", "dispatch", "reconcile", "--watch"], {
+      cwd: process.cwd(),
+      env: { ...process.env, ...env },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    try {
+      // Issued as if from inside the controller's sandbox: the marker makes
+      // `orch run create` proxy instead of spawning a (doomed) nested worker.
+      const created = await runOrch(createArgs(fx.worktree), { ...env, ORCH_SANDBOX_ENGINE: "seatbelt-v1" }, "dispatched task\n");
+      expect(created.exitCode).toBe(0);
+      const runId = (JSON.parse(created.stdout) as { run_id: string }).run_id;
+      const runDir = join(fx.runsDir, runId);
+      const status = await waitForTerminal(join(runDir, "status.json"), 30_000);
+
+      // The dispatched worker ran host-side under its OWN fresh sandbox with
+      // project-write: inside write landed, out-of-jail write was denied.
+      expect(status.state).toBe("done");
+      expect(status.sandbox_engine).toBe("seatbelt-v1");
+      expect(status.sandbox_posture).toBe("project-write");
+      expect(readFileSync(join(fx.worktree, "inside.txt"), "utf8").trim()).toBe("dispatched");
+      expect(existsSync(outsideProbe)).toBe(false);
+      // The formal spec was written host-side (not by the sandboxed caller).
+      const spec = JSON.parse(readFileSync(join(runDir, "spec.json"), "utf8")) as RunSpec;
+      expect(spec.sandbox_engine).toBe("seatbelt-v1");
+    } finally {
+      reconciler.kill();
+      await reconciler.exited;
+    }
+  },
+  45_000,
+);
+
+// F5: the controller's Seatbelt grants ONLY the narrow dispatch outbox, never
+// the orch state root — so it cannot overwrite any run's formal artifacts, yet
+// its host-side operations (queued via the dispatch dir) still complete.
+test.skipIf(process.platform !== "darwin")(
+  "controller jail: dispatch dir writable, run artifacts denied",
+  async () => {
+    const fx = await fixture(true);
+    // The controller runs on claude: it needs its own logged-in state present.
+    mkdirSync(join(fx.home, ".claude"), { recursive: true });
+    writeFileSync(join(fx.home, ".claude.json"), "{}", "utf8");
+    // A pre-existing run whose spec.json the controller must NOT be able to
+    // clobber (it lives under the orch state root, outside the dispatch dir).
+    const victimRunDir = join(fx.runsDir, "victim-run");
+    mkdirSync(victimRunDir, { recursive: true });
+    writeFileSync(join(victimRunDir, "spec.json"), '{"trusted":true}', "utf8");
+    const stateRoot = join(fx.env.XDG_STATE_HOME!, "orch");
+
+    // Fake claude controller: probes the boundary from inside its own jail,
+    // then emits a controller result.
+    const binDir = join(fx.home, "bin");
+    mkdirSync(binDir, { recursive: true });
+    const result = { schema: "orch.result/controller/v1", run_id: "RUN_ID", verdict: "completed", summary: "probed", actions: [] };
+    writeFileSync(
+      join(binDir, "claude"),
+      `#!/bin/sh
+cat >/dev/null
+# Writing a run's formal artifact under the state root must be denied.
+if echo clobbered > ${JSON.stringify(join(victimRunDir, "spec.json"))} 2>/dev/null; then echo ARTIFACT_WRITABLE >&2; fi
+# Writing the dispatch outbox must succeed (that is how it queues work).
+echo probe > ${JSON.stringify(join(stateRoot, "dispatch", "pending", "probe.json"))} 2>/dev/null || echo DISPATCH_DENIED >&2
+printf '%s\\n' '${JSON.stringify(result)}'
+`,
+      "utf8",
+    );
+    chmodSync(join(binDir, "claude"), 0o755);
+    const env = { ...fx.env, PATH: `${binDir}:${process.env.PATH ?? ""}` };
+
+    const created = await runOrch(
+      ["run", "create", "--mr", "42", "--role", "controller", "--agent", "claude", "--worktree", fx.worktree, "--task", "-", "--json"],
+      env,
+      "probe the controller jail\n",
+    );
+    expect(created.exitCode).toBe(0);
+    const runId = (JSON.parse(created.stdout) as { run_id: string }).run_id;
+    const status = await waitForTerminal(join(fx.runsDir, runId, "status.json"), 30_000);
+    expect(status.state).toBe("done");
+
+    // The victim run's spec.json is untouched (artifact write was jailed out).
+    expect(JSON.parse(readFileSync(join(victimRunDir, "spec.json"), "utf8"))).toEqual({ trusted: true });
+    // The controller's own stderr must not report a boundary breach.
+    const stderr = readFileSync(join(fx.runsDir, runId, "stderr.log"), "utf8");
+    expect(stderr).not.toContain("ARTIFACT_WRITABLE");
+    expect(stderr).not.toContain("DISPATCH_DENIED");
+  },
+  30_000,
+);

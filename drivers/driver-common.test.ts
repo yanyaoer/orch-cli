@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -958,10 +958,24 @@ test.skipIf(process.platform !== "darwin")("seatbelt profile grants the minimum 
   expect(claude.profile).toContain(`(literal "${canonical(join(claude.home, ".claude.json"))}")`);
   expect(claude.profile).toContain(`(literal "${canonical(claude.home)}/.claude.json.backup")`);
 
-  // controller: worktree read-only + exactly the orch state root.
+  // controller: worktree read-only + only the narrow dispatch outbox (F5: NOT
+  // the whole orch state root, which would let it overwrite every run's
+  // spec/status/result/sandbox.json).
   const controller = profileFor("controller", "claude");
   expect(controller.profile).not.toContain(`(subpath "${canonical(controller.worktree)}")`);
-  expect(controller.profile).toContain(`(subpath "${canonical(controller.home)}/.local/state/orch")`);
+  expect(controller.profile).toContain(`(subpath "${canonical(controller.home)}/.local/state/orch/dispatch")`);
+  expect(controller.profile).not.toContain(`(subpath "${canonical(controller.home)}/.local/state/orch")`);
+});
+
+// F2 at the plan level: a symlinked provider-state dir that resolves to $HOME
+// must fail closed, not silently widen the profile to a home-wide write.
+test.skipIf(process.platform !== "darwin")("seatbelt plan fails closed when provider state symlinks to HOME", () => {
+  const ctx = seatbeltContext("implementer", "pi");
+  rmSync(join(ctx.home, ".pi"), { recursive: true, force: true });
+  symlinkSync(ctx.home, join(ctx.home, ".pi")); // ~/.pi -> $HOME
+  expect(() =>
+    buildProviderExecutionPlan({ provider: "pi", spec: ctx.spec, runDir: ctx.runDir, worktree: ctx.worktree, env: ctx.env }),
+  ).toThrow(/state-target[\s\S]*home directory/);
 });
 
 test.skipIf(process.platform !== "darwin")("seatbelt preflight fails closed: hardlinks, missing provider state, nesting, dry-run purity", () => {

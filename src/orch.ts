@@ -111,7 +111,8 @@ import {
 import { workspace } from "./workspace-cli.ts";
 import { assertKnownFlags, CliError, collectFlags, flagBool, flagNumber, flagString, hasHelp, parseArgs, printJson, readStdinText, type ParsedArgs } from "./cli.ts";
 import { buildPrompt, buildProviderExecutionPlan, type ProviderExecutionPlan } from "../drivers/driver-common.ts";
-import { sandboxPosture, SEATBELT_ENGINE, seatbeltUnsupportedReason } from "../drivers/sandbox.ts";
+import { sandboxPosture, sandboxRunIdentity, SEATBELT_ENGINE, seatbeltUnsupportedReason } from "../drivers/sandbox.ts";
+import { insideSandbox, proxyToHost, reconcileDispatchOnce, reconcileDispatchWatch, shouldProxyToHost } from "./dispatch.ts";
 import { classifyNewOpenQuestions, evaluateNewExecution, validateNewPlanMarkdown, type NewExecutionRun } from "./new-flow.ts";
 
 type IdempotencyRecord = {
@@ -1277,16 +1278,18 @@ async function createRun(args: ParsedArgs): Promise<number> {
   if (!Number.isFinite(timeoutSec) || timeoutSec <= 0) throw new CliError("--timeout-sec must be positive");
   const providerSession = resume ? resume.session : providerSessionConfig(args, agent, roleDefaults.model ?? null);
 
-  // Validated before any run state is touched: sandbox:true on a platform
-  // that cannot apply it must fail the create, not produce a doomed run.
+  // Resolved exactly once here and threaded through to the spec, key,
+  // compatibility check, dry-run, and startRun (F6): a config change between
+  // two reads must not split the idempotency key from the recorded spec.
   const sandboxEngine = requestedSandboxEngine();
+  const sandboxIdentity = sandboxRunIdentity(sandboxEngine);
 
   const repo = await getRepoIdentity(worktree);
   const mrDir = mrStateDir(repo.repo_key, mr);
   const taskSha = sha256(taskText);
   // The engine version is part of the default fingerprint so sandboxed and
   // unsandboxed requests can never reuse each other's runs.
-  const defaultIdempotencyKey = `mr${mr}:${tag}:${taskSha}:session-${providerSessionFingerprint(providerSession)}${sandboxEngine ? `:sandbox-${sandboxEngine}` : ""}`;
+  const defaultIdempotencyKey = `mr${mr}:${tag}:${taskSha}:session-${providerSessionFingerprint(providerSession)}${sandboxIdentity.keySuffix}`;
   const idempotencyKey = flagString(args, "idempotency-key", defaultIdempotencyKey);
   const idempotencyPath = `${mrDir}/idempotency.json`;
   const dryRun = flagBool(args, "dry-run");
@@ -1310,7 +1313,7 @@ async function createRun(args: ParsedArgs): Promise<number> {
       agent,
       tag,
       ...(orchLanguage() === "中文" ? { language: "中文" as const } : {}),
-      ...(sandboxEngine ? { sandbox_engine: sandboxEngine } : {}),
+      ...sandboxIdentity.specField,
       ...effectiveSession,
       idempotency_key: idempotencyKey,
       repo_key: repo.repo_key,
@@ -1440,6 +1443,7 @@ async function createRun(args: ParsedArgs): Promise<number> {
       mrDir,
       idempotencyKey,
       idempotencyPath,
+      sandboxEngine,
     })),
   });
   return 0;
@@ -1461,17 +1465,18 @@ interface StartRunInput {
   mrDir: string;
   idempotencyKey: string;
   idempotencyPath: string;
+  // Resolved once by the caller (createRun) and passed in immutable, so the
+  // spec startRun writes cannot diverge from the idempotency key createRun
+  // built from an earlier config read (F6).
+  sandboxEngine: typeof SEATBELT_ENGINE | null;
 }
 
 // Spawns a single supervised run and returns its create payload. Shared by
 // `run create` and the fan-out commands (cross-review / fanout / investigate).
 async function startRun(input: StartRunInput): Promise<Record<string, unknown>> {
   const { args, mr, role, agent, tag, worktree, taskPath, taskText, taskSha, timeoutSec } = input;
-  const { providerSession, repo, mrDir, idempotencyKey, idempotencyPath } = input;
-
-  // Recomputed here (not passed in) so every startRun caller gets the same
-  // fail-closed platform validation before any state is written.
-  const sandboxEngine = requestedSandboxEngine();
+  const { providerSession, repo, mrDir, idempotencyKey, idempotencyPath, sandboxEngine } = input;
+  const sandboxIdentity = sandboxRunIdentity(sandboxEngine);
 
   try {
     ensureStateLayout(mrDir);
@@ -1526,7 +1531,7 @@ async function startRun(input: StartRunInput): Promise<Record<string, unknown>> 
       agent,
       tag,
       ...(orchLanguage() === "中文" ? { language: "中文" as const } : {}),
-      ...(sandboxEngine ? { sandbox_engine: sandboxEngine } : {}),
+      ...sandboxIdentity.specField,
       ...providerSession,
       idempotency_key: idempotencyKey,
       repo_key: repo.repo_key,
@@ -2238,7 +2243,16 @@ async function newCommand(args: ParsedArgs): Promise<number> {
     worktree,
   );
   process.stderr.write(`[orch new] executing; follow along: orch wait --thread ${mr} · orch events tail --mr ${mr} -f --native\n`);
-  const execStatus = await newWaitRun(execHandle, "exec");
+  // When config sandbox is on, the controller runs under Seatbelt and cannot
+  // spawn workers itself; it enqueues them to the dispatch queue. This
+  // unsandboxed parent drains that queue in-process for the controller's whole
+  // lifetime, so dispatched workers are spawned host-side with project-write.
+  let controllerDone = false;
+  const reconcile = reconcileDispatchWatch(orchCommand(), () => controllerDone);
+  const execStatus = await newWaitRun(execHandle, "exec").finally(() => {
+    controllerDone = true;
+  });
+  await reconcile;
   const execResult = readJsonFile<RoleResult | null>(execHandle.result_path, null);
   if (execResult && "summary" in execResult) process.stderr.write(`\n[orch new] controller summary: ${execResult.summary}\n`);
   if (execResult && execResult.schema === "orch.result/controller/v1") {
@@ -3550,6 +3564,28 @@ async function updateCommand(args: ParsedArgs): Promise<number> {
   return 0;
 }
 
+// Unsandboxed host reconciler for the dispatch queue: executes the state
+// mutations a sandboxed controller enqueued (run create, decision, mail, …).
+// `--watch` is the companion for the mailctl controller (which runs detached);
+// orch new drives the same reconcile loop in-process while its controller runs.
+async function dispatchCommand(args: ParsedArgs): Promise<number> {
+  const sub = args.positionals[1];
+  if (sub !== "reconcile") {
+    process.stderr.write("usage: orch dispatch reconcile [--once|--watch]\n");
+    return 2;
+  }
+  assertKnownFlags(args, "dispatch reconcile", ["once", "watch", "json"]);
+  if (flagBool(args, "watch")) {
+    process.stderr.write("orch dispatch reconcile --watch: draining sandboxed dispatch requests (Ctrl-C to stop)\n");
+    await reconcileDispatchWatch(orchCommand(), () => false);
+    return 0;
+  }
+  const handled = await reconcileDispatchOnce(orchCommand());
+  if (flagBool(args, "json")) printJson({ reconciled: handled });
+  else process.stdout.write(`dispatch reconcile: handled ${handled} request(s)\n`);
+  return 0;
+}
+
 async function main(): Promise<number> {
   const args = parseArgs(process.argv.slice(2));
   const [first, second] = args.positionals;
@@ -3562,6 +3598,23 @@ async function main(): Promise<number> {
   if (first === "__driver-claude") return runClaudeDriver(process.argv.slice(3));
   if (first === "__driver-pi") return runPiDriver(process.argv.slice(3));
   if (first === "__driver-omp") return runOmpDriver(process.argv.slice(3));
+
+  // Host-side dispatch boundary: a state-mutating orch command issued from
+  // inside a sandbox (a controller's `orch run create` / decision / mail) can't
+  // spawn a working worker or touch run artifacts under the jail. Proxy it to
+  // the unsandboxed host reconciler and relay its result. Reads run locally.
+  if (insideSandbox() && first !== "dispatch" && shouldProxyToHost(args.positionals)) {
+    const forwardArgv = process.argv.slice(2);
+    // Only drain stdin when the command actually takes it (a `-` marker, e.g.
+    // `--task -`); reading unconditionally could block a stdin-less command
+    // (decision/mail) if the shell left stdin open.
+    const stdin = !process.stdin.isTTY && forwardArgv.includes("-") ? await readStdinText() : "";
+    const result = await proxyToHost({ argv: forwardArgv, stdin, cwd: process.cwd() });
+    if (result.stdout) process.stdout.write(result.stdout);
+    if (result.stderr) process.stderr.write(result.stderr);
+    return result.exit_code;
+  }
+  if (first === "dispatch") return dispatchCommand(args);
 
   // Bare `orch` is the overview: current state + runnable pending actions.
   // `orch --help` keeps printing the command reference.

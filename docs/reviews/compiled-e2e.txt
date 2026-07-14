@@ -1,0 +1,7 @@
+### [compiled] dry-run sandbox plan
+engine=seatbelt-v1 posture=project-write native=False argv0=/usr/bin/sandbox-exec hash_len=64
+### [compiled] real sandboxed implementer run
+state=done inside=inside escape_blocked=yes
+status engine=seatbelt-v1 posture=project-write native=False
+### [compiled] host dispatch: marker run-create proxied -> reconciler -> worker project-write
+dispatched state=done inside=inside engine=seatbelt-v1

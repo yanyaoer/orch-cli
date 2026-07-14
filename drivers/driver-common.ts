@@ -8,7 +8,9 @@ import {
   acceptableHostTmpDir,
   canonicalizePath,
   findWorktreeHardlinks,
+  narrowWritableDirReason,
   providerStatePaths,
+  rootLevelStateFileReason,
   sandboxPosture,
   scratchEnv,
   SEATBELT_ENGINE,
@@ -1011,20 +1013,45 @@ export function buildProviderExecutionPlan(ctx: ExecutionContext): ProviderExecu
     );
   }
 
+  // Every canonical write subpath derived from provider/controller state must
+  // survive the narrow-dir gate: a symlinked `~/.pi -> $HOME` or
+  // `XDG_STATE_HOME -> /` would otherwise become a home/root-wide (subpath ...)
+  // allow. Fail closed on the first offender instead of widening the boundary.
+  const providerStateDirs = state.dirs.map(canonicalizePath);
+  for (const dir of providerStateDirs) {
+    const reason = narrowWritableDirReason(dir, canonicalHome, canonicalWorktree);
+    if (reason) fail("state-target", `provider state ${dir} ${reason}; refusing to grant it as a write subpath`);
+  }
+  const providerStateFiles = state.files.map(canonicalizePath);
+  for (const file of providerStateFiles) {
+    const reason = rootLevelStateFileReason(file, canonicalHome);
+    if (reason) fail("state-target", `provider state file ${file} ${reason}; refusing to grant it as a write literal`);
+  }
+
+  // Finding 5: the controller does NOT get the whole orch state root (that
+  // would let it overwrite every run's spec/status/result/sandbox.json). Its
+  // only writable orch area is a narrow dispatch outbox; a host-side reconciler
+  // executes the queued state mutations (see src/dispatch.ts). The driver runs
+  // unsandboxed, so it creates and canonicalizes the dir here.
+  let orchStateDir: string | null = null;
+  if (spec.role === "controller") {
+    const stateRoot = env.XDG_STATE_HOME ? `${env.XDG_STATE_HOME}/orch` : `${home}/.local/state/orch`;
+    const dispatchDir = `${stateRoot}/dispatch`;
+    if (!ctx.dryRun) mkdirSync(`${dispatchDir}/pending`, { recursive: true, mode: 0o700 });
+    orchStateDir = canonicalizePath(dispatchDir);
+    const reason = narrowWritableDirReason(orchStateDir, canonicalHome, canonicalWorktree);
+    if (reason) fail("state-target", `controller dispatch dir ${orchStateDir} ${reason}; refusing to grant it as a write subpath`);
+  }
+
   const hostTmp = env.TMPDIR ? canonicalizePath(env.TMPDIR) : null;
   const profile = seatbeltProfile({
     posture,
     worktree: canonicalWorktree,
     scratchDir: canonicalScratch,
-    providerStateDirs: state.dirs.map(canonicalizePath),
-    providerStateFiles: state.files.map(canonicalizePath),
-    hostTmpDir: hostTmp && acceptableHostTmpDir(hostTmp, canonicalHome) ? hostTmp : null,
-    // controller dispatches via Bash(orch *): exactly the orch state root, not
-    // the whole ~/.local/state.
-    orchStateDir:
-      spec.role === "controller"
-        ? canonicalizePath(env.XDG_STATE_HOME ? `${env.XDG_STATE_HOME}/orch` : `${home}/.local/state/orch`)
-        : null,
+    providerStateDirs,
+    providerStateFiles,
+    hostTmpDir: hostTmp && acceptableHostTmpDir(hostTmp, canonicalHome, canonicalWorktree) ? hostTmp : null,
+    orchStateDir,
   });
 
   return {

@@ -1,0 +1,14 @@
+date_utc: 2026-07-14T12:22:12Z
+bun: 1.3.14   binary: dist/orch (compiled)   host: macOS (darwin)
+--- four-provider fresh/resume ---
+pi FRESH: state=done verdict=completed engine=seatbelt-v1 hello=[hello] escape=blocked run=implementer-20260714T121720-e50d0f
+pi RESUME: skipped (no provider_resume_id backfilled — pre-existing gap, not sandbox-related)
+codex FRESH: state=done verdict=completed engine=seatbelt-v1 hello=[hello] escape=blocked run=implementer-20260714T121745-0d24ed
+codex RESUME: state=done verdict=completed hello=[hello,resumed,]
+claude FRESH: state=done verdict=completed engine=seatbelt-v1 hello=[hello] escape=blocked run=implementer-20260714T121911-90de38
+claude RESUME: state=done verdict=completed hello=[hello,resumed,]
+omp FRESH: state=done verdict=completed engine=seatbelt-v1 hello=[hello] escape=blocked run=implementer-20260714T122000-ec5ab0
+omp RESUME: skipped (no provider_resume_id backfilled — pre-existing gap, not sandbox-related)
+--- real-LLM claude controller dispatch ---
+controller: state=done verdict=completed
+dispatched worker: state=done engine=seatbelt-v1 posture=project-write output=[dispatched] escape=blocked
