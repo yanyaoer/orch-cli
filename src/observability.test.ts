@@ -584,7 +584,9 @@ test("run create dry-run passes explicit model to the pi provider plan", async (
       "--dry-run",
       "--json",
     ],
-    { XDG_STATE_HOME: stateHome },
+    // Isolate config: the host's real config.json may set sandbox:true, which
+    // would wrap the expected native pi argv in a Seatbelt plan.
+    { XDG_STATE_HOME: stateHome, XDG_CONFIG_HOME: join(root, "config") },
   );
 
   expect(result).toMatchObject({ exitCode: 0, stderr: "" });
