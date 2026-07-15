@@ -16,9 +16,13 @@
     "orch": "bun run src/orch.ts",
     "test": "bun test",
     "build": "bun build src/orch.ts --compile --outfile dist/orch",
+    "docs:build": "bun run scripts/docs.ts build",
+    "docs:check": "bun run scripts/docs.ts check",
     "install:local": "bun run build && mkdir -p \"$HOME/.local/bin\" && rm -f \"$HOME/.local/bin/orch\" && cp dist/orch \"$HOME/.local/bin/orch\" && chmod 755 \"$HOME/.local/bin/orch\""
   },
   "devDependencies": {
-    "@types/bun": "latest"
+    "@types/bun": "latest",
+    "github-slugger": "2.0.0",
+    "marked": "18.0.6"
   }
 }

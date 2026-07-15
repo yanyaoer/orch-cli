@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark light">
   <title>orch-cli × matchlock — microVM sandbox 交互流程</title>
+  <link rel="stylesheet" href="assets/site.css">
   <style>
     :root {
       --bg: #0b0f14; --panel: #10161d; --panel-2: #0e141b;
@@ -33,8 +34,8 @@
       border-radius: 4px; padding: .1em .4em; }
     .wrap { width: min(1180px, calc(100% - 40px)); margin: 0 auto; }
 
-    header { border-bottom: 1px solid var(--line); background: var(--panel-2); }
-    header .wrap { padding: 20px 20px 22px; }
+    .matchlock-heading { border-bottom: 1px solid var(--line); background: var(--panel-2); }
+    .matchlock-heading .wrap { padding: 20px 20px 22px; }
     .brand { font: 700 14px var(--mono); color: var(--text); }
     .brand span { color: var(--accent); }
     h1 { font-size: 22px; margin: 10px 0 6px; letter-spacing: -.01em; }
@@ -108,7 +109,26 @@
   </style>
 </head>
 <body>
-<header>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+  <nav class="site-nav site-wrap" aria-label="Primary">
+    <a class="site-brand" href="index.html"><span>$</span> orch</a>
+    <details class="site-menu">
+      <summary>Menu</summary>
+      <div class="site-nav-links">
+        <a href="index.html">Home</a>
+        <a class="is-current" aria-current="page" href="contents.html">Docs</a>
+        <a href="adr/index.html">ADRs</a>
+        <a href="specs/index.html">Specs</a>
+        <a href="contents.html#reviews">Reviews</a>
+        <a href="contents.html#evidence">Evidence</a>
+        <a href="https://github.com/yanyaoer/orch-cli">GitHub</a>
+      </div>
+    </details>
+  </nav>
+</header>
+
+<section class="matchlock-heading">
   <div class="wrap">
     <div class="brand">orch<span>-cli</span> × matchlock</div>
     <h1>microVM sandbox — 交互流程（PlantUML v1）</h1>
@@ -120,10 +140,18 @@
       <span class="chip warn"><b>接缝</b> driver-common.ts:878</span>
     </div>
   </div>
-</header>
+</section>
 
-<main>
+<main id="main">
   <div class="wrap">
+    <nav class="breadcrumbs" aria-label="Breadcrumb">
+      <ol>
+        <li><a href="index.html">Home</a></li>
+        <li><a href="contents.html">Docs</a></li>
+        <li><a href="contents.html#diagrams">Diagrams</a></li>
+        <li aria-current="page">matchlock flow</li>
+      </ol>
+    </nav>
     <div class="toolbar">
       <div class="tabs" id="tabs">
         <button data-k="seq" class="on">交互时序</button>

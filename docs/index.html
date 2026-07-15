@@ -6,6 +6,7 @@
   <meta name="color-scheme" content="dark light">
   <meta name="description" content="orch runs headless coding agents (codex, claude, pi, omp) as supervised, auditable local jobs — no daemon, signed local mail bus, schema-validated results.">
   <title>orch-cli — daemonless multi-agent orchestration</title>
+  <link rel="stylesheet" href="assets/site.css">
   <style>
     :root {
       --bg: #0b0f14;
@@ -324,28 +325,33 @@
   </style>
 </head>
 <body class="en">
-  <header>
-    <nav class="wrap" aria-label="Primary">
-      <a class="brand" href="#top"><span>$</span> orch</a>
-      <div class="nav-links">
-        <a href="#flow" data-lang="en">architecture</a>
-        <a href="#flow" data-lang="zh">架构</a>
-        <a href="#roles" data-lang="en">roles</a>
-        <a href="#roles" data-lang="zh">角色</a>
-        <a href="#observe" data-lang="en">observe</a>
-        <a href="#observe" data-lang="zh">观测</a>
-        <a href="#quickstart" data-lang="en">quickstart</a>
-        <a href="#quickstart" data-lang="zh">上手</a>
-        <a href="https://github.com/yanyaoer/orch-cli">GitHub</a>
-        <div class="lang" aria-label="Language">
-          <button type="button" class="active" data-set-lang="en">EN</button>
-          <button type="button" data-set-lang="zh">中文</button>
+  <a class="skip-link" href="#top">Skip to content</a>
+  <header class="site-header">
+    <nav class="wrap site-wrap site-nav" aria-label="Primary">
+      <a class="brand site-brand" href="index.html"><span>$</span> orch</a>
+      <details class="site-menu">
+        <summary>Menu</summary>
+        <div class="nav-links site-nav-links">
+          <a class="is-current" aria-current="page" href="index.html">Home</a>
+          <a href="contents.html">Docs</a>
+          <a href="adr/index.html">ADRs</a>
+          <a href="specs/index.html">Specs</a>
+          <a href="contents.html#reviews">Reviews</a>
+          <a href="contents.html#evidence">Evidence</a>
+          <a href="https://github.com/yanyaoer/orch-cli">GitHub</a>
+          <div class="lang" aria-label="Language">
+            <button type="button" class="active" data-set-lang="en">EN</button>
+            <button type="button" data-set-lang="zh">中文</button>
+          </div>
         </div>
-      </div>
+      </details>
     </nav>
   </header>
 
   <main id="top">
+    <div class="wrap breadcrumbs landing-breadcrumb" role="navigation" aria-label="Breadcrumb">
+      <ol><li aria-current="page">Home</li></ol>
+    </div>
     <div class="wrap hero">
       <p class="eyebrow" data-lang="en">daemonless multi-agent orchestration</p>
       <p class="eyebrow" data-lang="zh">无常驻服务的多 Agent 编排</p>
