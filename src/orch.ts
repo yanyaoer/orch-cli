@@ -2058,13 +2058,13 @@ function newReadPlanResult(handle: NewRunHandle, status: RunStatus): ResearcherR
   const result = readJsonFile<RoleResult | null>(handle.result_path, null);
   if (status.state !== "done" || !result || result.schema !== "orch.result/researcher/v1" || result.verdict !== "completed") {
     throw new CliError(
-      `plan run ${handle.run_id} ended ${status.state}${result ? ` (${resultVerdict(result)})` : ""}; inspect: orch result --mr ${status.mr} --run ${handle.run_id}`,
+      `plan run ${handle.run_id} ended ${status.state}${result ? ` (${resultVerdict(result)})` : ""}; inspect: orch result --mr ${status.mr} --run ${handle.run_id} --worktree ${status.worktree}`,
     );
   }
   const validation = validateNewPlanMarkdown(result.recommendation);
   if (!validation.ok) {
     throw new CliError(
-      `plan run ${handle.run_id} returned an invalid orch new plan:\n${validation.errors.map((error) => `- ${error}`).join("\n")}\ninspect: orch result --mr ${status.mr} --run ${handle.run_id}`,
+      `plan run ${handle.run_id} returned an invalid orch new plan:\n${validation.errors.map((error) => `- ${error}`).join("\n")}\ninspect: orch result --mr ${status.mr} --run ${handle.run_id} --worktree ${status.worktree}`,
     );
   }
   return result;
