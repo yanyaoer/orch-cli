@@ -1020,6 +1020,22 @@ test.skipIf(process.platform !== "darwin")("seatbelt preflight fails closed: har
     buildProviderExecutionPlan({ provider: "pi", spec: linked.spec, runDir: linked.runDir, worktree: linked.worktree, env: linked.env }),
   ).toThrow(/hardlink-preflight[\s\S]*aliased\.txt/);
 
+  // The same hardlinked worktree must NOT block a read-only role: its profile
+  // never write-allows the worktree, so the shared inode stays unreachable
+  // (real-world case: Gradle hardlinks cxx intermediates to committed jniLibs).
+  const linkedReadOnly = seatbeltContext("reviewer", "pi");
+  writeFileSync(join(linkedReadOnly.root, "outside.txt"), "outside", "utf8");
+  linkSync(join(linkedReadOnly.root, "outside.txt"), join(linkedReadOnly.worktree, "aliased.txt"));
+  const readOnlyPlan = buildProviderExecutionPlan({
+    provider: "pi",
+    spec: linkedReadOnly.spec,
+    runDir: linkedReadOnly.runDir,
+    worktree: linkedReadOnly.worktree,
+    env: linkedReadOnly.env,
+  });
+  expect(readOnlyPlan.sandboxEngine).toBe("seatbelt-v1");
+  expect(readOnlyPlan.sandboxPosture).toBe("read-only");
+
   // Provider state missing → tell the user to log in, never open $HOME.
   const uninitialized = seatbeltContext("implementer", "pi");
   rmSync(join(uninitialized.home, ".pi"), { recursive: true, force: true });

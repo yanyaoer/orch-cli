@@ -223,7 +223,7 @@ Codex 的 `--output-last-message` 必须写到 `scratch/last_message.txt`。driv
 
 Seatbelt 是路径策略。一个在 worktree 中已经存在、但与外部文件共享 inode 的 hardlink，可以经允许路径修改外部内容。这个逃逸已被真实 probe 证实。
 
-v1 在启动任何 sandboxed provider 前遍历 worktree 中的普通文件，排除只读的 `.git`，只要发现 `stat.nlink > 1` 就失败关闭，并列出冲突路径。不能提供忽略开关；需要保留 hardlink 的项目应先复制到不共享 inode 的 worktree 或使用更强隔离。
+v1 在启动 worktree 可写的 sandboxed provider 前（posture 为 `project-write`，或 worktree 位于恒可写的 `/private/tmp` 之下）遍历 worktree 中的普通文件，排除只读的 `.git`，只要发现 `stat.nlink > 1` 就失败关闭，并列出冲突路径。不能提供忽略开关；需要保留 hardlink 的项目应先复制到不共享 inode 的 worktree 或使用更强隔离。read-only posture 不做该预检：worktree 路径不在写允许集内，经 hardlink 路径的写入本身就被拒绝，而真实项目（如 Gradle 把 cxx intermediates hardlink 到已提交的 jniLibs）不应因此无法被纯分析角色读取。
 
 已验证 sandbox 内不能新建跨边界 hardlink，symlink 写入和跨边界 rename 也被拒绝。预检仍存在 host 进程在“扫描后、spawn 前”制造 hardlink 的竞态；这在个人防误写威胁模型内接受，在敌对并发模型内不接受。
 
@@ -331,7 +331,7 @@ profile hash 用于诊断和审计，不进入幂等 key，因为 run-scoped scr
 - `/usr/bin/sandbox-exec` 不存在或不可执行；
 - 路径无法 canonicalize，或包含无法安全编码的字符；
 - provider state 未初始化；
-- worktree hardlink 预检失败；
+- worktree hardlink 预检失败（仅 worktree 可写的 posture 执行该预检）；
 - profile 编译/应用失败；
 - 外层 Seatbelt 返回典型 `sandbox_apply` 错误，包括 exit code 71。
 

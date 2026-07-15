@@ -1014,12 +1014,23 @@ export function buildProviderExecutionPlan(ctx: ExecutionContext): ProviderExecu
   }
   const canonicalScratch = canonicalizePath(scratchDir);
 
-  const hardlinks = findWorktreeHardlinks(canonicalWorktree);
-  if (hardlinks.length > 0) {
-    fail(
-      "hardlink-preflight",
-      `worktree files share inodes with content that may live outside the sandbox (Seatbelt is path-based and cannot stop writes through them): ${hardlinks.join(", ")} — use a hardlink-free copy of the project or stronger isolation`,
-    );
+  // A hardlink escape needs a write-allowed path to the shared inode. Only the
+  // project-write posture puts worktree paths in the allow set — plus the edge
+  // case of a worktree living under the always-writable /private/tmp. Under a
+  // read-only worktree every write through a hardlinked path is denied anyway,
+  // so pure-analysis roles must not be blocked by build-tool hardlinks (e.g.
+  // Gradle hardlinks cxx intermediates to committed jniLibs).
+  const worktreeWritable = posture === "project-write"
+    || canonicalWorktree === "/private/tmp"
+    || canonicalWorktree.startsWith("/private/tmp/");
+  if (worktreeWritable) {
+    const hardlinks = findWorktreeHardlinks(canonicalWorktree);
+    if (hardlinks.length > 0) {
+      fail(
+        "hardlink-preflight",
+        `worktree files share inodes with content that may live outside the sandbox (Seatbelt is path-based and cannot stop writes through them): ${hardlinks.join(", ")} — use a hardlink-free copy of the project or stronger isolation`,
+      );
+    }
   }
 
   // Every canonical write subpath derived from provider/controller state must
