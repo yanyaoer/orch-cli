@@ -1,5 +1,10 @@
 # seatbelt-v1 review fixes — 2026-07-14
 
+> Historical first-round evidence. The follow-up review further narrowed the
+> controller grant from the dispatch root to per-run `pending/`, added host-side
+> request rebinding/argv reconstruction, and made `claims/`/`done/` host-owned.
+> Treat the current implementation and `docs/sandbox-design.md` as authoritative.
+
 Baseline reviewed: `cdf499f`. Six findings (three P1, three P2). All fixed with
 minimal-repro tests that fail on the old code, then verified with real macOS
 Seatbelt processes (no argv-only mocks) and real providers. Evidence:

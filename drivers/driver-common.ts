@@ -7,8 +7,10 @@ import { sha256 } from "../src/hash.ts";
 import {
   acceptableHostTmpDir,
   canonicalizePath,
+  exactStateDirReason,
   findWorktreeHardlinks,
   narrowWritableDirReason,
+  providerStateDirReason,
   providerStatePaths,
   rootLevelStateFileReason,
   sandboxPosture,
@@ -944,6 +946,11 @@ export interface ProviderExecutionPlan {
 // 71); the nested driver sees the marker and fails closed with a specific
 // error instead of a bare 71.
 export const SEATBELT_ENV_MARKER = "ORCH_SANDBOX_ENGINE";
+// Immutable host-owned run context inherited by a sandboxed controller's
+// `orch ...` subprocesses. The host reconciler validates these values against
+// spec.json/status.json before honoring a queued mutation.
+export const ORCH_SANDBOX_RUN_ID_ENV = "ORCH_SANDBOX_RUN_ID";
+export const ORCH_SANDBOX_RUN_DIR_ENV = "ORCH_SANDBOX_RUN_DIR";
 
 // The single atomic decision point for how a provider executes: engine and
 // posture, provider argv, native-sandbox opt-outs (codex bypass, claude
@@ -954,6 +961,8 @@ export function buildProviderExecutionPlan(ctx: ExecutionContext): ProviderExecu
   const { provider, spec, runDir, worktree } = ctx;
   const posture = sandboxPosture(spec.role);
   const env = buildWorkerEnv(ctx.env ?? process.env);
+  env[ORCH_SANDBOX_RUN_ID_ENV] = spec.run_id;
+  env[ORCH_SANDBOX_RUN_DIR_ENV] = runDir;
   if (spec.sandbox_engine === undefined) {
     return {
       argv: providerArgv(provider, spec, runDir, worktree, ctx.prompt ?? "", false),
@@ -1018,28 +1027,48 @@ export function buildProviderExecutionPlan(ctx: ExecutionContext): ProviderExecu
   // `XDG_STATE_HOME -> /` would otherwise become a home/root-wide (subpath ...)
   // allow. Fail closed on the first offender instead of widening the boundary.
   const providerStateDirs = state.dirs.map(canonicalizePath);
-  for (const dir of providerStateDirs) {
-    const reason = narrowWritableDirReason(dir, canonicalHome, canonicalWorktree);
+  for (let index = 0; index < providerStateDirs.length; index += 1) {
+    const dir = providerStateDirs[index]!;
+    const reason = providerStateDirReason(state.dirs[index]!, dir, canonicalHome, canonicalWorktree);
     if (reason) fail("state-target", `provider state ${dir} ${reason}; refusing to grant it as a write subpath`);
   }
   const providerStateFiles = state.files.map(canonicalizePath);
-  for (const file of providerStateFiles) {
-    const reason = rootLevelStateFileReason(file, canonicalHome);
+  for (let index = 0; index < providerStateFiles.length; index += 1) {
+    const file = providerStateFiles[index]!;
+    const reason = rootLevelStateFileReason(state.files[index]!, file, canonicalHome);
     if (reason) fail("state-target", `provider state file ${file} ${reason}; refusing to grant it as a write literal`);
   }
 
   // Finding 5: the controller does NOT get the whole orch state root (that
   // would let it overwrite every run's spec/status/result/sandbox.json). Its
-  // only writable orch area is a narrow dispatch outbox; a host-side reconciler
+  // only writable orch area is dispatch/pending; done/ stays host-owned so the
+  // controller cannot forge a result. A host-side reconciler
   // executes the queued state mutations (see src/dispatch.ts). The driver runs
   // unsandboxed, so it creates and canonicalizes the dir here.
   let orchStateDir: string | null = null;
   if (spec.role === "controller") {
     const stateRoot = env.XDG_STATE_HOME ? `${env.XDG_STATE_HOME}/orch` : `${home}/.local/state/orch`;
-    const dispatchDir = `${stateRoot}/dispatch`;
-    if (!ctx.dryRun) mkdirSync(`${dispatchDir}/pending`, { recursive: true, mode: 0o700 });
-    orchStateDir = canonicalizePath(dispatchDir);
-    const reason = narrowWritableDirReason(orchStateDir, canonicalHome, canonicalWorktree);
+    const canonicalStateRoot = canonicalizePath(stateRoot);
+    const dispatchDir = `${canonicalStateRoot}/dispatch`;
+    const controllerPendingDir = `${dispatchDir}/pending/${spec.run_id}`;
+    const controllerQueueDirs = [
+      controllerPendingDir,
+      `${dispatchDir}/claims/${spec.run_id}`,
+      `${dispatchDir}/done/${spec.run_id}`,
+    ];
+    for (const dir of controllerQueueDirs) {
+      const reason = exactStateDirReason(dir, canonicalizePath(dir));
+      if (reason) fail("state-target", `controller dispatch dir ${dir} ${reason}; refusing to use it as a queue endpoint`);
+    }
+    if (!ctx.dryRun) {
+      for (const dir of controllerQueueDirs) mkdirSync(dir, { recursive: true, mode: 0o700 });
+      for (const dir of controllerQueueDirs) {
+        const reason = exactStateDirReason(dir, canonicalizePath(dir));
+        if (reason) fail("state-target", `controller dispatch dir ${dir} ${reason}; refusing to use it as a queue endpoint`);
+      }
+    }
+    orchStateDir = controllerPendingDir;
+    const reason = narrowWritableDirReason(orchStateDir, canonicalHome, canonicalWorktree, ctx.dryRun === true);
     if (reason) fail("state-target", `controller dispatch dir ${orchStateDir} ${reason}; refusing to grant it as a write subpath`);
   }
 

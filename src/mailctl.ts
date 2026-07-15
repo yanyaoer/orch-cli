@@ -2058,11 +2058,10 @@ export async function mailctlPoll(ctx: MailctlContext, opts: PollOptions = {}): 
       // dispatch queue. Drain them here so a plain `orch mailctl poll` cron
       // makes the controller progress; a low-latency companion is
       // `orch dispatch reconcile --watch`. No-op when the queue is empty.
-      try {
-        await reconcileDispatchOnce(ctx.orch.orchCommand());
-      } catch {
-        // Dispatch reconciliation is best-effort; never break the poll.
-      }
+      // Per-request failures are terminalized by the reconciler. Infrastructure
+      // failures must fail poll so its existing failure audit/backoff path makes
+      // the stalled controller visible instead of reporting a false success.
+      await reconcileDispatchOnce(ctx.orch.orchCommand());
       if (ctx.config.notify.enabled && opts.sync !== false) {
         try {
           await mailctlSync(ctx, { execute: true });

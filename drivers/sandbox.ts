@@ -144,15 +144,18 @@ const SHARED_ROOTS: ReadonlySet<string> = new Set([
 // the fail-closed gate for every writable path derived from provider/controller
 // state — a symlinked `~/.pi -> $HOME` or `XDG_STATE_HOME -> /` must be caught
 // here, not silently turned into a home-wide (subpath ...) allow.
-export function narrowWritableDirReason(canonical: string, home: string, worktree: string): string | null {
+export function narrowWritableDirReason(canonical: string, home: string, worktree: string, allowMissing = false): string | null {
   if (SHARED_ROOTS.has(canonical)) return "resolves to a shared system root";
   if (canonical === home) return "resolves to the home directory";
   if (isAncestorOrEqual(canonical, home)) return "resolves to an ancestor of HOME";
-  if (isAncestorOrEqual(canonical, worktree)) return "resolves to the worktree or an ancestor of it";
+  if (isAncestorOrEqual(canonical, worktree) || isAncestorOrEqual(worktree, canonical)) {
+    return "overlaps the worktree";
+  }
   let stat;
   try {
     stat = lstatSync(canonical);
-  } catch {
+  } catch (error) {
+    if (allowMissing && (error as NodeJS.ErrnoException).code === "ENOENT") return null;
     return "does not exist";
   }
   if (!stat.isDirectory()) return "is not a directory (symlinks are already resolved)";
@@ -160,12 +163,54 @@ export function narrowWritableDirReason(canonical: string, home: string, worktre
   return null;
 }
 
-// A root-level provider-state file (~/.claude.json[.backup]) must canonicalize
-// to a direct child of the real HOME. If it is a symlink pointing elsewhere
-// (e.g. -> /etc/hosts, or -> ~/other/x), canonicalization moves its dirname off
-// HOME and this rejects it, instead of granting a literal write outside HOME.
-export function rootLevelStateFileReason(canonical: string, home: string): string | null {
-  if (dirname(canonical) !== home) return "does not resolve to a direct child of HOME";
+// v1 deliberately rejects top-level provider-state symlinks. Merely checking
+// that their canonical target is "narrow" is insufficient: ~/.codex -> another
+// project or ~/.claude.json -> ~/.zshrc would rename an unrelated path into the
+// selected provider's write exception.
+export function providerStateDirReason(expected: string, canonical: string, home: string, worktree: string): string | null {
+  if (dirname(expected) !== home || dirname(canonical) !== home || basename(canonical) !== basename(expected)) {
+    return "does not resolve to its exact provider-state slot under HOME";
+  }
+  try {
+    if (lstatSync(expected).isSymbolicLink()) return "is a symlink (provider-state symlinks are not supported by seatbelt-v1)";
+  } catch {
+    return "does not exist";
+  }
+  return narrowWritableDirReason(canonical, home, worktree);
+}
+
+// Dispatch queue directories are protocol endpoints, not generic writable
+// state. They must be the exact host-owned slots below the canonical orch
+// state root: following an alias here would move either the controller's
+// outbox grant or the host-owned claim/result directories somewhere else.
+// Missing paths are accepted for dry-run and pre-creation validation.
+export function exactStateDirReason(expected: string, canonical: string): string | null {
+  if (canonical !== expected) return "does not resolve to its exact host-owned state slot";
+  try {
+    const stat = lstatSync(expected);
+    if (stat.isSymbolicLink()) return "is a symlink";
+    if (!stat.isDirectory()) return "is not a directory";
+    if (typeof process.getuid === "function" && stat.uid !== process.getuid()) return "is not owned by the current user";
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") return "cannot be inspected safely";
+  }
+  return null;
+}
+
+export function rootLevelStateFileReason(expected: string, canonical: string, home: string): string | null {
+  if (dirname(expected) !== home || dirname(canonical) !== home || basename(canonical) !== basename(expected)) {
+    return "does not resolve to its exact root-level provider-state file under HOME";
+  }
+  try {
+    const stat = lstatSync(expected);
+    if (stat.isSymbolicLink()) return "is a symlink (provider-state symlinks are not supported by seatbelt-v1)";
+    if (!stat.isFile()) return "is not a regular file";
+    if (stat.nlink > 1) return "is hardlinked (provider-state hardlinks are not supported by seatbelt-v1)";
+  } catch (error) {
+    // Claude may create these root-level files on first use; a missing exact
+    // path is safe because canonicalizePath rebuilt it under canonical HOME.
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") return "cannot be inspected safely";
+  }
   return null;
 }
 
@@ -188,7 +233,7 @@ export interface SeatbeltProfileInput {
   providerStateDirs: string[]; // canonical, subpath rules
   providerStateFiles: string[]; // canonical, literal rules
   hostTmpDir: string | null; // canonical, pre-vetted via acceptableHostTmpDir
-  orchStateDir: string | null; // canonical narrow dispatch outbox, controller only
+  orchStateDir: string | null; // canonical dispatch/pending request dir, controller only
 }
 
 // Profile shape: reads/exec/network stay open, writes are default-denied, the

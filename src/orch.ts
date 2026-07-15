@@ -3600,16 +3600,16 @@ async function main(): Promise<number> {
   if (first === "__driver-omp") return runOmpDriver(process.argv.slice(3));
 
   // Host-side dispatch boundary: a state-mutating orch command issued from
-  // inside a sandbox (a controller's `orch run create` / decision / mail) can't
+  // inside a sandbox (a controller's run/decision/mailctl mutation) can't
   // spawn a working worker or touch run artifacts under the jail. Proxy it to
   // the unsandboxed host reconciler and relay its result. Reads run locally.
   if (insideSandbox() && first !== "dispatch" && shouldProxyToHost(args.positionals)) {
     const forwardArgv = process.argv.slice(2);
     // Only drain stdin when the command actually takes it (a `-` marker, e.g.
-    // `--task -`); reading unconditionally could block a stdin-less command
-    // (decision/mail) if the shell left stdin open.
-    const stdin = !process.stdin.isTTY && forwardArgv.includes("-") ? await readStdinText() : "";
-    const result = await proxyToHost({ argv: forwardArgv, stdin, cwd: process.cwd() });
+    // `--task -` / `--task=-`); reading unconditionally could block a
+    // stdin-less command (decision/mail) if the shell left stdin open.
+    const stdin = !process.stdin.isTTY && args.flags.get("task") === "-" ? await readStdinText() : "";
+    const result = await proxyToHost({ argv: forwardArgv, stdin });
     if (result.stdout) process.stdout.write(result.stdout);
     if (result.stderr) process.stderr.write(result.stderr);
     return result.exit_code;

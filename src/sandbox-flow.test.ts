@@ -59,6 +59,8 @@ interface Fixture {
   home: string;
   worktree: string;
   env: Record<string, string>;
+  repoKey: string;
+  stateRoot: string;
   runsDir: string;
 }
 
@@ -75,11 +77,14 @@ async function fixture(sandbox: boolean, extraEnv: Record<string, string> = {}):
   mkdirSync(join(configHome, "orch"), { recursive: true });
   writeFileSync(join(configHome, "orch", "config.json"), JSON.stringify({ version: 1, workspaces: {}, ...(sandbox ? { sandbox: true } : {}) }));
   const stateHome = join(root, "state");
+  const repoKey = repoKeyFromRemote(remote, worktree);
   return {
     home,
     worktree,
     env: { HOME: home, XDG_CONFIG_HOME: configHome, XDG_STATE_HOME: stateHome, ...extraEnv },
-    runsDir: join(stateHome, "orch", repoKeyFromRemote(remote, worktree), "mrs", "42", "runs"),
+    repoKey,
+    stateRoot: join(stateHome, "orch"),
+    runsDir: join(stateHome, "orch", repoKey, "mrs", "42", "runs"),
   };
 }
 
@@ -304,7 +309,32 @@ test.skipIf(process.platform !== "darwin")(
     const binDir = join(fx.home, "bin");
     const outsideProbe = join(fx.home, "dispatch_escape.txt");
     writeFakeImplementerPi(binDir, outsideProbe);
-    const env = { ...fx.env, PATH: `${binDir}:${process.env.PATH ?? ""}` };
+    const controllerRunId = "controller-dispatch";
+    const controllerRunDir = join(fx.runsDir, controllerRunId);
+    mkdirSync(controllerRunDir, { recursive: true });
+    writeFileSync(
+      join(controllerRunDir, "spec.json"),
+      JSON.stringify({
+        run_id: controllerRunId,
+        mr: "42",
+        role: "controller",
+        agent: "claude",
+        sandbox_engine: "seatbelt-v1",
+        repo_key: fx.repoKey,
+        worktree: fx.worktree,
+      }),
+    );
+    writeFileSync(
+      join(controllerRunDir, "status.json"),
+      JSON.stringify({ run_id: controllerRunId, role: "controller", state: "running", pid: process.pid, worktree: fx.worktree }),
+    );
+    for (const kind of ["pending", "claims", "done"]) mkdirSync(join(fx.stateRoot, "dispatch", kind, controllerRunId), { recursive: true });
+    const env = {
+      ...fx.env,
+      PATH: `${binDir}:${process.env.PATH ?? ""}`,
+      ORCH_SANDBOX_RUN_ID: controllerRunId,
+      ORCH_SANDBOX_RUN_DIR: controllerRunDir,
+    };
 
     // Unsandboxed host reconciler (the role orch new / a mailctl companion
     // plays). cwd stays the repo root so the relative `src/orch.ts` resolves.
@@ -317,7 +347,11 @@ test.skipIf(process.platform !== "darwin")(
     try {
       // Issued as if from inside the controller's sandbox: the marker makes
       // `orch run create` proxy instead of spawning a (doomed) nested worker.
-      const created = await runOrch(createArgs(fx.worktree), { ...env, ORCH_SANDBOX_ENGINE: "seatbelt-v1" }, "dispatched task\n");
+      const created = await runOrch(
+        ["run", "create", "--mr", "42", "--role", "implementer", "--agent", "pi", "--task=-", "--json"],
+        { ...env, ORCH_SANDBOX_ENGINE: "seatbelt-v1" },
+        "dispatched task\n",
+      );
       expect(created.exitCode).toBe(0);
       const runId = (JSON.parse(created.stdout) as { run_id: string }).run_id;
       const runDir = join(fx.runsDir, runId);
@@ -341,11 +375,11 @@ test.skipIf(process.platform !== "darwin")(
   45_000,
 );
 
-// F5: the controller's Seatbelt grants ONLY the narrow dispatch outbox, never
+// F5: the controller's Seatbelt grants ONLY its narrow pending queue, never
 // the orch state root — so it cannot overwrite any run's formal artifacts, yet
 // its host-side operations (queued via the dispatch dir) still complete.
 test.skipIf(process.platform !== "darwin")(
-  "controller jail: dispatch dir writable, run artifacts denied",
+  "controller jail: own pending writable, host results and run artifacts denied",
   async () => {
     const fx = await fixture(true);
     // The controller runs on claude: it needs its own logged-in state present.
@@ -370,7 +404,8 @@ cat >/dev/null
 # Writing a run's formal artifact under the state root must be denied.
 if echo clobbered > ${JSON.stringify(join(victimRunDir, "spec.json"))} 2>/dev/null; then echo ARTIFACT_WRITABLE >&2; fi
 # Writing the dispatch outbox must succeed (that is how it queues work).
-echo probe > ${JSON.stringify(join(stateRoot, "dispatch", "pending", "probe.json"))} 2>/dev/null || echo DISPATCH_DENIED >&2
+echo probe > "${join(stateRoot, "dispatch", "pending")}/$ORCH_SANDBOX_RUN_ID/probe.json" 2>/dev/null || echo DISPATCH_DENIED >&2
+if echo forged > "${join(stateRoot, "dispatch", "done")}/$ORCH_SANDBOX_RUN_ID/forged.json" 2>/dev/null; then echo RESULT_WRITABLE >&2; fi
 printf '%s\\n' '${JSON.stringify(result)}'
 `,
       "utf8",
@@ -394,6 +429,7 @@ printf '%s\\n' '${JSON.stringify(result)}'
     const stderr = readFileSync(join(fx.runsDir, runId, "stderr.log"), "utf8");
     expect(stderr).not.toContain("ARTIFACT_WRITABLE");
     expect(stderr).not.toContain("DISPATCH_DENIED");
+    expect(stderr).not.toContain("RESULT_WRITABLE");
   },
   30_000,
 );

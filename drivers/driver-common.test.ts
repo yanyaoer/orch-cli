@@ -963,7 +963,8 @@ test.skipIf(process.platform !== "darwin")("seatbelt profile grants the minimum 
   // spec/status/result/sandbox.json).
   const controller = profileFor("controller", "claude");
   expect(controller.profile).not.toContain(`(subpath "${canonical(controller.worktree)}")`);
-  expect(controller.profile).toContain(`(subpath "${canonical(controller.home)}/.local/state/orch/dispatch")`);
+  expect(controller.profile).toContain(`(subpath "${canonical(controller.home)}/.local/state/orch/dispatch/pending/${controller.spec.run_id}")`);
+  expect(controller.profile).not.toContain(`(subpath "${canonical(controller.home)}/.local/state/orch/dispatch/done")`);
   expect(controller.profile).not.toContain(`(subpath "${canonical(controller.home)}/.local/state/orch")`);
 });
 
@@ -975,7 +976,39 @@ test.skipIf(process.platform !== "darwin")("seatbelt plan fails closed when prov
   symlinkSync(ctx.home, join(ctx.home, ".pi")); // ~/.pi -> $HOME
   expect(() =>
     buildProviderExecutionPlan({ provider: "pi", spec: ctx.spec, runDir: ctx.runDir, worktree: ctx.worktree, env: ctx.env }),
-  ).toThrow(/state-target[\s\S]*home directory/);
+  ).toThrow(/state-target[\s\S]*(exact provider-state slot|symlink)/);
+});
+
+test.skipIf(process.platform !== "darwin")("controller queue endpoints reject aliases in pending, claims, and done", () => {
+  for (const kind of ["pending", "claims", "done"] as const) {
+    const ctx = seatbeltContext("controller", "claude");
+    const victim = join(ctx.root, `victim-${kind}`);
+    const queueRoot = join(ctx.env.XDG_STATE_HOME, "orch", "dispatch", kind);
+    mkdirSync(victim, { recursive: true });
+    mkdirSync(queueRoot, { recursive: true });
+    symlinkSync(victim, join(queueRoot, ctx.spec.run_id));
+
+    expect(() =>
+      buildProviderExecutionPlan({ provider: "claude", spec: ctx.spec, runDir: ctx.runDir, worktree: ctx.worktree, env: ctx.env }),
+    ).toThrow(/state-target[\s\S]*exact host-owned state slot/);
+  }
+});
+
+test.skipIf(process.platform !== "darwin")("controller dry-run accepts missing exact queue slots without creating them", () => {
+  const ctx = seatbeltContext("controller", "claude");
+  const dispatch = join(ctx.env.XDG_STATE_HOME, "orch", "dispatch");
+  const plan = buildProviderExecutionPlan({
+    provider: "claude",
+    spec: ctx.spec,
+    runDir: ctx.runDir,
+    worktree: ctx.worktree,
+    env: ctx.env,
+    dryRun: true,
+  });
+
+  expect(plan.sandboxEngine).toBe("seatbelt-v1");
+  expect(plan.argv[2]).toContain(`/dispatch/pending/${ctx.spec.run_id}`);
+  expect(existsSync(dispatch)).toBe(false);
 });
 
 test.skipIf(process.platform !== "darwin")("seatbelt preflight fails closed: hardlinks, missing provider state, nesting, dry-run purity", () => {

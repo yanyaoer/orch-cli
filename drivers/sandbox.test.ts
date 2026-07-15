@@ -5,8 +5,10 @@ import { join } from "node:path";
 import {
   acceptableHostTmpDir,
   canonicalizePath,
+  exactStateDirReason,
   findWorktreeHardlinks,
   narrowWritableDirReason,
+  providerStateDirReason,
   providerStatePaths,
   rootLevelStateFileReason,
   sandboxPosture,
@@ -81,6 +83,23 @@ test("canonicalizePath resolves symlink aliases and rebuilds missing tails on th
   // Missing tail (dry-run run dir, not-yet-created literal file): canonical
   // existing ancestor + remaining segments.
   expect(canonicalizePath(join(alias, "missing", "leaf.txt"))).toBe(join(canonicalRoot, "real", "missing", "leaf.txt"));
+});
+
+test("exactStateDirReason accepts only the exact owned directory slot", () => {
+  const root = tempDir();
+  const canonicalRoot = realpathSync(root);
+  const exact = join(canonicalRoot, "dispatch", "pending", "run-1");
+  mkdirSync(exact, { recursive: true });
+  expect(exactStateDirReason(exact, canonicalizePath(exact))).toBeNull();
+
+  const victim = join(canonicalRoot, "victim");
+  mkdirSync(victim);
+  const alias = join(canonicalRoot, "dispatch", "pending", "run-2");
+  symlinkSync(victim, alias);
+  expect(exactStateDirReason(alias, canonicalizePath(alias))).toContain("exact host-owned state slot");
+
+  const missing = join(canonicalRoot, "dispatch", "done", "run-3");
+  expect(exactStateDirReason(missing, canonicalizePath(missing))).toBeNull();
 });
 
 test("providerStatePaths: exactly the selected provider's state", () => {
@@ -161,7 +180,8 @@ test("narrowWritableDirReason rejects home/root/ancestor/shared/non-owned/non-di
   expect(narrowWritableDirReason(good, home, worktree)).toBeNull(); // the legit case
   expect(narrowWritableDirReason(home, home, worktree)).toContain("home");
   expect(narrowWritableDirReason("/", home, worktree)).toContain("shared system root");
-  expect(narrowWritableDirReason(join(home, "proj"), home, worktree)).toContain("ancestor of it"); // worktree parent
+  expect(narrowWritableDirReason(join(home, "proj"), home, worktree)).toContain("overlaps the worktree"); // worktree parent
+  expect(narrowWritableDirReason(join(worktree, "state"), home, worktree)).toContain("overlaps the worktree");
   expect(narrowWritableDirReason(root, home, worktree)).toContain("ancestor of HOME"); // HOME's parent
   for (const shared of ["/usr", "/etc", "/private/var/folders", "/Library", "/opt"]) {
     expect(narrowWritableDirReason(shared, home, worktree)).toContain("shared system root");
@@ -173,13 +193,35 @@ test("narrowWritableDirReason rejects home/root/ancestor/shared/non-owned/non-di
   expect(narrowWritableDirReason(join(home, "missing"), home, worktree)).toContain("does not exist");
 });
 
-test("rootLevelStateFileReason accepts only direct children of HOME", () => {
-  const home = "/Users/u";
-  expect(rootLevelStateFileReason("/Users/u/.claude.json", home)).toBeNull();
-  expect(rootLevelStateFileReason("/Users/u/.claude.json.backup", home)).toBeNull();
-  // A symlinked ~/.claude.json resolving off HOME (e.g. -> /etc/hosts) is rejected.
-  expect(rootLevelStateFileReason("/etc/hosts", home)).toContain("direct child of HOME");
-  expect(rootLevelStateFileReason("/Users/u/nested/x.json", home)).toContain("direct child of HOME");
+test("provider state targets must retain their exact HOME slot and reject symlinks", () => {
+  const root = realpathSync(tempDir());
+  const home = join(root, "home");
+  const worktree = join(home, "worktree");
+  const state = join(home, ".pi");
+  mkdirSync(worktree, { recursive: true });
+  mkdirSync(state);
+  expect(providerStateDirReason(state, realpathSync(state), home, worktree)).toBeNull();
+
+  const other = join(home, "other-project");
+  mkdirSync(other);
+  const alias = join(home, ".codex");
+  symlinkSync(other, alias);
+  expect(providerStateDirReason(alias, realpathSync(alias), home, worktree)).toContain("exact provider-state slot");
+});
+
+test("rootLevelStateFileReason accepts only the exact standalone HOME file", () => {
+  const home = tempDir();
+  const state = join(home, ".claude.json");
+  writeFileSync(state, "{}", "utf8");
+  expect(rootLevelStateFileReason(state, state, home)).toBeNull();
+  expect(rootLevelStateFileReason(join(home, ".claude.json.backup"), join(home, ".claude.json.backup"), home)).toBeNull();
+  expect(rootLevelStateFileReason(state, "/etc/hosts", home)).toContain("exact root-level");
+  expect(rootLevelStateFileReason(state, join(home, ".zshrc"), home)).toContain("exact root-level");
+
+  const linked = join(home, ".claude.json.backup");
+  linkSync(state, linked);
+  expect(rootLevelStateFileReason(state, state, home)).toContain("hardlinked");
+  expect(rootLevelStateFileReason(linked, linked, home)).toContain("hardlinked");
 });
 
 test("seatbeltProfile: default-deny writes, minimal allows, Git denied last", () => {
@@ -207,7 +249,7 @@ test("seatbeltProfile: default-deny writes, minimal allows, Git denied last", ()
   expect(gitDeny).toBeGreaterThan(profile.indexOf('(subpath "/wt")'));
   expect(profile.slice(gitDeny)).not.toContain("(allow file-write*");
 
-  // read-only posture: no worktree rule; controller gets exactly the orch state root.
+  // read-only posture: no worktree rule; controller gets only request pending/.
   const readOnly = seatbeltProfile({
     posture: "read-only",
     worktree: "/wt",
@@ -215,10 +257,11 @@ test("seatbeltProfile: default-deny writes, minimal allows, Git denied last", ()
     providerStateDirs: ["/Users/u/.claude"],
     providerStateFiles: ["/Users/u/.claude.json"],
     hostTmpDir: null,
-    orchStateDir: "/Users/u/.local/state/orch",
+    orchStateDir: "/Users/u/.local/state/orch/dispatch/pending",
   });
   expect(readOnly).not.toContain('(subpath "/wt")');
   expect(readOnly).toContain('(literal "/Users/u/.claude.json")');
-  expect(readOnly).toContain('(subpath "/Users/u/.local/state/orch")');
+  expect(readOnly).toContain('(subpath "/Users/u/.local/state/orch/dispatch/pending")');
+  expect(readOnly).not.toContain('(subpath "/Users/u/.local/state/orch/dispatch/done")');
   expect(readOnly).not.toContain('"/Users/u/.local/state")');
 });

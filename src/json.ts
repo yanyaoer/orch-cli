@@ -1,4 +1,4 @@
-import { closeSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, renameSync, writeFileSync } from "node:fs";
+import { closeSync, fstatSync, linkSync, mkdirSync, openSync, readFileSync, readSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
 export function jsonBytes(value: unknown): string {
@@ -27,6 +27,22 @@ export function writeJsonExclusive(path: string, value: unknown): void {
     writeFileSync(fd, jsonBytes(value), "utf8");
   } finally {
     closeSync(fd);
+  }
+}
+
+// Publish a complete JSON inode without replacing an existing destination.
+// The temporary name does not end in .json, so queue consumers cannot observe
+// or claim a partially-written request. link(2) is the atomic no-overwrite
+// publish step; unlike rename(2), it preserves O_EXCL semantics at `path`.
+export function writeJsonAtomicExclusive(path: string, value: unknown, mode = 0o644): void {
+  const bytes = jsonBytes(value);
+  mkdirSync(dirname(path), { recursive: true });
+  const tmp = `${path}.${process.pid}.${Date.now()}.pending`;
+  try {
+    writeFileSync(tmp, bytes, { encoding: "utf8", flag: "wx", mode });
+    linkSync(tmp, path);
+  } finally {
+    rmSync(tmp, { force: true });
   }
 }
 

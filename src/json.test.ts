@@ -1,8 +1,8 @@
 import { expect, test } from "bun:test";
-import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createFileFollower } from "./json.ts";
+import { createFileFollower, writeJsonAtomicExclusive } from "./json.ts";
 
 function withDir(fn: (dir: string) => void): void {
   const dir = mkdtempSync(join(tmpdir(), "orch-json-test-"));
@@ -12,6 +12,19 @@ function withDir(fn: (dir: string) => void): void {
     rmSync(dir, { recursive: true, force: true });
   }
 }
+
+test("writeJsonAtomicExclusive publishes complete JSON once without temporary queue entries", () => {
+  withDir((dir) => {
+    const path = join(dir, "request.json");
+    writeJsonAtomicExclusive(path, { state: "ready" }, 0o600);
+    expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({ state: "ready" });
+    expect(readdirSync(dir)).toEqual(["request.json"]);
+
+    expect(() => writeJsonAtomicExclusive(path, { state: "replaced" })).toThrow();
+    expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({ state: "ready" });
+    expect(readdirSync(dir)).toEqual(["request.json"]);
+  });
+});
 
 test("createFileFollower drains appended complete lines exactly once", () => {
   withDir((dir) => {
