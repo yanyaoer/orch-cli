@@ -124,6 +124,18 @@ export function scratchEnv(scratchDir: string): Record<string, string> {
   return { TMPDIR: tmp, TMP: tmp, TEMP: tmp, XDG_CACHE_HOME: cache, BUN_INSTALL_CACHE_DIR: join(cache, "bun") };
 }
 
+// Persistent host-owned worker cache, shared across runs and repos. Per-run
+// scratch is the wrong home for heavyweight tool state: Gradle homes rebuilt
+// from zero in every run (or pushed into ad-hoc /tmp dirs) dominated real run
+// wall time. One narrow per-user dir is granted to every sandboxed run;
+// workers reach it through the env seam (ORCH_WORKER_CACHE, GRADLE_USER_HOME).
+// A symlinked ~/.cache is legitimate (bigger disk): canonicalizePath follows
+// it and the narrow-dir gate then vets the resolved target like any grant.
+export function workerCacheDir(env: Record<string, string | undefined>, home: string): string {
+  const base = env.XDG_CACHE_HOME?.trim() ? env.XDG_CACHE_HOME.trim() : join(home, ".cache");
+  return join(base, "orch", "worker");
+}
+
 // True when `path` equals or contains `other` (both canonical, no trailing /).
 function isAncestorOrEqual(path: string, other: string): boolean {
   return other === path || other.startsWith(`${path}/`);
@@ -234,6 +246,7 @@ export interface SeatbeltProfileInput {
   providerStateFiles: string[]; // canonical, literal rules
   hostTmpDir: string | null; // canonical, pre-vetted via acceptableHostTmpDir
   orchStateDir: string | null; // canonical dispatch/pending request dir, controller only
+  workerCacheDir: string; // canonical persistent per-user cache, pre-vetted via narrowWritableDirReason
 }
 
 // Profile shape: reads/exec/network stay open, writes are default-denied, the
@@ -248,6 +261,7 @@ export function seatbeltProfile(input: SeatbeltProfileInput): string {
   for (const dir of input.providerStateDirs) allows.push(`(subpath ${sbplString(dir)})`);
   for (const file of input.providerStateFiles) allows.push(`(literal ${sbplString(file)})`);
   allows.push(`(subpath ${sbplString(input.scratchDir)})`);
+  allows.push(`(subpath ${sbplString(input.workerCacheDir)})`);
   // Disposable-state exceptions, not part of the project boundary: /private/tmp
   // for CLI temp files, /dev/null for the ubiquitous sink. Never the whole
   // /dev, never the whole /private/var/folders tree.

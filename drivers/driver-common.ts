@@ -18,6 +18,7 @@ import {
   SEATBELT_ENGINE,
   seatbeltProfile,
   seatbeltUnsupportedReason,
+  workerCacheDir,
 } from "./sandbox.ts";
 
 export interface DriverArgs {
@@ -1014,6 +1015,17 @@ export function buildProviderExecutionPlan(ctx: ExecutionContext): ProviderExecu
   }
   const canonicalScratch = canonicalizePath(scratchDir);
 
+  // Persistent worker cache: heavyweight tool state (Gradle home & co.) lives
+  // across runs in one host-owned dir instead of cold per-run scratch or
+  // ad-hoc /tmp dirs. Same fail-closed narrow-dir gate as every other grant.
+  const cacheDir = workerCacheDir(env, home!);
+  if (!ctx.dryRun) mkdirSync(cacheDir, { recursive: true, mode: 0o700 });
+  const canonicalCache = canonicalizePath(cacheDir);
+  {
+    const reason = narrowWritableDirReason(canonicalCache, canonicalHome, canonicalWorktree, ctx.dryRun === true);
+    if (reason) fail("cache-target", `worker cache ${canonicalCache} ${reason}; refusing to grant it as a write subpath (set XDG_CACHE_HOME to a plain per-user cache dir)`);
+  }
+
   // A hardlink escape needs a write-allowed path to the shared inode. Only the
   // project-write posture puts worktree paths in the allow set — plus the edge
   // case of a worktree living under the always-writable /private/tmp. Under a
@@ -1092,6 +1104,7 @@ export function buildProviderExecutionPlan(ctx: ExecutionContext): ProviderExecu
     providerStateFiles,
     hostTmpDir: hostTmp && acceptableHostTmpDir(hostTmp, canonicalHome, canonicalWorktree) ? hostTmp : null,
     orchStateDir,
+    workerCacheDir: canonicalCache,
   });
 
   return {
@@ -1103,6 +1116,11 @@ export function buildProviderExecutionPlan(ctx: ExecutionContext): ProviderExecu
     env: {
       ...env,
       ...scratchEnv(canonicalScratch),
+      // The env seam to the persistent cache grant above. Gradle cannot write
+      // ~/.gradle inside the jail; without a stable home it rebuilds a cold
+      // cache per run (or lands in ad-hoc /tmp dirs), dominating wall time.
+      ORCH_WORKER_CACHE: canonicalCache,
+      GRADLE_USER_HOME: `${canonicalCache}/gradle`,
       // Git metadata is read-only in the jail; without this, `git status`
       // tries to take the optional index lock to refresh stat data and fails.
       GIT_OPTIONAL_LOCKS: "0",

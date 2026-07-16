@@ -924,7 +924,7 @@ test.skipIf(process.platform !== "darwin")("seatbelt profile grants the minimum 
   const profileFor = (role: RunSpec["role"], provider: AgentName) => {
     const ctx = seatbeltContext(role, provider);
     const plan = buildProviderExecutionPlan({ provider, spec: ctx.spec, runDir: ctx.runDir, worktree: ctx.worktree, env: ctx.env });
-    return { profile: plan.argv[2]!, ...ctx };
+    return { profile: plan.argv[2]!, planEnv: plan.env, ...ctx };
   };
 
   const pi = profileFor("implementer", "pi");
@@ -937,21 +937,30 @@ test.skipIf(process.platform !== "darwin")("seatbelt profile grants the minimum 
   expect(denyBlock).toContain(`(subpath "${canonical(pi.worktree)}/.git")`);
   // Only the selected provider's state; scratch, /private/tmp, /dev/null.
   expect(pi.profile).toContain(`(subpath "${canonical(join(pi.home, ".pi"))}")`);
-  for (const other of [".claude", ".codex", ".omp", ".config", ".npm", ".cache"]) {
+  for (const other of [".claude", ".codex", ".omp", ".config", ".npm"]) {
     expect(pi.profile).not.toContain(other);
   }
   expect(pi.profile).toContain(`(subpath "${canonical(pi.runDir)}/scratch")`);
   expect(pi.profile).toContain('(subpath "/private/tmp")');
   expect(pi.profile).toContain('(literal "/dev/null")');
+  // Persistent worker cache: only the narrow orch/worker slot, never ~/.cache
+  // itself, and the env seam points tools (Gradle) into it.
+  const piCache = canonical(join(pi.home, ".cache", "orch", "worker"));
+  expect(pi.profile).toContain(`(subpath "${piCache}")`);
+  expect(pi.profile).not.toContain(`(subpath "${canonical(join(pi.home, ".cache"))}")`);
+  expect(pi.planEnv.ORCH_WORKER_CACHE).toBe(piCache);
+  expect(pi.planEnv.GRADLE_USER_HOME).toBe(`${piCache}/gradle`);
   // The trial implementation's broad grants must be gone.
   for (const broad of ['(subpath "/private/var/folders")', '(subpath "/dev")', "Library/Caches", "Library/Application Support", "Library/Preferences", ".local/state"]) {
     expect(pi.profile).not.toContain(broad);
   }
 
-  // Read-only roles: no worktree write rule at all.
+  // Read-only roles: no worktree write rule at all, but the persistent worker
+  // cache still applies (read-only tools may need mandatory cache writes).
   const reviewer = profileFor("reviewer", "omp");
   expect(reviewer.profile).not.toContain(`(subpath "${canonical(reviewer.worktree)}")`);
   expect(reviewer.profile).toContain(`(subpath "${canonical(join(reviewer.home, ".omp"))}")`);
+  expect(reviewer.profile).toContain(`(subpath "${canonical(join(reviewer.home, ".cache", "orch", "worker"))}")`);
 
   // claude: root-level state files are exact literals (backup may not exist yet).
   const claude = profileFor("verifier", "claude");
@@ -1035,6 +1044,19 @@ test.skipIf(process.platform !== "darwin")("seatbelt preflight fails closed: har
   });
   expect(readOnlyPlan.sandboxEngine).toBe("seatbelt-v1");
   expect(readOnlyPlan.sandboxPosture).toBe("read-only");
+
+  // A worker cache resolving into the worktree (hostile/broken XDG_CACHE_HOME)
+  // must fail closed instead of write-opening project paths via the cache grant.
+  const badCache = seatbeltContext("implementer", "pi");
+  expect(() =>
+    buildProviderExecutionPlan({
+      provider: "pi",
+      spec: badCache.spec,
+      runDir: badCache.runDir,
+      worktree: badCache.worktree,
+      env: { ...badCache.env, XDG_CACHE_HOME: join(badCache.worktree, "cache") },
+    }),
+  ).toThrow(/cache-target[\s\S]*overlaps the worktree/);
 
   // Provider state missing → tell the user to log in, never open $HOME.
   const uninitialized = seatbeltContext("implementer", "pi");

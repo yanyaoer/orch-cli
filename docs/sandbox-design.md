@@ -170,7 +170,8 @@ profile 使用以下形态：
 - `/private/tmp/`，用于 Claude 等 CLI 的已验证临时文件；
 - 当前进程的 canonical `TMPDIR`，仅当它是真正的 Darwin per-user temp（`/private/var/folders/<hash>/<hash>/T[/...]`）且由当前 uid 拥有时；任意 `$TMPDIR`（`~/Documents`、其他 repo、`/opt/...`）一律拒绝，防止调用者用环境变量把任意目录塞进写白名单；
 - 精确的 `/dev/null`；
-- controller role 自己的 canonical `${orchStateRoot}/dispatch/pending/<controller-run-id>`；`claims/`、`done/` 和整个 orch state root 均不允许写。
+- controller role 自己的 canonical `${orchStateRoot}/dispatch/pending/<controller-run-id>`；`claims/`、`done/` 和整个 orch state root 均不允许写；
+- 持久 worker cache：canonical `${XDG_CACHE_HOME:-~/.cache}/orch/worker`（所有 posture 均授予）。重量级工具状态（Gradle home 等）不该每 run 在 scratch 冷启动或散落 /tmp——真实 run 证据：大仓库上重复的冷 Gradle 构建主导了 wall time。该目录经 canonicalize + 窄目录门校验（拒绝与 worktree/HOME 重叠等）后才授予；不开放整个 `~/.cache`。env seam：`ORCH_WORKER_CACHE` 指向它，`GRADLE_USER_HOME` 指向其 `gradle/` 子目录。
 
 `/private/tmp` 是有意接受的 disposable-state 例外，不应被描述成项目边界的一部分。`/private/var/folders` 整棵树、整个 `/dev`、整个 run dir 都不允许写。
 
@@ -201,7 +202,7 @@ XDG_CACHE_HOME=<runDir>/scratch/cache
 BUN_INSTALL_CACHE_DIR=<runDir>/scratch/cache/bun
 ```
 
-如 npm 等实际测试证明需要，再把相应 cache 环境变量指向同一 scratch。默认不开放 `~/.cache`、`~/.npm`、`~/.bun`、`~/Library/Caches` 或 `.cargo`。
+如 npm 等实际测试证明需要，再把相应 cache 环境变量指向同一 scratch。默认不开放 `~/.cache`、`~/.npm`、`~/.bun`、`~/Library/Caches` 或 `.cargo`。跨 run 需要持久化的重量级工具 cache 走 6.3 的持久 worker cache（`ORCH_WORKER_CACHE`），不走 run-scoped scratch。
 
 Codex 的 `--output-last-message` 必须写到 `scratch/last_message.txt`。driver 在 provider 退出后读取它并生成正式 artifact，不能因为这个参数而把整个 run dir 交给 provider。
 
