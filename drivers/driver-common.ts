@@ -66,6 +66,13 @@ export function buildPrompt(spec: RunSpec, provider: string): string {
     `It must also include "verdict", exactly one of: ${verdicts.map((verdict) => `"${verdict}"`).join(" | ")}. Never omit "verdict".` +
       (failure ? ` Use "${failure}" when the task could not genuinely be completed; never claim success for ungrounded or partial work.` : ""),
     "Do not wrap the JSON in Markdown. Do not create or edit result files in the worktree; return the JSON as your final answer only.",
+    ...(role === "implementer"
+      ? [
+          // Repeated full builds inside implement loops dominated real run wall
+          // time on large repos; exhaustive verification is the verifier's job.
+          "Verification discipline: finish ALL edits first, then verify ONCE with checks scoped to the code you changed (one targeted build/test command). If that fails, fix and re-run the same scoped check. Never run repo-wide or full-module test suites — that exhaustive pass belongs to a separate verifier run.",
+        ]
+      : []),
     ...(spec.language === "中文"
       ? [
           "结果 JSON 中人类可读的 prose 字段(summary、blocking/non_blocking findings 的 body、suggested_tests、recommendation、risks、acceptance evidence、rollback)必须用中文书写;代码、命令、文件路径、标识符保持原样。",
