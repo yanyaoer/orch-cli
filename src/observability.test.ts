@@ -689,6 +689,64 @@ test("branch-derived mr keeps its raw value through run list and decision", asyn
   expect(outbox.mr).toBe("feat/slash-branch");
 });
 
+test("run create guards provider session chains: same-task tags only, max 3 runs", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orch-session-chain-test-"));
+  const stateHome = join(root, "state");
+  const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
+  await initGitWorktree(worktree);
+  const env = { XDG_STATE_HOME: stateHome, ORCH_DRIVER_FAKE_RESULT: "1" };
+  const taskPath = join(root, "task.md");
+  writeFileSync(taskPath, "chained task\n", "utf8");
+  const create = (tag: string, extra: string[] = []) =>
+    runOrch(
+      [
+        "run",
+        "create",
+        "--mr",
+        "chain",
+        "--role",
+        "reviewer",
+        "--agent",
+        "codex",
+        "--tag",
+        tag,
+        "--worktree",
+        worktree,
+        "--task",
+        taskPath,
+        "--session-mode",
+        "resume_exact",
+        "--session-id",
+        "sess-chain-1",
+        ...extra,
+      ],
+      env,
+    );
+
+  // First consumer of the session: nothing bound yet.
+  expect(await create("taskx")).toMatchObject({ exitCode: 0 });
+  // Same task, next round (suffixed tag) → allowed.
+  expect(await create("taskx-r2")).toMatchObject({ exitCode: 0 });
+
+  // Unrelated task on the same session → refused, with the override spelled out.
+  const foreign = await create("other-task");
+  expect(foreign.exitCode).not.toBe(0);
+  expect(foreign.stderr).toContain("already belongs to task tag");
+  expect(foreign.stderr).toContain("--allow-session-chain");
+
+  // Third same-task run fills the chain; a fourth is refused on depth.
+  expect(await create("taskx-r3")).toMatchObject({ exitCode: 0 });
+  const fourth = await create("taskx-r4");
+  expect(fourth.exitCode).not.toBe(0);
+  expect(fourth.stderr).toContain("refusing a chain longer than 3");
+
+  // Deliberate override works; dry-run enforces the same guard without state.
+  expect(await create("taskx-r5", ["--allow-session-chain"])).toMatchObject({ exitCode: 0 });
+  const dry = await create("another", ["--dry-run", "--json"]);
+  expect(dry.exitCode).not.toBe(0);
+  expect(dry.stderr).toContain("already belongs to task tag");
+});
+
 test("run create rejects the removed agy agent and accepts omp for any result role", async () => {
   const root = mkdtempSync(join(tmpdir(), "orch-omp-role-test-"));
   const stateHome = join(root, "state");

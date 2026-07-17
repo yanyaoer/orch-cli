@@ -1167,6 +1167,7 @@ const RUN_CREATE_FLAGS = [
   "session-mode",
   "session-name",
   "session-id",
+  "allow-session-chain",
   "dry-run",
   "json",
 ] as const;
@@ -1232,6 +1233,60 @@ async function resolveResumeFrom(args: ParsedArgs): Promise<ResumeContext> {
       model,
     },
   };
+}
+
+// Session-chain guard. Pinning unrelated tasks onto one provider session
+// measured as pure cost on a real thread (7 runs, ~150k-token context on every
+// turn): per-turn prefill/attention grows while exploration turns do not
+// shrink, and stale task residue steers new work. Session reuse is for
+// continuing the SAME task — rework rounds under the same (or suffixed) tag,
+// at most three runs per session. Anything else starts fresh and carries prior
+// decisions in the task text; --allow-session-chain overrides deliberately.
+const SESSION_CHAIN_MAX_RUNS = 3;
+
+function assertSessionChainAllowed(mrDir: string, session: ProviderSessionConfig, tag: string, allow: boolean): void {
+  if (allow || session.provider_session_mode !== "resume_exact" || !session.provider_session_id) return;
+  const sessionId = session.provider_session_id;
+  let entries: string[];
+  try {
+    entries = readdirSync(`${mrDir}/runs`);
+  } catch {
+    return; // no runs yet — nothing to chain onto
+  }
+  const bound: { run_id: string; tag: string }[] = [];
+  for (const entry of entries) {
+    const spec = readJsonFile<RunSpec | null>(`${mrDir}/runs/${entry}/spec.json`, null);
+    if (!spec) continue;
+    const status = readJsonFile<RunStatus | null>(`${mrDir}/runs/${entry}/status.json`, null);
+    // A run is on this session when it consumed it (spec pinned the id) or
+    // created/continued it (terminal backfill recorded the provider id).
+    if (spec.provider_session_id === sessionId || status?.provider_resume_id === sessionId) {
+      bound.push({ run_id: spec.run_id, tag: spec.tag });
+    }
+  }
+  if (bound.length === 0) return;
+  // Same task = same tag family: rework rounds drop their -r<N> suffix first
+  // (memory-v1 ≙ memory-v1-r2 ≙ memory-v1-r3), then a prefix relation still
+  // counts (taskx vs taskx-fix). Unrelated names never match.
+  const family = (t: string) => t.replace(/-r\d+$/, "");
+  const sameTask = (a: string, b: string) => {
+    const fa = family(a);
+    const fb = family(b);
+    return fa === fb || fa.startsWith(fb) || fb.startsWith(fa);
+  };
+  const advice =
+    "start a fresh session (the default) and carry prior decisions in the task text, or pass --allow-session-chain to chain deliberately";
+  const foreign = bound.find((run) => !sameTask(run.tag, tag));
+  if (foreign) {
+    throw new CliError(
+      `provider session ${sessionId} already belongs to task tag ${JSON.stringify(foreign.tag)} (run ${foreign.run_id}); refusing to reuse it for tag ${JSON.stringify(tag)} — chained sessions pay per-turn prefill on the accumulated context without reducing exploration turns; ${advice}`,
+    );
+  }
+  if (bound.length >= SESSION_CHAIN_MAX_RUNS) {
+    throw new CliError(
+      `provider session ${sessionId} already hosts ${bound.length} runs (${bound.map((run) => run.run_id).join(", ")}); refusing a chain longer than ${SESSION_CHAIN_MAX_RUNS} — ${advice}`,
+    );
+  }
 }
 
 // Per-role defaults from config.json (defaults.agents); bare string = agent.
@@ -1312,6 +1367,9 @@ async function createRun(args: ParsedArgs): Promise<number> {
     if (existing && !retry) assertSandboxCompatible(existing, sandboxEngine, role);
     const effectiveSession = existingSession ?? providerSession;
     const idempotent = Boolean(existing && !retry);
+    // Same guard as the real create; an idempotent hit reuses an existing run
+    // and chains nothing new.
+    if (!idempotent) assertSessionChainAllowed(mrDir, effectiveSession, tag, flagBool(args, "allow-session-chain"));
     const id = idempotent ? existing!.run_id : runId(tag);
     const runDir = idempotent ? existing!.run_dir : `${mrDir}/runs/${id}`;
     const specPath = `${runDir}/spec.json`;
@@ -1523,6 +1581,8 @@ async function startRun(input: StartRunInput): Promise<Record<string, unknown>> 
         result_path: existing.result_path,
       };
     }
+
+    assertSessionChainAllowed(mrDir, providerSession, tag, flagBool(args, "allow-session-chain"));
 
     const dirty = await gitDirty(worktree);
     if (dirty.length > 0 && writeRoles.has(role) && !flagBool(args, "allow-dirty")) {
@@ -2203,7 +2263,9 @@ async function newCommand(args: ParsedArgs): Promise<number> {
     const revisionPath = `${mrDir}/tasks/plan-round-${revision}.md`;
     writeTextAtomic(revisionPath, newPlanRevisionTask(answer, acceptDefaults));
     handle = await newSpawnRunCreate(
-      ["--resume-from", handle.run_id, "--tag", `plan-r${revision}`, "--task", revisionPath],
+      // First-party deliberate chain: replan rounds continue the plan session
+      // by design, past any session-chain depth cap.
+      ["--resume-from", handle.run_id, "--tag", `plan-r${revision}`, "--task", revisionPath, "--allow-session-chain"],
       worktree,
     );
     planRuns.push(handle.run_id);
@@ -2257,7 +2319,9 @@ async function newCommand(args: ParsedArgs): Promise<number> {
   writeTextAtomic(execTaskPath, newExecTask(mr, worktree, plan.recommendation));
   const baselineRuns = new Set(collectMrRuns(repo.repo_key, mr).map((run) => run.run_id));
   const execHandle = await newSpawnRunCreate(
-    ["--resume-from", handle.run_id, "--role", "controller", "--tag", "exec", "--task", execTaskPath],
+    // First-party deliberate chain: the confirmed plan session resumes as the
+    // exec controller by design (different tag, same session).
+    ["--resume-from", handle.run_id, "--role", "controller", "--tag", "exec", "--task", execTaskPath, "--allow-session-chain"],
     worktree,
   );
   process.stderr.write(`[orch new] executing; follow along: orch wait --thread ${mr} · orch events tail --mr ${mr} -f --native\n`);
