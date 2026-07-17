@@ -1033,6 +1033,33 @@ export function buildProviderExecutionPlan(ctx: ExecutionContext): ProviderExecu
     if (reason) fail("cache-target", `worker cache ${canonicalCache} ${reason}; refusing to grant it as a write subpath (set XDG_CACHE_HOME to a plain per-user cache dir)`);
   }
 
+  // Config-declared extra write dirs, snapshotted into the spec at create
+  // (the driver never reads live config). Re-vet each entry fail-closed:
+  // orch's own config dir and state root are never grantable — a worker could
+  // otherwise edit sandbox_write_dirs for future runs or forge run state —
+  // and everything else passes the same narrow-dir gate as built-in grants.
+  const extraWriteDirs: string[] = [];
+  if ((spec.sandbox_write_dirs ?? []).length > 0) {
+    const guarded: Array<[string, string]> = [
+      [canonicalizePath(env.XDG_CONFIG_HOME ? `${env.XDG_CONFIG_HOME}/orch` : `${home}/.config/orch`), "orch config dir"],
+      [canonicalizePath(env.XDG_STATE_HOME ? `${env.XDG_STATE_HOME}/orch` : `${home}/.local/state/orch`), "orch state root"],
+    ];
+    for (const raw of spec.sandbox_write_dirs!) {
+      if (typeof raw !== "string" || !raw.startsWith("/")) {
+        fail("config-write-dir", `sandbox_write_dirs entry is not an absolute path: ${JSON.stringify(raw)}`);
+      }
+      const canonical = canonicalizePath(raw);
+      for (const [dir, label] of guarded) {
+        if (canonical === dir || canonical.startsWith(`${dir}/`) || dir.startsWith(`${canonical}/`)) {
+          fail("config-write-dir", `sandbox_write_dirs entry ${raw} overlaps the ${label} (${dir}); orch's own config/state is never grantable`);
+        }
+      }
+      const reason = narrowWritableDirReason(canonical, canonicalHome, canonicalWorktree, ctx.dryRun === true);
+      if (reason) fail("config-write-dir", `sandbox_write_dirs entry ${raw} ${reason}; refusing to grant it as a write subpath`);
+      if (!extraWriteDirs.includes(canonical)) extraWriteDirs.push(canonical);
+    }
+  }
+
   // A hardlink escape needs a write-allowed path to the shared inode. Only the
   // project-write posture puts worktree paths in the allow set — plus the edge
   // case of a worktree living under the always-writable /private/tmp. Under a
@@ -1112,6 +1139,7 @@ export function buildProviderExecutionPlan(ctx: ExecutionContext): ProviderExecu
     hostTmpDir: hostTmp && acceptableHostTmpDir(hostTmp, canonicalHome, canonicalWorktree) ? hostTmp : null,
     orchStateDir,
     workerCacheDir: canonicalCache,
+    extraWriteDirs,
   });
 
   return {

@@ -82,7 +82,7 @@ import { runClaudeDriver } from "../drivers/claude-headless.ts";
 import { deployWorker, locateBridgeDir, runChatgptBridge } from "../drivers/chatgpt-bridge.ts";
 import { runPiDriver } from "../drivers/pi-headless.ts";
 import { runOmpDriver } from "../drivers/omp-headless.ts";
-import { addWorkspace, chatgptBridgeConfigPath, orchLanguage, orchSandbox, readBridgeConfig, readMailAgentsConfig, readMailControlConfig, readOrchConfig, validateMailControlConfig, writeBridgeConfig, type RoleDefaults } from "./config.ts";
+import { addWorkspace, chatgptBridgeConfigPath, orchLanguage, readBridgeConfig, readMailAgentsConfig, readMailControlConfig, readOrchConfig, validateMailControlConfig, writeBridgeConfig, type RoleDefaults } from "./config.ts";
 import { createInterface, type Interface as ReadlineInterface, type ReadLineOptions } from "node:readline";
 import { buildBundle, type BundleOptions } from "./handoff-pro.ts";
 import { mail, mailFanout, type MailCliContext, type MailFanoutOutcome } from "./mail-cli.ts";
@@ -334,12 +334,22 @@ function assertProviderSessionCompatible(
 
 // config sandbox:true resolves to the versioned engine, validated fail-closed
 // before any run state is created or reused: a platform that cannot apply the
-// sandbox must refuse the run, never silently downgrade it.
-function requestedSandboxEngine(): typeof SEATBELT_ENGINE | null {
-  if (!orchSandbox()) return null;
+// sandbox must refuse the run, never silently downgrade it. Extra write dirs
+// come from the SAME config read (F6: engine and dirs must not split across
+// two reads); shape-checked here for early feedback, authoritatively re-vetted
+// by the driver against canonical paths.
+function requestedSandboxEngine(): { engine: typeof SEATBELT_ENGINE | null; writeDirs: string[] } {
+  const cfg = readOrchConfig();
+  if (cfg.sandbox !== true) return { engine: null, writeDirs: [] };
   const reason = seatbeltUnsupportedReason();
   if (reason) throw new CliError(reason);
-  return SEATBELT_ENGINE;
+  const writeDirs = [...new Set((cfg.sandbox_write_dirs ?? []).map((dir) => dir.trim()).filter((dir) => dir.length > 0))];
+  for (const dir of writeDirs) {
+    if (!dir.startsWith("/")) {
+      throw new CliError(`config sandbox_write_dirs entries must be absolute paths (no ~ or relative): ${JSON.stringify(dir)}`);
+    }
+  }
+  return { engine: SEATBELT_ENGINE, writeDirs };
 }
 
 // An idempotency hit (notably an explicit --idempotency-key) must never hand
@@ -1281,8 +1291,8 @@ async function createRun(args: ParsedArgs): Promise<number> {
   // Resolved exactly once here and threaded through to the spec, key,
   // compatibility check, dry-run, and startRun (F6): a config change between
   // two reads must not split the idempotency key from the recorded spec.
-  const sandboxEngine = requestedSandboxEngine();
-  const sandboxIdentity = sandboxRunIdentity(sandboxEngine);
+  const { engine: sandboxEngine, writeDirs: sandboxWriteDirs } = requestedSandboxEngine();
+  const sandboxIdentity = sandboxRunIdentity(sandboxEngine, sandboxWriteDirs);
 
   const repo = await getRepoIdentity(worktree);
   const mrDir = mrStateDir(repo.repo_key, mr);
@@ -1444,6 +1454,7 @@ async function createRun(args: ParsedArgs): Promise<number> {
       idempotencyKey,
       idempotencyPath,
       sandboxEngine,
+      sandboxWriteDirs,
     })),
   });
   return 0;
@@ -1469,14 +1480,15 @@ interface StartRunInput {
   // spec startRun writes cannot diverge from the idempotency key createRun
   // built from an earlier config read (F6).
   sandboxEngine: typeof SEATBELT_ENGINE | null;
+  sandboxWriteDirs: string[];
 }
 
 // Spawns a single supervised run and returns its create payload. Shared by
 // `run create` and the fan-out commands (cross-review / fanout / investigate).
 async function startRun(input: StartRunInput): Promise<Record<string, unknown>> {
   const { args, mr, role, agent, tag, worktree, taskPath, taskText, taskSha, timeoutSec } = input;
-  const { providerSession, repo, mrDir, idempotencyKey, idempotencyPath, sandboxEngine } = input;
-  const sandboxIdentity = sandboxRunIdentity(sandboxEngine);
+  const { providerSession, repo, mrDir, idempotencyKey, idempotencyPath, sandboxEngine, sandboxWriteDirs } = input;
+  const sandboxIdentity = sandboxRunIdentity(sandboxEngine, sandboxWriteDirs);
 
   try {
     ensureStateLayout(mrDir);

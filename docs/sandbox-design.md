@@ -172,6 +172,7 @@ profile 使用以下形态：
 - 精确的 `/dev/null`；
 - controller role 自己的 canonical `${orchStateRoot}/dispatch/pending/<controller-run-id>`；`claims/`、`done/` 和整个 orch state root 均不允许写；
 - 持久 worker cache：canonical `${XDG_CACHE_HOME:-~/.cache}/orch/worker`（所有 posture 均授予）。重量级工具状态（Gradle home 等）不该每 run 在 scratch 冷启动或散落 /tmp——真实 run 证据：大仓库上重复的冷 Gradle 构建主导了 wall time。该目录经 canonicalize + 窄目录门校验（拒绝与 worktree/HOME 重叠等）后才授予；不开放整个 `~/.cache`。env seam：`ORCH_WORKER_CACHE` 指向它，`GRADLE_USER_HOME` 指向其 `gradle/` 子目录。
+- config `sandbox_write_dirs`：用户显式声明的额外可写目录（绝对路径）。这是明确的授权而非环境继承：config 是 host-owned（`~/.config/orch` 不在任何写授权内），在 run create 时随 engine 同一次 config 读快照进 `spec.sandbox_write_dirs`（driver 不读 live config）。driver 逐项 fail-closed 复核：canonicalize 后过与内置授权相同的窄目录门，且无条件拒绝与 orch config dir、orch state root 的任意方向重叠——否则 worker 能改写这份列表为后续 run 开门，或伪造 run 状态。列入目录的误写 blast-radius 责任转移给用户；目录内容不做递归 hardlink 保证（与 provider state 同级）。
 
 `/private/tmp` 是有意接受的 disposable-state 例外，不应被描述成项目边界的一部分。`/private/var/folders` 整棵树、整个 `/dev`、整个 run dir 都不允许写。
 

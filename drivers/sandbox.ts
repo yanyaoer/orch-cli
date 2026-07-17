@@ -21,12 +21,19 @@ export function sandboxPosture(role: RunRole): SandboxPosture {
 // Single seam mapping a resolved engine to BOTH its idempotency-key suffix and
 // its spec field, so the key and the spec can never be built from two different
 // engine reads (F6 TOCTOU): callers resolve the engine once and derive both
-// from this one value.
-export function sandboxRunIdentity(engine: typeof SEATBELT_ENGINE | null): {
+// from this one value. Config-declared extra write dirs ride the same seam and
+// the same config read: they land in the spec (the driver must not depend on
+// live global config) but not in the key — a dir-list edit changes future
+// grants, not run identity.
+export function sandboxRunIdentity(engine: typeof SEATBELT_ENGINE | null, writeDirs: readonly string[] = []): {
   keySuffix: string;
-  specField: { sandbox_engine?: typeof SEATBELT_ENGINE };
+  specField: { sandbox_engine?: typeof SEATBELT_ENGINE; sandbox_write_dirs?: string[] };
 } {
-  return engine ? { keySuffix: `:sandbox-${engine}`, specField: { sandbox_engine: engine } } : { keySuffix: "", specField: {} };
+  if (!engine) return { keySuffix: "", specField: {} };
+  return {
+    keySuffix: `:sandbox-${engine}`,
+    specField: { sandbox_engine: engine, ...(writeDirs.length > 0 ? { sandbox_write_dirs: [...writeDirs] } : {}) },
+  };
 }
 
 // sandbox:true must fail closed, never silently downgrade: a run created with
@@ -247,6 +254,7 @@ export interface SeatbeltProfileInput {
   hostTmpDir: string | null; // canonical, pre-vetted via acceptableHostTmpDir
   orchStateDir: string | null; // canonical dispatch/pending request dir, controller only
   workerCacheDir: string; // canonical persistent per-user cache, pre-vetted via narrowWritableDirReason
+  extraWriteDirs: string[]; // canonical config-declared dirs, pre-vetted (narrow gate + orch config/state denial)
 }
 
 // Profile shape: reads/exec/network stay open, writes are default-denied, the
@@ -262,6 +270,7 @@ export function seatbeltProfile(input: SeatbeltProfileInput): string {
   for (const file of input.providerStateFiles) allows.push(`(literal ${sbplString(file)})`);
   allows.push(`(subpath ${sbplString(input.scratchDir)})`);
   allows.push(`(subpath ${sbplString(input.workerCacheDir)})`);
+  for (const dir of input.extraWriteDirs) allows.push(`(subpath ${sbplString(dir)})`);
   // Disposable-state exceptions, not part of the project boundary: /private/tmp
   // for CLI temp files, /dev/null for the ubiquitous sink. Never the whole
   // /dev, never the whole /private/var/folders tree.

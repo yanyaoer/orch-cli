@@ -1045,6 +1045,36 @@ test.skipIf(process.platform !== "darwin")("seatbelt preflight fails closed: har
   expect(readOnlyPlan.sandboxEngine).toBe("seatbelt-v1");
   expect(readOnlyPlan.sandboxPosture).toBe("read-only");
 
+  // Config-declared sandbox_write_dirs: a vetted narrow dir is granted; orch's
+  // own state root, worktree overlaps, and relative paths all fail closed.
+  const extra = seatbeltContext("implementer", "pi");
+  const extraDir = join(extra.root, "gradle-home");
+  mkdirSync(extraDir, { recursive: true });
+  const extraPlan = buildProviderExecutionPlan({
+    provider: "pi",
+    spec: { ...extra.spec, sandbox_write_dirs: [extraDir] },
+    runDir: extra.runDir,
+    worktree: extra.worktree,
+    env: extra.env,
+  });
+  expect(extraPlan.argv[2]).toContain(`(subpath "${realpathSync(extraDir)}")`);
+  for (const [bad, why] of [
+    [join(extra.env.XDG_STATE_HOME, "orch"), /orch state root/],
+    [join(extra.env.XDG_STATE_HOME, "orch", "dispatch"), /orch state root/],
+    [extra.worktree, /overlaps the worktree/],
+    ["relative/dir", /not an absolute path/],
+  ] as const) {
+    expect(() =>
+      buildProviderExecutionPlan({
+        provider: "pi",
+        spec: { ...extra.spec, sandbox_write_dirs: [bad] },
+        runDir: extra.runDir,
+        worktree: extra.worktree,
+        env: extra.env,
+      }),
+    ).toThrow(why);
+  }
+
   // A worker cache resolving into the worktree (hostile/broken XDG_CACHE_HOME)
   // must fail closed instead of write-opening project paths via the cache grant.
   const badCache = seatbeltContext("implementer", "pi");

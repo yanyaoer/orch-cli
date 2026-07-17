@@ -234,6 +234,7 @@ test("seatbeltProfile: default-deny writes, minimal allows, Git denied last", ()
     hostTmpDir: "/private/var/folders/ab/cdef/T",
     orchStateDir: null,
     workerCacheDir: "/Users/u/.cache/orch/worker",
+    extraWriteDirs: ["/Users/u/.gradle"],
   });
   const lines = profile.split("\n");
   expect(lines[0]).toBe("(version 1)");
@@ -245,6 +246,7 @@ test("seatbeltProfile: default-deny writes, minimal allows, Git denied last", ()
   expect(profile).toContain('(subpath "/private/tmp")');
   expect(profile).toContain('(subpath "/private/var/folders/ab/cdef/T")');
   expect(profile).toContain('(subpath "/Users/u/.cache/orch/worker")');
+  expect(profile).toContain('(subpath "/Users/u/.gradle")');
   expect(profile).toContain('(literal "/dev/null")');
   // Git deny comes after the allow block: in SBPL the last matching rule wins.
   const gitDeny = profile.indexOf('(subpath "/wt/.git")');
@@ -261,6 +263,7 @@ test("seatbeltProfile: default-deny writes, minimal allows, Git denied last", ()
     hostTmpDir: null,
     orchStateDir: "/Users/u/.local/state/orch/dispatch/pending",
     workerCacheDir: "/Users/u/.cache/orch/worker",
+    extraWriteDirs: [],
   });
   expect(readOnly).not.toContain('(subpath "/wt")');
   expect(readOnly).toContain('(literal "/Users/u/.claude.json")');

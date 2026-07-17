@@ -54,6 +54,15 @@ export interface OrchConfig {
   // fail-closed (the run refuses to start) off darwin or whenever the sandbox
   // cannot be applied — never a silent downgrade.
   sandbox?: boolean;
+  // Explicit user-owned escape hatch: extra absolute directories granted as
+  // write subpaths to every sandboxed run (e.g. "~/.gradle" is deliberately
+  // NOT granted by default — prefer the built-in ORCH_WORKER_CACHE). Each
+  // entry is snapshotted into spec.sandbox_write_dirs at run create and
+  // re-vetted fail-closed by the driver (canonicalized, narrow-dir gate, and
+  // orch's own config dir + state root are always refused: a worker must
+  // never be able to edit this list or forge run state). This shifts the
+  // blast-radius responsibility for the listed dirs to the user.
+  sandbox_write_dirs?: string[];
 }
 
 export interface MailAgentDefinition {

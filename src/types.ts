@@ -63,6 +63,11 @@ export interface RunSpec {
   // sandbox. Posture is derived from the immutable role, never stored, so the
   // two can't contradict. Mirrors `language` snapshotting.
   sandbox_engine?: "seatbelt-v1";
+  // Snapshot of config.json `sandbox_write_dirs` at spec creation: extra
+  // user-declared write subpaths for this run. The driver re-vets each entry
+  // fail-closed before granting; orch's own config dir and state root are
+  // never grantable.
+  sandbox_write_dirs?: string[];
 }
 
 export interface RunStatus {
