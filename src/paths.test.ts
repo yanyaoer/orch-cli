@@ -74,6 +74,33 @@ test("repo identity and worktree locks use the git top-level for nested cwd", as
   }
 });
 
+const hasJj = Boolean(Bun.which("jj"));
+
+test.skipIf(!hasJj)("repo identity resolves through jj for jj worktrees", async () => {
+  const root = tempDir();
+  const stateHome = join(root, "state");
+  const worktree = join(root, "repo");
+  const nested = join(worktree, "packages", "cli");
+  mkdirSync(nested, { recursive: true });
+  await runCmd(["jj", "git", "init", "--colocate"], worktree);
+  writeFileSync(join(worktree, "README.md"), "initial\n", "utf8");
+  await runCmd(["jj", "commit", "-m", "init"], worktree);
+  await runCmd(["jj", "git", "remote", "add", "origin", "https://github.com/acme/demo.git"], worktree);
+
+  const prev = process.env.XDG_STATE_HOME;
+  process.env.XDG_STATE_HOME = stateHome;
+  try {
+    expect(canonicalWorktreeRoot(nested)).toBe(canonicalWorktreeRoot(worktree));
+    const identity = await getRepoIdentity(nested);
+    expect(identity.repo_root).toBe(canonicalWorktreeRoot(worktree));
+    expect(identity.remote_url).toBe("https://github.com/acme/demo.git");
+    expect(identity.repo_key.startsWith("github.com/acme/demo-")).toBe(true);
+  } finally {
+    if (prev === undefined) delete process.env.XDG_STATE_HOME;
+    else process.env.XDG_STATE_HOME = prev;
+  }
+});
+
 test("state path components reject traversal segments", () => {
   const root = tempDir();
   const prev = process.env.XDG_STATE_HOME;

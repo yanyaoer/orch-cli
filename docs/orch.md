@@ -47,6 +47,13 @@ permissions, model/effort tiers, result schemas — live in the CLI:
   `orch handoff-pro` packs the repo into one markdown blob to paste in;
   execute the returned plan via `orch run create`.
 
+## Local VCS: jj first
+A worktree with a Jujutsu workspace (`.jj`, colocated included) is driven
+through jj: MR inference reads the nearest bookmark, base/dirty/evidence use
+the auto-snapshotted working-copy commit (`jj diff --from <base> --git`).
+Anything else uses git. Sandboxed workers see `.jj` like `.git` — read-only:
+edit files, leave VCS to the host.
+
 ## Publication language
 Optional `language` in `~/.config/orch/config.json`: `中文` or `english`
 (default; any other value falls back to english). Rule: when set to `中文`,

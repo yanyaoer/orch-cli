@@ -34,6 +34,7 @@ import {
 import { argvForDisplay, createForgeAdapter, detectForge, mrRefFromText } from "./forge.ts";
 import { findPrivateLeak, privateLeakAllowed, privateLeakErrorMessage } from "./leak.ts";
 import { runSupervisor, writeInitialRunFiles } from "./supervisor.ts";
+import { vcsBranch, vcsDirty, vcsHead } from "./vcs.ts";
 import { createNativeNormalizer, normalizeNativeLine } from "./native-events.ts";
 import {
   buildOverview,
@@ -371,27 +372,6 @@ function assertSandboxCompatible(existing: IdempotencyRecord, engine: typeof SEA
   );
 }
 
-async function gitHead(worktree: string): Promise<string> {
-  return (await $`git -C ${worktree} rev-parse HEAD`.quiet().text()).trim();
-}
-
-async function gitDirty(worktree: string): Promise<string> {
-  try {
-    return (await $`git -C ${worktree} status --porcelain`.quiet().text()).trim();
-  } catch {
-    return "";
-  }
-}
-
-async function gitBranch(worktree: string): Promise<string | null> {
-  try {
-    const branch = (await $`git -C ${worktree} rev-parse --abbrev-ref HEAD`.quiet().text()).trim();
-    return branch && branch !== "HEAD" ? branch : null;
-  } catch {
-    return null;
-  }
-}
-
 function mrFromForgeUrl(text: string): string | null {
   return text.match(/\/-\/merge_requests\/(\d+)/)?.[1] ?? text.match(/github\.com\/[^\s/]+\/[^\s/]+\/pull\/(\d+)/)?.[1] ?? null;
 }
@@ -414,10 +394,10 @@ async function resolveMr(args: ParsedArgs, taskText: string, worktree: string): 
   if (args.flags.has("mr")) return { mr: flagString(args, "mr"), source: "flag" };
   const fromTask = mrFromTask(taskText);
   if (fromTask) return { mr: fromTask, source: "task" };
-  const branch = await gitBranch(worktree);
+  const branch = await vcsBranch(worktree);
   if (branch) return { mr: branch, source: "branch" };
   throw new CliError(
-    "--mr is required: no MR/PR reference found in the task text and the worktree is not on a branch (detached HEAD or not a git repo)",
+    "--mr is required: no MR/PR reference found in the task text and the worktree is not on a branch or jj bookmark (detached HEAD or not a git/jj repo)",
   );
 }
 
@@ -1360,8 +1340,8 @@ async function createRun(args: ParsedArgs): Promise<number> {
   const dryRun = flagBool(args, "dry-run");
   if (dryRun) {
     const retry = flagBool(args, "retry");
-    const dirty = await gitDirty(worktree);
-    const baseSha = await gitHead(worktree);
+    const dirty = await vcsDirty(worktree);
+    const baseSha = await vcsHead(worktree);
     const existing = readIdempotency(idempotencyPath)[idempotencyKey];
     const existingSession = existing && !retry ? assertProviderSessionCompatible(existing, providerSession, agent) : null;
     if (existing && !retry) assertSandboxCompatible(existing, sandboxEngine, role);
@@ -1584,13 +1564,13 @@ async function startRun(input: StartRunInput): Promise<Record<string, unknown>> 
 
     assertSessionChainAllowed(mrDir, providerSession, tag, flagBool(args, "allow-session-chain"));
 
-    const dirty = await gitDirty(worktree);
+    const dirty = await vcsDirty(worktree);
     if (dirty.length > 0 && writeRoles.has(role) && !flagBool(args, "allow-dirty")) {
       process.stderr.write(
         `warn: worktree has uncommitted changes; write-role run will proceed. Pass --allow-dirty to acknowledge.\n`,
       );
     }
-    const baseSha = await gitHead(worktree);
+    const baseSha = await vcsHead(worktree);
     const id = runId(tag);
     const runDir = `${mrDir}/runs/${id}`;
     mkdirSync(runDir, { recursive: true });

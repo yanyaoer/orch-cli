@@ -101,15 +101,15 @@ export function providerStatePaths(provider: AgentName, home: string): ProviderS
 // Seatbelt is a path policy: a pre-existing regular file inside the worktree
 // that shares an inode with an outside file lets an allowed write mutate
 // outside content (probe-verified escape). Scan before spawn and fail closed;
-// deliberately no ignore switch. `.git` is skipped: it stays read-only under
-// the profile and git object stores hardlink routinely.
+// deliberately no ignore switch. `.git` and `.jj` are skipped: both stay
+// read-only under the profile and their object stores hardlink routinely.
 export function findWorktreeHardlinks(worktree: string, limit = 20): string[] {
   const found: string[] = [];
   const stack = [worktree];
   while (stack.length > 0 && found.length < limit) {
     const dir = stack.pop()!;
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
-      if (entry.name === ".git") continue;
+      if (entry.name === ".git" || entry.name === ".jj") continue;
       const path = join(dir, entry.name);
       if (entry.isDirectory()) {
         stack.push(path);
@@ -279,6 +279,7 @@ export function seatbeltProfile(input: SeatbeltProfileInput): string {
   allows.push('(literal "/dev/null")');
   if (input.orchStateDir) allows.push(`(subpath ${sbplString(input.orchStateDir)})`);
   const gitDir = join(input.worktree, ".git");
+  const jjDir = join(input.worktree, ".jj");
   return [
     "(version 1)",
     "(allow default)",
@@ -289,9 +290,13 @@ export function seatbeltProfile(input: SeatbeltProfileInput): string {
     "(deny file-write*",
     // Both forms: .git is a file in a linked worktree, a dir in the main one.
     // A linked worktree's common Git dir lives outside the worktree and is
-    // simply never allowed.
+    // simply never allowed. .jj gets the same treatment: workers edit files,
+    // the host does VCS — jj would otherwise snapshot worker state into the
+    // op log on any jj invocation inside the jail.
     `  (literal ${sbplString(gitDir)})`,
     `  (subpath ${sbplString(gitDir)})`,
+    `  (literal ${sbplString(jjDir)})`,
+    `  (subpath ${sbplString(jjDir)})`,
     ")",
   ].join("\n");
 }

@@ -112,17 +112,20 @@ test("providerStatePaths: exactly the selected provider's state", () => {
   });
 });
 
-test("findWorktreeHardlinks flags nlink>1 regular files and skips .git", () => {
+test("findWorktreeHardlinks flags nlink>1 regular files and skips .git and .jj", () => {
   const root = tempDir();
   const worktree = join(root, "wt");
   mkdirSync(join(worktree, "nested"), { recursive: true });
   mkdirSync(join(worktree, ".git"), { recursive: true });
+  mkdirSync(join(worktree, ".jj", "repo"), { recursive: true });
   writeFileSync(join(worktree, "plain.txt"), "a", "utf8");
   expect(findWorktreeHardlinks(worktree)).toEqual([]);
 
-  // A hardlinked pair inside .git is ignored (read-only under the profile)…
+  // A hardlinked pair inside .git or .jj is ignored (read-only under the profile)…
   writeFileSync(join(worktree, ".git", "obj"), "o", "utf8");
   linkSync(join(worktree, ".git", "obj"), join(worktree, ".git", "obj2"));
+  writeFileSync(join(worktree, ".jj", "repo", "obj"), "j", "utf8");
+  linkSync(join(worktree, ".jj", "repo", "obj"), join(worktree, ".jj", "repo", "obj2"));
   expect(findWorktreeHardlinks(worktree)).toEqual([]);
 
   // …but one that aliases content outside the worktree is found.
@@ -248,10 +251,14 @@ test("seatbeltProfile: default-deny writes, minimal allows, Git denied last", ()
   expect(profile).toContain('(subpath "/Users/u/.cache/orch/worker")');
   expect(profile).toContain('(subpath "/Users/u/.gradle")');
   expect(profile).toContain('(literal "/dev/null")');
-  // Git deny comes after the allow block: in SBPL the last matching rule wins.
+  // VCS denies come after the allow block: in SBPL the last matching rule wins.
   const gitDeny = profile.indexOf('(subpath "/wt/.git")');
   expect(gitDeny).toBeGreaterThan(profile.indexOf('(subpath "/wt")'));
   expect(profile.slice(gitDeny)).not.toContain("(allow file-write*");
+  const jjDeny = profile.indexOf('(subpath "/wt/.jj")');
+  expect(jjDeny).toBeGreaterThan(profile.indexOf('(subpath "/wt")'));
+  expect(profile.slice(jjDeny)).not.toContain("(allow file-write*");
+  expect(profile).toContain('(literal "/wt/.jj")');
 
   // read-only posture: no worktree rule; controller gets only request pending/.
   const readOnly = seatbeltProfile({
