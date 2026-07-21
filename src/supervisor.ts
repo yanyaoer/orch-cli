@@ -9,6 +9,7 @@ import { lockPathForWorktree } from "./paths.ts";
 import { providerResumeIdFromNativeText } from "./native-events.ts";
 import { buildWorkerEnv } from "../drivers/driver-common.ts";
 import { sandboxPosture } from "../drivers/sandbox.ts";
+import { jjWorkspaceRoot, vcsHead, vcsKind } from "./vcs.ts";
 
 function now(): string {
   return new Date().toISOString();
@@ -113,9 +114,9 @@ function appendStream(stream: ReadableStream<Uint8Array> | null, path: string): 
   })();
 }
 
-async function gitHead(worktree: string): Promise<string | null> {
+async function worktreeHead(worktree: string): Promise<string | null> {
   try {
-    return (await Bun.$`git -C ${worktree} rev-parse HEAD`.quiet().text()).trim();
+    return await vcsHead(worktree);
   } catch {
     return null;
   }
@@ -127,16 +128,27 @@ async function writeEvidence(runDir: string, spec: RunSpec): Promise<void> {
     if (!writeRoles.has(spec.role) || !baseSha) return;
     const artifactsDir = runDirFile(runDir, "artifacts");
     mkdirSync(artifactsDir, { recursive: true });
-    // git output is redirected straight to the artifact files so a large or
+    // VCS output is redirected straight to the artifact files so a large or
     // binary diff never transits JS memory. No timeout: these are read-only
-    // git commands and the whole block is best-effort diagnostics.
-    await Bun.$`git -C ${spec.worktree} status --porcelain=v1 > ${`${artifactsDir}/git-status.txt`}`.quiet();
+    // commands and the whole block is best-effort diagnostics.
+    if (vcsKind(spec.worktree) === "jj") {
+      // cwd must be the workspace root: jj prints cwd-relative paths and
+      // changed-files.txt consumers expect root-relative ones. The base is
+      // @'s snapshot at run creation; jj keeps it addressable even after the
+      // working copy amended past it, so --from shows exactly the run's edits.
+      const root = jjWorkspaceRoot(spec.worktree) ?? spec.worktree;
+      await Bun.$`jj status > ${`${artifactsDir}/git-status.txt`}`.cwd(root).quiet();
+      await Bun.$`jj diff --from ${baseSha} --git > ${`${artifactsDir}/diff.patch`}`.cwd(root).quiet();
+      await Bun.$`jj diff --from ${baseSha} --name-only > ${`${artifactsDir}/changed-files.txt`}`.cwd(root).quiet();
+    } else {
+      await Bun.$`git -C ${spec.worktree} status --porcelain=v1 > ${`${artifactsDir}/git-status.txt`}`.quiet();
 
-    // Diffing the base SHA against the worktree captures uncommitted tracked
-    // edits. Untracked files are intentionally visible only in git-status.txt.
-    await Bun.$`git -C ${spec.worktree} diff --binary ${baseSha} -- . > ${`${artifactsDir}/diff.patch`}`.quiet();
+      // Diffing the base SHA against the worktree captures uncommitted tracked
+      // edits. Untracked files are intentionally visible only in git-status.txt.
+      await Bun.$`git -C ${spec.worktree} diff --binary ${baseSha} -- . > ${`${artifactsDir}/diff.patch`}`.quiet();
 
-    await Bun.$`git -C ${spec.worktree} diff --name-only ${baseSha} -- . > ${`${artifactsDir}/changed-files.txt`}`.quiet();
+      await Bun.$`git -C ${spec.worktree} diff --name-only ${baseSha} -- . > ${`${artifactsDir}/changed-files.txt`}`.quiet();
+    }
   } catch {
     // Evidence is diagnostic only; collection must not change the run outcome.
   }
@@ -199,8 +211,8 @@ function fallbackSpec(runDir: string): RunSpec {
     provider_session_mode: "fresh_persistent",
     idempotency_key: "unknown",
     repo_key: "unknown",
-    // The run dir is not a git worktree, so gitHead resolves to null instead of
-    // picking up whatever repo the supervisor process happens to run in.
+    // The run dir is not a VCS worktree, so worktreeHead resolves to null instead
+    // of picking up whatever repo the supervisor process happens to run in.
     worktree: runDir,
     task_path: null,
     task_text: "",
@@ -318,7 +330,7 @@ export async function runSupervisor(runDir: string, orchCommand: string[]): Prom
       exit_code: exitCode,
       last_event_seq: nextSeq(runDir) - 1,
       provider_resume_id: readProviderResumeId(runDir),
-      head_sha: await gitHead(spec.worktree),
+      head_sha: await worktreeHead(spec.worktree),
     });
 
     return finalState === "done" ? 0 : exitCode || 1;
@@ -335,7 +347,7 @@ export async function runSupervisor(runDir: string, orchCommand: string[]): Prom
       exit_code: exitCode,
       last_event_seq: nextSeq(runDir) - 1,
       provider_resume_id: readProviderResumeId(runDir),
-      head_sha: await gitHead(spec.worktree),
+      head_sha: await worktreeHead(spec.worktree),
     });
     return exitCode;
   } finally {

@@ -9,6 +9,7 @@ import type { RunState, RunStatus } from "./types.ts";
 import { readJsonFile } from "./json.ts";
 import { mailControlStateDir, mrStateDir, orchStateRoot, statePathSegment } from "./paths.ts";
 import { isPidAlive } from "./locks.ts";
+import { vcsKind } from "./vcs.ts";
 
 export interface OverviewRun {
   repo_key: string;
@@ -407,8 +408,9 @@ export function buildOverview(repoKeys: string[], withWorktree: boolean, options
 // HEAD itself (a just-created branch with no commits yet is indistinguishable
 // from a merged one by ancestry alone). Sanitized forms are included so
 // outbox-only mr dirs (no runs to recover the raw name from) match too.
-// Returns null outside a git repo.
+// Returns null outside a git/jj repo.
 export async function mergedBranchMrs(worktree: string): Promise<Set<string> | null> {
+  if (vcsKind(worktree) === "jj") return mergedBookmarkMrs(worktree);
   const git = (...args: string[]) =>
     Bun.spawn(["git", "-C", worktree, ...args], { stdout: "pipe", stderr: "ignore" });
   try {
@@ -423,6 +425,31 @@ export async function mergedBranchMrs(worktree: string): Promise<Set<string> | n
       if (!branch || branch === current || sha === head) continue;
       mrs.add(branch);
       mrs.add(statePathSegment(branch, "mr"));
+    }
+    return mrs;
+  } catch {
+    return null;
+  }
+}
+
+// jj analog of the git rule above: local bookmarks pointing strictly below @-
+// retired their line of work. @- is where the active bookmark trails the
+// working copy, so it plays both "current branch" and "at HEAD" exclusions;
+// remote-only refs never qualify.
+async function mergedBookmarkMrs(worktree: string): Promise<Set<string> | null> {
+  try {
+    const proc = Bun.spawn(
+      ["jj", "bookmark", "list", "-r", "::@- ~ @-", "--ignore-working-copy", "-T", 'if(remote, "", name ++ "\\n")'],
+      { cwd: worktree, stdout: "pipe", stderr: "ignore" },
+    );
+    const out = await new Response(proc.stdout).text();
+    if ((await proc.exited) !== 0) return null;
+    const mrs = new Set<string>();
+    for (const line of out.split("\n")) {
+      const bookmark = line.trim();
+      if (!bookmark) continue;
+      mrs.add(bookmark);
+      mrs.add(statePathSegment(bookmark, "mr"));
     }
     return mrs;
   } catch {

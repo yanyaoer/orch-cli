@@ -392,6 +392,30 @@ test("mergedBranchMrs lists merged branches, excluding the current one", async (
   expect(await mergedBranchMrs(plain)).toBeNull();
 });
 
+test.skipIf(!Boolean(Bun.which("jj")))("mergedBranchMrs (jj) lists bookmarks below @-, keeping the trailing one live", async () => {
+  const worktree = realpathSync(mkdtempSync(join(tmpdir(), "orch-overview-jj-")));
+  cleanups.push(() => rmSync(worktree, { recursive: true, force: true }));
+  const jj = async (...args: string[]) => {
+    const proc = Bun.spawn(["jj", ...args], { cwd: worktree, stdout: "ignore", stderr: "ignore" });
+    expect(await proc.exited).toBe(0);
+  };
+  await jj("git", "init", "--colocate");
+  writeFileSync(join(worktree, "a.txt"), "a\n", "utf8");
+  await jj("commit", "-m", "first");
+  await jj("bookmark", "create", "feat/merged", "-r", "@-");
+  writeFileSync(join(worktree, "b.txt"), "b\n", "utf8");
+  await jj("commit", "-m", "second");
+  await jj("bookmark", "create", "current", "-r", "@-");
+
+  const mrs = await mergedBranchMrs(worktree);
+  expect(mrs).not.toBeNull();
+  // feat/merged sits on an ancestor of @- -> its line of work shipped.
+  expect(mrs!.has("feat/merged")).toBe(true);
+  expect(mrs!.has("feat_merged")).toBe(true); // sanitized form for outbox-only dirs
+  // The bookmark trailing the working copy plays "current branch": never archived.
+  expect(mrs!.has("current")).toBe(false);
+});
+
 test("decision close acks without queueing a mirror comment; sweep batch-acks the backlog", async () => {
   const stateHome = makeStateHome();
   const worktree = realpathSync(mkdtempSync(join(tmpdir(), "orch-overview-wt-")));

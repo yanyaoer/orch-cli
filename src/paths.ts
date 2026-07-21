@@ -1,7 +1,7 @@
 import { basename, dirname, resolve } from "node:path";
 import { mkdirSync, realpathSync } from "node:fs";
-import { $ } from "bun";
 import { randomHex, sha256, shortHash } from "./hash.ts";
+import { jjWorkspaceRoot, vcsRemoteOriginUrl } from "./vcs.ts";
 
 export interface RepoIdentity {
   repo_root: string;
@@ -82,6 +82,8 @@ export function repoKeyFromRemote(remoteUrl: string, repoRoot: string): string {
 export function canonicalWorktreeRoot(worktree: string): string {
   const resolved = resolve(worktree);
   try {
+    const jjRoot = jjWorkspaceRoot(resolved);
+    if (jjRoot) return realpathSync(jjRoot);
     const proc = Bun.spawnSync(["git", "-C", resolved, "rev-parse", "--show-toplevel"], {
       stdout: "pipe",
       stderr: "ignore",
@@ -89,7 +91,7 @@ export function canonicalWorktreeRoot(worktree: string): string {
     const root = proc.exitCode === 0 ? proc.stdout.toString().trim() : "";
     if (root) return realpathSync(root);
   } catch {
-    // Fall through to the resolved path for non-git directories.
+    // Fall through to the resolved path for non-VCS directories.
   }
   return realpathSync(resolved);
 }
@@ -98,7 +100,7 @@ export async function getRepoIdentity(worktree: string): Promise<RepoIdentity> {
   const repoRoot = canonicalWorktreeRoot(worktree);
   let remoteUrl = "";
   try {
-    remoteUrl = (await $`git -C ${repoRoot} remote get-url origin`.quiet().text()).trim();
+    remoteUrl = (await vcsRemoteOriginUrl(repoRoot)).trim();
   } catch {
     remoteUrl = repoRoot;
   }

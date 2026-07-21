@@ -5,6 +5,7 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { extname } from "node:path";
 import { resolveSafePath, run } from "../drivers/chatgpt-bridge.ts";
 import { sha256 } from "./hash.ts";
+import { vcsKind } from "./vcs.ts";
 
 export interface BundleOptions {
   worktree: string;
@@ -138,10 +139,13 @@ async function hasCommand(name: string, cwd: string): Promise<boolean> {
 
 async function repoTree(root: string): Promise<string> {
   if (await hasCommand("tree", root)) {
-    const out = await run(["tree", "-L", "3", "-a", "-I", "node_modules|.git", "--noreport"], root);
+    const out = await run(["tree", "-L", "3", "-a", "-I", "node_modules|.git|.jj", "--noreport"], root);
     if (out.code === 0 && out.stdout.trim()) return out.stdout.trim();
   }
-  const ls = await run(["git", "-C", root, "ls-files"], root);
+  const ls =
+    vcsKind(root) === "jj"
+      ? await run(["jj", "file", "list"], root)
+      : await run(["git", "-C", root, "ls-files"], root);
   if (ls.code === 0 && ls.stdout.trim()) {
     const lines = ls.stdout.trim().split("\n");
     const head = lines.slice(0, 300).join("\n");
@@ -150,17 +154,37 @@ async function repoTree(root: string): Promise<string> {
   return "(repository tree unavailable)";
 }
 
-async function gitStatus(root: string): Promise<string> {
+async function vcsStatus(root: string): Promise<string> {
+  if (vcsKind(root) === "jj") {
+    const out = await run(["jj", "status"], root);
+    return out.code === 0 ? out.stdout.trimEnd() : `(jj unavailable: ${out.stderr.trim()})`;
+  }
   const out = await run(["git", "-C", root, "status", "--short"], root);
   return out.code === 0 ? out.stdout.trimEnd() : `(git unavailable: ${out.stderr.trim()})`;
 }
 
-async function gitLog(root: string): Promise<string> {
+// Changed files for auto-include. jj answers directly (its status output is
+// prose, not porcelain); git goes through the porcelain parser.
+async function changedFilesList(root: string, status: string): Promise<string[]> {
+  if (vcsKind(root) !== "jj") return parseChangedFiles(status);
+  const out = await run(["jj", "diff", "--name-only"], root);
+  return out.code === 0 ? unique(out.stdout.split(/\r?\n/)) : [];
+}
+
+async function vcsLog(root: string): Promise<string> {
+  if (vcsKind(root) === "jj") {
+    const out = await run(["jj", "log", "--no-graph", "-n", "8", "-T", "builtin_log_oneline"], root);
+    return out.code === 0 ? out.stdout.trimEnd() : `(jj log unavailable: ${out.stderr.trim()})`;
+  }
   const out = await run(["git", "-C", root, "log", "--oneline", "-8"], root);
   return out.code === 0 ? out.stdout.trimEnd() : `(git log unavailable: ${out.stderr.trim()})`;
 }
 
-async function gitDiff(root: string): Promise<string> {
+async function vcsDiff(root: string): Promise<string> {
+  if (vcsKind(root) === "jj") {
+    const out = await run(["jj", "diff", "--git"], root);
+    return out.code === 0 ? out.stdout : `(jj diff unavailable: ${out.stderr.trim()})`;
+  }
   const out = await run(["git", "-C", root, "diff"], root);
   return out.code === 0 ? out.stdout : `(git diff unavailable: ${out.stderr.trim()})`;
 }
@@ -210,8 +234,8 @@ export async function buildBundle(options: BundleOptions): Promise<BundleResult>
   const includeChanged = options.includeChangedFiles !== false;
   const includeDiff = options.includeDiff !== false;
 
-  const status = await gitStatus(root);
-  const changedFiles = parseChangedFiles(status);
+  const status = await vcsStatus(root);
+  const changedFiles = await changedFilesList(root, status);
   const importantFiles = includeImportant ? existingImportantFiles(root) : [];
   const selectedPaths = unique(options.selectedPaths ?? []);
   const globFiles = await filesForGlobs(root, options.extraGlobs ?? [], maxFiles);
@@ -238,10 +262,10 @@ export async function buildBundle(options: BundleOptions): Promise<BundleResult>
 
   parts.push(section("Repository Tree", `\`\`\`text\n${await repoTree(root)}\n\`\`\``));
   parts.push(section("Git Status", `\`\`\`text\n${status || "(clean)"}\n\`\`\``));
-  parts.push(section("Recent Commits", `\`\`\`text\n${await gitLog(root)}\n\`\`\``));
+  parts.push(section("Recent Commits", `\`\`\`text\n${await vcsLog(root)}\n\`\`\``));
 
   if (includeDiff) {
-    const diff = truncateText(await gitDiff(root), maxDiffBytes);
+    const diff = truncateText(await vcsDiff(root), maxDiffBytes);
     truncated ||= diff.truncated;
     parts.push(section("Git Diff", `\`\`\`diff\n${diff.text}\n\`\`\``));
   }
