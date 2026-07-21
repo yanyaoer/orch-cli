@@ -1,4 +1,5 @@
 import { $ } from "bun";
+import { realpathSync } from "node:fs";
 
 // jj-first local VCS seam. A worktree managed by Jujutsu answers every local
 // VCS question through jj — including colocated repos, where plain git
@@ -31,12 +32,35 @@ function probe(worktree: string): VcsProbe {
       stderr: "ignore",
     });
     const root = proc.exitCode === 0 ? proc.stdout.toString().trim() : "";
-    if (root) result = { kind: "jj", jjRoot: root };
+    // Nearest-repo rule: a git checkout nested inside a jj workspace (e.g. a
+    // linked worktree under <jj-repo>/.claude/worktrees/) belongs to git —
+    // jj root walks past it to the outer workspace and would misdirect
+    // base/dirty/evidence to the outer working copy. jj wins only when git
+    // agrees on the same root (colocated) or has no repo here at all.
+    if (root) {
+      const gitTop = gitToplevel(worktree);
+      if (gitTop === null || realpathSync(root) === gitTop) result = { kind: "jj", jjRoot: root };
+    }
   } catch {
     // jj missing or worktree unreadable: git handles (or fails) as before.
   }
   probeCache.set(worktree, result);
   return result;
+}
+
+// Nearest git toplevel, realpath'd; null when no git repo encloses the path
+// (pure jj workspace — jj wins by default there).
+function gitToplevel(worktree: string): string | null {
+  try {
+    const proc = Bun.spawnSync(["git", "-C", worktree, "rev-parse", "--show-toplevel"], {
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+    const top = proc.exitCode === 0 ? proc.stdout.toString().trim() : "";
+    return top ? realpathSync(top) : null;
+  } catch {
+    return null;
+  }
 }
 
 export function vcsKind(worktree: string): VcsKind {

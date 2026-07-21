@@ -105,6 +105,19 @@ test.skipIf(!hasJj)("jj repo: branch is the nearest bookmarked ancestor's local 
   expect(await vcsBranch(dir)).toBe("feat/task");
 });
 
+test.skipIf(!hasJj)("git linked worktree nested inside a jj workspace stays git", async () => {
+  const dir = await jjFixture();
+  // Mirrors <jj-repo>/.claude/worktrees/<name>: jj root resolves to the outer
+  // workspace, but base/dirty/branch must bind to the inner git checkout.
+  const nested = join(dir, ".claude", "worktrees", "side");
+  await sh(dir, "git", "worktree", "add", "-b", "side-branch", nested);
+  expect(vcsKind(nested)).toBe("git");
+  expect(jjWorkspaceRoot(nested)).toBeNull();
+  expect(await vcsBranch(nested)).toBe("side-branch");
+  // The outer workspace itself still answers as jj.
+  expect(vcsKind(dir)).toBe("jj");
+});
+
 test.skipIf(!hasJj)("jj repo: origin url comes from jj git remote list", async () => {
   const dir = await jjFixture();
   expect(await vcsRemoteOriginUrl(dir)).toBe("");
