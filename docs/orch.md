@@ -47,6 +47,15 @@ permissions, model/effort tiers, result schemas — live in the CLI:
   `orch handoff-pro` packs the repo into one markdown blob to paste in;
   execute the returned plan via `orch run create`.
 
+## Scratch worktrees (review / verify)
+One persistent scratch worktree per repo — never one per MR, never a full
+`git clone` under /tmp. First time: `git -C <repo> worktree add --detach
+/tmp/<repo>-review`. Each round: `git -C /tmp/<repo>-review checkout --detach
+<mr-head> && git clean -fd` (keep ignored build dirs for incremental verify).
+Parallel reviewers of the same MR share it read-only. A second concurrent MR
+may get one extra worktree, but `git -C <repo> worktree remove --force <path>`
+it the moment its round ends — `git worktree list` must stay clean.
+
 ## Local VCS: jj first
 A worktree with a Jujutsu workspace (`.jj`, colocated included) is driven
 through jj: MR inference reads the nearest bookmark, base/dirty/evidence use
