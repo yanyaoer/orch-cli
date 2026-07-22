@@ -3,3 +3,5 @@ dist/
 *.log
 .spike/
 /bun.lock
+.claude
+.DS_Store
