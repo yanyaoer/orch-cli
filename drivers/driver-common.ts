@@ -263,7 +263,9 @@ function providerArgv(
     // runProviderDriver before spawn (omp native retry.fallbackChains).
     if (fallbacks.length > 0) argv.push("--config", ompFallbackConfigPath(runDir));
     argv.push("-p", "--mode", "json");
-    if (readOnly) argv.push("--tools", "read,grep,find,ls");
+    // omp's tool names diverge from pi's: find/ls are not valid (omp 17 exits 2
+    // on argv validation, before any event); glob covers file discovery.
+    if (readOnly) argv.push("--tools", "read,grep,glob");
     if (spec.provider_session_mode === "ephemeral") {
       argv.push("--no-session");
     } else if (spec.provider_session_mode === "resume_exact" && spec.provider_session_id) {
