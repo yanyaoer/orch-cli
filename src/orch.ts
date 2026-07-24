@@ -116,6 +116,13 @@ import { sandboxPosture, sandboxRunIdentity, SEATBELT_ENGINE, seatbeltUnsupporte
 import { insideSandbox, proxyToHost, reconcileDispatchOnce, reconcileDispatchWatch, shouldProxyToHost } from "./dispatch.ts";
 import { classifyNewOpenQuestions, evaluateNewExecution, validateNewPlanMarkdown, type NewExecutionRun } from "./new-flow.ts";
 
+// Host-side git probes (vcsDirty at run create, supervisor evidence capture,
+// repo-root resolution) run in worktrees the user may be rebasing in at the
+// same time; `git status`/`git diff` opportunistically rewrite the index,
+// taking short-lived index.lock that races the user's own git. Workers inherit
+// this through buildWorkerEnv, covering non-seatbelt sandboxes too.
+process.env.GIT_OPTIONAL_LOCKS = "0";
+
 type IdempotencyRecord = {
   run_id: string;
   run_dir: string;
