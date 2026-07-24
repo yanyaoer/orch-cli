@@ -14,7 +14,10 @@ final class MainViewController: NSViewController {
     // run's normalized native trajectory (orch events tail --native).
     private var streamTask: StreamTask?
     private var currentStreamRunID: String?
+    private var detailTailer: FileTailer?
     private var selectedRun: RunEntry?
+
+    private static let activeStates: Set<String> = ["running", "starting", "pending"]
 
     var onRunsChanged: (() -> Void)?
 
@@ -117,18 +120,21 @@ final class MainViewController: NSViewController {
 
     private func startGlobalStream() {
         currentStreamRunID = nil
+        detailTailer?.stop()
+        detailTailer = nil
         streamTask?.terminate()
         appendLog("\n── 全局进展流 · 全部仓库 ──\n", color: .tertiaryLabelColor)
         streamTask = StreamTask(["events", "tail", "-f", "--all", "--native"],
                                 cwd: NSHomeDirectory()) { [weak self] text in
-            self?.appendLog(text, color: .secondaryLabelColor)
+            self?.appendCapped(text, color: .secondaryLabelColor)
         }
     }
 
-    /// Sidebar selection drives which trajectory renders: a run row streams
-    /// that agent's normalized native events; anything else returns to the
-    /// all-repo multiplexer. Reselecting the same run is a no-op so the
-    /// sidebar's 5s poll refresh does not restart the stream.
+    /// Sidebar selection drives what renders: a run row shows that agent's
+    /// trajectory summarized straight from its state-dir native.jsonl (live
+    /// runs keep following by file offset); anything else returns to the
+    /// all-repo multiplexer. Reselecting the same run only refreshes state so
+    /// the sidebar's 5s poll does not re-render the view.
     func selectRun(_ entry: RunEntry?) {
         selectedRun = entry
         updateCancelButton()
@@ -136,56 +142,68 @@ final class MainViewController: NSViewController {
             if currentStreamRunID != nil { startGlobalStream() }
             return
         }
-        guard entry.info.run_id != currentStreamRunID else { return }
-        var isDir: ObjCBool = false
-        if let wt = entry.info.worktree,
-           FileManager.default.fileExists(atPath: wt, isDirectory: &isDir), isDir.boolValue {
-            startRunStream(entry, worktree: wt)
-        } else {
-            replayFromState(entry)
-        }
-    }
-
-    private func startRunStream(_ entry: RunEntry, worktree: String) {
-        let info = entry.info
-        currentStreamRunID = info.run_id
-        streamTask?.terminate()
-        appendLog("\n── \(info.role) · \(info.agent) — \(info.run_id) ──\n", color: .tertiaryLabelColor)
-        streamTask = StreamTask(
-            ["events", "tail", "--run", info.run_id, "--mr", info.mr,
-             "--native", "-n", "40", "-f", "--worktree", worktree],
-            cwd: worktree
-        ) { [weak self] text in
-            self?.appendLog(text)
-        } onExit: { [weak self] _ in
-            // tail --run -f exits once the run is terminal and drained; only
-            // fall back when this run is still the active stream.
-            guard let self, self.currentStreamRunID == info.run_id else { return }
-            self.appendLog("── run 已终态，返回全局流 ──\n", color: .tertiaryLabelColor)
-            self.onRunsChanged?()
-            self.startGlobalStream()
-        }
-    }
-
-    /// The run's worktree is gone (scratch dirs get deleted) so `orch events
-    /// tail` cannot derive the repo key — replay the trajectory straight from
-    /// the persisted state dir instead. Such runs are terminal: a static tail
-    /// is complete, not a degraded live view.
-    private func replayFromState(_ entry: RunEntry) {
-        currentStreamRunID = entry.info.run_id
-        streamTask?.terminate()
-        streamTask = nil
-        appendLog("\n── \(entry.info.role) · \(entry.info.agent) — \(entry.info.run_id) (worktree 已删除，静态回放) ──\n",
-                  color: .tertiaryLabelColor)
-        for name in ["native.jsonl", "events.jsonl"] {
-            guard let text = try? String(contentsOfFile: entry.runDir + "/" + name, encoding: .utf8) else { continue }
-            let lines = text.split(separator: "\n").suffix(40)
-            for line in lines {
-                appendLog(String(line.prefix(400)) + (line.count > 400 ? " …\n" : "\n"), color: .secondaryLabelColor)
+        if entry.info.run_id == currentStreamRunID {
+            // Fresh state from the sidebar poll: stop following once terminal.
+            if detailTailer != nil, !Self.activeStates.contains(entry.info.state) {
+                detailTailer?.stop()
+                detailTailer = nil
+                appendLog("── run 已终态 (\(entry.info.state)) ──\n", color: .tertiaryLabelColor)
             }
             return
         }
-        appendLog("(无事件记录)\n", color: .secondaryLabelColor)
+        showRunDetail(entry)
+    }
+
+    private static let detailEventCount = 12
+
+    // The trajectory renders from the persisted native.jsonl, one summarized
+    // line per event: parsing the JSON resolves the escaped-blob soup a raw
+    // dump (or the CLI's rendering of huge final messages) produces, and the
+    // state dir needs no worktree — deleted scratch dirs replay identically.
+    private func showRunDetail(_ entry: RunEntry) {
+        let info = entry.info
+        currentStreamRunID = info.run_id
+        detailTailer?.stop()
+        detailTailer = nil
+        streamTask?.terminate()
+        streamTask = nil
+        appendLog("\n── \(info.role) · \(info.agent) · \(info.state) — \(info.run_id) ──\n",
+                  color: .tertiaryLabelColor)
+
+        let nativePath = entry.runDir + "/native.jsonl"
+        let eventsPath = entry.runDir + "/events.jsonl"
+        let path = FileManager.default.fileExists(atPath: nativePath) ? nativePath : eventsPath
+        // Read a generous window, then keep only events with human-relevant
+        // text: token-progress events dominate the raw stream (observed
+        // ~2/3 of a claude run) and would fill the view with blank rows.
+        guard let tail = NativeLog.tail(path: path, count: 300) else {
+            appendLog("(无事件记录)\n", color: .secondaryLabelColor)
+            return
+        }
+        var summaries = tail.lines.map(NativeLog.summarize).filter { !$0.text.isEmpty }
+        if summaries.isEmpty {
+            summaries = tail.lines.suffix(5).map { ("raw", NativeLog.clip($0, 300)) }
+        }
+        let shown = summaries.suffix(Self.detailEventCount)
+        appendLog("最近 \(shown.count) 条事件：\n", color: .tertiaryLabelColor)
+        for summary in shown { appendSummary(summary) }
+
+        if Self.activeStates.contains(info.state) {
+            detailTailer = FileTailer(path: path, offset: tail.endOffset) { [weak self] line in
+                self?.appendEvent(line)
+            }
+        }
+    }
+
+    private func appendEvent(_ line: String) {
+        let summary = NativeLog.summarize(line)
+        guard !summary.text.isEmpty else { return }
+        appendSummary(summary)
+    }
+
+    private func appendSummary(_ summary: (tag: String, text: String)) {
+        appendLog("▸ \(summary.tag)  ", color: summary.tag.contains("error") ? .systemRed : .tertiaryLabelColor)
+        appendLog(summary.text + "\n", color: .labelColor)
     }
 
     // MARK: run / cancel
@@ -288,6 +306,17 @@ final class MainViewController: NSViewController {
     func stopAll() {
         newTask?.terminate()
         streamTask?.terminate()
+        detailTailer?.stop()
+    }
+
+    /// Long single lines (a final event can embed a whole result JSON) make
+    /// NSTextView layout crawl; cap every physical line before appending.
+    private func appendCapped(_ text: String, color: NSColor, lineCap: Int = 300) {
+        let capped = text
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { $0.count > lineCap ? String($0.prefix(lineCap)) + " …" : String($0) }
+            .joined(separator: "\n")
+        appendLog(capped, color: color)
     }
 
     // MARK: log

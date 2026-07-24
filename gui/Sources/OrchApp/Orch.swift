@@ -134,6 +134,119 @@ final class StateScanner {
     }
 }
 
+// MARK: - native.jsonl reading / rendering
+
+struct NativeTail {
+    let lines: [String]
+    let endOffset: UInt64
+}
+
+enum NativeLog {
+    /// Last `count` complete lines of a (possibly huge) jsonl file, reading at
+    /// most `maxBytes` from the end; endOffset lets a tailer continue live.
+    static func tail(path: String, count: Int, maxBytes: UInt64 = 262_144) -> NativeTail? {
+        guard let fh = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { try? fh.close() }
+        guard let size = try? fh.seekToEnd() else { return nil }
+        let start = size > maxBytes ? size - maxBytes : 0
+        try? fh.seek(toOffset: start)
+        guard let data = try? fh.readToEnd() else { return NativeTail(lines: [], endOffset: size) }
+        var lines = String(decoding: data, as: UTF8.self)
+            .split(separator: "\n", omittingEmptySubsequences: true)
+        if start > 0, !lines.isEmpty { lines.removeFirst() }
+        return NativeTail(lines: lines.suffix(count).map(String.init), endOffset: size)
+    }
+
+    // Keys worth surfacing, in display priority; everything else in a native
+    // event is machinery.
+    private static let priorityKeys = [
+        "title", "text", "message", "summary", "command", "error",
+        "result", "recommendation", "content", "name", "path", "state", "reason",
+    ]
+
+    /// Provider-agnostic one-line summary of a native event: parse the JSON
+    /// and surface the human-relevant strings (parsing also resolves the
+    /// escaped-blob soup a raw dump shows).
+    static func summarize(_ line: String) -> (tag: String, text: String) {
+        guard let data = line.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return ("raw", clip(line, 300))
+        }
+        let tag = (obj["type"] as? String) ?? (obj["kind"] as? String) ?? "event"
+        var parts: [String] = []
+        collect(obj, depth: 0, parts: &parts)
+        return (tag, clip(parts.joined(separator: " · "), 500))
+    }
+
+    private static func collect(_ any: Any, depth: Int, parts: inout [String]) {
+        guard depth < 5, parts.count < 4 else { return }
+        if let dict = any as? [String: Any] {
+            for key in priorityKeys {
+                guard parts.count < 4 else { return }
+                if let s = dict[key] as? String {
+                    let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !trimmed.isEmpty { parts.append(clip(trimmed.replacingOccurrences(of: "\n", with: " ⏎ "), 200)) }
+                }
+            }
+            for key in dict.keys.sorted() {
+                guard parts.count < 4 else { return }
+                let value = dict[key]
+                if value is [String: Any] || value is [Any] {
+                    collect(value as Any, depth: depth + 1, parts: &parts)
+                }
+            }
+        } else if let arr = any as? [Any] {
+            for value in arr {
+                guard parts.count < 4 else { return }
+                collect(value, depth: depth + 1, parts: &parts)
+            }
+        }
+    }
+
+    static func clip(_ s: String, _ n: Int) -> String {
+        s.count <= n ? s : String(s.prefix(n)) + " …"
+    }
+}
+
+/// Follows appended bytes of a file by offset polling (1s): native.jsonl has
+/// no writer notification we can subscribe to without extra machinery.
+final class FileTailer {
+    private let path: String
+    private var offset: UInt64
+    private var carry = Data()
+    private var timer: Timer?
+    private let onLine: (String) -> Void
+
+    init(path: String, offset: UInt64, onLine: @escaping (String) -> Void) {
+        self.path = path
+        self.offset = offset
+        self.onLine = onLine
+        timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            self?.poll()
+        }
+    }
+
+    private func poll() {
+        guard let fh = FileHandle(forReadingAtPath: path) else { return }
+        defer { try? fh.close() }
+        guard let size = try? fh.seekToEnd(), size > offset else { return }
+        try? fh.seek(toOffset: offset)
+        guard let data = try? fh.readToEnd() else { return }
+        offset = size
+        carry.append(data)
+        while let nl = carry.firstIndex(of: 0x0A) {
+            let lineData = carry.subdata(in: carry.startIndex..<nl)
+            carry = carry.subdata(in: carry.index(after: nl)..<carry.endIndex)
+            if !lineData.isEmpty { onLine(String(decoding: lineData, as: UTF8.self)) }
+        }
+    }
+
+    func stop() {
+        timer?.invalidate()
+        timer = nil
+    }
+}
+
 func relativeTime(_ iso: String?) -> String {
     guard let iso else { return "" }
     let parser = ISO8601DateFormatter()
