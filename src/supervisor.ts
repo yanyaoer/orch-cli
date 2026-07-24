@@ -141,7 +141,10 @@ async function writeEvidence(runDir: string, spec: RunSpec): Promise<void> {
       await Bun.$`jj diff --from ${baseSha} --git > ${`${artifactsDir}/diff.patch`}`.cwd(root).quiet();
       await Bun.$`jj diff --from ${baseSha} --name-only > ${`${artifactsDir}/changed-files.txt`}`.cwd(root).quiet();
     } else {
-      await Bun.$`git -C ${spec.worktree} status --porcelain=v1 > ${`${artifactsDir}/git-status.txt`}`.quiet();
+      // --untracked-files=all: the default collapses an untracked subtree to
+      // one "dir/" entry, hiding what a worker actually created — consumers
+      // (prewalk's handoff gate) need per-file evidence.
+      await Bun.$`git -C ${spec.worktree} status --porcelain=v1 --untracked-files=all > ${`${artifactsDir}/git-status.txt`}`.quiet();
 
       // Diffing the base SHA against the worktree captures uncommitted tracked
       // edits. Untracked files are intentionally visible only in git-status.txt.
