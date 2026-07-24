@@ -32,6 +32,11 @@ permissions, model/effort tiers, result schemas — live in the CLI:
   diff; `--auto` records the unambiguous decisions and queues ONE merged MR
   comment), `orch investigate` (researcher role, omp+claude),
   `orch fanout --role <r>` (generic).
+- **Bounded, testable task on a budget** → `orch prewalk --task <f>
+  --executor-model <m>`: a guide model plans a validated TODO and lands the
+  first edit, then the cheaper model resumes the SAME provider session to
+  finish; the handoff gate is host-verified, an unmet gate keeps the guide
+  model. Not for ambiguous or high-risk work — those stay frontier-only.
 - **Drive orch by email** → `orch mailctl`: poll ingests an allowlisted,
   authenticated sender's task and spawns a claude controller that fans work out
   and replies in-thread; the controller orchestrates, it never edits code.

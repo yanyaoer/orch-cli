@@ -59,6 +59,7 @@ import {
   verdictHelp,
   waitHelp,
   fanoutHelp,
+  prewalkHelp,
   mirrorHelp,
   mirrorSyncHelp,
   mailHelp,
@@ -115,6 +116,7 @@ import { buildPrompt, buildProviderExecutionPlan, type ProviderExecutionPlan } f
 import { sandboxPosture, sandboxRunIdentity, SEATBELT_ENGINE, seatbeltUnsupportedReason } from "../drivers/sandbox.ts";
 import { insideSandbox, proxyToHost, reconcileDispatchOnce, reconcileDispatchWatch, shouldProxyToHost } from "./dispatch.ts";
 import { classifyNewOpenQuestions, evaluateNewExecution, validateNewPlanMarkdown, type NewExecutionRun } from "./new-flow.ts";
+import { prewalkCommand } from "./prewalk.ts";
 
 // Host-side git probes (vcsDirty at run create, supervisor evidence capture,
 // repo-root resolution) run in worktrees the user may be rebasing in at the
@@ -3734,6 +3736,10 @@ async function main(): Promise<number> {
       process.stdout.write(fanoutHelp());
       return 0;
     }
+    if (first === "prewalk") {
+      process.stdout.write(prewalkHelp());
+      return 0;
+    }
     if (first === "events" && second === "tail") {
       process.stdout.write(eventsTailHelp());
       return 0;
@@ -3815,6 +3821,7 @@ async function main(): Promise<number> {
   if (first === "cross-review") return crossReview(args);
   if (first === "fanout") return fanout(args);
   if (first === "investigate") return investigate(args);
+  if (first === "prewalk") return prewalkCommand(args, { orchCommand: orchCommand() });
   if (first === "events" && second === "tail") return eventsTail(args);
   if (first === "result") return result(args);
   if (first === "status") return status(args);

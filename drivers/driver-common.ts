@@ -822,6 +822,18 @@ function fakeResearchQuestions(spec: RunSpec): string[] {
   return value;
 }
 
+// Optional fake implementer edit: writes a real file into the worktree so the
+// supervisor's git/jj evidence (git-status.txt) reflects a change, letting
+// composition flows (prewalk's handoff gate) exercise their host-side checks.
+function fakeImplementerEdit(spec: RunSpec): string[] {
+  const rel = process.env.ORCH_DRIVER_FAKE_IMPL_EDIT;
+  if (!rel) return [];
+  const path = `${spec.worktree}/${rel}`;
+  mkdirSync(path.slice(0, path.lastIndexOf("/")), { recursive: true });
+  writeFileSync(path, `fake edit by ${spec.run_id}\n`, "utf8");
+  return [rel];
+}
+
 const FAKE_RESEARCH_PLAN = [
   "## Destination",
   "Complete one fake worker task.",
@@ -898,10 +910,10 @@ export async function maybeWriteFakeResult(runDir: string, spec: RunSpec, provid
             schema: "orch.result/implementer/v1",
             run_id: spec.run_id,
             verdict: "completed",
-            summary: `fake ${provider} completed`,
+            summary: process.env.ORCH_DRIVER_FAKE_IMPL_SUMMARY ?? `fake ${provider} completed`,
             base_sha: spec.base_sha,
             head_sha: spec.base_sha,
-            changed_files: [],
+            changed_files: fakeImplementerEdit(spec),
             tests: [],
             acceptance: [],
             risks: [],
