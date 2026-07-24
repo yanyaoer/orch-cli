@@ -19,7 +19,12 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
     private var timer: Timer?
 
     var onInspectRun: ((RunInfo) -> Void)?
+    var onSelectRun: ((RunInfo?) -> Void)?
     var onError: ((String) -> Void)?
+    // Suppresses selection callbacks while apply() rebuilds rows: reloadData
+    // transiently clears the selection, which must not bounce the main view
+    // back to the global stream on every 5s poll.
+    private var isApplying = false
 
     var worktreePath: String? {
         didSet {
@@ -73,6 +78,9 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
     }
 
     private func apply(_ status: RepoStatus) {
+        let selectedID = (outline.item(atRow: outline.selectedRow) as? RunNode)?.info.run_id
+        isApplying = true
+        defer { isApplying = false }
         var fresh: [MRNode] = []
         var seen = Set<String>()
         for mr in status.mrs {
@@ -97,11 +105,32 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
         nodeByMR = nodeByMR.filter { seen.contains($0.key) }
         nodes = fresh.sorted { $0.latest > $1.latest }
         outline.reloadData()
+        // Restore the selection onto the recreated RunNode and hand the main
+        // view the FRESH RunInfo (state may have changed → cancel button).
+        var reselected: RunInfo?
+        if let selectedID {
+            outer: for mrNode in nodes {
+                for runNode in mrNode.runs where runNode.info.run_id == selectedID {
+                    let row = outline.row(forItem: runNode)
+                    if row >= 0 {
+                        outline.selectRowIndexes([row], byExtendingSelection: false)
+                        reselected = runNode.info
+                    }
+                    break outer
+                }
+            }
+        }
+        onSelectRun?(reselected)
     }
 
     @objc private func doubleClicked() {
         guard let node = outline.item(atRow: outline.clickedRow) as? RunNode else { return }
         onInspectRun?(node.info)
+    }
+
+    func outlineViewSelectionDidChange(_ notification: Notification) {
+        guard !isApplying else { return }
+        onSelectRun?((outline.item(atRow: outline.selectedRow) as? RunNode)?.info)
     }
 
     // MARK: NSOutlineViewDataSource

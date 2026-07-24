@@ -11,6 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         main.onWorkspaceChanged = { [weak self] ws in self?.sidebar.worktreePath = ws.path }
         main.onRunsChanged = { [weak self] in self?.sidebar.refresh() }
         sidebar.onInspectRun = { [weak self] run in self?.main.inspectRun(run) }
+        sidebar.onSelectRun = { [weak self] run in self?.main.selectRun(run) }
         sidebar.onError = { [weak self] msg in self?.main.showError(msg) }
 
         let split = NSSplitViewController()

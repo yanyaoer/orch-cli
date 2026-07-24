@@ -5,11 +5,16 @@ final class MainViewController: NSViewController {
     private let workspacePopup = NSPopUpButton()
     private let queryField = NSTextField()
     private let runButton = NSButton(title: "运行", target: nil, action: nil)
+    private let cancelButton = NSButton(title: "取消 Run", target: nil, action: nil)
     private let spinner = NSProgressIndicator()
 
     private var workspaces: [Workspace] = []
     private var newTask: StreamTask?
-    private var tailTask: StreamTask?
+    // One live event stream: either the workspace-wide multiplexer or a single
+    // run's normalized native trajectory (orch events tail --native).
+    private var streamTask: StreamTask?
+    private var currentStreamRunID: String?
+    private var selectedRun: RunInfo?
 
     var onWorkspaceChanged: ((Workspace) -> Void)?
     var onRunsChanged: (() -> Void)?
@@ -42,11 +47,16 @@ final class MainViewController: NSViewController {
         runButton.action = #selector(submit)
         runButton.bezelStyle = .rounded
 
+        cancelButton.target = self
+        cancelButton.action = #selector(cancelSelectedRun)
+        cancelButton.bezelStyle = .rounded
+        cancelButton.isEnabled = false
+
         spinner.style = .spinning
         spinner.controlSize = .small
         spinner.isDisplayedWhenStopped = false
 
-        let bar = NSStackView(views: [workspacePopup, queryField, runButton, spinner])
+        let bar = NSStackView(views: [workspacePopup, queryField, runButton, cancelButton, spinner])
         bar.orientation = .horizontal
         bar.spacing = 8
 
@@ -99,10 +109,62 @@ final class MainViewController: NSViewController {
     @objc private func workspaceChanged() {
         guard let ws = currentWorkspace else { return }
         UserDefaults.standard.set(ws.id, forKey: "workspace")
+        selectedRun = nil
+        updateCancelButton()
+        startGlobalStream()
         onWorkspaceChanged?(ws)
     }
 
-    // MARK: run
+    // MARK: event streams
+
+    private func startGlobalStream() {
+        guard let ws = currentWorkspace else { return }
+        currentStreamRunID = nil
+        streamTask?.terminate()
+        appendLog("\n── 全局进展流 · \(ws.id) ──\n", color: .tertiaryLabelColor)
+        streamTask = StreamTask(["events", "tail", "-f", "--native", "--worktree", ws.path],
+                                cwd: ws.path) { [weak self] text in
+            self?.appendLog(text, color: .secondaryLabelColor)
+        }
+    }
+
+    /// Sidebar selection drives which trajectory renders: a run row streams
+    /// that agent's normalized native events; anything else returns to the
+    /// workspace-wide multiplexer. Reselecting the same run is a no-op so the
+    /// sidebar's 5s poll refresh does not restart the stream.
+    func selectRun(_ info: RunInfo?) {
+        selectedRun = info
+        updateCancelButton()
+        guard let info else {
+            if currentStreamRunID != nil { startGlobalStream() }
+            return
+        }
+        guard info.run_id != currentStreamRunID else { return }
+        startRunStream(info)
+    }
+
+    private func startRunStream(_ info: RunInfo) {
+        guard let ws = currentWorkspace else { return }
+        currentStreamRunID = info.run_id
+        streamTask?.terminate()
+        appendLog("\n── \(info.role) · \(info.agent) — \(info.run_id) ──\n", color: .tertiaryLabelColor)
+        streamTask = StreamTask(
+            ["events", "tail", "--run", info.run_id, "--mr", info.mr,
+             "--native", "-n", "40", "-f", "--worktree", ws.path],
+            cwd: ws.path
+        ) { [weak self] text in
+            self?.appendLog(text)
+        } onExit: { [weak self] _ in
+            // tail --run -f exits once the run is terminal and drained; only
+            // fall back when this run is still the active stream.
+            guard let self, self.currentStreamRunID == info.run_id else { return }
+            self.appendLog("── run 已终态，返回全局流 ──\n", color: .tertiaryLabelColor)
+            self.onRunsChanged?()
+            self.startGlobalStream()
+        }
+    }
+
+    // MARK: run / cancel
 
     @objc private func submit() {
         if let task = newTask, task.isRunning {
@@ -119,11 +181,9 @@ final class MainViewController: NSViewController {
 
         appendLog("\n$ orch new '\(query)' --workspace \(ws.id) --yes\n", color: .systemBlue)
         setBusy(true)
-
-        tailTask = StreamTask(["events", "tail", "-f", "--native", "--worktree", ws.path],
-                              cwd: ws.path) { [weak self] text in
-            self?.appendLog(text, color: .secondaryLabelColor)
-        }
+        // The global multiplexer picks up runs created while following; make
+        // sure it is the active stream so the new controller's workers show.
+        if currentStreamRunID != nil { startGlobalStream() }
 
         newTask = StreamTask(["new", query, "--workspace", ws.id, "--yes"],
                              cwd: ws.path) { [weak self] text in
@@ -135,21 +195,34 @@ final class MainViewController: NSViewController {
             self.setBusy(false)
             self.newTask = nil
             self.onRunsChanged?()
-            // drain trailing worker events, then stop the multiplexer
-            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
-                self?.tailTask?.terminate()
-                self?.tailTask = nil
-            }
         }
 
         if newTask == nil {
-            tailTask?.terminate()
-            tailTask = nil
             setBusy(false)
             return
         }
         queryField.stringValue = ""
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.onRunsChanged?() }
+    }
+
+    @objc private func cancelSelectedRun() {
+        guard let run = selectedRun, let ws = currentWorkspace else { return }
+        appendLog("\n$ orch run cancel --run \(run.run_id)\n", color: .systemOrange)
+        cancelButton.isEnabled = false
+        Orch.capture(["run", "cancel", "--run", run.run_id, "--mr", run.mr,
+                      "--reason", "canceled from gui", "--worktree", ws.path]) { [weak self] data, err in
+            if let err {
+                self?.appendLog("⚠️ \(err)\n", color: .systemRed)
+            } else if let data, let text = String(data: data, encoding: .utf8), !text.isEmpty {
+                self?.appendLog(text.hasSuffix("\n") ? text : text + "\n", color: .secondaryLabelColor)
+            }
+            self?.onRunsChanged?()
+        }
+    }
+
+    private func updateCancelButton() {
+        let active = ["running", "starting", "pending"].contains(selectedRun?.state ?? "")
+        cancelButton.isEnabled = active
     }
 
     private func setBusy(_ busy: Bool) {
@@ -182,7 +255,7 @@ final class MainViewController: NSViewController {
 
     func stopAll() {
         newTask?.terminate()
-        tailTask?.terminate()
+        streamTask?.terminate()
     }
 
     // MARK: log
