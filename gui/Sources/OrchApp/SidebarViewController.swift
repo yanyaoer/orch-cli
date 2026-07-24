@@ -32,6 +32,7 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
     private var didInitialExpand = false
 
     var onInspectRun: ((RunEntry) -> Void)?
+    var onAttachRun: ((RunEntry) -> Void)?
     var onSelectRun: ((RunEntry?) -> Void)?
     // Suppresses selection callbacks while apply() rebuilds rows: reloadData
     // transiently clears the selection, which must not bounce the main view
@@ -50,6 +51,9 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
         outline.delegate = self
         outline.target = self
         outline.doubleAction = #selector(doubleClicked)
+        let menu = NSMenu()
+        menu.addItem(withTitle: "查看 result", action: #selector(inspectClicked), keyEquivalent: "").target = self
+        outline.menu = menu
 
         let scroll = NSScrollView()
         scroll.documentView = outline
@@ -149,7 +153,14 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
         onSelectRun?(reselected)
     }
 
+    // Double-click attaches the input box to the run's provider session;
+    // result inspection moved to the context menu.
     @objc private func doubleClicked() {
+        guard let node = outline.item(atRow: outline.clickedRow) as? RunNode else { return }
+        onAttachRun?(node.entry)
+    }
+
+    @objc private func inspectClicked() {
         guard let node = outline.item(atRow: outline.clickedRow) as? RunNode else { return }
         onInspectRun?(node.entry)
     }

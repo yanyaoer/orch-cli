@@ -6,6 +6,7 @@ final class MainViewController: NSViewController {
     private let queryField = NSTextField()
     private let runButton = NSButton(title: "运行", target: nil, action: nil)
     private let cancelButton = NSButton(title: "取消 Run", target: nil, action: nil)
+    private let attachChip = NSButton(title: "", target: nil, action: nil)
     private let spinner = NSProgressIndicator()
 
     private var workspaces: [Workspace] = []
@@ -16,6 +17,9 @@ final class MainViewController: NSViewController {
     private var currentStreamRunID: String?
     private var detailTailer: FileTailer?
     private var selectedRun: RunEntry?
+    // Input-box target: nil = `orch new`; otherwise messages continue this
+    // run's provider session via `orch run create --resume-from`.
+    private var attachTarget: RunEntry?
 
     private static let activeStates: Set<String> = ["running", "starting", "pending"]
 
@@ -54,11 +58,18 @@ final class MainViewController: NSViewController {
         cancelButton.bezelStyle = .rounded
         cancelButton.isEnabled = false
 
+        attachChip.target = self
+        attachChip.action = #selector(detach)
+        attachChip.bezelStyle = .rounded
+        attachChip.isHidden = true
+        attachChip.setContentHuggingPriority(.required, for: .horizontal)
+        attachChip.toolTip = "点击脱离，恢复 orch new"
+
         spinner.style = .spinning
         spinner.controlSize = .small
         spinner.isDisplayedWhenStopped = false
 
-        let bar = NSStackView(views: [workspacePopup, queryField, runButton, cancelButton, spinner])
+        let bar = NSStackView(views: [workspacePopup, attachChip, queryField, runButton, cancelButton, spinner])
         bar.orientation = .horizontal
         bar.spacing = 8
 
@@ -173,29 +184,28 @@ final class MainViewController: NSViewController {
         let nativePath = entry.runDir + "/native.jsonl"
         let eventsPath = entry.runDir + "/events.jsonl"
         let nativeSize = (try? FileManager.default.attributesOfItem(atPath: nativePath))?[.size] as? Int ?? 0
-        // Some providers leave native.jsonl empty; the orch event log at least
-        // shows the run lifecycle then.
-        let path = nativeSize > 0 ? nativePath : eventsPath
+        // Active runs always follow native.jsonl — it may not exist yet for a
+        // just-created run and the tailer waits for it. Terminal runs with an
+        // empty native.jsonl (some providers) fall back to the orch event log.
+        let active = Self.activeStates.contains(info.state)
+        let path = active || nativeSize > 0 ? nativePath : eventsPath
         // Read a generous window, then keep only events with human-relevant
         // text: token-progress events dominate the raw stream (observed
         // ~2/3 of a claude run) and would fill the view with blank rows.
-        guard let tail = NativeLog.tail(path: path, count: 300) else {
-            appendLog("(无事件记录)\n", color: .secondaryLabelColor)
-            return
-        }
+        let tail = NativeLog.tail(path: path, count: 300) ?? NativeTail(lines: [], endOffset: 0)
         var summaries = tail.lines.map(NativeLog.summarize).filter { !$0.text.isEmpty }
         if summaries.isEmpty {
             summaries = tail.lines.suffix(5).map { ("raw", NativeLog.clip($0, 300)) }
         }
         let shown = summaries.suffix(Self.detailEventCount)
         if shown.isEmpty {
-            appendLog("(无事件记录)\n", color: .secondaryLabelColor)
+            appendLog(active ? "(等待事件…)\n" : "(无事件记录)\n", color: .secondaryLabelColor)
         } else {
             appendLog("最近 \(shown.count) 条事件：\n", color: .tertiaryLabelColor)
             for summary in shown { appendSummary(summary) }
         }
 
-        if Self.activeStates.contains(info.state) {
+        if active {
             detailTailer = FileTailer(path: path, offset: tail.endOffset) { [weak self] line in
                 self?.appendEvent(line)
             }
@@ -213,6 +223,90 @@ final class MainViewController: NSViewController {
         appendLog(summary.text + "\n", color: .labelColor)
     }
 
+    // MARK: attach — the input box targets a run's provider session
+
+    /// Attach only makes sense for a terminal run with a persisted provider
+    /// session: `orch run create --resume-from` refuses anything else.
+    func attachRun(_ entry: RunEntry) {
+        let info = entry.info
+        if Self.activeStates.contains(info.state) {
+            showError("run 仍在执行，待终态后再 attach")
+            return
+        }
+        if info.provider_session_mode == "ephemeral" || (info.provider_resume_id ?? info.provider_session_id) == nil {
+            showError("该 run 未保留 provider session，无法 attach")
+            return
+        }
+        attachTarget = entry
+        attachChip.title = "@ \(info.agent)·\(info.role) ✕"
+        attachChip.isHidden = false
+        queryField.placeholderString = "发消息给 \(info.agent)（续接 \(info.run_id)）"
+        if info.run_id != currentStreamRunID { showRunDetail(entry) }
+        appendLog("── 已 attach：输入将经 orch run create --resume-from 发给该 session ──\n",
+                  color: .tertiaryLabelColor)
+        view.window?.makeFirstResponder(queryField)
+    }
+
+    @objc private func detach() {
+        attachTarget = nil
+        attachChip.isHidden = true
+        queryField.placeholderString = "描述一个新任务，回车执行 orch new …"
+    }
+
+    private func sendToAttached(_ text: String, target: RunEntry) {
+        let info = target.info
+        var isDir: ObjCBool = false
+        let wtExists = info.worktree.map { FileManager.default.fileExists(atPath: $0, isDirectory: &isDir) && isDir.boolValue } ?? false
+        guard let worktree = wtExists ? info.worktree : currentWorkspace?.path else {
+            showError("run 的 worktree 已删除且无可用 workspace")
+            return
+        }
+        let taskPath = NSTemporaryDirectory() + "orch-gui-attach-\(UUID().uuidString).md"
+        do { try text.write(toFile: taskPath, atomically: true, encoding: .utf8) } catch {
+            showError("写入消息文件失败: \(error.localizedDescription)")
+            return
+        }
+        appendLog("\n$ [\(info.agent)·\(info.role)] \(text)\n", color: .systemBlue)
+        queryField.isEnabled = false
+        spinner.startAnimation(nil)
+        // Same tag keeps the session-chain guard's tag family; the chain
+        // itself is a deliberate, user-driven continuation.
+        Orch.capture(["run", "create",
+                      "--resume-from", info.run_id,
+                      "--mr", info.mr,
+                      "--worktree", worktree,
+                      "--tag", info.tag ?? info.role,
+                      "--allow-session-chain",
+                      "--task", taskPath,
+                      "--json"]) { [weak self] data, err in
+            guard let self else { return }
+            try? FileManager.default.removeItem(atPath: taskPath)
+            self.spinner.stopAnimation(nil)
+            self.queryField.isEnabled = true
+            if let err {
+                self.showError(err)
+                return
+            }
+            struct CreatePayload: Decodable { let run_id: String; let status_path: String }
+            guard let data, let payload = try? JSONDecoder().decode(CreatePayload.self, from: data) else {
+                self.showError("解析 run create 输出失败")
+                return
+            }
+            self.queryField.stringValue = ""
+            let runDir = (payload.status_path as NSString).deletingLastPathComponent
+            if let statusData = FileManager.default.contents(atPath: payload.status_path),
+               let newInfo = try? JSONDecoder().decode(RunInfo.self, from: statusData) {
+                let entry = RunEntry(info: newInfo, runDir: runDir, decision: nil)
+                // Follow the reply live and roll the attach target forward so
+                // the next message continues from the newest run in the chain.
+                self.attachTarget = entry
+                self.showRunDetail(entry)
+            }
+            self.onRunsChanged?()
+            self.view.window?.makeFirstResponder(self.queryField)
+        }
+    }
+
     // MARK: run / cancel
 
     @objc private func submit() {
@@ -223,6 +317,10 @@ final class MainViewController: NSViewController {
         }
         let query = queryField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty else { return }
+        if let target = attachTarget {
+            sendToAttached(query, target: target)
+            return
+        }
         guard let ws = currentWorkspace else {
             appendLog("⚠️ 请先选择 workspace\n", color: .systemRed)
             return

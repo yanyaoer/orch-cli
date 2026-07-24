@@ -33,6 +33,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         main.onRunsChanged = { [weak self] in self?.sidebar.refresh() }
         sidebar.onInspectRun = { [weak self] run in self?.main.inspectRun(run) }
+        sidebar.onAttachRun = { [weak self] run in self?.main.attachRun(run) }
         sidebar.onSelectRun = { [weak self] run in self?.main.selectRun(run) }
 
         let split = NSSplitViewController()

@@ -14,6 +14,10 @@ struct RunInfo: Decodable {
     let updated_at: String?
     let exit_code: Int?
     let worktree: String?
+    let tag: String?
+    let provider_resume_id: String?
+    let provider_session_id: String?
+    let provider_session_mode: String?
 }
 
 struct RunEntry {
