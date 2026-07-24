@@ -227,6 +227,11 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
             label.toolTip = node.mr
         } else if let node = item as? RunNode {
             let info = node.entry.info
+            // Controller rows keep full contrast (they are the orchestrator);
+            // every other role reads one gray tier lower.
+            let isController = info.role == "controller"
+            let primary: NSColor = isController ? .labelColor : .secondaryLabelColor
+            let secondary: NSColor = isController ? .secondaryLabelColor : .tertiaryLabelColor
             let text = NSMutableAttributedString()
             text.append(NSAttributedString(string: "● ", attributes: [
                 .foregroundColor: Self.stateColor(info.state),
@@ -234,7 +239,7 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
                 .paragraphStyle: para,
             ]))
             text.append(NSAttributedString(string: "\(info.role) · \(info.agent)", attributes: [
-                .foregroundColor: NSColor.labelColor,
+                .foregroundColor: primary,
                 .font: NSFont.systemFont(ofSize: 12),
                 .paragraphStyle: para,
             ]))
@@ -246,7 +251,7 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
             }
             if !detail.isEmpty {
                 text.append(NSAttributedString(string: detail, attributes: [
-                    .foregroundColor: NSColor.secondaryLabelColor,
+                    .foregroundColor: secondary,
                     .font: NSFont.systemFont(ofSize: 11),
                     .paragraphStyle: para,
                 ]))
