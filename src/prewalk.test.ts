@@ -1,9 +1,17 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RunSpec } from "./types.ts";
-import { evaluateHandoffGate, meaningfulChangedFiles, parseStatusPaths, parseTodoChecklist } from "./prewalk.ts";
+import {
+  buildPrewalkPayload,
+  evaluateHandoffGate,
+  meaningfulChangedFiles,
+  parseStatusPaths,
+  parseTodoChecklist,
+  unquoteGitPath,
+  type PrewalkOutcome,
+} from "./prewalk.ts";
 
 const tempDirs: string[] = [];
 
@@ -25,44 +33,123 @@ const GUIDE_SUMMARY = [
   "- [ ] Add eviction edge-case tests — validate: bun test src/cache.test.ts",
 ].join("\n");
 
-test("parseTodoChecklist counts checked and unchecked checkbox lines", () => {
-  expect(parseTodoChecklist(GUIDE_SUMMARY)).toEqual({ checked: 1, unchecked: 3, total: 4 });
-  expect(parseTodoChecklist("no checklist here")).toEqual({ checked: 0, unchecked: 0, total: 0 });
-  expect(parseTodoChecklist("* [X] star style\n  - [ ] indented")).toEqual({ checked: 1, unchecked: 1, total: 2 });
+test("parseTodoChecklist keeps item order and states", () => {
+  const todo = parseTodoChecklist(GUIDE_SUMMARY);
+  expect(todo.total).toBe(4);
+  expect(todo.checked).toBe(1);
+  expect(todo.unchecked).toBe(3);
+  expect(todo.items[0]).toEqual({ checked: true, text: "Add LruCache skeleton in src/cache.ts — validate: bun test src/cache.test.ts" });
+  expect(todo.items[1]!.checked).toBe(false);
+  expect(parseTodoChecklist("no checklist here").total).toBe(0);
 });
 
-test("parseStatusPaths reads git porcelain and jj status lines, including untracked and renames", () => {
-  const git = [" M src/cache.ts", "?? src/cache.test.ts", "R  old.ts -> new.ts", ""].join("\n");
-  expect(parseStatusPaths(git)).toEqual(["src/cache.ts", "src/cache.test.ts", "new.ts"]);
+test("parseStatusPaths handles porcelain, jj, quoting, conflicts, and renames", () => {
+  const git = [
+    " M src/cache.ts",
+    "?? src/cache.test.ts",
+    "R  old.ts -> new.ts",
+    'R  "old name.ts" -> "new name.ts"',
+    "UU src/conflict.ts",
+    "T  src/mode.ts",
+    '?? "docs/read me.md"',
+    '?? "docs/\\346\\226\\207.md"',
+    "",
+  ].join("\n");
+  expect(parseStatusPaths(git)).toEqual([
+    "src/cache.ts",
+    "src/cache.test.ts",
+    "new.ts",
+    "new name.ts",
+    "src/conflict.ts",
+    "src/mode.ts",
+    "docs/read me.md",
+    "docs/文.md",
+  ]);
   const jj = ["Working copy changes:", "M src/cache.ts", "A src/cache.test.ts", "Working copy : abc123"].join("\n");
   expect(parseStatusPaths(jj)).toEqual(["src/cache.ts", "src/cache.test.ts"]);
+});
+
+test("unquoteGitPath decodes escapes byte-accurately so docs cannot dodge classification", () => {
+  expect(unquoteGitPath('"docs/read me.md"')).toBe("docs/read me.md");
+  expect(unquoteGitPath('"a\\"b\\\\c\\t.md"')).toBe('a"b\\c\t.md');
+  expect(meaningfulChangedFiles([unquoteGitPath('"docs/read me.md"'), unquoteGitPath('"docs/\\346\\226\\207.md"')])).toEqual([]);
 });
 
 test("meaningfulChangedFiles drops docs and orch metadata", () => {
   expect(meaningfulChangedFiles(["README.md", "notes.txt", ".orch/state.json", "src/cache.ts"])).toEqual(["src/cache.ts"]);
 });
 
-test("evaluateHandoffGate: pass, fail reasons, and already-complete", () => {
+test("evaluateHandoffGate passes only on ordered, validated, host-evidenced progress", () => {
   const base = {
     state: "done",
     verdict: "completed" as string | null,
-    todo: { checked: 1, unchecked: 3, total: 4 },
-    changedFiles: ["src/cache.ts"],
+    todo: parseTodoChecklist(GUIDE_SUMMARY),
+    changedFiles: ["src/cache.ts"] as string[] | null,
     resumable: true,
   };
   expect(evaluateHandoffGate(base)).toEqual({ ok: true, alreadyComplete: false, reasons: [] });
 
-  const failed = evaluateHandoffGate({
+  // First item unchecked while a later one is checked: no valid in-context example.
+  const wrongOrder = evaluateHandoffGate({
     ...base,
-    todo: { checked: 0, unchecked: 2, total: 2 },
-    changedFiles: ["README.md"],
+    todo: parseTodoChecklist("- [ ] a — validate: t\n- [x] b — validate: t\n- [ ] c — validate: t"),
+  });
+  expect(wrongOrder.ok).toBe(false);
+  expect(wrongOrder.reasons).toContain("first todo item is not checked off");
+
+  // Items without validation steps break the executor's check-then-tick loop.
+  const unvalidated = evaluateHandoffGate({
+    ...base,
+    todo: parseTodoChecklist("- [x] a\n- [ ] b\n- [ ] c"),
+  });
+  expect(unvalidated.ok).toBe(false);
+  expect(unvalidated.reasons).toContain("3 todo item(s) lack a validation step");
+
+  // Missing host evidence fails closed; docs-only evidence fails too.
+  expect(evaluateHandoffGate({ ...base, changedFiles: null }).reasons).toContain(
+    "host-side edit evidence unavailable (status artifact missing)",
+  );
+  expect(evaluateHandoffGate({ ...base, changedFiles: ["README.md"] }).ok).toBe(false);
+
+  // A fully checked checklist completes without needing a resumable session.
+  const complete = evaluateHandoffGate({
+    ...base,
+    todo: parseTodoChecklist("- [x] a — validate: t\n- [x] b — validate: t\n- [x] c — validate: t"),
     resumable: false,
   });
-  expect(failed.ok).toBe(false);
-  expect(failed.reasons).toHaveLength(4);
-
-  const complete = evaluateHandoffGate({ ...base, todo: { checked: 4, unchecked: 0, total: 4 } });
   expect(complete).toEqual({ ok: false, alreadyComplete: true, reasons: [] });
+
+  // Unmet gate with remaining work still reports the resumability gap.
+  const stuck = evaluateHandoffGate({ ...base, changedFiles: [], resumable: false });
+  expect(stuck.reasons).toContain("guide run recorded no resumable provider session");
+});
+
+test("buildPrewalkPayload never recommends acceptance for a failed outcome", () => {
+  const outcome: PrewalkOutcome = {
+    mr: "prewalk-1",
+    worktree: "/tmp/w t",
+    guide: {
+      run_id: "guide-1",
+      model: "frontier-x",
+      state: "done",
+      verdict: "completed",
+      todo: parseTodoChecklist(GUIDE_SUMMARY),
+      changed_files: ["src/cache.ts"],
+    },
+    gate: { ok: true, alreadyComplete: false, reasons: [] },
+    executor: { run_id: "exec-1", model: "cheap-mini", state: "done", verdict: "failed" },
+    succeeded: false,
+  };
+  const failed = buildPrewalkPayload(outcome);
+  expect(failed.prewalk).toBe("failed");
+  const failedNext = (failed.next as string[]).join("\n");
+  expect(failedNext).not.toContain("decision accept");
+  expect(failedNext).toContain("--resume-from");
+  expect(failedNext).toContain("'/tmp/w t'");
+
+  const done = buildPrewalkPayload({ ...outcome, executor: { ...outcome.executor!, verdict: "completed" }, succeeded: true });
+  expect(done.prewalk).toBe("done");
+  expect((done.next as string[]).join("\n")).toContain("decision accept");
 });
 
 async function runOrch(
@@ -106,8 +193,9 @@ function findSpec(stateHome: string, runId: string): RunSpec {
 }
 
 interface PrewalkPayload {
+  prewalk: string;
   mr: string;
-  guide_run: { run_id: string; state: string; verdict: string | null; todo: { total: number } };
+  guide_run: { run_id: string; model: string | null; state: string; verdict: string | null; todo: { total: number } };
   handoff: { ok: boolean; already_complete: boolean; reasons: string[] };
   executor_run: { run_id: string; model: string | null; state: string | null; verdict: string | null } | null;
 }
@@ -133,8 +221,10 @@ test(
     );
     expect(run.exitCode).toBe(0);
     const payload = JSON.parse(run.stdout) as PrewalkPayload;
+    expect(payload.prewalk).toBe("done");
     expect(payload.handoff).toEqual({ ok: true, already_complete: false, reasons: [] });
     expect(payload.guide_run.todo.total).toBe(4);
+    expect(payload.guide_run.model).toBe("frontier-x");
     expect(payload.executor_run?.verdict).toBe("completed");
 
     const guideSpec = findSpec(stateHome, payload.guide_run.run_id);
@@ -151,7 +241,7 @@ test(
 );
 
 test(
-  "prewalk keeps the guide model when the gate is not met",
+  "prewalk keeps the guide model when the guide reports no checklist and made no edit",
   async () => {
     const root = tempDir();
     const stateHome = join(root, "state");
@@ -179,6 +269,36 @@ test(
     // Omitted --model on resume: the session's own model continues.
     expect(execSpec.model).toBe("frontier-x");
     expect(execSpec.provider_session_mode).toBe("resume_exact");
+  },
+  120000,
+);
+
+test(
+  "prewalk does not credit pre-existing dirty files to the guide",
+  async () => {
+    const root = tempDir();
+    const stateHome = join(root, "state");
+    const worktree = mkdtempSync(join(root, "worktree-"));
+    await initRepo(worktree);
+    // Dirty BEFORE the guide runs: a valid checklist plus this pre-existing
+    // source file must not pass the gate when the guide edits nothing.
+    writeFileSync(join(worktree, "preexisting.ts"), "already dirty\n", "utf8");
+    const env = {
+      XDG_STATE_HOME: stateHome,
+      XDG_CONFIG_HOME: join(root, "config"),
+      ORCH_DRIVER_FAKE_RESULT: "1",
+      ORCH_DRIVER_FAKE_IMPL_SUMMARY: GUIDE_SUMMARY,
+    };
+    const run = await runOrch(
+      ["prewalk", "--task", "-", "--worktree", worktree, "--agent", "codex", "--guide-model", "frontier-x", "--executor-model", "cheap-mini", "--allow-dirty"],
+      env,
+      "Add an LRU cache with eviction tests.",
+    );
+    expect(run.exitCode).toBe(0);
+    const payload = JSON.parse(run.stdout) as PrewalkPayload;
+    expect(payload.handoff.ok).toBe(false);
+    expect(payload.handoff.reasons.join("\n")).toContain("pre-run baseline");
+    expect(payload.executor_run?.model).toBe("frontier-x");
   },
   120000,
 );

@@ -1,19 +1,21 @@
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { assertKnownFlags, CliError, flagBool, flagString, printJson, readStdinText, type ParsedArgs } from "./cli.ts";
 import { randomHex } from "./hash.ts";
 import { readJsonFile } from "./json.ts";
 import { isTerminal } from "./overview.ts";
-import type { ImplementerResult, RoleResult, RunStatus } from "./types.ts";
+import { vcsKind } from "./vcs.ts";
+import type { ImplementerResult, RoleResult, RunSpec, RunStatus } from "./types.ts";
 
 // orch prewalk — two-phase implementer run on ONE provider session (after
 // stencil.so/blog/prewalk). A guide model explores, writes a validated TODO,
 // and lands the first meaningful edit; a cheaper executor model then resumes
 // the same session — inheriting the guide's full trajectory and prompt cache,
 // not a plan document — and finishes the remaining items. The handoff gate is
-// judged host-side from persisted evidence (supervisor git/jj status + the
-// guide's result), never from the guide's own claim alone; an unmet gate keeps
+// judged host-side from persisted evidence, never from the guide's claim: the
+// edit signal is the VCS status delta against a pre-run baseline, and the
+// gate fails closed when that evidence is unavailable. An unmet gate keeps
 // the guide model for the continuation instead of forcing the cheap switch.
 
 const PREWALK_FLAGS = [
@@ -35,22 +37,29 @@ export interface PrewalkDeps {
   orchCommand: string[];
 }
 
+export interface TodoItem {
+  checked: boolean;
+  text: string;
+}
+
 export interface TodoChecklist {
+  items: TodoItem[];
   checked: number;
   unchecked: number;
   total: number;
 }
 
-// Markdown checkboxes in the guide's result summary; the summary is part of
-// the persisted result contract, so the TODO survives for audit and gating.
+// Ordered markdown checkboxes from the guide's result summary; the summary is
+// part of the persisted result contract, so the TODO survives for audit and
+// gating. Order matters: the gate verifies the FIRST item is the checked one.
 export function parseTodoChecklist(summary: string): TodoChecklist {
-  let checked = 0;
-  let unchecked = 0;
+  const items: TodoItem[] = [];
   for (const line of summary.split("\n")) {
-    if (/^\s*[-*]\s+\[[xX]\]\s+\S/.test(line)) checked += 1;
-    else if (/^\s*[-*]\s+\[ \]\s+\S/.test(line)) unchecked += 1;
+    const match = /^\s*[-*]\s+\[([ xX])\]\s+(\S.*)$/.exec(line);
+    if (match) items.push({ checked: match[1] !== " ", text: match[2]!.trim() });
   }
-  return { checked, unchecked, total: checked + unchecked };
+  const checked = items.filter((item) => item.checked).length;
+  return { items, checked, unchecked: items.length - checked, total: items.length };
 }
 
 // Docs-only or orch-metadata edits do not count as the executor's in-context
@@ -65,19 +74,47 @@ export function meaningfulChangedFiles(files: string[]): string[] {
   });
 }
 
-// Changed paths from the supervisor's status artifact. Accepts both formats:
-// `git status --porcelain=v1` ("XY path", "?? path", "R  old -> new") and
-// `jj status` ("M path" under a "Working copy changes:" header). Untracked
-// files matter here — new files a worker creates never appear in
-// changed-files.txt (diff vs base), only in the status output.
+// Git C-quotes unusual paths in porcelain output (`"docs/read me.md"`, octal
+// escapes for non-ASCII bytes). Decode byte-accurately so extension-based
+// classification cannot be dodged by a quoted docs path.
+export function unquoteGitPath(raw: string): string {
+  const s = raw.trim();
+  if (!(s.length >= 2 && s.startsWith('"') && s.endsWith('"'))) return s;
+  const inner = s.slice(1, -1);
+  const bytes: number[] = [];
+  for (let i = 0; i < inner.length; i++) {
+    const ch = inner[i]!;
+    if (ch !== "\\") {
+      for (const byte of Buffer.from(ch, "utf8")) bytes.push(byte);
+      continue;
+    }
+    const next = inner[i + 1] ?? "";
+    if (/[0-7]/.test(next)) {
+      bytes.push(parseInt(inner.slice(i + 1, i + 4), 8));
+      i += 3;
+      continue;
+    }
+    const escapes: Record<string, string> = { "\\": "\\", '"': '"', t: "\t", n: "\n", r: "\r", a: "\x07", b: "\b", f: "\f", v: "\v" };
+    for (const byte of Buffer.from(escapes[next] ?? next, "utf8")) bytes.push(byte);
+    i += 1;
+  }
+  return Buffer.from(bytes).toString("utf8");
+}
+
+// Changed paths from a VCS status text. Accepts both formats the supervisor
+// artifact can contain: `git status --porcelain=v1` ("XY path", "?? path",
+// "R  old -> new", conflicts "UU", type changes "T") and `jj status`
+// ("M path" under a "Working copy changes:" header). Untracked files matter
+// here — new files a worker creates never appear in changed-files.txt (diff
+// vs base), only in the status output.
 export function parseStatusPaths(statusText: string): string[] {
   const paths: string[] = [];
   for (const raw of statusText.split("\n")) {
-    const line = raw.trimEnd();
-    const match = /^(?:[MADRC?!]{1,2}|\?\?)\s+(.+)$/.exec(line.trim());
+    const match = /^(?:[MADRCUT?!]{1,2}|\?\?)\s+(.+)$/.exec(raw.trim());
     if (!match) continue;
     const target = match[1]!;
-    paths.push(target.includes(" -> ") ? target.split(" -> ").pop()!.trim() : target.trim());
+    const dest = target.includes(" -> ") ? target.split(" -> ").pop()! : target;
+    paths.push(unquoteGitPath(dest));
   }
   return paths;
 }
@@ -86,7 +123,9 @@ export interface HandoffGateInput {
   state: string;
   verdict: string | null;
   todo: TodoChecklist;
-  changedFiles: string[];
+  // Run-scoped edit evidence (status delta vs the pre-run baseline);
+  // null = host evidence unavailable, which fails the gate closed.
+  changedFiles: string[] | null;
   resumable: boolean;
 }
 
@@ -100,14 +139,26 @@ export function evaluateHandoffGate(input: HandoffGateInput): HandoffGate {
   const reasons: string[] = [];
   if (input.state !== "done") reasons.push(`guide run ended ${input.state}`);
   if (input.verdict !== "completed") reasons.push(`guide verdict ${input.verdict ?? "missing"}`);
-  if (input.todo.total < PREWALK_TODO_MIN || input.todo.total > PREWALK_TODO_MAX) {
-    reasons.push(`todo checklist has ${input.todo.total} items (need ${PREWALK_TODO_MIN}-${PREWALK_TODO_MAX})`);
+  const todo = input.todo;
+  if (todo.total < PREWALK_TODO_MIN || todo.total > PREWALK_TODO_MAX) {
+    reasons.push(`todo checklist has ${todo.total} items (need ${PREWALK_TODO_MIN}-${PREWALK_TODO_MAX})`);
   }
-  if (input.todo.checked < 1) reasons.push("no todo item is checked off");
-  const meaningful = meaningfulChangedFiles(input.changedFiles);
-  if (meaningful.length === 0) reasons.push("no meaningful edit (source/test/config) recorded");
-  if (!input.resumable) reasons.push("guide run recorded no resumable provider session");
-  const alreadyComplete = reasons.length === 0 && input.todo.unchecked === 0;
+  // The first item must be the completed one; extra checked items beyond it
+  // are wasted guide budget but not a handoff risk, so they do not fail the
+  // gate. Items without an embedded validation step break the executor's
+  // check-then-tick contract and do.
+  if (todo.total > 0 && !todo.items[0]!.checked) reasons.push("first todo item is not checked off");
+  const unvalidated = todo.items.filter((item) => !/validat/i.test(item.text)).length;
+  if (unvalidated > 0) reasons.push(`${unvalidated} todo item(s) lack a validation step`);
+  if (input.changedFiles === null) {
+    reasons.push("host-side edit evidence unavailable (status artifact missing)");
+  } else if (meaningfulChangedFiles(input.changedFiles).length === 0) {
+    reasons.push("no meaningful edit (source/test/config) beyond the pre-run baseline");
+  }
+  // Content completion is independent of resumability: a fully checked
+  // checklist needs no second run, so a missing session id must not block it.
+  const alreadyComplete = reasons.length === 0 && todo.unchecked === 0;
+  if (!alreadyComplete && !input.resumable) reasons.push("guide run recorded no resumable provider session");
   return { ok: reasons.length === 0 && !alreadyComplete, alreadyComplete, reasons };
 }
 
@@ -132,8 +183,8 @@ export function buildGuideTask(task: string): string {
   ].join("\n");
 }
 
-export function buildExecutorTask(task: string, handoff: boolean): string {
-  const header = handoff
+export function buildExecutorTask(task: string, gate: HandoffGate): string {
+  const header = gate.ok
     ? [
         "## Prewalk: executor phase",
         "You are resuming the guide session. The TODO checklist and the finished",
@@ -141,7 +192,12 @@ export function buildExecutorTask(task: string, handoff: boolean): string {
       ]
     : [
         "## Prewalk: continuation (handoff gate not met — same model continues)",
-        "Finish the task you started in this session.",
+        "The host-side gate found these gaps in your previous turn:",
+        ...gate.reasons.map((reason) => `- ${reason}`),
+        "Repair them first: (re)write the full TODO checklist per the original",
+        "contract (3-10 markdown checkbox items, each with an embedded",
+        "validation step) into your result summary, and land the first",
+        "meaningful source/test/config edit if none exists yet. Then:",
       ];
   return [
     ...header,
@@ -157,6 +213,52 @@ export function buildExecutorTask(task: string, handoff: boolean): string {
     "## Task (unchanged)",
     task,
   ].join("\n");
+}
+
+export interface PrewalkOutcome {
+  mr: string;
+  worktree: string;
+  guide: { run_id: string; model: string | null; state: string; verdict: string | null; todo: TodoChecklist; changed_files: string[] | null };
+  gate: HandoffGate;
+  executor: { run_id: string; model: string | null; state: string | null; verdict: string | null } | null;
+  succeeded: boolean;
+}
+
+function shq(value: string): string {
+  return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
+// Pure payload assembly so the failure shape is unit-testable: a failed
+// outcome must never hand the caller an acceptance command.
+export function buildPrewalkPayload(outcome: PrewalkOutcome): Record<string, unknown> {
+  const finishing = outcome.executor?.run_id ?? outcome.guide.run_id;
+  const base = `--mr ${shq(outcome.mr)} --worktree ${shq(outcome.worktree)}`;
+  const next = [
+    `orch status ${base}`,
+    ...(outcome.executor ? [`orch result --run ${shq(outcome.executor.run_id)} ${base}`] : []),
+    ...(outcome.succeeded
+      ? [`orch decision accept --run ${shq(finishing)} ${base} --reason 'prewalk reviewed'`]
+      : [
+          `orch result --run ${shq(outcome.guide.run_id)} ${base}`,
+          `orch run create --resume-from ${shq(finishing)} ${base} --task rework.md`,
+        ]),
+  ];
+  return {
+    prewalk: outcome.succeeded ? "done" : "failed",
+    mr: outcome.mr,
+    worktree: outcome.worktree,
+    guide_run: {
+      run_id: outcome.guide.run_id,
+      model: outcome.guide.model,
+      state: outcome.guide.state,
+      verdict: outcome.guide.verdict,
+      todo: { checked: outcome.guide.todo.checked, unchecked: outcome.guide.todo.unchecked, total: outcome.guide.todo.total },
+      changed_files: outcome.guide.changed_files,
+    },
+    handoff: { ok: outcome.gate.ok, already_complete: outcome.gate.alreadyComplete, reasons: outcome.gate.reasons },
+    executor_run: outcome.executor,
+    next,
+  };
 }
 
 interface RunHandle {
@@ -201,17 +303,42 @@ async function waitRun(handle: RunHandle, label: string): Promise<RunStatus> {
   }
 }
 
-// Host-side edit evidence: supervisor status artifact first (covers untracked
-// files), guide-reported changed_files as fallback when artifacts are absent.
-function guideChangedFiles(runDir: string, result: ImplementerResult | null): string[] {
-  try {
-    const statusText = readFileSync(`${runDir}/artifacts/git-status.txt`, "utf8");
-    const paths = parseStatusPaths(statusText);
-    if (paths.length > 0) return paths;
-  } catch {
-    // fall through to the result-reported list
+// Pre-run baseline of already-dirty paths: the gate must not credit the guide
+// with edits that existed before it ran. A guide edit to an already-dirty file
+// is invisible here — that errs toward keeping the guide model, never toward
+// a false cheap switch.
+export function captureBaselinePaths(worktree: string): string[] {
+  const argv = vcsKind(worktree) === "jj" ? ["jj", "status"] : ["git", "-C", worktree, "status", "--porcelain=v1"];
+  const proc = Bun.spawnSync(argv, { cwd: worktree, stdout: "pipe", stderr: "pipe" });
+  if (proc.exitCode !== 0) {
+    throw new CliError(`cannot capture VCS baseline in ${worktree}: ${proc.stderr.toString().trim().slice(0, 300)}`);
   }
-  return result?.changed_files ?? [];
+  return parseStatusPaths(proc.stdout.toString());
+}
+
+// Host-side, run-scoped edit evidence: union of the supervisor's terminal
+// status artifact (covers untracked files) and changed-files.txt (covers
+// edits a worker committed against policy), minus the pre-run baseline.
+// Returns null — failing the gate closed — when the status artifact is
+// missing; the guide's self-reported changed_files is never trusted.
+function guideEditEvidence(runDir: string, baseline: string[]): string[] | null {
+  let statusPaths: string[];
+  try {
+    statusPaths = parseStatusPaths(readFileSync(`${runDir}/artifacts/git-status.txt`, "utf8"));
+  } catch {
+    return null;
+  }
+  let diffPaths: string[] = [];
+  try {
+    diffPaths = readFileSync(`${runDir}/artifacts/changed-files.txt`, "utf8")
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+  } catch {
+    // status artifact alone is sufficient evidence
+  }
+  const before = new Set(baseline);
+  return [...new Set([...statusPaths, ...diffPaths])].filter((path) => !before.has(path));
 }
 
 function readImplementerResult(path: string): ImplementerResult | null {
@@ -241,101 +368,107 @@ export async function prewalkCommand(args: ParsedArgs, deps: PrewalkDeps): Promi
   const timeoutSec = args.flags.has("timeout-sec") ? flagString(args, "timeout-sec") : null;
   const allowDirty = flagBool(args, "allow-dirty");
 
+  const baseline = captureBaselinePaths(worktree);
   const taskDir = mkdtempSync(join(tmpdir(), "orch-prewalk-"));
-  const guideTaskPath = join(taskDir, "guide-task.md");
-  writeFileSync(guideTaskPath, buildGuideTask(task), "utf8");
+  try {
+    const guideTaskPath = join(taskDir, "guide-task.md");
+    writeFileSync(guideTaskPath, buildGuideTask(task), "utf8");
 
-  const guideArgv = [
-    "--mr", mr,
-    "--role", "implementer",
-    "--agent", agent,
-    // Guide gets the bare tag so the executor's `<tag>-exec` stays in the same
-    // tag family: the session-chain guard treats prefix-related tags as the
-    // same task and allows the deliberate two-run chain without an override.
-    "--tag", tag,
-    "--worktree", worktree,
-    "--task", guideTaskPath,
-    ...(guideModel ? ["--model", guideModel] : []),
-    ...(timeoutSec ? ["--timeout-sec", timeoutSec] : []),
-    ...(allowDirty ? ["--allow-dirty"] : []),
-  ];
-  const guide = await spawnRunCreate(deps, guideArgv, worktree);
-  const guideStatus = await waitRun(guide, "guide");
-  const guideResult = readImplementerResult(guide.result_path);
-  if (guideStatus.state !== "done") {
-    throw new CliError(
-      `guide run ${guide.run_id} ended ${guideStatus.state}; inspect: orch result --mr ${mr} --run ${guide.run_id} --worktree ${worktree}`,
-    );
-  }
-
-  const todo = parseTodoChecklist(guideResult?.summary ?? "");
-  const changedFiles = guideChangedFiles(guide.run_dir, guideResult);
-  const gate = evaluateHandoffGate({
-    state: guideStatus.state,
-    verdict: guideResult?.verdict ?? null,
-    todo,
-    changedFiles,
-    resumable: Boolean(guideStatus.provider_resume_id ?? guideStatus.provider_session_id),
-  });
-  process.stderr.write(
-    gate.ok
-      ? `[orch prewalk] handoff gate met: ${todo.checked}/${todo.total} todo done, ${meaningfulChangedFiles(changedFiles).length} meaningful edit(s); executor takes over on ${executorModel}\n`
-      : gate.alreadyComplete
-        ? "[orch prewalk] guide finished every todo item; no executor phase needed\n"
-        : `[orch prewalk] handoff gate NOT met (${gate.reasons.join("; ")}); guide model keeps the session\n`,
-  );
-
-  let executor: RunHandle | null = null;
-  let executorStatus: RunStatus | null = null;
-  if (!gate.alreadyComplete) {
-    if (!gate.ok && !(guideStatus.provider_resume_id ?? guideStatus.provider_session_id)) {
-      throw new CliError(`guide run ${guide.run_id} is not resumable; cannot continue in either model`);
-    }
-    const executorTaskPath = join(taskDir, "executor-task.md");
-    writeFileSync(executorTaskPath, buildExecutorTask(task, gate.ok), "utf8");
-    const executorArgv = [
-      "--resume-from", guide.run_id,
+    const guideArgv = [
       "--mr", mr,
-      "--tag", `${tag}-exec`,
+      "--role", "implementer",
+      "--agent", agent,
+      // Guide gets the bare tag so the executor's `<tag>-exec` stays in the
+      // same tag family: the session-chain guard treats prefix-related tags as
+      // the same task and allows the deliberate two-run chain.
+      "--tag", tag,
       "--worktree", worktree,
-      "--task", executorTaskPath,
-      // Gate unmet → omit --model: the session's own (guide) model continues.
-      ...(gate.ok ? ["--model", executorModel] : []),
+      "--task", guideTaskPath,
+      ...(guideModel ? ["--model", guideModel] : []),
       ...(timeoutSec ? ["--timeout-sec", timeoutSec] : []),
       ...(allowDirty ? ["--allow-dirty"] : []),
     ];
-    executor = await spawnRunCreate(deps, executorArgv, worktree);
-    executorStatus = await waitRun(executor, gate.ok ? "executor" : "continuation");
-  }
+    const guide = await spawnRunCreate(deps, guideArgv, worktree);
+    const guideStatus = await waitRun(guide, "guide");
+    const guideResult = readImplementerResult(guide.result_path);
+    if (guideStatus.state !== "done") {
+      throw new CliError(
+        `guide run ${guide.run_id} ended ${guideStatus.state}; inspect: orch result --mr ${shq(mr)} --run ${guide.run_id} --worktree ${shq(worktree)}`,
+      );
+    }
+    // The effective model comes from the persisted spec: a configured role
+    // default fills it even when --guide-model was omitted.
+    const guideSpec = readJsonFile<RunSpec | null>(`${guide.run_dir}/spec.json`, null);
+    const effectiveGuideModel = guideSpec?.model ?? guideModel;
 
-  const executorResult = executor ? readImplementerResult(executor.result_path) : null;
-  const succeeded = gate.alreadyComplete || (executorStatus?.state === "done" && executorResult?.verdict === "completed");
-  printJson({
-    prewalk: "done",
-    mr,
-    worktree,
-    guide_run: {
-      run_id: guide.run_id,
-      model: guideModel,
+    const todo = parseTodoChecklist(guideResult?.summary ?? "");
+    const changedFiles = guideEditEvidence(guide.run_dir, baseline);
+    const gate = evaluateHandoffGate({
       state: guideStatus.state,
       verdict: guideResult?.verdict ?? null,
       todo,
-      changed_files: changedFiles,
-    },
-    handoff: { ok: gate.ok, already_complete: gate.alreadyComplete, reasons: gate.reasons },
-    executor_run: executor
-      ? {
-          run_id: executor.run_id,
-          model: gate.ok ? executorModel : guideModel,
-          state: executorStatus?.state ?? null,
-          verdict: executorResult?.verdict ?? null,
-        }
-      : null,
-    next: [
-      `orch status --mr ${mr} --worktree ${worktree}`,
-      ...(executor ? [`orch result --mr ${mr} --run ${executor.run_id} --worktree ${worktree}`] : []),
-      `orch decision accept --mr ${mr} --run ${executor?.run_id ?? guide.run_id} --reason "prewalk reviewed"`,
-    ],
-  });
-  return succeeded ? 0 : 1;
+      changedFiles,
+      resumable: Boolean(guideStatus.provider_resume_id ?? guideStatus.provider_session_id),
+    });
+    process.stderr.write(
+      gate.ok
+        ? `[orch prewalk] handoff gate met: ${todo.checked}/${todo.total} todo done, ${meaningfulChangedFiles(changedFiles ?? []).length} meaningful edit(s); executor takes over on ${executorModel}\n`
+        : gate.alreadyComplete
+          ? "[orch prewalk] guide finished every todo item; no executor phase needed\n"
+          : `[orch prewalk] handoff gate NOT met (${gate.reasons.join("; ")}); guide model keeps the session\n`,
+    );
+
+    let executor: RunHandle | null = null;
+    let executorStatus: RunStatus | null = null;
+    if (!gate.alreadyComplete) {
+      if (!gate.ok && !(guideStatus.provider_resume_id ?? guideStatus.provider_session_id)) {
+        throw new CliError(`guide run ${guide.run_id} is not resumable; cannot continue in either model`);
+      }
+      const executorTaskPath = join(taskDir, "executor-task.md");
+      writeFileSync(executorTaskPath, buildExecutorTask(task, gate), "utf8");
+      const executorArgv = [
+        "--resume-from", guide.run_id,
+        "--mr", mr,
+        "--tag", `${tag}-exec`,
+        "--worktree", worktree,
+        "--task", executorTaskPath,
+        // Gate unmet → omit --model: the session's own (guide) model continues.
+        ...(gate.ok ? ["--model", executorModel] : []),
+        ...(timeoutSec ? ["--timeout-sec", timeoutSec] : []),
+        ...(allowDirty ? ["--allow-dirty"] : []),
+      ];
+      executor = await spawnRunCreate(deps, executorArgv, worktree);
+      executorStatus = await waitRun(executor, gate.ok ? "executor" : "continuation");
+    }
+
+    const executorResult = executor ? readImplementerResult(executor.result_path) : null;
+    const succeeded = gate.alreadyComplete || (executorStatus?.state === "done" && executorResult?.verdict === "completed");
+    printJson(
+      buildPrewalkPayload({
+        mr,
+        worktree,
+        guide: {
+          run_id: guide.run_id,
+          model: effectiveGuideModel,
+          state: guideStatus.state,
+          verdict: guideResult?.verdict ?? null,
+          todo,
+          changed_files: changedFiles,
+        },
+        gate,
+        executor: executor
+          ? {
+              run_id: executor.run_id,
+              model: gate.ok ? executorModel : effectiveGuideModel,
+              state: executorStatus?.state ?? null,
+              verdict: executorResult?.verdict ?? null,
+            }
+          : null,
+        succeeded,
+      }),
+    );
+    return succeeded ? 0 : 1;
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
 }
