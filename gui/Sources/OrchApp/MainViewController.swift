@@ -14,9 +14,8 @@ final class MainViewController: NSViewController {
     // run's normalized native trajectory (orch events tail --native).
     private var streamTask: StreamTask?
     private var currentStreamRunID: String?
-    private var selectedRun: RunInfo?
+    private var selectedRun: RunEntry?
 
-    var onWorkspaceChanged: ((Workspace) -> Void)?
     var onRunsChanged: (() -> Void)?
 
     var currentWorkspace: Workspace? {
@@ -109,49 +108,53 @@ final class MainViewController: NSViewController {
     @objc private func workspaceChanged() {
         guard let ws = currentWorkspace else { return }
         UserDefaults.standard.set(ws.id, forKey: "workspace")
-        selectedRun = nil
-        updateCancelButton()
-        startGlobalStream()
-        onWorkspaceChanged?(ws)
+        // The workspace only scopes `orch new`; the sidebar and the global
+        // stream cover every repo under the orch state root.
+        if streamTask == nil { startGlobalStream() }
     }
 
     // MARK: event streams
 
     private func startGlobalStream() {
-        guard let ws = currentWorkspace else { return }
         currentStreamRunID = nil
         streamTask?.terminate()
-        appendLog("\n── 全局进展流 · \(ws.id) ──\n", color: .tertiaryLabelColor)
-        streamTask = StreamTask(["events", "tail", "-f", "--native", "--worktree", ws.path],
-                                cwd: ws.path) { [weak self] text in
+        appendLog("\n── 全局进展流 · 全部仓库 ──\n", color: .tertiaryLabelColor)
+        streamTask = StreamTask(["events", "tail", "-f", "--all", "--native"],
+                                cwd: NSHomeDirectory()) { [weak self] text in
             self?.appendLog(text, color: .secondaryLabelColor)
         }
     }
 
     /// Sidebar selection drives which trajectory renders: a run row streams
     /// that agent's normalized native events; anything else returns to the
-    /// workspace-wide multiplexer. Reselecting the same run is a no-op so the
+    /// all-repo multiplexer. Reselecting the same run is a no-op so the
     /// sidebar's 5s poll refresh does not restart the stream.
-    func selectRun(_ info: RunInfo?) {
-        selectedRun = info
+    func selectRun(_ entry: RunEntry?) {
+        selectedRun = entry
         updateCancelButton()
-        guard let info else {
+        guard let entry else {
             if currentStreamRunID != nil { startGlobalStream() }
             return
         }
-        guard info.run_id != currentStreamRunID else { return }
-        startRunStream(info)
+        guard entry.info.run_id != currentStreamRunID else { return }
+        var isDir: ObjCBool = false
+        if let wt = entry.info.worktree,
+           FileManager.default.fileExists(atPath: wt, isDirectory: &isDir), isDir.boolValue {
+            startRunStream(entry, worktree: wt)
+        } else {
+            replayFromState(entry)
+        }
     }
 
-    private func startRunStream(_ info: RunInfo) {
-        guard let ws = currentWorkspace else { return }
+    private func startRunStream(_ entry: RunEntry, worktree: String) {
+        let info = entry.info
         currentStreamRunID = info.run_id
         streamTask?.terminate()
         appendLog("\n── \(info.role) · \(info.agent) — \(info.run_id) ──\n", color: .tertiaryLabelColor)
         streamTask = StreamTask(
             ["events", "tail", "--run", info.run_id, "--mr", info.mr,
-             "--native", "-n", "40", "-f", "--worktree", ws.path],
-            cwd: ws.path
+             "--native", "-n", "40", "-f", "--worktree", worktree],
+            cwd: worktree
         ) { [weak self] text in
             self?.appendLog(text)
         } onExit: { [weak self] _ in
@@ -162,6 +165,27 @@ final class MainViewController: NSViewController {
             self.onRunsChanged?()
             self.startGlobalStream()
         }
+    }
+
+    /// The run's worktree is gone (scratch dirs get deleted) so `orch events
+    /// tail` cannot derive the repo key — replay the trajectory straight from
+    /// the persisted state dir instead. Such runs are terminal: a static tail
+    /// is complete, not a degraded live view.
+    private func replayFromState(_ entry: RunEntry) {
+        currentStreamRunID = entry.info.run_id
+        streamTask?.terminate()
+        streamTask = nil
+        appendLog("\n── \(entry.info.role) · \(entry.info.agent) — \(entry.info.run_id) (worktree 已删除，静态回放) ──\n",
+                  color: .tertiaryLabelColor)
+        for name in ["native.jsonl", "events.jsonl"] {
+            guard let text = try? String(contentsOfFile: entry.runDir + "/" + name, encoding: .utf8) else { continue }
+            let lines = text.split(separator: "\n").suffix(40)
+            for line in lines {
+                appendLog(String(line.prefix(400)) + (line.count > 400 ? " …\n" : "\n"), color: .secondaryLabelColor)
+            }
+            return
+        }
+        appendLog("(无事件记录)\n", color: .secondaryLabelColor)
     }
 
     // MARK: run / cancel
@@ -206,11 +230,13 @@ final class MainViewController: NSViewController {
     }
 
     @objc private func cancelSelectedRun() {
-        guard let run = selectedRun, let ws = currentWorkspace else { return }
+        guard let entry = selectedRun else { return }
+        let run = entry.info
+        guard let worktree = run.worktree ?? currentWorkspace?.path else { return }
         appendLog("\n$ orch run cancel --run \(run.run_id)\n", color: .systemOrange)
         cancelButton.isEnabled = false
         Orch.capture(["run", "cancel", "--run", run.run_id, "--mr", run.mr,
-                      "--reason", "canceled from gui", "--worktree", ws.path]) { [weak self] data, err in
+                      "--reason", "canceled from gui", "--worktree", worktree]) { [weak self] data, err in
             if let err {
                 self?.appendLog("⚠️ \(err)\n", color: .systemRed)
             } else if let data, let text = String(data: data, encoding: .utf8), !text.isEmpty {
@@ -221,7 +247,7 @@ final class MainViewController: NSViewController {
     }
 
     private func updateCancelButton() {
-        let active = ["running", "starting", "pending"].contains(selectedRun?.state ?? "")
+        let active = ["running", "starting", "pending"].contains(selectedRun?.info.state ?? "")
         cancelButton.isEnabled = active
     }
 
@@ -237,15 +263,21 @@ final class MainViewController: NSViewController {
 
     // MARK: inspect
 
-    func inspectRun(_ info: RunInfo) {
-        guard let ws = currentWorkspace else { return }
-        appendLog("\n$ orch result --run \(info.run_id) --mr \(info.mr)\n", color: .systemBlue)
-        Orch.capture(["result", "--run", info.run_id, "--mr", info.mr, "--worktree", ws.path]) {
-            [weak self] data, err in
-            if let err { self?.appendLog(err + "\n", color: .systemRed); return }
-            if let data, let text = String(data: data, encoding: .utf8) {
-                self?.appendLog(text.hasSuffix("\n") ? text : text + "\n")
-            }
+    /// result.json is read straight from the run's state dir: no CLI round
+    /// trip, and it works when the run's worktree no longer exists.
+    func inspectRun(_ entry: RunEntry) {
+        appendLog("\n── result · \(entry.info.run_id) ──\n", color: .systemBlue)
+        let path = entry.runDir + "/result.json"
+        guard let data = FileManager.default.contents(atPath: path) else {
+            appendLog("(尚无 result.json — run 可能仍在执行)\n", color: .secondaryLabelColor)
+            return
+        }
+        if let obj = try? JSONSerialization.jsonObject(with: data),
+           let pretty = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys]),
+           let text = String(data: pretty, encoding: .utf8) {
+            appendLog(text + "\n")
+        } else if let text = String(data: data, encoding: .utf8) {
+            appendLog(text.hasSuffix("\n") ? text : text + "\n")
         }
     }
 

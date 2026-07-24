@@ -1,40 +1,42 @@
 import AppKit
 
+final class RepoNode {
+    let repoKey: String
+    var mrs: [MRNode] = []
+    init(repoKey: String) { self.repoKey = repoKey }
+}
+
 final class MRNode {
+    let key: String
     let mr: String
     var runs: [RunNode] = []
-    var latest: String = ""
-    init(mr: String) { self.mr = mr }
+    init(key: String, mr: String) {
+        self.key = key
+        self.mr = mr
+    }
 }
 
 final class RunNode {
-    let info: RunInfo
-    init(_ info: RunInfo) { self.info = info }
+    let entry: RunEntry
+    init(_ entry: RunEntry) { self.entry = entry }
 }
 
 final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NSOutlineViewDelegate {
     private let outline = NSOutlineView()
-    private var nodes: [MRNode] = []
-    private var nodeByMR: [String: MRNode] = [:]
+    private var repos: [RepoNode] = []
+    private var repoByKey: [String: RepoNode] = [:]
+    private var mrByKey: [String: MRNode] = [:]
     private var timer: Timer?
+    private let scanner = StateScanner()
+    private var isScanning = false
+    private var didInitialExpand = false
 
-    var onInspectRun: ((RunInfo) -> Void)?
-    var onSelectRun: ((RunInfo?) -> Void)?
-    var onError: ((String) -> Void)?
+    var onInspectRun: ((RunEntry) -> Void)?
+    var onSelectRun: ((RunEntry?) -> Void)?
     // Suppresses selection callbacks while apply() rebuilds rows: reloadData
     // transiently clears the selection, which must not bounce the main view
     // back to the global stream on every 5s poll.
     private var isApplying = false
-
-    var worktreePath: String? {
-        didSet {
-            guard worktreePath != oldValue else { return }
-            nodes = []
-            nodeByMR = [:]
-            outline.reloadData()
-            refresh(reportError: true)
-        }
-    }
 
     override func loadView() {
         let column = NSTableColumn(identifier: .init("main"))
@@ -58,65 +60,89 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
 
     override func viewDidLoad() {
         super.viewDidLoad()
+        refresh()
         timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             self?.refresh()
         }
     }
 
-    func refresh(reportError: Bool = false) {
-        guard let path = worktreePath else { return }
-        Orch.capture(["status", "--json", "--worktree", path]) { [weak self] data, err in
-            guard let self, self.worktreePath == path else { return }
-            if let err {
-                if reportError { self.onError?(err) }
-                return
+    // Scans the orch state tree off-main; the mtime cache inside StateScanner
+    // keeps the steady-state cost at stat() calls.
+    func refresh() {
+        guard !isScanning else { return }
+        isScanning = true
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            let groups = self.scanner.scan()
+            DispatchQueue.main.async {
+                self.isScanning = false
+                self.apply(groups)
             }
-            guard let data,
-                  let status = try? JSONDecoder().decode(RepoStatus.self, from: data) else { return }
-            self.apply(status)
         }
     }
 
-    private func apply(_ status: RepoStatus) {
-        let selectedID = (outline.item(atRow: outline.selectedRow) as? RunNode)?.info.run_id
+    private func apply(_ groups: [RepoGroup]) {
+        let selectedID = (outline.item(atRow: outline.selectedRow) as? RunNode)?.entry.info.run_id
         isApplying = true
         defer { isApplying = false }
-        var fresh: [MRNode] = []
-        var seen = Set<String>()
-        for mr in status.mrs {
-            seen.insert(mr.mr)
-            let node: MRNode
-            let isNew: Bool
-            if let existing = nodeByMR[mr.mr] {
-                node = existing
-                isNew = false
-            } else {
-                node = MRNode(mr: mr.mr)
-                nodeByMR[mr.mr] = node
-                isNew = true
+
+        var freshRepos: [RepoNode] = []
+        var seenRepos = Set<String>()
+        var seenMRs = Set<String>()
+        var newMRNodes: [MRNode] = []
+        for group in groups {
+            seenRepos.insert(group.repoKey)
+            let repoNode = repoByKey[group.repoKey] ?? {
+                let node = RepoNode(repoKey: group.repoKey)
+                repoByKey[group.repoKey] = node
+                return node
+            }()
+            var mrNodes: [MRNode] = []
+            for mrGroup in group.mrs {
+                let key = "\(group.repoKey)#\(mrGroup.mr)"
+                seenMRs.insert(key)
+                let mrNode: MRNode
+                if let existing = mrByKey[key] {
+                    mrNode = existing
+                } else {
+                    mrNode = MRNode(key: key, mr: mrGroup.mr)
+                    mrByKey[key] = mrNode
+                    newMRNodes.append(mrNode)
+                }
+                mrNode.runs = mrGroup.runs.map(RunNode.init)
+                mrNodes.append(mrNode)
             }
-            node.runs = mr.runs
-                .sorted { ($0.updated_at ?? "") > ($1.updated_at ?? "") }
-                .map(RunNode.init)
-            node.latest = mr.runs.compactMap(\.updated_at).max() ?? ""
-            fresh.append(node)
-            if isNew { DispatchQueue.main.async { self.outline.expandItem(node) } }
+            repoNode.mrs = mrNodes
+            freshRepos.append(repoNode)
         }
-        nodeByMR = nodeByMR.filter { seen.contains($0.key) }
-        nodes = fresh.sorted { $0.latest > $1.latest }
+        repoByKey = repoByKey.filter { seenRepos.contains($0.key) }
+        mrByKey = mrByKey.filter { seenMRs.contains($0.key) }
+        repos = freshRepos
         outline.reloadData()
+
+        if !didInitialExpand, let first = repos.first {
+            didInitialExpand = true
+            outline.expandItem(first)
+            if let mr = first.mrs.first { outline.expandItem(mr) }
+        }
+        for node in newMRNodes where didInitialExpand {
+            outline.expandItem(node)
+        }
+
         // Restore the selection onto the recreated RunNode and hand the main
-        // view the FRESH RunInfo (state may have changed → cancel button).
-        var reselected: RunInfo?
+        // view the FRESH entry (state may have changed → cancel button).
+        var reselected: RunEntry?
         if let selectedID {
-            outer: for mrNode in nodes {
-                for runNode in mrNode.runs where runNode.info.run_id == selectedID {
-                    let row = outline.row(forItem: runNode)
-                    if row >= 0 {
-                        outline.selectRowIndexes([row], byExtendingSelection: false)
-                        reselected = runNode.info
+            outer: for repo in repos {
+                for mrNode in repo.mrs {
+                    for runNode in mrNode.runs where runNode.entry.info.run_id == selectedID {
+                        let row = outline.row(forItem: runNode)
+                        if row >= 0 {
+                            outline.selectRowIndexes([row], byExtendingSelection: false)
+                            reselected = runNode.entry
+                        }
+                        break outer
                     }
-                    break outer
                 }
             }
         }
@@ -125,28 +151,32 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
 
     @objc private func doubleClicked() {
         guard let node = outline.item(atRow: outline.clickedRow) as? RunNode else { return }
-        onInspectRun?(node.info)
+        onInspectRun?(node.entry)
     }
 
     func outlineViewSelectionDidChange(_ notification: Notification) {
         guard !isApplying else { return }
-        onSelectRun?((outline.item(atRow: outline.selectedRow) as? RunNode)?.info)
+        onSelectRun?((outline.item(atRow: outline.selectedRow) as? RunNode)?.entry)
     }
 
     // MARK: NSOutlineViewDataSource
 
     func outlineView(_ v: NSOutlineView, numberOfChildrenOfItem item: Any?) -> Int {
-        if item == nil { return nodes.count }
+        if item == nil { return repos.count }
+        if let repo = item as? RepoNode { return repo.mrs.count }
         return (item as? MRNode)?.runs.count ?? 0
     }
 
     func outlineView(_ v: NSOutlineView, child index: Int, ofItem item: Any?) -> Any {
-        if let node = item as? MRNode { return node.runs[index] }
-        return nodes[index]
+        if let repo = item as? RepoNode { return repo.mrs[index] }
+        if let mr = item as? MRNode { return mr.runs[index] }
+        return repos[index]
     }
 
     func outlineView(_ v: NSOutlineView, isItemExpandable item: Any) -> Bool {
-        (item as? MRNode)?.runs.isEmpty == false
+        if let repo = item as? RepoNode { return !repo.mrs.isEmpty }
+        if let mr = item as? MRNode { return !mr.runs.isEmpty }
+        return false
     }
 
     // MARK: NSOutlineViewDelegate
@@ -156,12 +186,25 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
         label.lineBreakMode = .byTruncatingMiddle
         label.allowsDefaultTighteningForTruncation = true
 
-        if let node = item as? MRNode {
-            label.font = .systemFont(ofSize: 12, weight: .semibold)
-            label.stringValue = node.mr
+        if let repo = item as? RepoNode {
+            label.font = .systemFont(ofSize: 11, weight: .bold)
+            label.textColor = .secondaryLabelColor
+            label.stringValue = repo.repoKey.components(separatedBy: "/").last ?? repo.repoKey
+            label.toolTip = repo.repoKey
+        } else if let node = item as? MRNode {
+            let text = NSMutableAttributedString()
+            text.append(NSAttributedString(string: node.mr, attributes: [
+                .foregroundColor: NSColor.labelColor,
+                .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
+            ]))
+            text.append(NSAttributedString(string: "  \(node.runs.count)", attributes: [
+                .foregroundColor: NSColor.tertiaryLabelColor,
+                .font: NSFont.systemFont(ofSize: 11),
+            ]))
+            label.attributedStringValue = text
             label.toolTip = node.mr
         } else if let node = item as? RunNode {
-            let info = node.info
+            let info = node.entry.info
             let text = NSMutableAttributedString()
             text.append(NSAttributedString(string: "● ", attributes: [
                 .foregroundColor: Self.stateColor(info.state),
@@ -171,7 +214,13 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
                 .foregroundColor: NSColor.labelColor,
                 .font: NSFont.systemFont(ofSize: 12),
             ]))
-            text.append(NSAttributedString(string: "  \(info.state)", attributes: [
+            var detail = "  \(info.state)"
+            let when = relativeTime(info.updated_at)
+            if !when.isEmpty { detail += " · \(when)" }
+            if let decision = node.entry.decision {
+                detail += " · " + (decision == "accept" ? "✓" : decision == "rework" ? "↻" : "✕")
+            }
+            text.append(NSAttributedString(string: detail, attributes: [
                 .foregroundColor: NSColor.secondaryLabelColor,
                 .font: NSFont.systemFont(ofSize: 11),
             ]))
