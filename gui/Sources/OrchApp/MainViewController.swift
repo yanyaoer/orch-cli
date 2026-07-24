@@ -20,6 +20,24 @@ final class MainViewController: NSViewController {
     // Input-box target: nil = `orch new`; otherwise messages continue this
     // run's provider session via `orch run create --resume-from`.
     private var attachTarget: RunEntry?
+    private var logScroll: NSScrollView!
+
+    // Backward paging state for the current run detail. Order safety: all
+    // mutation happens on the main thread, loads are single-flight, batches
+    // always insert at the fixed anchor (older batches land above newer ones
+    // by construction), and async completions are dropped unless run id and
+    // window offset still match.
+    private struct DetailHistory {
+        let runID: String
+        let path: String
+        var startOffset: UInt64
+        var backlog: [(tag: String, text: String)]
+        var exhausted: Bool
+        var loading = false
+        var notedStart = false
+        var anchor: Int
+    }
+    private var detailHistory: DetailHistory?
 
     private static let activeStates: Set<String> = ["running", "starting", "pending"]
 
@@ -33,6 +51,11 @@ final class MainViewController: NSViewController {
 
     override func loadView() {
         let scroll = NSTextView.scrollableTextView()
+        logScroll = scroll
+        scroll.contentView.postsBoundsChangedNotifications = true
+        NotificationCenter.default.addObserver(self, selector: #selector(logScrolled),
+                                               name: NSView.boundsDidChangeNotification,
+                                               object: scroll.contentView)
         logView = (scroll.documentView as! NSTextView)
         logView.isEditable = false
         logView.isRichText = false
@@ -133,6 +156,7 @@ final class MainViewController: NSViewController {
         currentStreamRunID = nil
         detailTailer?.stop()
         detailTailer = nil
+        detailHistory = nil
         streamTask?.terminate()
         appendLog("\n── 全局进展流 · 全部仓库 ──\n", color: .tertiaryLabelColor)
         streamTask = StreamTask(["events", "tail", "-f", "--all", "--native"],
@@ -192,7 +216,7 @@ final class MainViewController: NSViewController {
         // Read a generous window, then keep only events with human-relevant
         // text: token-progress events dominate the raw stream (observed
         // ~2/3 of a claude run) and would fill the view with blank rows.
-        let tail = NativeLog.tail(path: path, count: 300) ?? NativeTail(lines: [], endOffset: 0)
+        let tail = NativeLog.tail(path: path, count: 300) ?? NativeTail(lines: [], startOffset: 0, endOffset: 0)
         var summaries = tail.lines.map(NativeLog.summarize).filter { !$0.text.isEmpty }
         if summaries.isEmpty {
             summaries = tail.lines.suffix(5).map { ("raw", NativeLog.clip($0, 300)) }
@@ -201,9 +225,18 @@ final class MainViewController: NSViewController {
         if shown.isEmpty {
             appendLog(active ? "(等待事件…)\n" : "(无事件记录)\n", color: .secondaryLabelColor)
         } else {
-            appendLog("最近 \(shown.count) 条事件：\n", color: .tertiaryLabelColor)
-            for summary in shown { appendSummary(summary) }
+            appendLog("最近 \(shown.count) 条事件（向上滚动加载更早）：\n", color: .tertiaryLabelColor)
         }
+        let anchor = logView.textStorage?.length ?? 0
+        for summary in shown { appendSummary(summary) }
+        detailHistory = DetailHistory(
+            runID: info.run_id,
+            path: path,
+            startOffset: tail.startOffset,
+            backlog: Array(summaries.dropLast(shown.count)),
+            exhausted: tail.startOffset == 0,
+            anchor: anchor
+        )
 
         if active {
             detailTailer = FileTailer(path: path, offset: tail.endOffset) { [weak self] line in
@@ -221,6 +254,100 @@ final class MainViewController: NSViewController {
     private func appendSummary(_ summary: (tag: String, text: String)) {
         appendLog("▸ \(summary.tag)  ", color: summary.tag.contains("error") ? .systemRed : .tertiaryLabelColor)
         appendLog(summary.text + "\n", color: .labelColor)
+    }
+
+    // MARK: backward history paging
+
+    private static let historyPage = 12
+
+    @objc private func logScrolled() {
+        guard detailHistory != nil else { return }
+        let clip = logScroll.contentView
+        let y = clip.bounds.origin.y
+        // y < 0 is the elastic over-scroll at the top; the 150pt threshold
+        // only applies when there is actually something to scroll.
+        let scrollable = logView.frame.height > clip.bounds.height + 8
+        if y < 0 || (scrollable && y < 150) { loadMoreHistory() }
+    }
+
+    private func loadMoreHistory() {
+        guard var h = detailHistory, !h.loading else { return }
+        guard currentStreamRunID == h.runID else {
+            detailHistory = nil
+            return
+        }
+        if h.backlog.isEmpty && h.exhausted {
+            if !h.notedStart {
+                h.notedStart = true
+                detailHistory = h
+                prependAtAnchor(Self.eventAttributed([("history", "（已到最早事件）")]))
+            }
+            return
+        }
+        if h.backlog.count >= Self.historyPage || h.exhausted {
+            let take = min(Self.historyPage, h.backlog.count)
+            let page = Array(h.backlog.suffix(take))
+            h.backlog.removeLast(take)
+            detailHistory = h
+            if !page.isEmpty { prependAtAnchor(Self.eventAttributed(page)) }
+            return
+        }
+        // Backlog thin and file has earlier bytes: fetch the previous chunk
+        // off-main, then re-enter to render. The (runID, startOffset) check
+        // drops stale completions after a run switch or competing load.
+        h.loading = true
+        detailHistory = h
+        let (path, upTo, runID) = (h.path, h.startOffset, h.runID)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let chunk = NativeLog.chunkBefore(path: path, upTo: upTo)
+            let sums = (chunk?.lines ?? []).map(NativeLog.summarize).filter { !$0.text.isEmpty }
+            DispatchQueue.main.async {
+                guard let self, var h2 = self.detailHistory, h2.runID == runID, h2.startOffset == upTo else { return }
+                h2.loading = false
+                if let chunk {
+                    h2.startOffset = chunk.startOffset
+                    h2.exhausted = chunk.startOffset == 0
+                    h2.backlog.insert(contentsOf: sums, at: 0)
+                } else {
+                    h2.exhausted = true
+                }
+                self.detailHistory = h2
+                self.loadMoreHistory()
+            }
+        }
+    }
+
+    private static func eventAttributed(_ summaries: [(tag: String, text: String)]) -> NSAttributedString {
+        let font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        let out = NSMutableAttributedString()
+        for summary in summaries {
+            out.append(NSAttributedString(string: "▸ \(summary.tag)  ", attributes: [
+                .font: font,
+                .foregroundColor: summary.tag.contains("error") ? NSColor.systemRed : NSColor.tertiaryLabelColor,
+            ]))
+            out.append(NSAttributedString(string: summary.text + "\n", attributes: [
+                .font: font,
+                .foregroundColor: NSColor.labelColor,
+            ]))
+        }
+        return out
+    }
+
+    /// Insert at the fixed anchor (start of the oldest displayed event) and
+    /// compensate the scroll offset by the inserted height so the visible
+    /// content does not jump.
+    private func prependAtAnchor(_ attr: NSAttributedString) {
+        guard let storage = logView.textStorage, let h = detailHistory,
+              let lm = logView.layoutManager, let tc = logView.textContainer else { return }
+        let clip = logScroll.contentView
+        let savedY = clip.bounds.origin.y
+        lm.ensureLayout(for: tc)
+        let before = lm.usedRect(for: tc).height
+        storage.insert(attr, at: min(h.anchor, storage.length))
+        lm.ensureLayout(for: tc)
+        let delta = lm.usedRect(for: tc).height - before
+        clip.scroll(to: NSPoint(x: clip.bounds.origin.x, y: max(0, savedY + delta)))
+        logScroll.reflectScrolledClipView(clip)
     }
 
     // MARK: attach — the input box targets a run's provider session
@@ -430,6 +557,12 @@ final class MainViewController: NSViewController {
         guard let storage = logView.textStorage else { return }
         if storage.length > 800_000 {
             storage.deleteCharacters(in: NSRange(location: 0, length: 200_000))
+            // Keep the history anchor aligned with the trimmed buffer; give
+            // up paging if the detail section itself was cut.
+            if var h = detailHistory {
+                h.anchor -= 200_000
+                detailHistory = h.anchor >= 0 ? h : nil
+            }
         }
         let atBottom = logView.visibleRect.maxY >= logView.bounds.maxY - 44
         storage.append(NSAttributedString(string: text, attributes: [

@@ -142,10 +142,37 @@ final class StateScanner {
 
 struct NativeTail {
     let lines: [String]
+    /// Byte offset of the first returned line — where backward history
+    /// paging continues from.
+    let startOffset: UInt64
     let endOffset: UInt64
 }
 
 enum NativeLog {
+    /// Complete lines of a chunk with their absolute byte offsets; a chunk cut
+    /// mid-file drops its leading partial line (the preceding chunk read later
+    /// will contain it whole).
+    private static func completeLines(_ data: Data, base: UInt64, dropFirstPartial: Bool) -> [(offset: UInt64, text: String)] {
+        let bytes = [UInt8](data)
+        var result: [(UInt64, String)] = []
+        var lineStart = 0
+        var usable = !dropFirstPartial
+        for i in 0..<bytes.count where bytes[i] == 0x0A {
+            if usable {
+                if i > lineStart {
+                    result.append((base + UInt64(lineStart), String(decoding: bytes[lineStart..<i], as: UTF8.self)))
+                }
+            } else {
+                usable = true
+            }
+            lineStart = i + 1
+        }
+        if usable, lineStart < bytes.count {
+            result.append((base + UInt64(lineStart), String(decoding: bytes[lineStart...], as: UTF8.self)))
+        }
+        return result
+    }
+
     /// Last `count` complete lines of a (possibly huge) jsonl file, reading at
     /// most `maxBytes` from the end; endOffset lets a tailer continue live.
     static func tail(path: String, count: Int, maxBytes: UInt64 = 262_144) -> NativeTail? {
@@ -154,11 +181,22 @@ enum NativeLog {
         guard let size = try? fh.seekToEnd() else { return nil }
         let start = size > maxBytes ? size - maxBytes : 0
         try? fh.seek(toOffset: start)
-        guard let data = try? fh.readToEnd() else { return NativeTail(lines: [], endOffset: size) }
-        var lines = String(decoding: data, as: UTF8.self)
-            .split(separator: "\n", omittingEmptySubsequences: true)
-        if start > 0, !lines.isEmpty { lines.removeFirst() }
-        return NativeTail(lines: lines.suffix(count).map(String.init), endOffset: size)
+        guard let data = try? fh.readToEnd() else { return NativeTail(lines: [], startOffset: size, endOffset: size) }
+        let lines = completeLines(data, base: start, dropFirstPartial: start > 0)
+        let kept = Array(lines.suffix(count))
+        return NativeTail(lines: kept.map(\.text), startOffset: kept.first?.offset ?? size, endOffset: size)
+    }
+
+    /// One chunk of history immediately BEFORE byte `upTo` (which must be a
+    /// line start): returns older complete lines and the new window start.
+    static func chunkBefore(path: String, upTo: UInt64, maxBytes: UInt64 = 262_144) -> (lines: [String], startOffset: UInt64)? {
+        guard upTo > 0, let fh = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { try? fh.close() }
+        let start = upTo > maxBytes ? upTo - maxBytes : 0
+        try? fh.seek(toOffset: start)
+        guard let data = try? fh.read(upToCount: Int(upTo - start)), !data.isEmpty else { return nil }
+        let lines = completeLines(data, base: start, dropFirstPartial: start > 0)
+        return (lines.map(\.text), lines.first?.offset ?? start)
     }
 
     // Keys worth surfacing, in display priority; everything else in a native
