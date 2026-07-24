@@ -888,7 +888,7 @@ export function prewalkHelp(): string {
     "     checklist with per-item validation, implements ONLY the first item,",
     "     reports the checklist in its result summary.",
     "  2. Host-side handoff gate, judged from persisted evidence (supervisor",
-    "     git/jj status artifact + result): checklist size in range, first item",
+    "     status + changed-files artifacts): checklist size in range, first item",
     "     checked, every item carries a validation step, and a meaningful",
     "     (non-docs) edit exists beyond the pre-run dirty baseline. The gate",
     "     fails closed when host evidence is missing; the guide's own",

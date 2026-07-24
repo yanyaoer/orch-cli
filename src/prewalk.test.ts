@@ -1,14 +1,16 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RunSpec } from "./types.ts";
 import {
   buildPrewalkPayload,
   evaluateHandoffGate,
+  guideEditEvidence,
   meaningfulChangedFiles,
   parseStatusPaths,
   parseTodoChecklist,
+  renameDestination,
   unquoteGitPath,
   type PrewalkOutcome,
 } from "./prewalk.ts";
@@ -72,11 +74,36 @@ test("parseStatusPaths handles porcelain, jj, quoting, conflicts, and renames", 
 test("unquoteGitPath decodes escapes byte-accurately so docs cannot dodge classification", () => {
   expect(unquoteGitPath('"docs/read me.md"')).toBe("docs/read me.md");
   expect(unquoteGitPath('"a\\"b\\\\c\\t.md"')).toBe('a"b\\c\t.md');
+  // Literal non-BMP characters inside a quoted path (core.quotePath=false).
+  expect(unquoteGitPath('"😀 file.ts"')).toBe("😀 file.ts");
   expect(meaningfulChangedFiles([unquoteGitPath('"docs/read me.md"'), unquoteGitPath('"docs/\\346\\226\\207.md"')])).toEqual([]);
 });
 
-test("meaningfulChangedFiles drops docs and orch metadata", () => {
+test("renameDestination survives arrows inside quoted fields", () => {
+  expect(renameDestination("old.ts -> new.ts")).toBe("new.ts");
+  expect(renameDestination('"old.ts" -> "new -> file.ts"')).toBe('"new -> file.ts"');
+  expect(parseStatusPaths('R  "old.ts" -> "new -> file.md"')).toEqual(["new -> file.md"]);
+});
+
+test("meaningfulChangedFiles drops docs, orch metadata, and unclassifiable directory entries", () => {
   expect(meaningfulChangedFiles(["README.md", "notes.txt", ".orch/state.json", "src/cache.ts"])).toEqual(["src/cache.ts"]);
+  // Collapsed untracked directories cannot be classified — never credit them.
+  expect(meaningfulChangedFiles(["docs/new/", "src/new/"])).toEqual([]);
+});
+
+test("guideEditEvidence decodes quoted changed-files entries and fails closed without artifacts", () => {
+  const runDir = tempDir();
+  expect(guideEditEvidence(runDir, [])).toBeNull();
+  const artifacts = join(runDir, "artifacts");
+  mkdirSync(artifacts, { recursive: true });
+  writeFileSync(join(artifacts, "git-status.txt"), ' M "docs/\\346\\226\\207.md"\n', "utf8");
+  writeFileSync(join(artifacts, "changed-files.txt"), '"docs/\\346\\226\\207.md"\n', "utf8");
+  const evidence = guideEditEvidence(runDir, []);
+  // Both sources decode to the same canonical docs path: no meaningful edit.
+  expect(evidence).toEqual(["docs/文.md"]);
+  expect(meaningfulChangedFiles(evidence!)).toEqual([]);
+  // Baseline subtraction removes pre-existing dirt in canonical form.
+  expect(guideEditEvidence(runDir, ["docs/文.md"])).toEqual([]);
 });
 
 test("evaluateHandoffGate passes only on ordered, validated, host-evidenced progress", () => {
@@ -97,13 +124,14 @@ test("evaluateHandoffGate passes only on ordered, validated, host-evidenced prog
   expect(wrongOrder.ok).toBe(false);
   expect(wrongOrder.reasons).toContain("first todo item is not checked off");
 
-  // Items without validation steps break the executor's check-then-tick loop.
+  // Items without an explicit "validate:" marker break the executor's
+  // check-then-tick loop; mentioning the word validation is not enough.
   const unvalidated = evaluateHandoffGate({
     ...base,
-    todo: parseTodoChecklist("- [x] a\n- [ ] b\n- [ ] c"),
+    todo: parseTodoChecklist("- [x] Add input validation logic\n- [ ] Skip validation for legacy\n- [ ] c"),
   });
   expect(unvalidated.ok).toBe(false);
-  expect(unvalidated.reasons).toContain("3 todo item(s) lack a validation step");
+  expect(unvalidated.reasons).toContain('3 todo item(s) lack a "validate:" step');
 
   // Missing host evidence fails closed; docs-only evidence fails too.
   expect(evaluateHandoffGate({ ...base, changedFiles: null }).reasons).toContain(
@@ -128,6 +156,7 @@ test("buildPrewalkPayload never recommends acceptance for a failed outcome", () 
   const outcome: PrewalkOutcome = {
     mr: "prewalk-1",
     worktree: "/tmp/w t",
+    tag: "prewalk",
     guide: {
       run_id: "guide-1",
       model: "frontier-x",
@@ -145,6 +174,9 @@ test("buildPrewalkPayload never recommends acceptance for a failed outcome", () 
   const failedNext = (failed.next as string[]).join("\n");
   expect(failedNext).not.toContain("decision accept");
   expect(failedNext).toContain("--resume-from");
+  // The rework command must stay in the session's tag family or the
+  // session-chain guard rejects it.
+  expect(failedNext).toContain("--tag 'prewalk-exec-r2'");
   expect(failedNext).toContain("'/tmp/w t'");
 
   const done = buildPrewalkPayload({ ...outcome, executor: { ...outcome.executor!, verdict: "completed" }, succeeded: true });
@@ -236,6 +268,24 @@ test(
     expect(execSpec.tag).toBe("prewalk-exec");
     expect(execSpec.provider_session_mode).toBe("resume_exact");
     expect(execSpec.provider_session_id).toBe("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee");
+
+    // The advertised failure-path rework command must pass the session-chain
+    // guard against this two-run chain.
+    const reworkTask = join(root, "rework.md");
+    writeFileSync(reworkTask, "rework the failing item", "utf8");
+    const rework = await runOrch(
+      [
+        "run", "create",
+        "--resume-from", payload.executor_run!.run_id,
+        "--mr", (payload as { mr: string }).mr,
+        "--worktree", worktree,
+        "--tag", "prewalk-exec-r2",
+        "--task", reworkTask,
+        "--dry-run",
+      ],
+      env,
+    );
+    expect(rework.exitCode).toBe(0);
   },
   120000,
 );

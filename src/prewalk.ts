@@ -63,11 +63,14 @@ export function parseTodoChecklist(summary: string): TodoChecklist {
 }
 
 // Docs-only or orch-metadata edits do not count as the executor's in-context
-// example; the guide must have touched source, test, or config.
+// example; the guide must have touched source, test, or config. A bare
+// directory entry (git's collapsed untracked-dir form, trailing "/") cannot
+// be classified, so it is excluded — erring toward keeping the guide model.
 export function meaningfulChangedFiles(files: string[]): string[] {
   return files.filter((file) => {
     const path = file.trim();
     if (!path) return false;
+    if (path.endsWith("/")) return false;
     if (/\.(md|markdown|txt)$/i.test(path)) return false;
     if (path === ".orch" || path.startsWith(".orch/")) return false;
     return true;
@@ -80,17 +83,20 @@ export function meaningfulChangedFiles(files: string[]): string[] {
 export function unquoteGitPath(raw: string): string {
   const s = raw.trim();
   if (!(s.length >= 2 && s.startsWith('"') && s.endsWith('"'))) return s;
-  const inner = s.slice(1, -1);
+  // Iterate code points, not UTF-16 units: with core.quotePath=false a quoted
+  // path can contain literal non-BMP characters, and splitting a surrogate
+  // pair through Buffer.from would mangle them.
+  const cps = Array.from(s.slice(1, -1));
   const bytes: number[] = [];
-  for (let i = 0; i < inner.length; i++) {
-    const ch = inner[i]!;
+  for (let i = 0; i < cps.length; i++) {
+    const ch = cps[i]!;
     if (ch !== "\\") {
       for (const byte of Buffer.from(ch, "utf8")) bytes.push(byte);
       continue;
     }
-    const next = inner[i + 1] ?? "";
-    if (/[0-7]/.test(next)) {
-      bytes.push(parseInt(inner.slice(i + 1, i + 4), 8));
+    const next = cps[i + 1] ?? "";
+    if (/^[0-7]$/.test(next)) {
+      bytes.push(parseInt(cps.slice(i + 1, i + 4).join(""), 8));
       i += 3;
       continue;
     }
@@ -99,6 +105,25 @@ export function unquoteGitPath(raw: string): string {
     i += 1;
   }
   return Buffer.from(bytes).toString("utf8");
+}
+
+// Rename targets are "old -> new"; the old side may be a C-quoted field that
+// itself contains " -> ", so a plain split on the arrow corrupts the
+// destination. Scan past a quoted old field first, then split once.
+export function renameDestination(target: string): string {
+  if (target.startsWith('"')) {
+    for (let i = 1; i < target.length; i++) {
+      if (target[i] === "\\") {
+        i += 1;
+      } else if (target[i] === '"') {
+        const rest = target.slice(i + 1);
+        return rest.startsWith(" -> ") ? rest.slice(4) : target;
+      }
+    }
+    return target;
+  }
+  const arrow = target.indexOf(" -> ");
+  return arrow === -1 ? target : target.slice(arrow + 4);
 }
 
 // Changed paths from a VCS status text. Accepts both formats the supervisor
@@ -112,9 +137,7 @@ export function parseStatusPaths(statusText: string): string[] {
   for (const raw of statusText.split("\n")) {
     const match = /^(?:[MADRCUT?!]{1,2}|\?\?)\s+(.+)$/.exec(raw.trim());
     if (!match) continue;
-    const target = match[1]!;
-    const dest = target.includes(" -> ") ? target.split(" -> ").pop()! : target;
-    paths.push(unquoteGitPath(dest));
+    paths.push(unquoteGitPath(renameDestination(match[1]!)));
   }
   return paths;
 }
@@ -148,8 +171,10 @@ export function evaluateHandoffGate(input: HandoffGateInput): HandoffGate {
   // gate. Items without an embedded validation step break the executor's
   // check-then-tick contract and do.
   if (todo.total > 0 && !todo.items[0]!.checked) reasons.push("first todo item is not checked off");
-  const unvalidated = todo.items.filter((item) => !/validat/i.test(item.text)).length;
-  if (unvalidated > 0) reasons.push(`${unvalidated} todo item(s) lack a validation step`);
+  // The guide contract demands an explicit "validate: <command or check>"
+  // marker per item; a mere mention of the word validation is not a check.
+  const unvalidated = todo.items.filter((item) => !/validate:\s*\S/i.test(item.text)).length;
+  if (unvalidated > 0) reasons.push(`${unvalidated} todo item(s) lack a "validate:" step`);
   if (input.changedFiles === null) {
     reasons.push("host-side edit evidence unavailable (status artifact missing)");
   } else if (meaningfulChangedFiles(input.changedFiles).length === 0) {
@@ -218,6 +243,7 @@ export function buildExecutorTask(task: string, gate: HandoffGate): string {
 export interface PrewalkOutcome {
   mr: string;
   worktree: string;
+  tag: string;
   guide: { run_id: string; model: string | null; state: string; verdict: string | null; todo: TodoChecklist; changed_files: string[] | null };
   gate: HandoffGate;
   executor: { run_id: string; model: string | null; state: string | null; verdict: string | null } | null;
@@ -240,7 +266,9 @@ export function buildPrewalkPayload(outcome: PrewalkOutcome): Record<string, unk
       ? [`orch decision accept --run ${shq(finishing)} ${base} --reason 'prewalk reviewed'`]
       : [
           `orch result --run ${shq(outcome.guide.run_id)} ${base}`,
-          `orch run create --resume-from ${shq(finishing)} ${base} --task rework.md`,
+          // The rework tag must stay in the session's tag family (-r<N> is
+          // stripped by the guard) or the session-chain guard rejects it.
+          `orch run create --resume-from ${shq(finishing)} ${base} --tag ${shq(`${outcome.tag}-exec-r2`)} --task rework.md`,
         ]),
   ];
   return {
@@ -307,8 +335,15 @@ async function waitRun(handle: RunHandle, label: string): Promise<RunStatus> {
 // with edits that existed before it ran. A guide edit to an already-dirty file
 // is invisible here — that errs toward keeping the guide model, never toward
 // a false cheap switch.
+// Known limitation: the baseline is captured before the run starts, so a
+// concurrent external edit inside the run window would be attributed to the
+// guide. prewalk assumes the caller owns the worktree for the duration, the
+// same assumption every write-role run already makes.
 export function captureBaselinePaths(worktree: string): string[] {
-  const argv = vcsKind(worktree) === "jj" ? ["jj", "status"] : ["git", "-C", worktree, "status", "--porcelain=v1"];
+  const argv =
+    vcsKind(worktree) === "jj"
+      ? ["jj", "status"]
+      : ["git", "-C", worktree, "status", "--porcelain=v1", "--untracked-files=all"];
   const proc = Bun.spawnSync(argv, { cwd: worktree, stdout: "pipe", stderr: "pipe" });
   if (proc.exitCode !== 0) {
     throw new CliError(`cannot capture VCS baseline in ${worktree}: ${proc.stderr.toString().trim().slice(0, 300)}`);
@@ -321,7 +356,7 @@ export function captureBaselinePaths(worktree: string): string[] {
 // edits a worker committed against policy), minus the pre-run baseline.
 // Returns null — failing the gate closed — when the status artifact is
 // missing; the guide's self-reported changed_files is never trusted.
-function guideEditEvidence(runDir: string, baseline: string[]): string[] | null {
+export function guideEditEvidence(runDir: string, baseline: string[]): string[] | null {
   let statusPaths: string[];
   try {
     statusPaths = parseStatusPaths(readFileSync(`${runDir}/artifacts/git-status.txt`, "utf8"));
@@ -330,9 +365,12 @@ function guideEditEvidence(runDir: string, baseline: string[]): string[] | null 
   }
   let diffPaths: string[] = [];
   try {
+    // `git diff --name-only` C-quotes unusual paths exactly like status
+    // output; decode so both sources and the baseline share one canonical
+    // representation (a raw quoted docs path must not evade classification).
     diffPaths = readFileSync(`${runDir}/artifacts/changed-files.txt`, "utf8")
       .split("\n")
-      .map((line) => line.trim())
+      .map((line) => unquoteGitPath(line))
       .filter(Boolean);
   } catch {
     // status artifact alone is sufficient evidence
@@ -447,6 +485,7 @@ export async function prewalkCommand(args: ParsedArgs, deps: PrewalkDeps): Promi
       buildPrewalkPayload({
         mr,
         worktree,
+        tag,
         guide: {
           run_id: guide.run_id,
           model: effectiveGuideModel,
