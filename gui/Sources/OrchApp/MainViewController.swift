@@ -172,7 +172,10 @@ final class MainViewController: NSViewController {
 
         let nativePath = entry.runDir + "/native.jsonl"
         let eventsPath = entry.runDir + "/events.jsonl"
-        let path = FileManager.default.fileExists(atPath: nativePath) ? nativePath : eventsPath
+        let nativeSize = (try? FileManager.default.attributesOfItem(atPath: nativePath))?[.size] as? Int ?? 0
+        // Some providers leave native.jsonl empty; the orch event log at least
+        // shows the run lifecycle then.
+        let path = nativeSize > 0 ? nativePath : eventsPath
         // Read a generous window, then keep only events with human-relevant
         // text: token-progress events dominate the raw stream (observed
         // ~2/3 of a claude run) and would fill the view with blank rows.
@@ -185,8 +188,12 @@ final class MainViewController: NSViewController {
             summaries = tail.lines.suffix(5).map { ("raw", NativeLog.clip($0, 300)) }
         }
         let shown = summaries.suffix(Self.detailEventCount)
-        appendLog("最近 \(shown.count) 条事件：\n", color: .tertiaryLabelColor)
-        for summary in shown { appendSummary(summary) }
+        if shown.isEmpty {
+            appendLog("(无事件记录)\n", color: .secondaryLabelColor)
+        } else {
+            appendLog("最近 \(shown.count) 条事件：\n", color: .tertiaryLabelColor)
+            for summary in shown { appendSummary(summary) }
+        }
 
         if Self.activeStates.contains(info.state) {
             detailTailer = FileTailer(path: path, offset: tail.endOffset) { [weak self] line in

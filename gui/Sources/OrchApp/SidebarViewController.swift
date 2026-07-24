@@ -181,10 +181,19 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
 
     // MARK: NSOutlineViewDelegate
 
+    // Rows are strictly single-line: state renders as the colored dot only,
+    // with the textual state in the tooltip.
     func outlineView(_ v: NSOutlineView, viewFor c: NSTableColumn?, item: Any) -> NSView? {
         let label = NSTextField(labelWithString: "")
-        label.lineBreakMode = .byTruncatingMiddle
+        label.maximumNumberOfLines = 1
+        label.cell?.usesSingleLineMode = true
+        label.cell?.wraps = false
+        label.lineBreakMode = .byTruncatingTail
         label.allowsDefaultTighteningForTruncation = true
+        // attributedStringValue overrides the label's line-break mode; carry
+        // it in the string's own paragraph style.
+        let para = NSMutableParagraphStyle()
+        para.lineBreakMode = .byTruncatingTail
 
         if let repo = item as? RepoNode {
             label.font = .systemFont(ofSize: 11, weight: .bold)
@@ -196,10 +205,12 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
             text.append(NSAttributedString(string: node.mr, attributes: [
                 .foregroundColor: NSColor.labelColor,
                 .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
+                .paragraphStyle: para,
             ]))
             text.append(NSAttributedString(string: "  \(node.runs.count)", attributes: [
                 .foregroundColor: NSColor.tertiaryLabelColor,
                 .font: NSFont.systemFont(ofSize: 11),
+                .paragraphStyle: para,
             ]))
             label.attributedStringValue = text
             label.toolTip = node.mr
@@ -209,23 +220,31 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
             text.append(NSAttributedString(string: "● ", attributes: [
                 .foregroundColor: Self.stateColor(info.state),
                 .font: NSFont.systemFont(ofSize: 12),
+                .paragraphStyle: para,
             ]))
             text.append(NSAttributedString(string: "\(info.role) · \(info.agent)", attributes: [
                 .foregroundColor: NSColor.labelColor,
                 .font: NSFont.systemFont(ofSize: 12),
+                .paragraphStyle: para,
             ]))
-            var detail = "  \(info.state)"
+            var detail = ""
             let when = relativeTime(info.updated_at)
-            if !when.isEmpty { detail += " · \(when)" }
+            if !when.isEmpty { detail += "  \(when)" }
             if let decision = node.entry.decision {
-                detail += " · " + (decision == "accept" ? "✓" : decision == "rework" ? "↻" : "✕")
+                detail += " " + (decision == "accept" ? "✓" : decision == "rework" ? "↻" : "✕")
             }
-            text.append(NSAttributedString(string: detail, attributes: [
-                .foregroundColor: NSColor.secondaryLabelColor,
-                .font: NSFont.systemFont(ofSize: 11),
-            ]))
+            if !detail.isEmpty {
+                text.append(NSAttributedString(string: detail, attributes: [
+                    .foregroundColor: NSColor.secondaryLabelColor,
+                    .font: NSFont.systemFont(ofSize: 11),
+                    .paragraphStyle: para,
+                ]))
+            }
             label.attributedStringValue = text
-            label.toolTip = info.run_id
+            var tip = "\(info.run_id)\n\(info.state)"
+            if !when.isEmpty { tip += " · \(when)" }
+            if let decision = node.entry.decision { tip += " · \(decision)" }
+            label.toolTip = tip
         }
 
         let cell = NSTableCellView()
