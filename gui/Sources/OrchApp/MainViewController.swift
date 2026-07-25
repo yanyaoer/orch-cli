@@ -1,5 +1,18 @@
 import AppKit
 
+/// Detail-view event: display summary plus the raw jsonl line for the
+/// click-to-expand HUD.
+struct EventItem {
+    let tag: String
+    let text: String
+    let raw: String
+}
+
+/// Standard macOS HUD panel (translucent dark); Esc closes it.
+final class HUDPanel: NSPanel {
+    override func cancelOperation(_ sender: Any?) { close() }
+}
+
 final class MainViewController: NSViewController {
     private var logView: NSTextView!
     private let workspacePopup = NSPopUpButton()
@@ -31,13 +44,20 @@ final class MainViewController: NSViewController {
         let runID: String
         let path: String
         var startOffset: UInt64
-        var backlog: [(tag: String, text: String)]
+        var backlog: [EventItem]
         var exhausted: Bool
         var loading = false
         var notedStart = false
         var anchor: Int
     }
     private var detailHistory: DetailHistory?
+
+    // Raw lines behind rendered events, keyed by the id embedded in the
+    // line's link attribute; clicking shows the full text in a HUD.
+    private var eventFullTexts: [Int: String] = [:]
+    private var nextEventID = 0
+    private var hudPanel: HUDPanel?
+    private var hudTextView: NSTextView?
 
     private static let activeStates: Set<String> = ["running", "starting", "pending"]
 
@@ -57,6 +77,10 @@ final class MainViewController: NSViewController {
                                                name: NSView.boundsDidChangeNotification,
                                                object: scroll.contentView)
         logView = (scroll.documentView as! NSTextView)
+        logView.delegate = self
+        // Event lines carry link attributes purely for click plumbing; keep
+        // our colors and only signal clickability via the cursor.
+        logView.linkTextAttributes = [.cursor: NSCursor.pointingHand]
         logView.isEditable = false
         logView.isRichText = false
         logView.drawsBackground = true
@@ -217,23 +241,26 @@ final class MainViewController: NSViewController {
         // text: token-progress events dominate the raw stream (observed
         // ~2/3 of a claude run) and would fill the view with blank rows.
         let tail = NativeLog.tail(path: path, count: 300) ?? NativeTail(lines: [], startOffset: 0, endOffset: 0)
-        var summaries = tail.lines.map(NativeLog.summarize).filter { !$0.text.isEmpty }
-        if summaries.isEmpty {
-            summaries = tail.lines.suffix(5).map { ("raw", NativeLog.clip($0, 300)) }
+        var items = tail.lines.compactMap { line -> EventItem? in
+            let summary = NativeLog.summarize(line)
+            return summary.text.isEmpty ? nil : EventItem(tag: summary.tag, text: summary.text, raw: line)
         }
-        let shown = summaries.suffix(Self.detailEventCount)
+        if items.isEmpty {
+            items = tail.lines.suffix(5).map { EventItem(tag: "raw", text: NativeLog.clip($0, 300), raw: $0) }
+        }
+        let shown = items.suffix(Self.detailEventCount)
         if shown.isEmpty {
             appendLog(active ? "(等待事件…)\n" : "(无事件记录)\n", color: .secondaryLabelColor)
         } else {
-            appendLog("最近 \(shown.count) 条事件（向上滚动加载更早）：\n", color: .tertiaryLabelColor)
+            appendLog("最近 \(shown.count) 条事件（向上滚动加载更早，点击条目看全文）：\n", color: .tertiaryLabelColor)
         }
         let anchor = logView.textStorage?.length ?? 0
-        for summary in shown { appendSummary(summary) }
+        for item in shown { appendAttributed(eventAttributed([item])) }
         detailHistory = DetailHistory(
             runID: info.run_id,
             path: path,
             startOffset: tail.startOffset,
-            backlog: Array(summaries.dropLast(shown.count)),
+            backlog: Array(items.dropLast(shown.count)),
             exhausted: tail.startOffset == 0,
             anchor: anchor
         )
@@ -248,12 +275,7 @@ final class MainViewController: NSViewController {
     private func appendEvent(_ line: String) {
         let summary = NativeLog.summarize(line)
         guard !summary.text.isEmpty else { return }
-        appendSummary(summary)
-    }
-
-    private func appendSummary(_ summary: (tag: String, text: String)) {
-        appendLog("▸ \(summary.tag)  ", color: summary.tag.contains("error") ? .systemRed : .tertiaryLabelColor)
-        appendLog(summary.text + "\n", color: .labelColor)
+        appendAttributed(eventAttributed([EventItem(tag: summary.tag, text: summary.text, raw: line)]))
     }
 
     // MARK: backward history paging
@@ -280,7 +302,7 @@ final class MainViewController: NSViewController {
             if !h.notedStart {
                 h.notedStart = true
                 detailHistory = h
-                prependAtAnchor(Self.eventAttributed([("history", "（已到最早事件）")]))
+                prependAtAnchor(eventAttributed([EventItem(tag: "history", text: "（已到最早事件）", raw: "")]))
             }
             return
         }
@@ -289,7 +311,7 @@ final class MainViewController: NSViewController {
             let page = Array(h.backlog.suffix(take))
             h.backlog.removeLast(take)
             detailHistory = h
-            if !page.isEmpty { prependAtAnchor(Self.eventAttributed(page)) }
+            if !page.isEmpty { prependAtAnchor(eventAttributed(page)) }
             return
         }
         // Backlog thin and file has earlier bytes: fetch the previous chunk
@@ -300,14 +322,17 @@ final class MainViewController: NSViewController {
         let (path, upTo, runID) = (h.path, h.startOffset, h.runID)
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let chunk = NativeLog.chunkBefore(path: path, upTo: upTo)
-            let sums = (chunk?.lines ?? []).map(NativeLog.summarize).filter { !$0.text.isEmpty }
+            let items = (chunk?.lines ?? []).compactMap { line -> EventItem? in
+                let summary = NativeLog.summarize(line)
+                return summary.text.isEmpty ? nil : EventItem(tag: summary.tag, text: summary.text, raw: line)
+            }
             DispatchQueue.main.async {
                 guard let self, var h2 = self.detailHistory, h2.runID == runID, h2.startOffset == upTo else { return }
                 h2.loading = false
                 if let chunk {
                     h2.startOffset = chunk.startOffset
                     h2.exhausted = chunk.startOffset == 0
-                    h2.backlog.insert(contentsOf: sums, at: 0)
+                    h2.backlog.insert(contentsOf: items, at: 0)
                 } else {
                     h2.exhausted = true
                 }
@@ -317,20 +342,35 @@ final class MainViewController: NSViewController {
         }
     }
 
-    private static func eventAttributed(_ summaries: [(tag: String, text: String)]) -> NSAttributedString {
+    private func eventAttributed(_ items: [EventItem]) -> NSAttributedString {
         let font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
         let out = NSMutableAttributedString()
-        for summary in summaries {
-            out.append(NSAttributedString(string: "▸ \(summary.tag)  ", attributes: [
+        for item in items {
+            out.append(NSAttributedString(string: "▸ \(item.tag)  ", attributes: [
                 .font: font,
-                .foregroundColor: summary.tag.contains("error") ? NSColor.systemRed : NSColor.tertiaryLabelColor,
+                .foregroundColor: item.tag.contains("error") ? NSColor.systemRed : NSColor.tertiaryLabelColor,
             ]))
-            out.append(NSAttributedString(string: summary.text + "\n", attributes: [
-                .font: font,
-                .foregroundColor: NSColor.labelColor,
-            ]))
+            var attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.labelColor]
+            if !item.raw.isEmpty {
+                attrs[.link] = "orch-event://\(registerFullText(item.raw))"
+            }
+            out.append(NSAttributedString(string: item.text + "\n", attributes: attrs))
         }
         return out
+    }
+
+    private func registerFullText(_ raw: String) -> Int {
+        let id = nextEventID
+        nextEventID += 1
+        eventFullTexts[id] = String(raw.prefix(262_144))
+        // Bound memory: drop the oldest ~500 entries once past 3000; clicking
+        // a pruned line reports it as cleaned up.
+        if eventFullTexts.count > 3000, let oldest = eventFullTexts.keys.min() {
+            for key in eventFullTexts.keys where key < oldest + 500 {
+                eventFullTexts.removeValue(forKey: key)
+            }
+        }
+        return id
     }
 
     /// Insert at the fixed anchor (start of the oldest displayed event) and
@@ -554,6 +594,13 @@ final class MainViewController: NSViewController {
     // MARK: log
 
     private func appendLog(_ text: String, color: NSColor = .labelColor) {
+        appendAttributed(NSAttributedString(string: text, attributes: [
+            .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular),
+            .foregroundColor: color,
+        ]))
+    }
+
+    private func appendAttributed(_ attr: NSAttributedString) {
         guard let storage = logView.textStorage else { return }
         if storage.length > 800_000 {
             storage.deleteCharacters(in: NSRange(location: 0, length: 200_000))
@@ -565,10 +612,68 @@ final class MainViewController: NSViewController {
             }
         }
         let atBottom = logView.visibleRect.maxY >= logView.bounds.maxY - 44
-        storage.append(NSAttributedString(string: text, attributes: [
-            .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular),
-            .foregroundColor: color,
-        ]))
+        storage.append(attr)
         if atBottom { logView.scrollToEndOfDocument(nil) }
+    }
+
+    // MARK: full-text HUD
+
+    private func showFullText(_ text: String) {
+        if hudPanel == nil {
+            let panel = HUDPanel(
+                contentRect: NSRect(x: 0, y: 0, width: 560, height: 420),
+                styleMask: [.hudWindow, .utilityWindow, .titled, .closable, .resizable],
+                backing: .buffered, defer: true)
+            panel.title = "事件全文"
+            panel.isFloatingPanel = true
+            panel.isReleasedWhenClosed = false
+            let scroll = NSTextView.scrollableTextView()
+            scroll.drawsBackground = false
+            let tv = scroll.documentView as! NSTextView
+            tv.isEditable = false
+            tv.drawsBackground = false
+            tv.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+            tv.textContainerInset = NSSize(width: 8, height: 8)
+            panel.contentView = scroll
+            hudPanel = panel
+            hudTextView = tv
+        }
+        hudTextView?.textStorage?.setAttributedString(NSAttributedString(string: text, attributes: [
+            .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular),
+            .foregroundColor: NSColor.labelColor,
+        ]))
+        if let panel = hudPanel {
+            if !panel.isVisible {
+                let mouse = NSEvent.mouseLocation
+                panel.setFrameTopLeftPoint(NSPoint(x: mouse.x + 16, y: mouse.y - 8))
+            }
+            panel.makeKeyAndOrderFront(nil)
+            hudTextView?.scroll(.zero)
+        }
+    }
+
+    fileprivate func showEventFullText(id: Int) {
+        guard let raw = eventFullTexts[id] else {
+            showFullText("（该条目已被清理）")
+            return
+        }
+        // Pretty-print when the raw line is JSON; fall back to the raw text.
+        if let data = raw.data(using: .utf8),
+           let obj = try? JSONSerialization.jsonObject(with: data),
+           let pretty = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys]),
+           let text = String(data: pretty, encoding: .utf8) {
+            showFullText(text)
+        } else {
+            showFullText(raw)
+        }
+    }
+}
+
+extension MainViewController: NSTextViewDelegate {
+    func textView(_ textView: NSTextView, clickedOnLink link: Any, at charIndex: Int) -> Bool {
+        guard let str = link as? String, str.hasPrefix("orch-event://"),
+              let id = Int(str.dropFirst("orch-event://".count)) else { return false }
+        showEventFullText(id: id)
+        return true
     }
 }
