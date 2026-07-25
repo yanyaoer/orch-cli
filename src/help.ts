@@ -21,6 +21,7 @@ export function topLevelHelp(): string {
     "  orch run cancel    Stop a running worker (supervisor finalizes it as failed)",
     "  orch search        Regex-search repo run files and mail event diagnostics",
     "  orch usage         Summarize token usage by run, thread, or day",
+    "  orch trajectory    Normalize a run/thread's provider session into role-based records",
     "  orch cross-review  Review one diff/run in parallel with several agents",
     "  orch fanout        Run one task across several agents (any result role)",
     "  orch investigate   Researcher-role research (defaults: omp-researcher + claude-researcher)",
@@ -290,6 +291,35 @@ export function usageHelp(): string {
     "  orch usage run --run impl-a-20260707T010000-abc123 --json",
     "  orch usage thread --thread review-123 --json",
     "  orch usage daily --days 14 --json",
+  ]);
+}
+
+export function trajectoryHelp(): string {
+  return lines([
+    "orch trajectory: normalize a run's provider session into role-based records",
+    "",
+    "The provider's own session file (located via the run's recorded",
+    "provider_resume_id) is parsed into trajectory records: meta | user |",
+    "assistant (with tool_calls) | reasoning | tool. Built-in adapters cover",
+    "claude (~/.claude/projects) and codex (~/.codex/sessions); other agents",
+    "error until their session layouts are verified. Note: resumed runs share",
+    "one provider session, so records cover the whole chain, not one run.",
+    "",
+    "Usage:",
+    "  orch trajectory --run <id> [--mr <id>] [--worktree <path>] [--jsonl] [--archive]",
+    "  orch trajectory --thread <id> [--worktree <path>] [--jsonl]",
+    "",
+    "Flags:",
+    "  --run <run_id>        Normalize the session behind one run",
+    "  --thread <id>         All sessions in a thread, deduped by session file",
+    "  --mr <id>             MR containing --run; omitted scans this repo's MRs",
+    "  --worktree <path>     Worktree used to derive repo_key; defaults to cwd",
+    "  --jsonl               Emit records as JSONL (for piping); default is one JSON payload",
+    "  --archive             With --run: also write <run_dir>/trajectory.jsonl",
+    "",
+    "Examples:",
+    "  orch trajectory --run impl-a-20260707T010000-abc123 --jsonl | jq -r 'select(.role==\"user\") | .content'",
+    "  orch trajectory --thread 4984 --worktree ~/mi/osbot",
   ]);
 }
 

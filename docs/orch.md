@@ -45,6 +45,11 @@ permissions, model/effort tiers, result schemas — live in the CLI:
 - **Watch a live worker** → `orch events tail --run <id> --native -f`
   (provider-independent progress stream). Run-state authority stays with
   `orch status` + plain `orch events tail`.
+- **Export a run's full message history** → `orch trajectory --run <id>
+  [--jsonl] [--archive]` / `--thread <id>`: the provider's own session file
+  normalized to role-based records (user/assistant/tool_calls/tool/reasoning).
+  Built-in adapters: claude + codex; resumed chains share one session, so
+  records cover the whole chain.
 - **Let ChatGPT read this repo live** → `orch chatgpt-bridge` (Cloudflare
   Worker MCP bridge, no tunnel). ⚠️ ChatGPT Pro / heavy-reasoning modes don't
   mount MCP connector tools — pick a non-Pro model, or use handoff-pro.
