@@ -229,6 +229,94 @@ final class MainViewController: NSViewController {
         appendLog("\n── \(info.role) · \(info.agent) · \(info.state) — \(info.run_id) ──\n",
                   color: .tertiaryLabelColor)
 
+        // Terminal runs render real history messages: the provider's own
+        // session file normalized into role-based records by the trajectory
+        // library. Active runs (and providers without a proven session
+        // locator) keep the native.jsonl event path.
+        if !Self.activeStates.contains(info.state), let session = Trajectory.sessionFile(for: info) {
+            appendLog("解析 provider session（trajectory 归一化）…\n", color: .tertiaryLabelColor)
+            let runID = info.run_id
+            Trajectory.normalize(source: session.source, path: session.path) { [weak self] records, err in
+                guard let self, self.currentStreamRunID == runID else { return }
+                if let records, !records.isEmpty {
+                    self.renderTrajectory(records, runID: runID)
+                } else {
+                    self.appendLog("（trajectory 解析失败：\(err ?? "空结果")，回退 native 事件流）\n",
+                                   color: .secondaryLabelColor)
+                    self.renderNativeDetail(entry)
+                }
+            }
+            return
+        }
+        renderNativeDetail(entry)
+    }
+
+    private func renderTrajectory(_ records: [[String: Any]], runID: String) {
+        var items: [EventItem] = []
+        for record in records { items.append(contentsOf: Self.trajectoryItems(record)) }
+        let shown = items.suffix(Self.detailEventCount)
+        guard !shown.isEmpty else {
+            appendLog("(无消息记录)\n", color: .secondaryLabelColor)
+            return
+        }
+        appendLog("共 \(items.count) 条消息，最近 \(shown.count) 条（向上滚动加载更早，点击看全文）：\n",
+                  color: .tertiaryLabelColor)
+        let anchor = logView.textStorage?.length ?? 0
+        for item in shown { appendAttributed(eventAttributed([item])) }
+        // All records live in memory: paging reuses the backlog machinery
+        // with the file window already exhausted.
+        detailHistory = DetailHistory(
+            runID: runID,
+            path: "",
+            startOffset: 0,
+            backlog: Array(items.dropLast(shown.count)),
+            exhausted: true,
+            anchor: anchor
+        )
+    }
+
+    /// One trajectory-v1 record → displayable items (an assistant record can
+    /// carry both text and tool calls).
+    private static func trajectoryItems(_ record: [String: Any]) -> [EventItem] {
+        let role = record["role"] as? String ?? "event"
+        if role == "meta" { return [] }
+        let raw = (try? JSONSerialization.data(withJSONObject: record))
+            .flatMap { String(data: $0, encoding: .utf8) } ?? ""
+        func asText(_ value: Any?) -> String {
+            if let s = value as? String { return s }
+            guard let value, !(value is NSNull),
+                  let data = try? JSONSerialization.data(withJSONObject: value) else { return "" }
+            return String(data: data, encoding: .utf8) ?? ""
+        }
+        func clip(_ s: String) -> String {
+            NativeLog.clip(s.trimmingCharacters(in: .whitespacesAndNewlines)
+                .replacingOccurrences(of: "\n", with: " ⏎ "), 400)
+        }
+        var items: [EventItem] = []
+        let content = asText(record["content"])
+        switch role {
+        case "user":
+            if !content.isEmpty { items.append(EventItem(tag: "user", text: clip(content), raw: raw)) }
+        case "reasoning":
+            if !content.isEmpty { items.append(EventItem(tag: "think", text: clip(content), raw: raw)) }
+        case "assistant":
+            if !content.isEmpty { items.append(EventItem(tag: "assistant", text: clip(content), raw: raw)) }
+            for call in record["tool_calls"] as? [[String: Any]] ?? [] {
+                let name = call["name"] as? String ?? "tool"
+                let args = asText(call["args"])
+                items.append(EventItem(tag: "⚙ \(name)", text: clip(args.isEmpty ? "()" : args), raw: raw))
+            }
+        case "tool":
+            let text = content.isEmpty ? "(empty)" : content
+            items.append(EventItem(tag: "↳ result", text: clip(text), raw: raw))
+        default:
+            if !content.isEmpty { items.append(EventItem(tag: role, text: clip(content), raw: raw)) }
+        }
+        return items
+    }
+
+    private func renderNativeDetail(_ entry: RunEntry) {
+        let info = entry.info
         let nativePath = entry.runDir + "/native.jsonl"
         let eventsPath = entry.runDir + "/events.jsonl"
         let nativeSize = (try? FileManager.default.attributesOfItem(atPath: nativePath))?[.size] as? Int ?? 0
@@ -346,11 +434,19 @@ final class MainViewController: NSViewController {
         let font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
         let out = NSMutableAttributedString()
         for item in items {
+            let tagColor: NSColor = item.tag.contains("error") ? .systemRed
+                : item.tag == "user" ? .systemBlue
+                : .tertiaryLabelColor
+            // Reasoning and tool results read dimmer than the assistant's own
+            // messages and tool calls.
+            let textColor: NSColor = item.tag == "think" || item.tag.hasPrefix("↳")
+                ? .secondaryLabelColor
+                : .labelColor
             out.append(NSAttributedString(string: "▸ \(item.tag)  ", attributes: [
                 .font: font,
-                .foregroundColor: item.tag.contains("error") ? NSColor.systemRed : NSColor.tertiaryLabelColor,
+                .foregroundColor: tagColor,
             ]))
-            var attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.labelColor]
+            var attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: textColor]
             if !item.raw.isEmpty {
                 attrs[.link] = "orch-event://\(registerFullText(item.raw))"
             }

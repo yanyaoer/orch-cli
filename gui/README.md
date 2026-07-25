@@ -14,15 +14,19 @@ cd gui && swift run
   dot, relative time, and decision mark (✓ accept / ↻ rework / ✕ close);
   rescans every 5s with an mtime cache. Double-click a run to pretty-print its
   `result.json` straight from the state dir.
-- Agent management rides orch's normalized native stream (never raw provider
-  session files — `native-events.ts` already unifies codex/claude/pi/omp):
-  single-click a run to follow that agent's live trajectory
-  (`orch events tail --run <id> --native -f`, with 40 lines of replay). Runs
-  whose worktree is gone (deleted scratch dirs) replay `native.jsonl` from the
-  state dir instead — those are terminal, so the static tail is complete. The
-  stream auto-returns to the all-repo multiplexer (`events tail -f --all
-  --native`) when the run ends or the selection clears. A "取消 Run" button
-  cancels the selected active run via `orch run cancel`.
+- History messages for a terminal run are the provider's OWN session file
+  (located via the run's `provider_resume_id`: `~/.claude/projects/…` /
+  `~/.codex/sessions/…`) normalized into role-based records — user /
+  assistant / reasoning / tool call / tool result — by
+  [@letta-ai/trajectory](https://github.com/letta-ai/trajectory) (bun runs the
+  fork's TypeScript source directly; set `ORCH_TRAJECTORY_DIR`, default
+  `~/Projects/fork/trajectory`). orch's `native.jsonl` is stream output the
+  trajectory adapters cannot parse (verified), so it remains the path for
+  active runs, pi/omp, and any normalize failure. Scroll-up paging works over
+  the in-memory records; clicking a line shows the full record JSON in a HUD.
+  The view auto-returns to the all-repo multiplexer (`events tail -f --all
+  --native`) when the selection clears. A "取消 Run" button cancels the
+  selected active run via `orch run cancel`.
 - Main pane: pick a workspace (`orch workspace list`) — it scopes only
   `orch new` — type a task, press Enter →
   `orch new '<query>' --workspace <id> --yes`. Plan/controller progress renders

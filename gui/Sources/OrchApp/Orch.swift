@@ -138,6 +138,102 @@ final class StateScanner {
     }
 }
 
+// MARK: - trajectory normalization (provider session files)
+
+// History messages for terminal runs come from the provider's own session
+// file, normalized into role-based records by the @letta-ai/trajectory
+// library (bun runs its TypeScript source directly; the fork has zero runtime
+// deps). orch's native.jsonl is stream output and lacks the user records the
+// adapters require — verified empirically — so it stays the live/fallback
+// path only.
+enum Trajectory {
+    static var libDir: String {
+        ProcessInfo.processInfo.environment["ORCH_TRAJECTORY_DIR"]
+            ?? NSHomeDirectory() + "/Projects/fork/trajectory"
+    }
+
+    static var available: Bool {
+        FileManager.default.fileExists(atPath: libDir + "/src/index.ts")
+    }
+
+    /// Locate the provider session file recorded by a run. claude and codex
+    /// are proven; pi/omp session layouts are unverified and fall back to the
+    /// native.jsonl renderer.
+    static func sessionFile(for info: RunInfo) -> (source: String, path: String)? {
+        guard available, let id = info.provider_resume_id ?? info.provider_session_id else { return nil }
+        let fm = FileManager.default
+        let home = NSHomeDirectory()
+        switch info.agent {
+        case "claude":
+            let projects = home + "/.claude/projects"
+            for slug in (try? fm.contentsOfDirectory(atPath: projects)) ?? [] {
+                let path = "\(projects)/\(slug)/\(id).jsonl"
+                if fm.fileExists(atPath: path) { return ("claude-code", path) }
+            }
+            return nil
+        case "codex":
+            let root = home + "/.codex/sessions"
+            let suffix = "-\(id).jsonl"
+            guard let walker = fm.enumerator(atPath: root) else { return nil }
+            for case let rel as String in walker where rel.hasSuffix(suffix) {
+                return ("codex", "\(root)/\(rel)")
+            }
+            return nil
+        default:
+            return nil
+        }
+    }
+
+    /// Normalize off-main; completion on main with the records array (as raw
+    /// dictionaries — rendering only needs a few fields and the full record
+    /// feeds the HUD) or an error string.
+    static func normalize(source: String, path: String,
+                          completion: @escaping ([[String: Any]]?, String?) -> Void) {
+        let script = """
+        import { normalizeTranscript } from '\(libDir)/src/index.ts';
+        const t = await Bun.file(process.env.TRAJ_FILE).text();
+        const { records } = normalizeTranscript({ source: process.env.TRAJ_SOURCE, transcript: t });
+        console.log(JSON.stringify(records));
+        """
+        DispatchQueue.global(qos: .userInitiated).async {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+            p.arguments = ["bun", "-e", script]
+            var env = ProcessInfo.processInfo.environment
+            let home = NSHomeDirectory()
+            env["PATH"] = "\(home)/.local/bin:\(home)/.local/share/mise/shims:/opt/homebrew/bin:/usr/local/bin:"
+                + (env["PATH"] ?? "/usr/bin:/bin")
+            env["TRAJ_SOURCE"] = source
+            env["TRAJ_FILE"] = path
+            p.environment = env
+            p.standardInput = FileHandle.nullDevice
+            let out = Pipe(), err = Pipe()
+            p.standardOutput = out
+            p.standardError = err
+            do { try p.run() } catch {
+                DispatchQueue.main.async { completion(nil, "无法启动 bun: \(error.localizedDescription)") }
+                return
+            }
+            let group = DispatchGroup()
+            var outData = Data(), errData = Data()
+            group.enter()
+            DispatchQueue.global().async { outData = out.fileHandleForReading.readDataToEndOfFile(); group.leave() }
+            group.enter()
+            DispatchQueue.global().async { errData = err.fileHandleForReading.readDataToEndOfFile(); group.leave() }
+            group.wait()
+            p.waitUntilExit()
+            if p.terminationStatus == 0,
+               let records = (try? JSONSerialization.jsonObject(with: outData)) as? [[String: Any]] {
+                DispatchQueue.main.async { completion(records, nil) }
+            } else {
+                let message = String(data: errData, encoding: .utf8)?
+                    .split(separator: "\n").last.map(String.init) ?? "normalize 失败"
+                DispatchQueue.main.async { completion(nil, message) }
+            }
+        }
+    }
+}
+
 // MARK: - native.jsonl reading / rendering
 
 struct NativeTail {
@@ -322,7 +418,7 @@ enum Orch {
         }
         var env = ProcessInfo.processInfo.environment
         let home = NSHomeDirectory()
-        env["PATH"] = "\(home)/.local/bin:/opt/homebrew/bin:/usr/local/bin:"
+        env["PATH"] = "\(home)/.local/bin:\(home)/.local/share/mise/shims:/opt/homebrew/bin:/usr/local/bin:"
             + (env["PATH"] ?? "/usr/bin:/bin")
         p.environment = env
         if let cwd { p.currentDirectoryURL = URL(fileURLWithPath: cwd) }
