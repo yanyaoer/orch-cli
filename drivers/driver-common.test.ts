@@ -16,6 +16,7 @@ import {
   ompFallbackConfigYaml,
   ompModelChain,
   OMP_MODEL_CHAIN,
+  pipeToFile,
   rawResultText,
   runProviderDriver,
   SEATBELT_ENV_MARKER,
@@ -1660,4 +1661,28 @@ test("extractResultFromText accepts a fenced gemini-style result with finding/sc
     ],
     non_blocking_findings: [{ body: "Doc gap\n\nZ is undocumented." }],
   });
+});
+
+test("pipeToFile drops message_update lines, including ones split across chunks", async () => {
+  const kept1 = '{"type":"session","session_id":"s-1"}\n';
+  const droppedWhole = `{"type":"message_update","assistantMessageEvent":{"partial":"${"x".repeat(50)}"}}\n`;
+  const droppedSplit = `{"type":"message_update","assistantMessageEvent":{"partial":"${"y".repeat(50)}"}}\n`;
+  const kept2 = '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"done"}]}}\n';
+  const keptTail = "plain trailing line without newline";
+
+  const encoder = new TextEncoder();
+  const half = Math.floor(droppedSplit.length / 2);
+  const chunks = [kept1 + droppedWhole, droppedSplit.slice(0, 10), droppedSplit.slice(10, half), droppedSplit.slice(half) + kept2, keptTail].map(
+    (part) => encoder.encode(part),
+  );
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(chunk);
+      controller.close();
+    },
+  });
+
+  const path = join(tempDir(), "native.jsonl");
+  await pipeToFile(stream, path);
+  expect(readFileSync(path, "utf8")).toBe(kept1 + kept2 + keptTail);
 });

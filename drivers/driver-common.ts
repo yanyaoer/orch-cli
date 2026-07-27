@@ -924,16 +924,36 @@ export async function maybeWriteFakeResult(runDir: string, spec: RunSpec, provid
   return true;
 }
 
+// pi/omp emit one message_update line per streaming delta, each embedding the
+// full accumulated partial message — O(n²) bytes per message that no reader
+// consumes (native-events.ts normalizes message_end/turn_end/agent_end only),
+// so those lines never reach disk. Matching is structural like the read side:
+// top-level JSONL events serialize their type key first.
+const droppedNativeLinePrefix = Buffer.from('{"type":"message_update"');
+
+function keepsNativeLine(line: Buffer): boolean {
+  return !line.subarray(0, droppedNativeLinePrefix.length).equals(droppedNativeLinePrefix);
+}
+
 export async function pipeToFile(stream: ReadableStream<Uint8Array> | null, path: string): Promise<void> {
   if (!stream) return;
   const fd = openSync(path, "w");
   try {
     const reader = stream.getReader();
+    let pending = Buffer.alloc(0);
     while (true) {
       const chunk = await reader.read();
       if (chunk.done) break;
-      writeSync(fd, chunk.value);
+      pending = pending.length === 0 ? Buffer.from(chunk.value) : Buffer.concat([pending, chunk.value]);
+      let start = 0;
+      for (let nl = pending.indexOf(0x0a, start); nl !== -1; nl = pending.indexOf(0x0a, start)) {
+        const line = pending.subarray(start, nl + 1);
+        if (keepsNativeLine(line)) writeSync(fd, line);
+        start = nl + 1;
+      }
+      pending = pending.subarray(start);
     }
+    if (pending.length > 0 && keepsNativeLine(pending)) writeSync(fd, pending);
   } finally {
     closeSync(fd);
   }
