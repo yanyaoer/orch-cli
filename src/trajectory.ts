@@ -97,16 +97,20 @@ function parseLines(text: string): Record<string, unknown>[] {
 
 // Claude content blocks: plain string, or [{type:"text"|"thinking"|"tool_use"
 // |"tool_result", ...}]. tool_result content is itself a string or an array
-// of text blocks.
+// of blocks. Structured blocks without a textual form (tool_reference etc.)
+// are serialized rather than silently dropped — an empty result must stay
+// distinguishable from an unrepresented one.
 function claudeBlockText(content: unknown): string {
   if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
+  if (content == null) return "";
+  if (!Array.isArray(content)) return JSON.stringify(content);
   const parts: string[] = [];
   for (const block of content) {
     if (typeof block === "string") parts.push(block);
     else if (block && typeof block === "object") {
       const b = block as Record<string, unknown>;
       if (typeof b.text === "string") parts.push(b.text);
+      else parts.push(JSON.stringify(b));
     }
   }
   return parts.join("\n");
@@ -140,6 +144,10 @@ function normalizeClaude(text: string): TrajectoryRecord[] {
           records.push({ role: "user", content: b.text, timestamp });
         }
       }
+      continue;
+    }
+    if (line.type === "assistant" && message && typeof message.content === "string") {
+      if (message.content.trim()) records.push({ role: "assistant", content: message.content, timestamp });
       continue;
     }
     if (line.type === "assistant" && message && Array.isArray(message.content)) {
@@ -183,6 +191,7 @@ function codexMessageText(content: unknown): string {
   for (const block of content) {
     const b = block as Record<string, unknown>;
     if (typeof b?.text === "string") parts.push(b.text);
+    else if (b && typeof b === "object") parts.push(JSON.stringify(b));
   }
   return parts.join("\n");
 }
@@ -233,10 +242,18 @@ function normalizeCodex(text: string): TrajectoryRecord[] {
       }
       case "function_call_output":
       case "custom_tool_call_output": {
+        // Current rollouts encode outputs as arrays of text blocks
+        // ({type:"input_text",text}); older ones use plain strings. Only
+        // genuinely structured non-text values stay JSON.
         const output = p.output;
+        const content = typeof output === "string"
+          ? output
+          : Array.isArray(output)
+            ? codexMessageText(output)
+            : JSON.stringify(output ?? "");
         records.push({
           role: "tool",
-          content: typeof output === "string" ? output : JSON.stringify(output ?? ""),
+          content,
           tool_call_id: typeof p.call_id === "string" ? p.call_id : null,
           timestamp,
         });

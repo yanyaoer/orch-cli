@@ -2816,19 +2816,35 @@ interface TrajectorySession {
 // One run's provider session, normalized. Chained (resumed) runs share a
 // session, so records cover the whole chain, not just this run.
 function trajectoryForStatus(status: RunStatus): TrajectorySession {
-  const resumeId = status.provider_resume_id ?? status.provider_session_id;
-  if (!resumeId) throw new CliError(`run ${status.run_id} recorded no provider session id`);
+  // Adapter support first: pi/omp runs usually also lack a resume id, and
+  // the actionable error is the missing adapter, not the missing id.
   if (!(status.agent in TRAJECTORY_SOURCES)) {
     throw new CliError(`agent ${status.agent} has no verified session adapter yet (supported: claude, codex)`);
   }
+  const resumeId = status.provider_resume_id ?? status.provider_session_id;
+  if (!resumeId) throw new CliError(`run ${status.run_id} recorded no provider session id`);
   const found = locateSessionFile(status.agent, resumeId);
   if (!found) throw new CliError(`no ${status.agent} session file found for id ${resumeId}`);
   const records = normalizeSession(found.source, readFileSync(found.path, "utf8"));
   return { run_ids: [status.run_id], source: found.source, session_path: found.path, records };
 }
 
+// Piping to head/grep -m1 closes stdout early; the awaited flush must treat
+// that as a normal end of output, not a crash.
+async function writeStdoutFlushed(text: string): Promise<void> {
+  try {
+    await Bun.write(Bun.stdout, text);
+  } catch (error) {
+    if ((error as { code?: string })?.code === "EPIPE" || String(error).includes("EPIPE")) return;
+    throw error;
+  }
+}
+
 async function trajectoryCommand(args: ParsedArgs): Promise<number> {
   assertKnownFlags(args, "trajectory", TRAJECTORY_FLAGS);
+  if (args.flags.has("run") && args.flags.has("thread")) {
+    throw new CliError("--run conflicts with --thread; pick one selector");
+  }
   const worktree = resolve(flagString(args, "worktree", process.cwd()));
   const repo = await getRepoIdentity(worktree);
   const jsonl = flagBool(args, "jsonl");
@@ -2863,12 +2879,13 @@ async function trajectoryCommand(args: ParsedArgs): Promise<number> {
           null,
           2,
         ) + "\n";
-    await Bun.write(Bun.stdout, out);
+    await writeStdoutFlushed(out);
     return 0;
   }
 
   if (args.flags.has("thread")) {
     if (flagBool(args, "archive")) throw new CliError("--archive applies to --run only");
+    if (args.flags.has("mr")) throw new CliError("--mr applies to --run; --thread already names the thread");
     const mr = flagString(args, "thread");
     const runsDir = `${mrStateDir(repo.repo_key, mr)}/runs`;
     let entries: string[];
@@ -2893,6 +2910,13 @@ async function trajectoryCommand(args: ParsedArgs): Promise<number> {
         skipped.push({ run_id: status.run_id, reason: error instanceof Error ? error.message : String(error) });
       }
     }
+    // Partial exports must be visible in every mode (the JSON payload lists
+    // skipped runs, but --jsonl would otherwise drop them silently), and an
+    // export with nothing to export is a failure, not an empty success.
+    for (const skip of skipped) process.stderr.write(`skip ${skip.run_id}: ${skip.reason}\n`);
+    if (sessions.size === 0) {
+      throw new CliError(`no exportable session in thread ${mr} (${skipped.length} run(s) skipped)`);
+    }
     const out = jsonl
       ? [...sessions.values()]
           .flatMap((session) => session.records.map((record) => JSON.stringify(record)))
@@ -2913,7 +2937,7 @@ async function trajectoryCommand(args: ParsedArgs): Promise<number> {
           null,
           2,
         ) + "\n";
-    await Bun.write(Bun.stdout, out);
+    await writeStdoutFlushed(out);
     return 0;
   }
 
