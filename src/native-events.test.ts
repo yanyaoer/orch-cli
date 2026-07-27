@@ -112,6 +112,19 @@ test("resume id: first line wins across lines, key order wins within a line", ()
   expect(providerResumeIdFromNativeText(jsonl([{ thread_id: "t1", session_id: "s1" }]))).toBe("s1");
 });
 
+test("pi/omp session announcement yields session event and resume id", () => {
+  const line = { type: "session", version: 3, id: "019f5a38-5df8-7000-a014-053e5ae73d56", timestamp: "2026-07-13T06:44:31.352Z", cwd: "/tmp/wt" };
+  expect(normalizeNativeLine(JSON.stringify(line))).toEqual([
+    { kind: "session", format: "pi", session_id: "019f5a38-5df8-7000-a014-053e5ae73d56" },
+  ]);
+  expect(providerResumeIdFromNativeText(jsonl([line]))).toBe("019f5a38-5df8-7000-a014-053e5ae73d56");
+
+  // Bare `id` on any other event type stays stream noise, and explicit
+  // session keys keep precedence over it on the same line.
+  expect(normalizeNativeLine(JSON.stringify({ type: "message_start", id: "msg-1" }))).toEqual([]);
+  expect(providerResumeIdFromNativeText(jsonl([{ type: "session", id: "i-1", session_id: "s-1" }]))).toBe("s-1");
+});
+
 test("long tool detail is compacted and truncated", () => {
   const long = "x".repeat(500);
   const [toolUse] = normalizeNativeLine(

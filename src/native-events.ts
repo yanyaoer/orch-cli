@@ -79,6 +79,12 @@ function sessionEvent(event: NativeLine & Record<string, unknown>): NativeEvent 
       typeof event.type === "string" && claudeEventTypes.has(event.type) ? "claude" : key === "thread_id" ? "codex" : "unknown";
     return { kind: "session", format, session_id: value };
   }
+  // pi/omp announce the session as {"type":"session","id":…}. Bare `id` is too
+  // generic for sessionKeys (any event may carry one), so it only counts on
+  // that event type — checked after the explicit keys to keep their precedence.
+  if (event.type === "session" && typeof event.id === "string" && event.id) {
+    return { kind: "session", format: "pi", session_id: event.id };
+  }
   return null;
 }
 
