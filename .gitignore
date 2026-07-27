@@ -5,3 +5,4 @@ dist/
 /bun.lock
 .claude
 .DS_Store
+gui/.build/
