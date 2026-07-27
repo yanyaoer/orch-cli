@@ -579,14 +579,14 @@
           <h2 data-lang="zh">一个 run 目录讲完整个故事。</h2>
           <p class="sec-lead" data-lang="en">
             Lifecycle authority stays in <code>events.jsonl</code> and <code>status.json</code>. The
-            provider-native stream is kept verbatim in <code>native.jsonl</code> — and
-            <code>events tail --native</code> normalizes it into provider-independent progress events,
-            so you watch every worker the same way.
+            provider-native stream lands in <code>native.jsonl</code> (minus redundant streaming
+            deltas) — and <code>events tail --native</code> normalizes it into provider-independent
+            progress events, so you watch every worker the same way.
           </p>
           <p class="sec-lead" data-lang="zh">
-            生命周期权威在 <code>events.jsonl</code> 与 <code>status.json</code>。provider 原生流原样保留在
-            <code>native.jsonl</code>——<code>events tail --native</code> 把它规范化为与 provider 无关的
-            进度事件，用同一种方式观察任何 worker。
+            生命周期权威在 <code>events.jsonl</code> 与 <code>status.json</code>。provider 原生流保留在
+            <code>native.jsonl</code>（冗余的流式 delta 除外）——<code>events tail --native</code>
+            把它规范化为与 provider 无关的进度事件，用同一种方式观察任何 worker。
           </p>
         </div>
 
@@ -596,7 +596,7 @@
             <pre>├── <span class="tf">spec.json</span>      <span class="tn">immutable input snapshot</span>
 ├── <span class="tf">status.json</span>    <span class="tn">state · pid · shas · resume id</span>
 ├── <span class="tf">events.jsonl</span>   <span class="auth">orch lifecycle — the authority</span>
-├── <span class="tf">native.jsonl</span>   <span class="tn">provider stream, verbatim</span>
+├── <span class="tf">native.jsonl</span>   <span class="tn">provider stream, deltas dropped</span>
 ├── <span class="tf">result.json</span>    <span class="tn">schema-validated role result</span>
 ├── <span class="tf">stdout.log</span> · <span class="tf">stderr.log</span>
 └── <span class="tf">artifacts/</span></pre>

@@ -2,6 +2,13 @@
 
 All notable user-facing changes are recorded here.
 
+## [0.0.10] - 2026-07-27
+
+### Fixes
+
+- `native.jsonl` no longer stores pi/omp `message_update` streaming deltas. Each delta embeds the full accumulated partial message — O(n²) bytes per message, with the encrypted thinking signature re-serialized every time — and no reader consumes them (the normalizer reads `message_end`/`turn_end`/`agent_end`/`tool_execution_*` only). They accounted for 92% of a 5.9 GB state tree; the driver now filters them line-by-line before they reach disk, and the complete messages stay available in `message_end`.
+- pi/omp runs now record `provider_resume_id`: the native normalizer recognizes their session announcement (`{"type":"session","id":…}`), so `orch run create --resume-from` reaches pi/omp runs. Both drivers already carried the resume argv (`omp --resume`, `pi --session-id`); only the id backfill from the native stream was missing. Bare `id` counts only on the `session` event type, so other events carrying an `id` stay stream noise.
+
 ## [0.0.9] - 2026-07-13
 
 ### Features

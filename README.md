@@ -351,7 +351,7 @@ Important run files:
 - `spec.sha256`: hash of the stored spec bytes
 - `status.json`: run lifecycle, pid/pgid, timestamps, exit code, resume id, git shas
 - `events.jsonl`: normalized orch events such as `created`, `running`, `heartbeat`, `done`, `failed`, `timeout`
-- `native.jsonl`: provider-native stream, not treated as orch events; `orch events tail --native` renders it as normalized progress events
+- `native.jsonl`: provider-native stream, not treated as orch events; `orch events tail --native` renders it as normalized progress events. pi/omp `message_update` streaming deltas (full accumulated partial snapshots that no reader consumes) are dropped at write time; complete messages stay in `message_end`
 - `stdout.log` and `stderr.log`: process output
 - `result.json`: role-specific result used for decisions
 - `artifacts/`: optional worker artifacts
