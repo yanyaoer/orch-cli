@@ -430,6 +430,8 @@ orch decision      Record accept/rework and queue a PR/MR mirror comment
 orch mail          Local signed-mail bus: submit, route, claim, reply, import
 orch mailctl       Email-driven orchestration over IMAP/SMTP (init/poll/watch/status/reply/ack/guidance)
 orch workspace     Register local workspaces for mail routing
+orch worktree clone  CoW-clone a worktree into an isolated per-agent checkout (macOS/APFS,
+                   carries untracked build output so incremental builds start warm)
 orch mirror        Mirror one local run result summary to a PR/MR comment
 orch mirror sync   Send queued outbox comments to a PR/MR
 orch chatgpt-bridge  Deploy + connect the read-only ChatGPT bridge (Cloudflare Worker)

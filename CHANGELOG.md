@@ -2,6 +2,12 @@
 
 All notable user-facing changes are recorded here.
 
+## [Unreleased]
+
+### Features
+
+- `orch worktree clone --dest <path> [--source <path>] [--branch <name>]` — per-agent isolated checkout via APFS copy-on-write (macOS). `cp -c` clones the whole worktree in seconds at near-zero disk cost, untracked build output included, so the clone's incremental builds start warm; the cloned `.git` pointer is then replaced by a freshly registered worktree slot (`worktree add --no-checkout` + graft + `worktree repair` + `reset`), giving the clone its own index/HEAD with no lock contention against the source. A colocated `.jj` store is dropped from the clone (plain git drives it). Teardown stays `git worktree remove --force`.
+
 ## [0.0.10] - 2026-07-27
 
 ### Fixes

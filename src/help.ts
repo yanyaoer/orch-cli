@@ -38,6 +38,7 @@ export function topLevelHelp(): string {
     "  orch mailctl       Drive orch from IMAP/SMTP mail: init, poll, watch, status, reply, ack, attachments",
     "  orch dispatch      reconcile: run the unsandboxed host reconciler for a sandboxed controller (config sandbox on)",
     "  orch workspace     Add or list project workspaces for mail routing",
+    "  orch worktree clone  CoW-clone a worktree into an isolated per-agent checkout (macOS/APFS, keeps build output)",
     "  orch update        Self-update to the latest GitHub release (--check to only compare)",
     "",
     "Quickstart:",
@@ -575,6 +576,36 @@ export function workspaceHelp(): string {
     "Examples:",
     "  orch workspace add --id orch-cli --path .",
     "  orch mail submit --thread th_plan --workspace orch-cli --task task.md",
+  ]);
+}
+
+export function worktreeCloneHelp(): string {
+  return lines([
+    "orch worktree clone: CoW-clone a worktree into an isolated per-agent checkout (macOS/APFS)",
+    "",
+    "Usage:",
+    "  orch worktree clone --dest <path> [--source <path>] [--branch <name>]",
+    "",
+    "Flags:",
+    "  --dest <path>      Where the clone is created; must not exist, must be outside the source",
+    "                     worktree and on the same APFS volume (required)",
+    "  --source <path>    Worktree to clone; resolved to its git toplevel. Defaults to the current directory",
+    "  --branch <name>    Create and check out this new branch at the source's HEAD commit.",
+    "                     Omitted: the clone stays detached at that commit",
+    "  --help             Show this help",
+    "",
+    "Behavior:",
+    "  cp -c (APFS clonefile) copies the whole worktree in seconds at near-zero disk cost,",
+    "  untracked build output included — incremental builds in the clone start warm.",
+    "  The cloned .git pointer is replaced by a freshly registered worktree slot, so the",
+    "  clone has its own index/HEAD and never races the source (a colocated .jj is dropped;",
+    "  the clone is plain git). Uncommitted source edits appear as modifications in the clone.",
+    "  Submodules are not rewired and stay pointed at the source's gitdirs.",
+    "  Teardown: git -C <source> worktree remove --force <dest>",
+    "",
+    "Examples:",
+    "  orch worktree clone --source ~/mi/osbot --dest ~/mi/osbot-agent2 --branch feat/agent2",
+    "  orch run create --mr 123 --role implementer --agent pi --worktree ~/mi/osbot-agent2 --task task.md",
   ]);
 }
 

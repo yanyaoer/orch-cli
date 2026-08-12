@@ -66,6 +66,13 @@ Parallel reviewers of the same MR share it read-only. A second concurrent MR
 may get one extra worktree, but `git -C <repo> worktree remove --force <path>`
 it the moment its round ends — `git worktree list` must stay clean.
 
+**Parallel implementers (macOS)** each get their own checkout via
+`orch worktree clone --source <repo> --dest <path> --branch <name>`: an APFS
+CoW clone (seconds, near-zero disk) that carries untracked build output, so
+incremental builds start warm, registered as an isolated git worktree — own
+index/HEAD, no lock contention with the source. Same teardown:
+`git -C <repo> worktree remove --force <dest>`.
+
 ## Local VCS: jj first
 A worktree with a Jujutsu workspace (`.jj`, colocated included) is driven
 through jj: MR inference reads the nearest bookmark, base/dirty/evidence use

@@ -66,6 +66,7 @@ import {
   mailctlHelp,
   newHelp,
   workspaceHelp,
+  worktreeCloneHelp,
   resultCommandHelp,
   runCancelHelp,
   runCreateHelp,
@@ -112,6 +113,7 @@ import {
   type MailctlContext,
 } from "./mailctl.ts";
 import { workspace } from "./workspace-cli.ts";
+import { worktreeClone } from "./worktree.ts";
 import { assertKnownFlags, CliError, collectFlags, flagBool, flagNumber, flagString, hasHelp, parseArgs, printJson, readStdinText, type ParsedArgs } from "./cli.ts";
 import { buildPrompt, buildProviderExecutionPlan, type ProviderExecutionPlan } from "../drivers/driver-common.ts";
 import { sandboxPosture, sandboxRunIdentity, SEATBELT_ENGINE, seatbeltUnsupportedReason } from "../drivers/sandbox.ts";
@@ -3914,6 +3916,10 @@ async function main(): Promise<number> {
       process.stdout.write(workspaceHelp());
       return 0;
     }
+    if (first === "worktree") {
+      process.stdout.write(worktreeCloneHelp());
+      return 0;
+    }
     if (first === "mirror" && second === "sync") {
       process.stdout.write(mirrorSyncHelp());
       return 0;
@@ -3977,6 +3983,7 @@ async function main(): Promise<number> {
   if (first === "mail") return mail(args, { orchCommand, locateRun, readMirrorResult });
   if (first === "mailctl") return mailctl(args, { orchCommand, locateRun, readMirrorResult });
   if (first === "workspace") return workspace(args);
+  if (first === "worktree" && second === "clone") return worktreeClone(args);
   if (first === "chatgpt-bridge") return chatgptBridge(args);
   if (first === "handoff-pro") return handoffPro(args);
   if (first === "update") return updateCommand(args);
