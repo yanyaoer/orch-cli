@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CliError } from "./cli.ts";
-import { cloneWorktreeCow } from "./worktree.ts";
+import { cloneWorktreeCow, defaultCloneDest } from "./worktree.ts";
 
 // cp -c needs APFS; the command itself is gated on darwin.
 const darwin = process.platform === "darwin";
@@ -68,6 +68,7 @@ test.skipIf(!darwin)("clone carries dirty + untracked state into an isolated reg
 
   expect(outcome.head).toMatch(/^[0-9a-f]{40}$/);
   expect(outcome.branch).toBe("feat/agent2");
+  expect(outcome.upstream).toBeNull(); // fixture has no origin/main
   expect(await Bun.file(join(dest, "build", "out.bin")).text()).toBe("artifact\n");
   expect(existsSync(join(dest, ".jj"))).toBe(false);
 
@@ -105,13 +106,38 @@ test.skipIf(!darwin)("existing dest and dest inside source are rejected", async 
   expect(() => cloneWorktreeCow(src, join(alias, "nested"), null)).toThrow(CliError);
 });
 
-test.skipIf(!darwin)("failed registration cleans up the clone and the slot", async () => {
+test.skipIf(!darwin)("existing branch fails fast, before any copy", async () => {
   const { root, src } = await fixture();
   await sh(src, "git", "branch", "occupied");
   const dest = join(root, "conflict");
-  expect(() => cloneWorktreeCow(src, dest, "occupied")).toThrow(CliError);
+  expect(() => cloneWorktreeCow(src, dest, "occupied")).toThrow("branch already exists");
+  expect(existsSync(dest)).toBe(false);
+});
+
+test.skipIf(!darwin)("failed registration cleans up the clone and the slot", async () => {
+  const { root, src } = await fixture();
+  const dest = join(root, "conflict");
+  // "bad..name" passes the show-ref pre-check (no such branch) and dies at
+  // worktree add -b, exercising the post-copy cleanup path.
+  expect(() => cloneWorktreeCow(src, dest, "bad..name")).toThrow(CliError);
   expect(existsSync(dest)).toBe(false);
   const worktrees = await sh(src, "git", "worktree", "list");
   expect(worktrees).not.toContain("conflict");
   expect(worktrees).not.toContain(".wt-");
+});
+
+test.skipIf(!darwin)("branch clones track origin/main when the ref exists", async () => {
+  const { root, src } = await fixture();
+  // A remote-tracking ref only counts as an upstream when its remote is configured.
+  await sh(src, "git", "remote", "add", "origin", "git@example.com:x/y.git");
+  await sh(src, "git", "update-ref", "refs/remotes/origin/main", "HEAD");
+  const dest = join(root, "tracked");
+  const outcome = cloneWorktreeCow(src, dest, "feat/tracked");
+  expect(outcome.upstream).toBe("origin/main");
+  expect((await sh(dest, "git", "rev-parse", "--abbrev-ref", "feat/tracked@{upstream}")).trim()).toBe("origin/main");
+});
+
+test("defaultCloneDest: sibling dir named after the branch", () => {
+  expect(defaultCloneDest("/Users/x/mi/osbot", "feat/agent2")).toBe("/Users/x/mi/osbot-feat_agent2");
+  expect(defaultCloneDest("/Users/x/mi/osbot", null)).toMatch(/^\/Users\/x\/mi\/osbot-wt-[0-9a-f]{6}$/);
 });

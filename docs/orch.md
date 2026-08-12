@@ -66,14 +66,15 @@ Parallel reviewers of the same MR share it read-only. A second concurrent MR
 may get one extra worktree, but `git -C <repo> worktree remove --force <path>`
 it the moment its round ends — `git worktree list` must stay clean.
 
-**Parallel implementers (macOS)** each get their own checkout via
-`orch worktree clone --source <repo> --dest <path> --branch <name>`: an APFS
-CoW clone (seconds, near-zero disk) that carries untracked build output, so
-incremental builds start warm, registered as an isolated git worktree — own
-index/HEAD, no lock contention with the source. Same teardown:
+**Parallel implementers** each get their own checkout via
+`orch worktree clone --source <repo> --branch <name>` (dest defaults to the
+sibling `<repo>-<slug>`): a CoW clone — APFS or reflink, probed — in seconds
+at near-zero disk that carries untracked build output, so incremental builds
+start warm, registered as an isolated git worktree — own index/HEAD, no lock
+contention with the source, branch tracking origin/main. Same teardown:
 `git -C <repo> worktree remove --force <dest>`.
 
-**Read-only fan-outs (macOS)**: `cross-review`/`investigate`/`fanout --clone`
+**Read-only fan-outs**: `cross-review`/`investigate`/`fanout --clone`
 dispatch every worker against ONE shared CoW clone under `/tmp/orch-clones`
 instead of the live worktree — the review target can't shift while you keep
 editing, and workers never take index locks in your tree. `cross-review
