@@ -113,7 +113,7 @@ import {
   type MailctlContext,
 } from "./mailctl.ts";
 import { workspace } from "./workspace-cli.ts";
-import { worktreeClone } from "./worktree.ts";
+import { removeWorktreeClone, worktreeClone } from "./worktree.ts";
 import { assertKnownFlags, CliError, collectFlags, flagBool, flagNumber, flagString, hasHelp, parseArgs, printJson, readStdinText, type ParsedArgs } from "./cli.ts";
 import { buildPrompt, buildProviderExecutionPlan, type ProviderExecutionPlan } from "../drivers/driver-common.ts";
 import { sandboxPosture, sandboxRunIdentity, SEATBELT_ENGINE, seatbeltUnsupportedReason } from "../drivers/sandbox.ts";
@@ -2419,6 +2419,17 @@ async function crossReviewAuto(args: ParsedArgs, outcome: MailFanoutOutcome): Pr
     tracked = collectMrRuns(repoKey, mr).filter((run) => runIds.has(run.run_id));
   }
 
+  // Every run is terminal: the fan-out's CoW clone has served its purpose.
+  // The timeout path above throws before this line, so runs that continue
+  // past --wait-sec keep their clone (remove_with stays in the payload).
+  let cloneReport: Record<string, unknown> | null = null;
+  if (outcome.clone) {
+    const removed = removeWorktreeClone(outcome.clone.source, outcome.clone.dest);
+    cloneReport = removed
+      ? { dest: outcome.clone.dest, removed: true }
+      : { dest: outcome.clone.dest, removed: false, remove_with: outcome.clone.remove_with };
+  }
+
   const mrDir = mrStateDir(repoKey, mr);
   ensureStateLayout(mrDir);
   const runsRoot = `${mrDir}/runs`;
@@ -2462,6 +2473,8 @@ async function crossReviewAuto(args: ParsedArgs, outcome: MailFanoutOutcome): Pr
     // Reviewer prose quotes absolute local paths as a matter of course:
     // relativize the known prefixes, and withhold a section that still trips
     // the guard rather than aborting the whole auto phase on honest content.
+    // Clone runs quote clone paths, not worktree paths; relativize those first.
+    if (outcome.clone) section = sanitizeCommentBody(section, outcome.clone.dest, undefined);
     section = sanitizeCommentBody(section, outcome.worktree, process.env.HOME);
     const leak = privateLeakAllowed() ? null : findPrivateLeak(section);
     if (leak) {
@@ -2560,6 +2573,7 @@ async function crossReviewAuto(args: ParsedArgs, outcome: MailFanoutOutcome): Pr
     runs: reportRuns,
     comment,
     attention,
+    ...(cloneReport ? { clone: cloneReport } : {}),
     ...(otherPending.length > 0 ? { other_pending_outbox: otherPending.length, other_pending_hint: `orch mirror sync --mr ${mr}` } : {}),
     ...(execute ? {} : { next: `orch mirror sync --mr ${mr} --execute` }),
   });

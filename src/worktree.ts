@@ -85,6 +85,30 @@ export function cloneWorktreeCow(sourceArg: string, destArg: string, branch: str
   }
 }
 
+// Fan-out clones live under /tmp: macOS clears it on reboot and purges idle
+// files, so an unremoved clone costs nothing durable. The prune below GCs the
+// stale worktree registrations that such cleanup leaves behind, keeping
+// `git worktree list` honest across reboots.
+const FANOUT_CLONE_ROOT = "/tmp/orch-clones";
+
+export function cloneForFanout(source: string, label: string): WorktreeCloneOutcome {
+  const src = git(["-C", resolve(source), "rev-parse", "--show-toplevel"]);
+  try {
+    git(["-C", src, "worktree", "prune"]);
+  } catch {}
+  const slug = label.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 40) || "thread";
+  const dest = join(FANOUT_CLONE_ROOT, `${basename(src)}-${slug}-${randomHex(3)}`);
+  return cloneWorktreeCow(src, dest, null);
+}
+
+export function removeWorktreeClone(source: string, dest: string): boolean {
+  const proc = Bun.spawnSync(["git", "-C", source, "worktree", "remove", "--force", dest], {
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  return proc.exitCode === 0;
+}
+
 export async function worktreeClone(args: ParsedArgs): Promise<number> {
   assertKnownFlags(args, "worktree clone", ["source", "dest", "branch"]);
   const source = flagString(args, "source", process.cwd());

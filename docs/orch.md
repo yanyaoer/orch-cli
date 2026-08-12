@@ -73,6 +73,14 @@ incremental builds start warm, registered as an isolated git worktree — own
 index/HEAD, no lock contention with the source. Same teardown:
 `git -C <repo> worktree remove --force <dest>`.
 
+**Read-only fan-outs (macOS)**: `cross-review`/`investigate`/`fanout --clone`
+dispatch every worker against ONE shared CoW clone under `/tmp/orch-clones`
+instead of the live worktree — the review target can't shift while you keep
+editing, and workers never take index locks in your tree. `cross-review
+--auto` removes the clone once all runs settle; otherwise the payload's
+`clone.remove_with` has the teardown. Writable roles are refused (use
+per-agent `orch worktree clone`).
+
 ## Local VCS: jj first
 A worktree with a Jujutsu workspace (`.jj`, colocated included) is driven
 through jj: MR inference reads the nearest bookmark, base/dirty/evidence use

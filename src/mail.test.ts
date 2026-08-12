@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { repoKeyFromRemote } from "./paths.ts";
 import { mailThreadDir } from "./mail.ts";
 import type { ImplementerResult, RunStatus } from "./types.ts";
@@ -458,6 +458,67 @@ test("cross-review --auto records decisions and queues one merged mirror comment
   expect(againPayload.auto).toBe("skipped");
   expect(againPayload.reason).toContain("orch verdict --thread");
   expect(readdirSync(join(mrDir, "outbox", "pending"))).toHaveLength(1);
+});
+
+test.skipIf(process.platform !== "darwin")("cross-review --clone dispatches against a CoW clone; --auto removes it", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orch-cross-review-clone-"));
+  const stateHome = join(root, "state");
+  const configHome = join(root, "config");
+  const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
+  const remote = "git@github.com:example/repo.git";
+  await initRepo(worktree, remote);
+  // Untracked build output must ride along into the clone.
+  writeFileSync(join(worktree, "artifact.bin"), "warm\n", "utf8");
+  const env = { XDG_STATE_HOME: stateHome, XDG_CONFIG_HOME: configHome, ORCH_DRIVER_FAKE_RESULT: "1" };
+  const thread = "review-clone-1";
+  const taskPath = join(root, "review.md");
+  writeFileSync(taskPath, "Review the pending diff.\n", "utf8");
+  await runOrch(["mail", "agent", "defaults"], env);
+
+  const auto = await runOrch(["cross-review", "--thread", thread, "--task", taskPath, "--worktree", worktree, "--clone", "--auto"], env);
+  expect(auto).toMatchObject({ exitCode: 0, stderr: "" });
+  const payload = JSON.parse(auto.stdout) as {
+    fanout: { clone: { dest: string; source: string; remove_with: string } };
+    runs: Array<{ run_id: string; decision: string | null }>;
+    clone: { dest: string; removed: boolean };
+  };
+  const cloneDest = payload.fanout.clone.dest;
+  // clone paths come back realpath-normalized (/tmp -> /private/tmp on macOS)
+  expect(dirname(cloneDest)).toBe(join(realpathSync("/tmp"), "orch-clones"));
+  expect(payload.runs).toHaveLength(2);
+  for (const run of payload.runs) expect(run.decision).toBe("accept");
+  // Runs recorded the clone as their worktree, and --auto tore it down after
+  // every run went terminal: directory gone, no stale worktree registration.
+  const runsRoot = join(stateHome, "orch", repoKeyFromRemote(remote, worktree), "mrs", thread, "runs");
+  for (const dir of readdirSync(runsRoot)) {
+    const status = JSON.parse(readFileSync(join(runsRoot, dir, "status.json"), "utf8")) as { worktree: string };
+    expect(status.worktree).toBe(cloneDest);
+  }
+  expect(payload.clone).toMatchObject({ dest: cloneDest, removed: true });
+  expect(existsSync(cloneDest)).toBe(false);
+  const wtProc = Bun.spawn(["git", "-C", worktree, "worktree", "list"], { stdout: "pipe", stderr: "pipe" });
+  expect(await new Response(wtProc.stdout).text()).not.toContain("orch-clones");
+  await wtProc.exited;
+});
+
+test("fanout --clone refuses writable roles", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orch-fanout-clone-role-"));
+  const stateHome = join(root, "state");
+  const configHome = join(root, "config");
+  const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
+  await initRepo(worktree, "git@github.com:example/repo.git");
+  const env = { XDG_STATE_HOME: stateHome, XDG_CONFIG_HOME: configHome };
+  const taskPath = join(root, "task.md");
+  writeFileSync(taskPath, "Implement the thing.\n", "utf8");
+  await runOrch(["mail", "agent", "defaults"], env);
+
+  const refused = await runOrch(
+    ["fanout", "--thread", "impl-1", "--role", "implementer", "--task", taskPath, "--worktree", worktree, "--clone"],
+    env,
+  );
+  expect(refused.exitCode).toBe(1);
+  expect(refused.stderr).toContain("--clone");
+  expect(refused.stderr).toContain("orch worktree clone");
 });
 
 test("cross-review --auto renders the merged comment in Chinese when config language is 中文", async () => {

@@ -30,6 +30,7 @@ import { getRepoIdentity, mrStateDir, orchStateRoot } from "./paths.ts";
 import type { AgentName, RoleResult, RunRole, RunStatus } from "./types.ts";
 import { isRunRole } from "./types.ts";
 import { acquirePidfileLockWait, type PidfileLock } from "./locks.ts";
+import { cloneForFanout, removeWorktreeClone, type WorktreeCloneOutcome } from "./worktree.ts";
 
 interface LocatedRun {
   mr: string;
@@ -567,6 +568,14 @@ function withAgentFlag(args: ParsedArgs, agentId: string): ParsedArgs {
   return { positionals: args.positionals, flags, flagValues: args.flagValues };
 }
 
+// Same, for --worktree: claimMailTasks prefers a task's workspace path unless
+// the flag is present, and a fan-out clone must override both.
+function withWorktreeFlag(args: ParsedArgs, worktree: string): ParsedArgs {
+  const flags = new Map(args.flags);
+  flags.set("worktree", worktree);
+  return { positionals: args.positionals, flags, flagValues: args.flagValues };
+}
+
 type FanoutAssignment = Record<string, unknown> & { agent_id: string; event_id: string };
 
 function fanoutAssignment(
@@ -638,6 +647,8 @@ export interface MailFanoutClaimedRun {
 // mailFanout returns instead of printing: callers own the output, so
 // cross-review --auto can fold the fan-out payload into its final report
 // rather than emitting two JSON documents from one invocation.
+export type MailFanoutClone = WorktreeCloneOutcome & { remove_with: string };
+
 export interface MailFanoutOutcome {
   code: number;
   dry_run: boolean;
@@ -645,6 +656,7 @@ export interface MailFanoutOutcome {
   worktree: string;
   repo_key: string;
   remote_url: string;
+  clone: MailFanoutClone | null;
   runs: MailFanoutClaimedRun[];
   payload: Record<string, unknown>;
 }
@@ -664,6 +676,7 @@ const FANOUT_FLAGS = [
   "allow-dirty",
   "limit",
   "dry-run",
+  "clone",
   // Harmless no-op: fan-out always prints JSON, but scripts habitually append it.
   "json",
 ] as const;
@@ -712,6 +725,7 @@ export async function mailFanout(args: ParsedArgs, context: MailCliContext, opts
       worktree,
       repo_key: repo.repo_key,
       remote_url: repo.remote_url,
+      clone: null,
       runs: [],
       payload: {
         mail: opts.command,
@@ -724,6 +738,24 @@ export async function mailFanout(args: ParsedArgs, context: MailCliContext, opts
     };
   }
 
+  // --clone: dispatch every worker against one shared APFS CoW clone under
+  // /tmp instead of the live worktree — snapshot semantics (mid-review edits
+  // or branch switches in the source can't shift the review target) and no
+  // index.lock contention with the user's own git. Shared is only safe for
+  // read-only postures; writable roles need per-agent clones (orch worktree
+  // clone), so they are refused here.
+  let clone: MailFanoutClone | null = null;
+  if (flagBool(args, "clone")) {
+    if (role !== "reviewer" && role !== "researcher") {
+      throw new CliError(
+        `--clone shares one read-only CoW clone across workers, so it only supports reviewer and researcher roles (got ${role}); writable roles need per-agent clones: orch worktree clone`,
+      );
+    }
+    const cloned = cloneForFanout(worktree, thread);
+    clone = { ...cloned, remove_with: `git -C ${cloned.source} worktree remove --force ${cloned.dest}` };
+  }
+  const dispatchWorktree = clone?.dest ?? worktree;
+
   const taskFlagValue = flagString(args, "task");
   const taskText = taskFlagValue === "-" ? await readStdinText() : readFileSync(resolve(taskFlagValue), "utf8");
   if (taskFlagValue === "-" && !taskText.trim()) throw new CliError("--task - received empty stdin");
@@ -733,33 +765,43 @@ export async function mailFanout(args: ParsedArgs, context: MailCliContext, opts
   const parentEventId = args.flags.has("parent-event") ? flagString(args, "parent-event") : null;
   const mr = args.flags.has("mr") ? flagString(args, "mr") : null;
 
-  // Serialize the dedup-check → publish → deliver → import window: two concurrent
-  // fan-outs would otherwise both miss findTask (events still in outbox) and
-  // publish duplicate tasks with distinct event ids. Claiming has per-event locks.
-  const fanoutLock = await acquireThreadLock(threadDir, "fanout.lock", `mail-${opts.command}`);
+  const runs: MailFanoutClaimedRun[] = [];
   let assigned: FanoutAssignment[];
   try {
-    assigned = agents.map((agent) =>
-      fanoutAssignment(bus, { agent, from, taskText, taskSha, role, parentEventId, mr, workspace }),
-    );
+    // Serialize the dedup-check → publish → deliver → import window: two concurrent
+    // fan-outs would otherwise both miss findTask (events still in outbox) and
+    // publish duplicate tasks with distinct event ids. Claiming has per-event locks.
+    const fanoutLock = await acquireThreadLock(threadDir, "fanout.lock", `mail-${opts.command}`);
+    try {
+      assigned = agents.map((agent) =>
+        fanoutAssignment(bus, { agent, from, taskText, taskSha, role, parentEventId, mr, workspace }),
+      );
 
-    // Deliver + import so the freshly published task.requested events are claimable.
-    const delivered = deliverLocalMail(threadDir);
-    for (const item of delivered) {
-      const imported = bus.importRaw(readFileSync(item.to, "utf8"), thread, repo.repo_key);
-      if (!imported.imported && imported.reason) {
-        throw new CliError(`fan-out mail quarantined (${imported.reason}): ${imported.quarantine_path ?? item.to}`);
+      // Deliver + import so the freshly published task.requested events are claimable.
+      const delivered = deliverLocalMail(threadDir);
+      for (const item of delivered) {
+        const imported = bus.importRaw(readFileSync(item.to, "utf8"), thread, repo.repo_key);
+        if (!imported.imported && imported.reason) {
+          throw new CliError(`fan-out mail quarantined (${imported.reason}): ${imported.quarantine_path ?? item.to}`);
+        }
       }
+    } finally {
+      fanoutLock.release();
     }
-  } finally {
-    fanoutLock.release();
-  }
 
-  const runs: MailFanoutClaimedRun[] = [];
-  for (const agent of agents) {
-    const eventIds = assigned.filter((item) => item.agent_id === agent.id).map((item) => item.event_id);
-    const claimed = await claimMailTasks(withAgentFlag(args, agent.id), threadDir, thread, worktree, repo.repo_key, context, { eventIds });
-    runs.push(...claimed);
+    for (const agent of agents) {
+      const eventIds = assigned.filter((item) => item.agent_id === agent.id).map((item) => item.event_id);
+      // The injected --worktree makes the clone win over the task's workspace path.
+      const claimArgs = clone ? withWorktreeFlag(withAgentFlag(args, agent.id), clone.dest) : withAgentFlag(args, agent.id);
+      const claimed = await claimMailTasks(claimArgs, threadDir, thread, dispatchWorktree, repo.repo_key, context, { eventIds });
+      runs.push(...claimed);
+    }
+  } catch (error) {
+    // A clone no run ever started against is torn down with the failure; once
+    // any run holds it, it stays (payload/remove_with is lost on throw, but
+    // /tmp self-cleans and the next --clone prunes the stale registration).
+    if (clone && runs.length === 0) removeWorktreeClone(worktree, clone.dest);
+    throw error;
   }
 
   return {
@@ -769,8 +811,9 @@ export async function mailFanout(args: ParsedArgs, context: MailCliContext, opts
     worktree,
     repo_key: repo.repo_key,
     remote_url: repo.remote_url,
+    clone,
     runs,
-    payload: { mail: opts.command, thread, role, worktree, assigned, runs },
+    payload: { mail: opts.command, thread, role, worktree, ...(clone ? { clone } : {}), assigned, runs },
   };
 }
 
