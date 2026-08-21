@@ -25,6 +25,11 @@ import {
   mailctlAttachmentPromote,
   mailctlAttachments,
   mailctlAttachmentShow,
+  mailctlDelta,
+  mailctlDraftList,
+  mailctlDraftRelease,
+  mailctlDraftShow,
+  mailctlDraftWithdraw,
   mailctlGuidance,
   mailctlInit,
   mailctlPoll,
@@ -1350,6 +1355,143 @@ describe("mailctlReply outbound policy", () => {
     expect(transport.sent).toHaveLength(0);
     expect(jsonFiles(outboxEmailPendingDir())).toEqual(beforePending);
     expect(jsonFiles(outboxEmailSentDir())).toEqual(beforeSent);
+  });
+});
+
+describe("held draft protocol", () => {
+  function followUp(uid: number, messageId: string, rootId: string, body: string) {
+    return {
+      ref: { uid },
+      raw: textMail({ subject: "Re: Task", messageId, headers: [`References: ${rootId}`], body }),
+    };
+  }
+
+  it("versions the thread, parks stale replies, and resolves them via release/withdraw", async () => {
+    const { cfg } = setupMailctl();
+    const transport = new FakeTransport([message(1, "<held-1@example.com>", "First task")]);
+    const ctx = fakeContext({ cfg, transport });
+    await mailctlPoll(ctx, { reconcile: false });
+    const thread = firstThreadState().thread;
+    expect(mailctlDelta({ thread }).current_version).toBe(1);
+    expect(mailctlDelta({ thread }).events.map((event) => event.kind)).toEqual(["inbound"]);
+
+    const sent = await mailctlReply(ctx, { thread, reportKey: "progress:ok", body: "matching base", baseVersion: 1 });
+    expect(sent.sent).toBe(true);
+    expect(transport.sent).toHaveLength(1);
+    expect(mailctlDelta({ thread, since: 1 }).events.map((event) => event.kind)).toEqual(["reply_sent"]);
+    expect(mailctlDelta({ thread }).current_version).toBe(2);
+
+    transport.messages.push(followUp(2, "<held-2@example.com>", "<held-1@example.com>", "Follow up two"));
+    await mailctlPoll(ctx, { reconcile: false });
+    expect(mailctlDelta({ thread }).current_version).toBe(3);
+
+    const held = await mailctlReply(ctx, { thread, reportKey: "reply:stale", body: "stale answer", baseVersion: 2 });
+    expect(held.held).toBe(true);
+    expect(held.currentVersion).toBe(3);
+    expect(held.delta?.map((event) => event.kind)).toEqual(["inbound"]);
+    expect(held.delta?.[0]?.summary).toContain("Follow up two");
+    expect(transport.sent).toHaveLength(1);
+    expect(mailctlDraftList({ thread }).drafts.map((draft) => draft.report_key)).toEqual(["reply:stale"]);
+    expect(auditRows().some((row) => row.type === "reply_held" && row.report_key === "reply:stale")).toBe(true);
+
+    await expect(mailctlReply(ctx, { thread, reportKey: "reply:future", body: "x", baseVersion: 99 })).rejects.toThrow(
+      "ahead of thread version",
+    );
+
+    transport.messages.push(followUp(3, "<held-3@example.com>", "<held-1@example.com>", "Follow up three"));
+    await mailctlPoll(ctx, { reconcile: false });
+    const reheld = await mailctlDraftRelease(ctx, { thread, reportKey: "reply:stale" });
+    expect(reheld.held).toBe(true);
+    expect(reheld.currentVersion).toBe(4);
+    expect(reheld.delta?.map((event) => event.version)).toEqual([3, 4]);
+    expect(transport.sent).toHaveLength(1);
+
+    const shown = mailctlDraftShow({ thread, reportKey: "reply:stale" });
+    expect(shown.draft.held_count).toBe(2);
+    expect(shown.current_version).toBe(4);
+
+    const released = await mailctlDraftRelease(ctx, { thread, reportKey: "reply:stale", force: true });
+    expect(released.sent).toBe(true);
+    expect(transport.sent).toHaveLength(2);
+    expect(transport.sent[1]).toContain("stale answer");
+    expect(mailctlDraftList({ thread }).drafts).toHaveLength(0);
+    expect(mailctlDelta({ thread }).current_version).toBe(5);
+    expect(auditRows().some((row) => row.type === "draft_released" && row.forced === true)).toBe(true);
+
+    const parked = await mailctlReply(ctx, { thread, reportKey: "reply:silent", body: "obsolete", baseVersion: 1 });
+    expect(parked.held).toBe(true);
+    const withdrawn = mailctlDraftWithdraw(ctx, { thread, reportKey: "reply:silent" });
+    expect(withdrawn.withdrawn).toBe(true);
+    expect(mailctlDraftList({ thread }).drafts).toHaveLength(0);
+    expect(() => mailctlDraftShow({ thread, reportKey: "reply:silent" })).toThrow("held draft not found");
+    expect(auditRows().some((row) => row.type === "draft_withdrawn" && row.report_key === "reply:silent")).toBe(true);
+  });
+
+  it("a revised submit at the current version sends and clears the parked draft", async () => {
+    const { cfg } = setupMailctl();
+    const transport = new FakeTransport([message(1, "<revise-1@example.com>")]);
+    const ctx = fakeContext({ cfg, transport });
+    await mailctlPoll(ctx, { reconcile: false });
+    const thread = firstThreadState().thread;
+
+    const held = await mailctlReply(ctx, { thread, reportKey: "reply:answer", body: "outdated body", baseVersion: 0 });
+    expect(held.held).toBe(true);
+    expect(transport.sent).toHaveLength(0);
+
+    const revised = await mailctlReply(ctx, { thread, reportKey: "reply:answer", body: "revised body", baseVersion: 1 });
+    expect(revised.sent).toBe(true);
+    expect(transport.sent[0]).toContain("revised body");
+    expect(mailctlDraftList({})).toEqual({ drafts: [] });
+  });
+
+  it("a parked draft blocks thread settlement until resolved", async () => {
+    const { cfg } = setupMailctl();
+    const transport = new FakeTransport([message(1, "<settle-hold@example.com>")]);
+    const ctx = fakeContext({ cfg, transport });
+    await mailctlPoll(ctx, { reconcile: false });
+    const thread = firstThreadState().thread;
+    const attention = attentionFiles().map((path) => readJsonFile<any>(path, null))[0];
+    mailctlAck(ctx, { thread, attention: attention.msg_sha });
+
+    const parked = await mailctlReply(ctx, { thread, reportKey: "reply:pending-choice", body: "parked", baseVersion: 0 });
+    expect(parked.held).toBe(true);
+    const final = await mailctlReply(ctx, { thread, reportKey: "settled:0", body: "final report" });
+    expect(final.sent).toBe(true);
+    expect(firstThreadState().status).toBe("active");
+
+    mailctlDraftWithdraw(ctx, { thread, reportKey: "reply:pending-choice" });
+    const duplicate = await mailctlReply(ctx, { thread, reportKey: "settled:0", body: "final report" });
+    expect(duplicate.duplicate).toBe(true);
+    expect(firstThreadState().status).toBe("settled");
+  });
+
+  it("re-triggers a controller for parked drafts and feeds them into the task file", async () => {
+    const { root, cfg } = setupMailctl();
+    process.env.ORCH_DRIVER_FAKE_RESULT = "1";
+    const orch = writeFakeOrch(root);
+    const transport = new FakeTransport([message(1, "<held-t5@example.com>")]);
+    const ctx = fakeContext({ cfg, transport, orch });
+
+    await mailctlPoll(ctx);
+    const state = firstThreadState();
+    const parked = await mailctlReply(ctx, { thread: state.thread, reportKey: "reply:parked", body: "parked body", baseVersion: 0 });
+    expect(parked.held).toBe(true);
+
+    const attention = attentionFiles().map((path) => readJsonFile<any>(path, null))[0];
+    mailctlAck(ctx, { thread: state.thread, attention: attention.msg_sha });
+    const gen0 = readJsonFile<any>(mailctlThreadStatePath(state.thread), null).controller.generations[0];
+    const status = readJsonFile<any>(gen0.status_path, null);
+    writeJsonAtomic(gen0.status_path, { ...status, state: "failed", updated_at: new Date(Date.now() - 2_000).toISOString() });
+
+    const retry = await mailctlReconcile(ctx);
+    expect(retry.spawned).toHaveLength(1);
+    const gen1 = readJsonFile<any>(mailctlThreadStatePath(state.thread), null).controller.generations[1];
+    expect(gen1.trigger_reasons.some((reason: string) => reason.startsWith("T5:held-draft:reply:parked"))).toBe(true);
+    const task = readFileSync(gen1.task_path, "utf8");
+    expect(task).toContain("## Held Drafts");
+    expect(task).toContain("reply:parked");
+    expect(task).toContain("parked body");
+    expect(task).toContain("--base-version");
   });
 });
 

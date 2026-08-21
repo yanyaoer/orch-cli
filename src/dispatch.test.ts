@@ -135,6 +135,11 @@ test("shouldProxyToHost proxies only controller mutations", () => {
   expect(shouldProxyToHost(["decision", "accept"])).toBe(true);
   expect(shouldProxyToHost(["mailctl", "reply"])).toBe(true);
   expect(shouldProxyToHost(["mailctl", "ack"])).toBe(true);
+  expect(shouldProxyToHost(["mailctl", "draft", "release"])).toBe(true);
+  expect(shouldProxyToHost(["mailctl", "draft", "withdraw"])).toBe(true);
+  expect(shouldProxyToHost(["mailctl", "draft", "list"])).toBe(false);
+  expect(shouldProxyToHost(["mailctl", "draft", "show"])).toBe(false);
+  expect(shouldProxyToHost(["mailctl", "delta"])).toBe(false);
   expect(shouldProxyToHost(["mailctl", "guidance"])).toBe(false);
   expect(shouldProxyToHost(["mailctl", "poll"])).toBe(false);
   expect(shouldProxyToHost(["run", "list"])).toBe(false);
@@ -268,6 +273,40 @@ test("mailctl host mutations are scoped to the controller thread", async () => {
   await reconcileDispatchOnce([process.execPath, "-e", "process.exit(0)"], { stateRoot: fx.stateRoot });
   expect((JSON.parse(readFileSync(join(dispatchDir(fx.stateRoot), "done", fx.runId, `${okId}.json`), "utf8")) as DispatchResult).exit_code).toBe(0);
   expect((JSON.parse(readFileSync(join(dispatchDir(fx.stateRoot), "done", fx.runId, `${badId}.json`), "utf8")) as DispatchResult).exit_code).toBe(1);
+});
+
+test("held draft mutations proxy with canonical argv and reads stay rejected", async () => {
+  const fx = controllerFixture({ controllerMr: "mailctl-em-x", thread: "em-x", tag: "mailctl", idempotencyKey: "ctrl:em-x:0" });
+  const echoOrch = join(fx.stateRoot, "echo-orch.js");
+  writeFileSync(echoOrch, 'process.stdout.write(JSON.stringify({ argv: process.argv.slice(2) }));process.exit(0);', "utf8");
+  const pending = join(dispatchDir(fx.stateRoot), "pending", fx.runId);
+  const replyId = "1700000000020-aaaaaaaaaaa1";
+  const releaseId = "1700000000021-aaaaaaaaaaa2";
+  const withdrawId = "1700000000022-aaaaaaaaaaa3";
+  const listId = "1700000000023-aaaaaaaaaaa4";
+  writeFileSync(
+    join(pending, `${replyId}.json`),
+    JSON.stringify(queuedRequest(fx, replyId, ["mailctl", "reply", "--thread", fx.thread, "--report-key", "k", "--body", "x", "--base-version", "3"])),
+  );
+  writeFileSync(
+    join(pending, `${releaseId}.json`),
+    JSON.stringify(queuedRequest(fx, releaseId, ["mailctl", "draft", "release", "--thread", fx.thread, "--report-key", "k", "--force", "--json"])),
+  );
+  writeFileSync(
+    join(pending, `${withdrawId}.json`),
+    JSON.stringify(queuedRequest(fx, withdrawId, ["mailctl", "draft", "withdraw", "--thread", fx.thread, "--report-key", "k"])),
+  );
+  writeFileSync(
+    join(pending, `${listId}.json`),
+    JSON.stringify(queuedRequest(fx, listId, ["mailctl", "draft", "list", "--thread", fx.thread])),
+  );
+  await reconcileDispatchOnce([process.execPath, echoOrch], { stateRoot: fx.stateRoot });
+  const done = (id: string) => JSON.parse(readFileSync(join(dispatchDir(fx.stateRoot), "done", fx.runId, `${id}.json`), "utf8")) as DispatchResult;
+  expect(JSON.parse(done(replyId).stdout).argv).toEqual(["mailctl", "reply", "--thread=em-x", "--report-key=k", "--body=x", "--base-version=3"]);
+  expect(JSON.parse(done(releaseId).stdout).argv).toEqual(["mailctl", "draft", "release", "--thread=em-x", "--report-key=k", "--force", "--json"]);
+  expect(JSON.parse(done(withdrawId).stdout).argv).toEqual(["mailctl", "draft", "withdraw", "--thread=em-x", "--report-key=k"]);
+  expect(done(listId).exit_code).toBe(1);
+  expect(done(listId).stderr).toContain("dispatch rejected");
 });
 
 test("an ordinary controller MR beginning with mailctl- keeps its full thread id", async () => {

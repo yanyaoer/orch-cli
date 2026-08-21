@@ -42,6 +42,17 @@ permissions, model/effort tiers, result schemas — live in the CLI:
   and replies in-thread; the controller orchestrates, it never edits code.
   MR progress email is synced by `orch mailctl sync` (or automatically by poll); configure `notify` first.
   Setup + security detail: README.
+- **Reply to a mail thread without racing it** → held drafts: every accepted
+  inbound message and delivered reply bumps the thread version;
+  `orch mailctl delta --thread em-<id> [--since <v>]` shows the current version
+  and what happened since. Pass that version as
+  `orch mailctl reply … --base-version <v>`; if the thread moved while you
+  drafted, the reply is parked (exit 3) with the missed events and you choose
+  explicitly: resubmit with the new `--base-version` (revise),
+  `orch mailctl draft release --thread … --report-key …` (send as-is; re-holds
+  if the thread moved again, `--force` overrides), or
+  `orch mailctl draft withdraw` (stay silent). Parked drafts re-trigger a
+  controller until resolved (`orch mailctl draft list` to inspect).
 - **Watch a live worker** → `orch events tail --run <id> --native -f`
   (provider-independent progress stream). Run-state authority stays with
   `orch status` + plain `orch events tail`.

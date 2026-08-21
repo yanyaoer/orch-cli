@@ -269,9 +269,11 @@ $ orch mailctl init --user you@example.com \
 $ orch mailctl poll --json      # main contract: one bounded ingest + reconcile cycle (cron/launchd)
 $ orch mailctl watch            # foreground convenience: IMAP IDLE + periodic reconcile
 $ orch mailctl status           # cursor, active threads, controller generations, outbound queue, recent rejections
-$ orch mailctl reply   --thread em-<id> --report-key <k> --body "…"   # (used by the controller)
+$ orch mailctl reply   --thread em-<id> --report-key <k> --body "…" [--base-version <v>]   # (used by the controller)
 $ orch mailctl ack     --thread em-<id> --attention <id>              # (used by the controller)
 $ orch mailctl guidance --thread em-<id>                             # unacked instructions for the controller
+$ orch mailctl delta   --thread em-<id> [--since <v>]                # thread version + events since a version
+$ orch mailctl draft   list|show|release|withdraw …                  # inspect/resolve held (parked) reply drafts
 $ orch mailctl attachments --thread em-<id>                          # quarantined attachments for a thread
 $ orch mailctl attachment show --id att-<id>                         # print a safe text attachment (log/patch/md/json/csv)
 $ orch mailctl attachment promote --id att-<id> [--dest <dir>]       # copy a stored payload out of quarantine
@@ -283,6 +285,8 @@ Each MR gets one subject root with dispatched/result/decision replies, with idem
 Delivery is **at-least-once**: outbox markers dedupe re-sends, but a crash in the window between SMTP acceptance and the sent-marker write can deliver the same progress email twice (stable Message-IDs let mail clients collapse the duplicate). Changing or removing `notify.to` also invalidates queued progress mail — stale retries are marked superseded and re-queued for the current recipient on the next sync, and the new recipient receives the thread's anchoring root once before further updates.
 Note: the first sync after enabling notifications backfills every existing MR under the repo (rate-limited by `max_per_hour`), so a repo with history produces a burst of catch-up mail. Set `"since": "<ISO-8601>"` in `notify` to cut the backfill: runs created before that timestamp are never projected.
 Body paths may use `$ORCH_STATE`, `$WORKSPACE`, or `~`; the `secretPatterns` leak guard always runs, and `max_per_hour` limits delivery.
+
+**Held drafts (optimistic concurrency).** Agents draft replies over seconds-to-minutes while the thread keeps moving — a new inbound mail or another agent's reply can make a drafted answer stale before it is sent. Every accepted inbound message and delivered reply appends one event to a per-thread append-only log; the line count is the **thread version**. `orch mailctl delta --thread em-<id> [--since <v>]` is the pull-based inbox: current version plus the events since a version. A reply submitted with `--base-version <v>` transmits only while the thread is still at `v`; otherwise the draft is **parked** under `outbox-email/held/` (exit code 3) and the JSON result carries the missed events plus the three explicit resolutions as literal commands: revise (resubmit the same `--report-key` with the current `--base-version`), `orch mailctl draft release` (send as-is — re-holds if the thread moved again after the hold; `--force` overrides), or `orch mailctl draft withdraw` (stay silent). A parked draft re-triggers a controller generation (trigger `T5`) with the draft and its missed events in the task file until it is resolved, and a thread cannot settle while one is parked. Guarded submits serialize on a per-thread lock, so two concurrent agents cannot double-answer: the second one is parked with the first one's reply in its delta. Replies without `--base-version` keep today's unguarded behavior.
 
 **Daemonless, precisely.** `poll` is the primary contract — a bounded one-shot ingest + reconcile you drive from `cron` or `launchd`, exactly the stateless-reconciler model, with no orch-owned background service. `watch` is a **foreground** convenience: it is honestly a long-running process (an IMAP-IDLE loop), but it is *not a daemon* — it never forks or detaches, owns no global scheduler, holds no persistent model session, and does one bounded reconcile per wake before returning to IDLE (`Ctrl-C` exits). So the "daemonless" claim means *no background service / no `orchd`*, not "no long-running process ever". **For unattended operation, drive `poll` from cron/launchd — do not keep `watch` alive under a restart supervisor.**
 
@@ -428,7 +432,7 @@ orch result        Print a run's local result.json
 orch status        Read local run status for an MR
 orch decision      Record accept/rework and queue a PR/MR mirror comment
 orch mail          Local signed-mail bus: submit, route, claim, reply, import
-orch mailctl       Email-driven orchestration over IMAP/SMTP (init/poll/watch/status/reply/ack/guidance)
+orch mailctl       Email-driven orchestration over IMAP/SMTP (init/poll/watch/status/reply/ack/guidance/delta/draft)
 orch workspace     Register local workspaces for mail routing
 orch worktree clone  CoW-clone a worktree into an isolated per-agent checkout (APFS/reflink,
                    carries untracked build output so incremental builds start warm)
