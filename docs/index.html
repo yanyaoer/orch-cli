@@ -643,10 +643,11 @@
 <span class="cm"># one sentence in: a researcher drafts the plan, you confirm, a controller executes</span>
 <span class="p">$</span> <span class="c">orch new</span> 'add rate limiting to the public API'
 
-<span class="cm"># one-shot fan-out: publish + claim + run per agent</span>
-<span class="p">$</span> <span class="c">orch cross-review</span> <span class="f">--thread</span> review-123 <span class="f">--task</span> review.md
+<span class="cm"># one-shot fan-out: publish + claim + run per agent (--clone: all reviewers share one CoW snapshot)</span>
+<span class="p">$</span> <span class="c">orch cross-review</span> <span class="f">--thread</span> review-123 <span class="f">--task</span> review.md <span class="f">--clone</span>
 <span class="p">$</span> <span class="c">orch fanout</span> <span class="f">--thread</span> verify-1 <span class="f">--role</span> verifier <span class="f">--task</span> verify.md
 <span class="p">$</span> <span class="c">orch investigate</span> <span class="f">--thread</span> research-1 <span class="f">--task</span> question.md
+<span class="p">$</span> <span class="c">orch worktree clone</span> <span class="f">--branch</span> fix/x               <span class="cm"># per-agent CoW checkout (APFS/reflink), builds start warm</span>
 
 <span class="cm"># follow the runs (mr == thread)</span>
 <span class="p">$</span> <span class="c">orch status</span> <span class="f">--mr</span> review-123
@@ -665,7 +666,13 @@
 <span class="p">$</span> <span class="c">orch mailctl init</span> <span class="f">--user</span> you@example.com <span class="f">--allow</span> boss@example.com <span class="f">--workspace</span> my-repo \
       <span class="f">--imap-host</span> imap.gmail.com <span class="f">--smtp-host</span> smtp.gmail.com
 <span class="p">$</span> <span class="c">orch mailctl poll</span> <span class="f">--json</span>                      <span class="cm"># cron/launchd: one bounded ingest + reconcile cycle</span>
-<span class="p">$</span> <span class="c">orch mailctl status</span>                            <span class="cm"># cursor · threads · controller generations · outbound</span></pre>
+<span class="p">$</span> <span class="c">orch mailctl status</span>                            <span class="cm"># cursor · threads · controller generations · outbound</span>
+
+<span class="cm"># held drafts: version-guarded replies — a stale draft is parked with what it missed,</span>
+<span class="cm">#   then explicitly revised, released as-is, or withdrawn (never a silent stale send)</span>
+<span class="p">$</span> <span class="c">orch mailctl delta</span> <span class="f">--thread</span> em-&lt;id&gt;            <span class="cm"># thread version + events since a version</span>
+<span class="p">$</span> <span class="c">orch mailctl reply</span> <span class="f">--thread</span> em-&lt;id&gt; <span class="f">--report-key</span> reply:1 <span class="f">--body</span> "…" <span class="f">--base-version</span> 4
+<span class="p">$</span> <span class="c">orch mailctl draft</span> release <span class="f">--thread</span> em-&lt;id&gt; <span class="f">--report-key</span> reply:1  <span class="cm"># or: withdraw</span></pre>
         </div>
       </div>
     </section>
@@ -684,10 +691,10 @@
             <ul>
               <li>bare <code>orch</code> (overview) · <code>new</code> · <code>verdict --wait</code> · <code>wait</code></li>
               <li><code>run create [--resume-from]</code> · <code>run list</code> · <code>run cancel</code> · <code>run reap</code> · <code>status</code></li>
-              <li><code>cross-review [--auto]</code> · <code>fanout</code> · <code>investigate</code></li>
+              <li><code>cross-review [--auto]</code> · <code>fanout</code> · <code>investigate</code> (each with <code>--clone</code>) · <code>worktree clone</code></li>
               <li><code>search</code> · <code>usage</code></li>
               <li><code>mail submit</code> · <code>mail route</code> · <code>mail claim</code> · <code>mail reply result</code></li>
-              <li><code>mailctl init</code> · <code>poll</code> · <code>watch</code> · <code>sync</code> · <code>status</code> · <code>reply</code> · <code>ack</code> · <code>guidance</code></li>
+              <li><code>mailctl init</code> · <code>poll</code> · <code>watch</code> · <code>sync</code> · <code>status</code> · <code>reply</code> · <code>ack</code> · <code>guidance</code> · <code>delta</code> · <code>draft</code></li>
               <li><code>events tail [--native]</code> · <code>result --wait</code></li>
               <li><code>decision</code> · <code>mirror</code> · <code>mirror sync</code> · <code>workspace</code></li>
               <li><code>chatgpt-bridge</code> · <code>handoff-pro</code></li>
