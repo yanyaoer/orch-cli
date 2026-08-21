@@ -69,10 +69,13 @@ export function insideSandbox(env: NodeJS.ProcessEnv = process.env): boolean {
 // Exact controller mutation set. Reads run locally. Host validation below is
 // authoritative and additionally pins flags, referenced runs, and cwd.
 export function shouldProxyToHost(positionals: string[]): boolean {
-  const [first, second] = positionals;
+  const [first, second, third] = positionals;
   if (first === "run") return second === "create" || second === "cancel";
   if (first === "decision") return second === "accept" || second === "rework";
-  if (first === "mailctl") return second === "reply" || second === "ack";
+  if (first === "mailctl") {
+    if (second === "draft") return third === "release" || third === "withdraw";
+    return second === "reply" || second === "ack";
+  }
   return first === "fanout" || first === "cross-review" || first === "investigate";
 }
 
@@ -181,7 +184,12 @@ function dispatchCommand(argv: string[], spec: RunSpec, stateRoot: string): stri
   const [first, second] = parsed.positionals;
   if (!shouldProxyToHost(parsed.positionals)) throw new Error("operation is not in the host dispatch allow-list");
 
-  const operation = first === "run" || first === "decision" || first === "mailctl" ? `${first} ${second}` : first!;
+  const operation =
+    first === "mailctl" && second === "draft"
+      ? `mailctl draft ${parsed.positionals[2]}`
+      : first === "run" || first === "decision" || first === "mailctl"
+        ? `${first} ${second}`
+        : first!;
   const expectedPositionals = operation.includes(" ") ? operation.split(" ") : [operation];
   if (parsed.positionals.length !== expectedPositionals.length || parsed.positionals.some((value, index) => value !== expectedPositionals[index])) {
     throw new Error(`unexpected positional arguments for ${operation}`);
@@ -201,8 +209,10 @@ function dispatchCommand(argv: string[], spec: RunSpec, stateRoot: string): stri
     fanout: ["thread", "role", "to-agent", "task", "model", "timeout-sec", "allow-dirty", "json"],
     "cross-review": ["thread", "to-agent", "task", "model", "timeout-sec", "json"],
     investigate: ["thread", "to-agent", "task", "model", "timeout-sec", "json"],
-    "mailctl reply": ["thread", "report-key", "body"],
+    "mailctl reply": ["thread", "report-key", "body", "base-version"],
     "mailctl ack": ["thread", "attention", "json"],
+    "mailctl draft release": ["thread", "report-key", "force", "json"],
+    "mailctl draft withdraw": ["thread", "report-key", "json"],
   };
   const allowed = new Set(allowedByOperation[operation] ?? []);
   for (const [name, value] of parsed.flags) {
@@ -297,6 +307,17 @@ function dispatchCommand(argv: string[], spec: RunSpec, stateRoot: string): stri
     pushValue("thread", thread);
     pushValue("report-key", required("report-key"));
     pushValue("body", required("body"));
+    pushValue("base-version", optional("base-version"));
+    return canonical;
+  }
+
+  if (operation === "mailctl draft release" || operation === "mailctl draft withdraw") {
+    if (!mailControllerThread(spec)) throw new Error("mailctl mutations require a host-created mail controller");
+    if (required("thread") !== thread) throw new Error(`${operation} must name controller thread ${thread}`);
+    pushValue("thread", thread);
+    pushValue("report-key", required("report-key"));
+    if (operation === "mailctl draft release") pushBoolean("force");
+    pushBoolean("json");
     return canonical;
   }
 

@@ -30,6 +30,19 @@ import {
   type ParsedAddress,
 } from "./mime.ts";
 import { ImapClient, filterNewUids, planUidScan } from "./imap.ts";
+import {
+  appendThreadEvent,
+  heldReplyPath,
+  listHeldDrafts,
+  outboxEmailHeldDir,
+  readHeldDraft,
+  reportFileName,
+  threadDelta,
+  threadVersion,
+  threadVersionLockPath,
+  type HeldDraftRecord,
+  type ThreadDeltaEvent,
+} from "./held-draft.ts";
 import { isTerminal, looksStale, collectMrRuns } from "./overview.ts";
 import { getRepoIdentity, mailControlStateDir, mrStateDir, orchStateRoot, statePathSegment } from "./paths.ts";
 import { assertNoPrivateLeak, redactPrivatePaths } from "./leak.ts";
@@ -105,6 +118,7 @@ export interface BuildControllerTaskInput {
   unackedMailText: string;
   notesTail?: string;
   sentReportSummary?: string;
+  heldDraftsText?: string;
 }
 
 export interface PollResult {
@@ -135,6 +149,11 @@ export interface ReplyResult {
   duplicate: boolean;
   sent: boolean;
   pending: boolean;
+  held?: boolean;
+  baseVersion?: number;
+  currentVersion?: number;
+  delta?: ThreadDeltaEvent[];
+  heldPath?: string;
   rawMessage?: string;
   messageId?: string;
   sentPath?: string;
@@ -160,6 +179,7 @@ export interface ReplyOptions {
   inReplyTo?: string | null;
   references?: string[];
   deferOnRateLimit?: boolean;
+  baseVersion?: number;
 }
 
 export interface SyncOptions {
@@ -218,6 +238,7 @@ export interface StatusThreadSummary {
   unacked_attention: number;
   pending_outbound: number;
   dropped_outbound: number;
+  held_outbound: number;
   controller: {
     current_run_id: string | null;
     final_report_sent: boolean;
@@ -234,6 +255,7 @@ export interface StatusSummary {
     dropped: number;
     quarantined: number;
     superseded: number;
+    held: number;
   };
   rejected_recent: RejectedRecentSummary;
 }
@@ -537,6 +559,11 @@ function isSelfGeneratedMessageId(raw: string): boolean {
   return at > 0 && body.slice(0, at).toLowerCase().startsWith("orch-");
 }
 
+function threadEventSummary(text: string): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  return flat.length > 200 ? `${flat.slice(0, 200)}…` : flat;
+}
+
 function firstBodyLine(text: string): string {
   return text.replace(/^\uFEFF/, "").split(/\r?\n/, 1)[0] ?? "";
 }
@@ -665,6 +692,7 @@ export function buildControllerTask(input: BuildControllerTaskInput): string {
   const notesTail = sanitizeControllerText(input.notesTail?.trim() || "(none)");
   const sentReportSummary = sanitizeControllerText(input.sentReportSummary?.trim() || "(none)");
   const unackedMailText = sanitizeControllerText(input.unackedMailText.trim());
+  const heldDraftsText = sanitizeControllerText(input.heldDraftsText?.trim() || "(none)");
 
   return [
     "# Mail Controller Task",
@@ -690,6 +718,9 @@ export function buildControllerTask(input: BuildControllerTaskInput): string {
     "## Sent Report Summary",
     sentReportSummary,
     "",
+    "## Held Drafts",
+    heldDraftsText,
+    "",
     "## Rules",
     "- Finish one batch of work, then exit. Do not run a long-lived watch loop; at most one bounded <=120s wait is allowed.",
     "- You have no Edit/Write; dispatch a worker to change code.",
@@ -704,6 +735,8 @@ export function buildControllerTask(input: BuildControllerTaskInput): string {
     `- Before emitting your final JSON, run orch mailctl guidance --thread ${thread} once more; if it lists new unacked instructions, handle them in this batch (classify, act or reply, ack) instead of leaving them to the next controller.`,
     "- If a new instruction invalidates work a dispatched run is still doing, stop it with orch run cancel --run <id> --reason <why>, then re-dispatch with the corrected task.",
     "- Report only for milestones, blockers, and final results via orch mailctl reply --report-key <progress:<run_id>|settled:<gen>|reply:<msg_sha>>.",
+    `- Replies are version-guarded: read the current thread version with orch mailctl delta --thread ${thread} and pass it as --base-version on every orch mailctl reply. If the reply returns held:true, the thread moved while you drafted — read the delta and choose explicitly: revise (resubmit with the new --base-version), send as-is (orch mailctl draft release --thread ${thread} --report-key <key>), or stay silent (orch mailctl draft withdraw --thread ${thread} --report-key <key>).`,
+    "- If Held Drafts lists a parked draft from a previous batch, resolve it this batch with one of those three paths; never leave it parked without a decision.",
     "- Each meaningful state change gets at most one report. Reply bodies must not contain local paths or secrets.",
     "- Put any durable cross-batch handoff notes into the summary field of your orch.result/controller/v1 output (you cannot write files).",
     "- Final output must be orch.result/controller/v1 JSON.",
@@ -762,6 +795,7 @@ function ensureMailctlStateDirs(): void {
     outboxEmailDroppedDir(),
     outboxEmailQuarantineDir(),
     outboxEmailSupersededDir(),
+    outboxEmailHeldDir(),
   ]) {
     mkdirSync(dir, { recursive: true });
   }
@@ -1295,6 +1329,9 @@ function settleThreadIfReady(ctx: MailctlContext, thread: string): boolean {
   const state = readThreadState(thread);
   if (!state) return false;
   if (listAttentionForThread(thread).length > 0) return false;
+  // A parked draft still needs an explicit resolution; a settled thread drops
+  // out of reconcile, which would orphan it.
+  if (listHeldDrafts(thread).length > 0) return false;
   if (!sentFinalReportExists(thread)) return false;
   if (state.status === "settled" && state.controller.final_report_sent === true) return false;
   writeThreadState({
@@ -1359,6 +1396,7 @@ export function mailctlStatus(ctx: MailctlContext, _opts: { json?: boolean } = {
   const dropped = droppedReplyRecords();
   const quarantined = unresolvedPolicyQuarantines();
   const superseded = supersededReplyRecords();
+  const held = listHeldDrafts();
   const threads = listThreadStates()
     .sort((a, b) => a.thread.localeCompare(b.thread))
     .map((state): StatusThreadSummary => ({
@@ -1368,6 +1406,7 @@ export function mailctlStatus(ctx: MailctlContext, _opts: { json?: boolean } = {
       unacked_attention: listAttentionForThread(state.thread).length,
       pending_outbound: pending.filter((record) => record.thread === state.thread).length,
       dropped_outbound: dropped.filter((record) => record.thread === state.thread).length,
+      held_outbound: held.filter((record) => record.thread === state.thread).length,
       controller: {
         current_run_id: state.controller.current_run_id,
         final_report_sent: state.controller.final_report_sent === true,
@@ -1383,6 +1422,7 @@ export function mailctlStatus(ctx: MailctlContext, _opts: { json?: boolean } = {
       dropped: dropped.length,
       quarantined: quarantined.length,
       superseded: superseded.length,
+      held: held.length,
     },
     rejected_recent: recentRejectedSummary(ctx.now()),
   };
@@ -1399,7 +1439,7 @@ export function renderMailctlStatus(summary: StatusSummary): string {
   const rows = [
     "mailctl status",
     `cursor: last_uid=${summary.cursor.last_uid ?? "none"} consecutive_failures=${summary.cursor.consecutive_failures} last_error=${lastError}`,
-    `outbound: pending=${summary.outbound.pending} dropped=${summary.outbound.dropped} quarantined=${summary.outbound.quarantined} superseded=${summary.outbound.superseded}`,
+    `outbound: pending=${summary.outbound.pending} dropped=${summary.outbound.dropped} quarantined=${summary.outbound.quarantined} superseded=${summary.outbound.superseded} held=${summary.outbound.held}`,
     `rejected(${summary.rejected_recent.days}d): ${
       summary.rejected_recent.total === 0
         ? "none"
@@ -1412,7 +1452,7 @@ export function renderMailctlStatus(summary: StatusSummary): string {
   ];
   for (const thread of summary.threads) {
     rows.push(
-      `  ${thread.thread} kind=${thread.kind} ${thread.status} attention=${thread.unacked_attention} generations=${thread.controller.generations.length} current=${thread.controller.current_run_id ?? "none"} final_report_sent=${thread.controller.final_report_sent} pending=${thread.pending_outbound} dropped=${thread.dropped_outbound}`,
+      `  ${thread.thread} kind=${thread.kind} ${thread.status} attention=${thread.unacked_attention} generations=${thread.controller.generations.length} current=${thread.controller.current_run_id ?? "none"} final_report_sent=${thread.controller.final_report_sent} pending=${thread.pending_outbound} dropped=${thread.dropped_outbound} held=${thread.held_outbound}`,
     );
   }
   return `${rows.join("\n")}\n`;
@@ -1564,6 +1604,13 @@ function backfillAcceptedMarker(ctx: MailctlContext, marker: MessageMarker): voi
     reply_to: attention.from || state.reply_to,
     last_instruction_event_id: attention.task_event_id,
     updated_at: nowIso(ctx),
+  });
+  appendThreadEvent(attention.thread, {
+    kind: "inbound",
+    at: nowIso(ctx),
+    ref: marker.msg_sha,
+    from: attention.from,
+    summary: threadEventSummary(`${attention.subject}: ${firstBodyLine(attention.body)}`),
   });
   updateMarker(marker.msg_sha, { thread_synced: true, task_event_id: attention.task_event_id }, nowIso(ctx));
 }
@@ -1829,6 +1876,14 @@ async function processAcceptedMessage(args: {
     if (existing) backfillAcceptedMarker(args.ctx, existing);
     return;
   }
+
+  appendThreadEvent(merge.thread, {
+    kind: "inbound",
+    at: ts,
+    ref: args.msgSha,
+    from: args.gate.from ?? "",
+    summary: threadEventSummary(`${decodedSubject(args.raw)}: ${firstBodyLine(args.gate.bodyText)}`),
+  });
 
   throwFault(args.opts, "marker-before-STORE");
 
@@ -2123,6 +2178,15 @@ function threadTriggerSet(state: MailctlThreadState): TriggerSet | null {
     reasons.push("T4:completed-no-final-report");
   }
 
+  // A parked draft needs an explicit resolution; the current version in the
+  // fingerprint re-triggers a fresh controller when the thread moves again
+  // while the draft stays parked.
+  const heldDrafts = listHeldDrafts(state.thread);
+  if (heldDrafts.length > 0) {
+    const version = threadVersion(state.thread);
+    for (const record of heldDrafts) reasons.push(`T5:held-draft:${record.report_key}:v${version}`);
+  }
+
   if (reasons.length === 0) return null;
   reasons.sort();
   return {
@@ -2203,6 +2267,26 @@ function sentReportSummary(thread: string): string {
   return rows.slice(-20).join("\n");
 }
 
+function heldDraftsTaskText(thread: string): string {
+  const drafts = listHeldDrafts(thread);
+  if (drafts.length === 0) return "";
+  const current = threadVersion(thread);
+  return drafts
+    .map((record) => {
+      const delta = threadDelta(thread, record.base_version)
+        .map((event) => `  v${event.version} ${event.kind} ${event.ref}: ${event.summary}`)
+        .join("\n");
+      return [
+        `### ${record.report_key} (base v${record.base_version}, held ${record.held_count}x, thread now v${current})`,
+        "Draft body:",
+        record.body.slice(0, 2000).split("\n").map((line) => `  ${line}`).join("\n"),
+        "Missed events:",
+        delta || "  (none)",
+      ].join("\n");
+    })
+    .join("\n\n");
+}
+
 function payloadString(payload: unknown, key: string): string | null {
   if (!payload || typeof payload !== "object") return null;
   const value = (payload as Record<string, unknown>)[key];
@@ -2226,6 +2310,7 @@ async function spawnController(
       unackedMailText: trigger.unackedText || trigger.summary,
       notesTail: previousControllerSummary(ctx, state),
       sentReportSummary: sentReportSummary(state.thread),
+      heldDraftsText: heldDraftsTaskText(state.thread),
     }),
   );
   const argv = [
@@ -2381,10 +2466,6 @@ export async function mailctlReconcile(ctx: MailctlContext): Promise<ReconcileRe
   } finally {
     lock.release();
   }
-}
-
-function reportFileName(reportKey: string): string {
-  return `${statePathSegment(reportKey, "report")}-${sha12(reportKey)}.json`;
 }
 
 export function pendingReplyPath(reportKey: string): string {
@@ -2701,6 +2782,12 @@ function writeSentReply(record: PendingReplyRecord, ts: string): string {
     attempts: record.attempts,
   });
   writeSelfMessageMarker(record.message_id, ts);
+  // Delivered replies advance the thread version so concurrent drafters see
+  // this send in their next --base-version check. Alert pseudo-threads have
+  // no thread state and stay unversioned.
+  if (readThreadState(record.thread)) {
+    appendThreadEvent(record.thread, { kind: "reply_sent", at: ts, ref: record.report_key, summary: threadEventSummary(record.body) });
+  }
   // A later successful retry supersedes an exhausted attempt with the same
   // stable report key. Keep only the delivered fact as live state.
   rmSync(droppedReplyPath(record.report_key), { force: true });
@@ -2722,6 +2809,9 @@ async function retryDuePendingReplies(ctx: MailctlContext): Promise<number> {
       // Crash recovery: sent was persisted but pending removal did not happen.
       // Never transmit again when the delivered marker already exists.
       if (existsSync(sentReplyPath(record.report_key))) {
+        if (readThreadState(record.thread)) {
+          appendThreadEvent(record.thread, { kind: "reply_sent", at: nowIso(ctx), ref: record.report_key, summary: threadEventSummary(record.body) });
+        }
         rmSync(path, { force: true });
         rmSync(droppedReplyPath(record.report_key), { force: true });
         appendAudit("reply_retry_finalized_sent", { report_key: record.report_key, ts: nowIso(ctx) });
@@ -3274,14 +3364,91 @@ export async function mailctlReply(ctx: MailctlContext, opts: ReplyOptions): Pro
   ensureMailctlStateDirs();
   const state = readThreadState(opts.thread);
   if (!state) throw new Error(`mailctl thread not found: ${opts.thread}`);
+  const guarded = opts.baseVersion !== undefined && !opts.dryRun;
+  if (guarded && (!Number.isInteger(opts.baseVersion) || opts.baseVersion! < 0)) {
+    throw new Error("mailctl reply --base-version must be a non-negative integer");
+  }
+  let result: ReplyResult;
+  if (guarded) {
+    // Serialize version check + transmit against other guarded replies so a
+    // concurrent send is observed (draft held) instead of double-answered.
+    const lock = await acquirePidfileLockWait(threadVersionLockPath(state.thread), 5_000, process.pid, `mailctl-reply:${opts.reportKey}`);
+    try {
+      result = await transmitReply(ctx, opts, state);
+    } finally {
+      lock.release();
+    }
+  } else {
+    result = await transmitReply(ctx, opts, state);
+  }
+  // Any committed report under this key (queued or delivered) resolves a
+  // held draft with the same key.
+  if (result.sent || result.pending) rmSync(heldReplyPath(opts.reportKey), { force: true });
+  return result;
+}
+
+// Held Draft: the thread moved while this reply was being drafted. Park the
+// draft with the events it missed instead of sending stale content; the
+// submitter must resolve it explicitly — revise (resubmit with the current
+// --base-version), release as-is, or withdraw.
+function holdDraft(
+  ctx: MailctlContext,
+  args: { state: MailctlThreadState; reportKey: string; body: string; baseVersion: number; current: number },
+): ReplyResult {
+  const existing = readHeldDraft(args.reportKey);
+  const ts = nowIso(ctx);
+  const record: HeldDraftRecord = {
+    schema: "orch.mailctl/held-draft/v1",
+    report_key: args.reportKey,
+    thread: args.state.thread,
+    body: args.body,
+    base_version: args.baseVersion,
+    held_at_version: args.current,
+    held_count: (existing?.held_count ?? 0) + 1,
+    created_at: existing?.created_at ?? ts,
+    updated_at: ts,
+  };
+  writeJsonAtomic(heldReplyPath(args.reportKey), record);
+  appendAudit("reply_held", {
+    report_key: args.reportKey,
+    thread: args.state.thread,
+    base_version: args.baseVersion,
+    held_at_version: args.current,
+    ts,
+  });
+  return {
+    dryRun: false,
+    duplicate: false,
+    sent: false,
+    pending: false,
+    held: true,
+    baseVersion: args.baseVersion,
+    currentVersion: args.current,
+    delta: threadDelta(args.state.thread, args.baseVersion),
+    heldPath: heldReplyPath(args.reportKey),
+  };
+}
+
+async function transmitReply(ctx: MailctlContext, opts: ReplyOptions, state: MailctlThreadState): Promise<ReplyResult> {
   assertSafeReportKey(opts.reportKey);
   const body = prepareMailReplyBody(ctx, opts.reportKey, state.thread, opts.body, !opts.dryRun);
 
   const pendingPath = pendingReplyPath(opts.reportKey);
   const sentPath = sentReplyPath(opts.reportKey);
   if (existsSync(sentPath) || existsSync(pendingPath)) {
+    rmSync(heldReplyPath(opts.reportKey), { force: true });
     if (existsSync(sentPath) && opts.reportKey.startsWith("settled:")) settleThreadIfReady(ctx, state.thread);
     return { dryRun: Boolean(opts.dryRun), duplicate: true, sent: existsSync(sentPath), pending: existsSync(pendingPath), sentPath, pendingPath };
+  }
+
+  if (opts.baseVersion !== undefined && !opts.dryRun) {
+    const current = threadVersion(state.thread);
+    if (opts.baseVersion > current) {
+      throw new Error(`mailctl reply --base-version ${opts.baseVersion} is ahead of thread version ${current}`);
+    }
+    if (opts.baseVersion < current) {
+      return holdDraft(ctx, { state, reportKey: opts.reportKey, body, baseVersion: opts.baseVersion, current });
+    }
   }
 
   // Sync mail resolves the recipient from the CURRENT config on every send;
@@ -3401,6 +3568,127 @@ export async function mailctlReply(ctx: MailctlContext, opts: ReplyOptions): Pro
       nextAttemptAt,
     };
   }
+}
+
+export interface DraftListEntry {
+  report_key: string;
+  thread: string;
+  base_version: number;
+  held_at_version: number;
+  current_version: number;
+  held_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+function requireHeldDraft(thread: string, reportKey: string): HeldDraftRecord {
+  assertSafeReportKey(reportKey);
+  const record = readHeldDraft(reportKey);
+  if (!record || record.thread !== thread) throw new Error(`mailctl held draft not found for ${thread}: ${reportKey}`);
+  return record;
+}
+
+export function mailctlDraftList(opts: { thread?: string } = {}): { drafts: DraftListEntry[] } {
+  ensureMailctlStateDirs();
+  return {
+    drafts: listHeldDrafts(opts.thread).map((record) => ({
+      report_key: record.report_key,
+      thread: record.thread,
+      base_version: record.base_version,
+      held_at_version: record.held_at_version,
+      current_version: threadVersion(record.thread),
+      held_count: record.held_count,
+      created_at: record.created_at,
+      updated_at: record.updated_at,
+    })),
+  };
+}
+
+export function mailctlDraftShow(opts: { thread: string; reportKey: string }): {
+  draft: HeldDraftRecord;
+  current_version: number;
+  delta: ThreadDeltaEvent[];
+} {
+  ensureMailctlStateDirs();
+  const record = requireHeldDraft(opts.thread, opts.reportKey);
+  return { draft: record, current_version: threadVersion(record.thread), delta: threadDelta(record.thread, record.base_version) };
+}
+
+// Release = informed override: send the parked draft as-is. If the thread
+// moved again since the hold, the hold is refreshed instead (release must stay
+// an informed choice); --force sends regardless of further movement.
+export async function mailctlDraftRelease(
+  ctx: MailctlContext,
+  opts: { thread: string; reportKey: string; force?: boolean },
+): Promise<ReplyResult> {
+  ensureMailctlStateDirs();
+  const lock = await acquirePidfileLockWait(threadVersionLockPath(opts.thread), 5_000, process.pid, `mailctl-draft-release:${opts.reportKey}`);
+  try {
+    const record = requireHeldDraft(opts.thread, opts.reportKey);
+    const current = threadVersion(opts.thread);
+    if (!opts.force && current > record.held_at_version) {
+      const ts = nowIso(ctx);
+      writeJsonAtomic(heldReplyPath(opts.reportKey), { ...record, held_at_version: current, held_count: record.held_count + 1, updated_at: ts });
+      appendAudit("reply_held", {
+        report_key: opts.reportKey,
+        thread: opts.thread,
+        base_version: record.base_version,
+        held_at_version: current,
+        ts,
+      });
+      return {
+        dryRun: false,
+        duplicate: false,
+        sent: false,
+        pending: false,
+        held: true,
+        baseVersion: record.base_version,
+        currentVersion: current,
+        delta: threadDelta(opts.thread, record.base_version),
+        heldPath: heldReplyPath(opts.reportKey),
+      };
+    }
+    // Unguarded transmit: the release decision replaces the version check.
+    const result = await mailctlReply(ctx, { thread: opts.thread, reportKey: opts.reportKey, body: record.body });
+    if (result.sent || result.pending || result.duplicate) {
+      rmSync(heldReplyPath(opts.reportKey), { force: true });
+      appendAudit("draft_released", {
+        report_key: opts.reportKey,
+        thread: opts.thread,
+        forced: Boolean(opts.force),
+        sent: result.sent,
+        ts: nowIso(ctx),
+      });
+    }
+    return result;
+  } finally {
+    lock.release();
+  }
+}
+
+export function mailctlDraftWithdraw(
+  ctx: MailctlContext,
+  opts: { thread: string; reportKey: string },
+): { thread: string; report_key: string; withdrawn: boolean } {
+  ensureMailctlStateDirs();
+  requireHeldDraft(opts.thread, opts.reportKey);
+  rmSync(heldReplyPath(opts.reportKey), { force: true });
+  appendAudit("draft_withdrawn", { report_key: opts.reportKey, thread: opts.thread, ts: nowIso(ctx) });
+  return { thread: opts.thread, report_key: opts.reportKey, withdrawn: true };
+}
+
+// Pull-based inbox for agents: what happened on the thread since version N.
+export function mailctlDelta(opts: { thread: string; since?: number }): {
+  thread: string;
+  since: number;
+  current_version: number;
+  events: ThreadDeltaEvent[];
+} {
+  ensureMailctlStateDirs();
+  if (!readThreadState(opts.thread)) throw new Error(`mailctl thread not found: ${opts.thread}`);
+  const since = opts.since ?? 0;
+  if (!Number.isInteger(since) || since < 0) throw new Error("mailctl delta --since must be a non-negative integer");
+  return { thread: opts.thread, since, current_version: threadVersion(opts.thread), events: threadDelta(opts.thread, since) };
 }
 
 export async function mailctlWatch(ctx: MailctlContext, opts: WatchOptions = {}): Promise<{ iterations: number; stopped: boolean }> {

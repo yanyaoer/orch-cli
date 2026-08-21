@@ -97,6 +97,11 @@ import {
   mailctlAttachmentPromote,
   mailctlAttachments,
   mailctlAttachmentShow,
+  mailctlDelta,
+  mailctlDraftList,
+  mailctlDraftRelease,
+  mailctlDraftShow,
+  mailctlDraftWithdraw,
   mailctlGuidance,
   mailctlInit,
   mailctlPoll,
@@ -104,6 +109,7 @@ import {
   mailctlStatus,
   mailctlSync,
   mailctlWatch,
+  type ReplyResult,
   renderMailctlAttachments,
   renderMailctlGuidance,
   renderMailctlStatus,
@@ -1800,17 +1806,24 @@ export async function mailctl(args: ParsedArgs, context: MailCliContext): Promis
     }
 
     if (mode === "reply") {
-      assertKnownFlags(args, "mailctl reply", ["thread", "report-key", "body", "body-file", "dry-run"]);
+      assertKnownFlags(args, "mailctl reply", ["thread", "report-key", "body", "body-file", "dry-run", "base-version"]);
       const dryRun = flagBool(args, "dry-run");
+      const thread = flagString(args, "thread");
+      const reportKey = flagString(args, "report-key");
       const result = await mailctlReply(mailctlContext(context), {
-        thread: flagString(args, "thread"),
-        reportKey: flagString(args, "report-key"),
+        thread,
+        reportKey,
         body: mailctlBody(args),
         dryRun,
+        baseVersion: flagNumber(args, "base-version"),
       });
       if (dryRun) {
         process.stdout.write(result.rawMessage ?? "");
         return 0;
+      }
+      if (result.held) {
+        printJson(heldDraftPayload("reply", thread, reportKey, result));
+        return 3;
       }
       printJson({
         mailctl: "reply",
@@ -1821,6 +1834,68 @@ export async function mailctl(args: ParsedArgs, context: MailCliContext): Promis
         next_attempt_at: result.nextAttemptAt ?? null,
       });
       return 0;
+    }
+
+    if (mode === "delta") {
+      assertKnownFlags(args, "mailctl delta", ["thread", "since", "json"]);
+      const result = mailctlDelta({ thread: flagString(args, "thread"), since: flagNumber(args, "since") });
+      if (flagBool(args, "json")) printJson(result);
+      else {
+        const rows = [`mailctl delta ${result.thread}: current_version=${result.current_version} since=${result.since}`];
+        for (const event of result.events) rows.push(`  v${event.version} ${event.kind} ${event.ref}: ${event.summary}`);
+        process.stdout.write(`${rows.join("\n")}\n`);
+      }
+      return 0;
+    }
+
+    if (mode === "draft") {
+      const action = args.positionals[2];
+      if (action === "list") {
+        assertKnownFlags(args, "mailctl draft list", ["thread", "json"]);
+        const result = mailctlDraftList({ thread: args.flags.has("thread") ? flagString(args, "thread") : undefined });
+        if (flagBool(args, "json")) printJson(result);
+        else {
+          const rows = [`mailctl draft list: ${result.drafts.length} held`];
+          for (const draft of result.drafts) {
+            rows.push(`  ${draft.report_key} thread=${draft.thread} base=v${draft.base_version} held_at=v${draft.held_at_version} now=v${draft.current_version} held=${draft.held_count}x`);
+          }
+          process.stdout.write(`${rows.join("\n")}\n`);
+        }
+        return 0;
+      }
+      if (action === "show") {
+        assertKnownFlags(args, "mailctl draft show", ["thread", "report-key", "json"]);
+        printJson(mailctlDraftShow({ thread: flagString(args, "thread"), reportKey: flagString(args, "report-key") }));
+        return 0;
+      }
+      if (action === "release") {
+        assertKnownFlags(args, "mailctl draft release", ["thread", "report-key", "force", "json"]);
+        const thread = flagString(args, "thread");
+        const reportKey = flagString(args, "report-key");
+        const result = await mailctlDraftRelease(mailctlContext(context), { thread, reportKey, force: flagBool(args, "force") });
+        if (result.held) {
+          printJson(heldDraftPayload("draft-release", thread, reportKey, result));
+          return 3;
+        }
+        printJson({
+          mailctl: "draft-release",
+          duplicate: result.duplicate,
+          sent: result.sent,
+          pending: result.pending,
+          message_id: result.messageId ?? null,
+          next_attempt_at: result.nextAttemptAt ?? null,
+        });
+        return 0;
+      }
+      if (action === "withdraw") {
+        assertKnownFlags(args, "mailctl draft withdraw", ["thread", "report-key", "json"]);
+        const result = mailctlDraftWithdraw(mailctlContext(context), { thread: flagString(args, "thread"), reportKey: flagString(args, "report-key") });
+        if (flagBool(args, "json")) printJson({ mailctl: "draft-withdraw", ...result });
+        else process.stdout.write(`mailctl draft withdraw: thread=${result.thread} report_key=${result.report_key} withdrawn=${result.withdrawn}\n`);
+        return 0;
+      }
+      process.stderr.write("usage: orch mailctl draft list|show|release|withdraw --thread em-<id> [--report-key <key>] [--force] [--json]\n");
+      return 2;
     }
 
     if (mode === "ack") {
@@ -1872,8 +1947,26 @@ export async function mailctl(args: ParsedArgs, context: MailCliContext): Promis
     throw new CliError(error instanceof Error ? error.message : String(error));
   }
 
-  process.stderr.write("usage: orch mailctl init|poll|watch|status|sync|reply|ack|guidance|attachments|attachment [flags]\n");
+  process.stderr.write("usage: orch mailctl init|poll|watch|status|sync|reply|ack|guidance|delta|draft|attachments|attachment [flags]\n");
   return 2;
+}
+
+// Held Draft outcome: externalize the resolution paths as literal commands so
+// the submitting agent chooses one instead of inferring the protocol.
+function heldDraftPayload(mode: string, thread: string, reportKey: string, result: ReplyResult): Record<string, unknown> {
+  return {
+    mailctl: mode,
+    held: true,
+    report_key: reportKey,
+    base_version: result.baseVersion ?? null,
+    current_version: result.currentVersion ?? null,
+    delta: result.delta ?? [],
+    options: {
+      revise: `orch mailctl reply --thread ${thread} --report-key ${reportKey} --base-version ${result.currentVersion} --body <revised body>`,
+      release: `orch mailctl draft release --thread ${thread} --report-key ${reportKey}`,
+      withdraw: `orch mailctl draft withdraw --thread ${thread} --report-key ${reportKey}`,
+    },
+  };
 }
 
 // cross-review: one diff reviewed in parallel by distinct model families.
