@@ -1,3 +1,5 @@
+
+
 # orch-cli
 
 Daemonless multi-agent orchestration for coding work.
@@ -8,7 +10,7 @@ Daemonless multi-agent orchestration for coding work.
 
 Project page: `docs/index.html` is ready for GitHub Pages and includes a bilingual animated overview.
 
-Latest release: `v0.0.8` ([CHANGELOG.md](CHANGELOG.md)).
+Latest release: `v0.0.11` ([CHANGELOG.md](CHANGELOG.md)).
 
 ## Current Scope
 
