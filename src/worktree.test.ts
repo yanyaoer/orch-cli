@@ -397,6 +397,10 @@ test("an untracked nested repository is digest-pinned: pristine removes, new wor
   writeFileSync(join(vendor, "lib.ts"), "export {}\n", "utf8");
   await sh(vendor, "git", "add", ".");
   await sh(vendor, "git", "commit", "-q", "-m", "vendored");
+  // An inherited non-sample hook, mode 0644: the digest must pin its
+  // executable bit, not just its bytes.
+  writeFileSync(join(vendor, ".git", "hooks", "post-commit"), "#!/bin/sh\nexit 0\n", "utf8");
+  chmodSync(join(vendor, ".git", "hooks", "post-commit"), 0o644);
 
   const pristine = join(root, "nested-pristine");
   cloneWorktreeCow(src, pristine, null, {}, portableBackend);
@@ -404,7 +408,7 @@ test("an untracked nested repository is digest-pinned: pristine removes, new wor
   expect(removeWorktreeClone(src, pristine)).toBe(true);
   expect(existsSync(join(src, "vendor", "lib.ts"))).toBe(true);
 
-  for (const mutate of ["commit", "branch", "tag", "dirty", "hook", "config"] as const) {
+  for (const mutate of ["commit", "branch", "tag", "dirty", "hook", "hook-mode", "attributes", "config"] as const) {
     const dest = join(root, `nested-${mutate}`);
     cloneWorktreeCow(src, dest, null, {}, portableBackend);
     if (mutate === "commit") {
@@ -416,6 +420,12 @@ test("an untracked nested repository is digest-pinned: pristine removes, new wor
       await sh(join(dest, "vendor"), "git", "tag", "agent-tag");
     } else if (mutate === "hook") {
       writeFileSync(join(dest, "vendor", ".git", "hooks", "pre-commit"), "#!/bin/sh\nexit 0\n", "utf8");
+    } else if (mutate === "hook-mode") {
+      chmodSync(join(dest, "vendor", ".git", "hooks", "post-commit"), 0o755);
+    } else if (mutate === "attributes") {
+      // Collision control: creating a file whose content is the literal word
+      // the old encoding used for absence must still move the digest.
+      writeFileSync(join(dest, "vendor", ".git", "info", "attributes"), "absent", "utf8");
     } else if (mutate === "config") {
       await sh(join(dest, "vendor"), "git", "config", "agent.marker", "1");
     } else {
@@ -425,7 +435,7 @@ test("an untracked nested repository is digest-pinned: pristine removes, new wor
     expect(removeWorktreeClone(src, dest)).toBe(false);
     expect(existsSync(join(dest, "vendor", ".git"))).toBe(true);
   }
-});
+}, 60000);
 
 test("a nested repo whose git resolution redirects elsewhere stays fail-closed", async () => {
   const { root, src } = await fixture();

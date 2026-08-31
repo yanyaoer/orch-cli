@@ -437,15 +437,25 @@ function detectUpstream(repo: string, branch: string | null, targetBranch: strin
 }
 
 // Hash of the user-authored gitdir metadata that HEAD/refs/workspace hashes
-// miss: config, info/exclude, info/attributes, and non-sample hooks.
+// miss: config, info/exclude, info/attributes, and non-sample hooks. Records
+// are structured (kind + mode + content/target hash) so absence, file type,
+// and the hook executable bit are all distinguishable — a mode-only change
+// still moves the digest.
 function nestedGitMetadata(gitdir: string): string {
-  const parts: string[] = [];
-  for (const rel of ["config", "info/exclude", "info/attributes"]) {
+  const record = (rel: string, path: string): unknown[] => {
+    let stat: ReturnType<typeof lstatSync>;
     try {
-      parts.push(`${rel}\n${readFileSync(join(gitdir, rel), "utf8")}`);
+      stat = lstatSync(path);
     } catch {
-      parts.push(`${rel}\nabsent`);
+      return [rel, "absent"];
     }
+    if (stat.isFile()) return [rel, "file", stat.mode & 0o777, sha256(readFileSync(path))];
+    if (stat.isSymbolicLink()) return [rel, "symlink", sha256(readlinkSync(path))];
+    return [rel, "special", stat.mode, stat.size];
+  };
+  const records: unknown[] = [];
+  for (const rel of ["config", "info/exclude", "info/attributes"]) {
+    records.push(record(rel, join(gitdir, rel)));
   }
   let hooks: string[] = [];
   try {
@@ -453,12 +463,8 @@ function nestedGitMetadata(gitdir: string): string {
       .filter((name) => !name.endsWith(".sample"))
       .sort();
   } catch {}
-  for (const name of hooks) {
-    const path = join(gitdir, "hooks", name);
-    const stat = lstatSync(path);
-    parts.push(`hooks/${name}\n${stat.isFile() ? sha256(readFileSync(path)) : `${stat.mode}:${stat.size}`}`);
-  }
-  return sha256(parts.join("\n---\n"));
+  for (const name of hooks) records.push(record(`hooks/${name}`, join(gitdir, "hooks", name)));
+  return sha256(JSON.stringify(records));
 }
 
 // A digest that pins an untracked nested repository's provable state: HEAD,
