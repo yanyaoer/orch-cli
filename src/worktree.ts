@@ -180,8 +180,11 @@ function systemCowBackend(destParent: string): CowCopyBackend {
   };
 }
 
-function validatePolicyPath(path: string, kind: "cache path" | "exclude pattern"): string {
-  const normalized = path.replaceAll("\\", "/").replace(/^\.\//, "");
+// "parked path" covers filenames enumerated from git itself: they may contain
+// literal glob characters or backslashes, so only traversal and VCS-metadata
+// guards apply — never the glob-char rejection meant for user-typed cache paths.
+function validatePolicyPath(path: string, kind: "cache path" | "exclude pattern" | "parked path"): string {
+  const normalized = kind === "parked path" ? path : path.replaceAll("\\", "/").replace(/^\.\//, "");
   if (!normalized || normalized === "." || isAbsolute(path) || normalized.split("/").includes("..")) {
     throw new CliError(`${kind} must stay inside the worktree: ${path}`);
   }
@@ -269,7 +272,15 @@ function copyWarmCaches(source: string, dest: string, copier: CowCopyBackend, pa
       throw new CliError(`warm-head cache path must be ignored by git: ${rel}`);
     }
     if (isExcluded(rel, matchers)) continue;
-    copyFiltered(source, dest, rel, copier, matchers);
+    if (matchers.length === 0) {
+      // Bulk-copy the whole cache in one CoW call — the per-file walk below
+      // would turn a large build cache into O(files) cp spawns.
+      const destPath = join(dest, rel);
+      mkdirSync(dirname(destPath), { recursive: true });
+      copier.copy(sourcePath, destPath);
+    } else {
+      copyFiltered(source, dest, rel, copier, matchers);
+    }
     copied.push(rel);
   }
   return copied;
@@ -558,7 +569,7 @@ function listParkablePaths(dest: string, provenance: CloneProvenance): string[] 
       .split("\0")
       .filter(Boolean),
   ];
-  const candidates = [...new Set(raw.map((path) => path.replace(/\/$/, "")).map((path) => validatePolicyPath(path, "cache path")))]
+  const candidates = [...new Set(raw.map((path) => path.replace(/\/$/, "")).map((path) => validatePolicyPath(path, "parked path")))]
     .filter((path) => pathExists(join(dest, path)))
     .sort((a, b) => a.length - b.length || a.localeCompare(b));
   return candidates.filter((candidate, index) => !candidates.slice(0, index).some((parent) => inside(parent, candidate) !== null));

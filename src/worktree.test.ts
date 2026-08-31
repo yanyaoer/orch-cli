@@ -247,6 +247,21 @@ test("warm-head materializes tracked HEAD plus explicit ignored caches only", as
   expect((await sh(dest, "git", "status", "--porcelain")).trim()).toBe("");
 });
 
+test("warm-head bulk-copies an unfiltered cache in a single copy call", async () => {
+  const { root, src } = await fixture({ ignoredBuild: true });
+  let copies = 0;
+  const countingBackend: CowBackendFactory = () => ({
+    copy(source: string, target: string): void {
+      copies += 1;
+      portableBackend(dirname(target)).copy(source, target);
+    },
+  });
+  const dest = join(root, "warm-bulk");
+  cloneWorktreeCow(src, dest, null, { mode: "warm-head", cachePaths: ["build"] }, countingBackend);
+  expect(copies).toBe(1);
+  expect(await Bun.file(join(dest, "build", "private", "secret.bin")).text()).toBe("secret\n");
+});
+
 test("warm-head rejects a cache path that Git does not ignore and rolls back", async () => {
   const { root, src } = await fixture();
   const dest = join(root, "bad-cache");
@@ -312,6 +327,17 @@ test("unchanged inherited changes are safe to remove", async () => {
   expect(removeWorktreeClone(src, dest)).toBe(true);
   expect(existsSync(dest)).toBe(false);
   expect((await sh(src, "git", "worktree", "list"))).not.toContain(dest);
+});
+
+test("removal parks inherited filenames containing literal glob characters", async () => {
+  const { root, src } = await fixture({ ignoredBuild: true });
+  writeFileSync(join(src, "notes [draft].md"), "x\n", "utf8");
+  writeFileSync(join(src, "build", "out[dev].log"), "log\n", "utf8");
+  const dest = join(root, "glob-names");
+  cloneWorktreeCow(src, dest, null, { cachePaths: ["build"] }, portableBackend);
+  expect(inspectWorktreeLosses(src, dest)).toEqual({ safe: true, losses: [] });
+  expect(removeWorktreeClone(src, dest)).toBe(true);
+  expect(existsSync(dest)).toBe(false);
 });
 
 test("an already-missing clone prunes its stale registration", async () => {
