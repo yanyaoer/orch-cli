@@ -79,7 +79,13 @@ export interface WorktreeLossAssessment {
 }
 
 function spawnGit(args: string[]): ReturnType<typeof Bun.spawnSync> {
-  return Bun.spawnSync(["git", ...args], { stdout: "pipe", stderr: "pipe" });
+  // An ambient GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE would redirect every -C
+  // call — and make loss-detection digests describe an unrelated repository.
+  const env = { ...process.env };
+  delete env.GIT_DIR;
+  delete env.GIT_WORK_TREE;
+  delete env.GIT_INDEX_FILE;
+  return Bun.spawnSync(["git", ...args], { stdout: "pipe", stderr: "pipe", env });
 }
 
 function gitRaw(args: string[]): string {
@@ -124,7 +130,12 @@ function canonicalizeAllowMissing(path: string): string {
   while (true) {
     try {
       return join(realpathSync(cursor), ...suffix);
-    } catch {}
+    } catch (error) {
+      // Climb only past missing/dangling components; a symlink loop or an
+      // unreadable directory must keep failing closed (classified external).
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") throw error;
+    }
     const parent = dirname(cursor);
     if (parent === cursor) return resolve(path);
     suffix.unshift(basename(cursor));
@@ -229,6 +240,43 @@ function isExcluded(rel: string, matchers: Bun.Glob[]): boolean {
   return matchers.some((matcher) => matcher.match(normalized));
 }
 
+// Creates every missing ancestor of rel in the dest, each mirroring the
+// corresponding source directory's mode. Owner-write is forced so children can
+// be copied into a read-only directory; group/other bits never widen beyond
+// the source's own mode. mirrorDirModes restores exact modes afterwards.
+function ensureDestDir(sourceRoot: string, destRoot: string, relDir: string): void {
+  if (!relDir || relDir === ".") return;
+  let cursor = "";
+  for (const part of relDir.split(sep)) {
+    cursor = cursor ? join(cursor, part) : part;
+    const destPath = join(destRoot, cursor);
+    if (pathExists(destPath)) continue;
+    let mode = 0o700;
+    try {
+      mode = (lstatSync(join(sourceRoot, cursor)).mode & 0o777) | 0o700;
+    } catch {}
+    mkdirSync(destPath, { mode });
+  }
+}
+
+// Final pass after all copies: restore each dest directory to the exact mode
+// of its source counterpart, covering ancestors materialized mid-copy.
+function mirrorDirModes(source: string, dest: string): void {
+  const visit = (dir: string): void => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (dir === dest && (entry.name === ".git" || entry.name === ".jj")) continue;
+      if (!entry.isDirectory()) continue;
+      const path = join(dir, entry.name);
+      visit(path);
+      try {
+        const sourceStat = lstatSync(join(source, relative(dest, path)));
+        if (sourceStat.isDirectory()) chmodSync(path, sourceStat.mode & 0o777);
+      } catch {}
+    }
+  };
+  visit(dest);
+}
+
 function copyFiltered(
   sourceRoot: string,
   destRoot: string,
@@ -241,16 +289,14 @@ function copyFiltered(
   const dest = join(destRoot, rel);
   const stat = lstatSync(source);
   if (!stat.isDirectory()) {
-    mkdirSync(dirname(dest), { recursive: true });
+    ensureDestDir(sourceRoot, destRoot, dirname(rel));
     copier.copy(source, dest);
     return;
   }
-  // Owner-write is forced so children can be copied into a read-only source
-  // directory; group/other bits never widen beyond the source's own mode.
-  mkdirSync(dest, { recursive: true, mode: (stat.mode & 0o777) | 0o700 });
+  ensureDestDir(sourceRoot, destRoot, rel);
   for (const entry of readdirSync(source)) copyFiltered(sourceRoot, destRoot, join(rel, entry), copier, matchers);
-  // Restore the exact source mode only after its children are copied.
-  chmodSync(dest, stat.mode & 0o777);
+  // Exact modes (including dropping the forced owner-write) are restored by
+  // mirrorDirModes after the symlink pass, which may still rewrite links here.
 }
 
 function copySnapshot(source: string, dest: string, copier: CowCopyBackend, exclude: string[]): void {
@@ -292,9 +338,8 @@ function copyWarmCaches(source: string, dest: string, copier: CowCopyBackend, pa
     if (matchers.length === 0) {
       // Bulk-copy the whole cache in one CoW call — the per-file walk below
       // would turn a large build cache into O(files) cp spawns.
-      const destPath = join(dest, rel);
-      mkdirSync(dirname(destPath), { recursive: true });
-      copier.copy(sourcePath, destPath);
+      ensureDestDir(source, dest, dirname(rel));
+      copier.copy(sourcePath, join(dest, rel));
     } else {
       copyFiltered(source, dest, rel, copier, matchers);
     }
@@ -325,7 +370,15 @@ function classifyAndRetargetSymlinks(
   };
   visit(dest);
   const retargetToClone = (link: { path: string; rel: string }, sourceRelative: string): void => {
-    rmSync(link.path);
+    try {
+      rmSync(link.path);
+    } catch {
+      // A bulk-copied read-only directory blocks the unlink; force owner-write
+      // on the clone's directory — mirrorDirModes restores the exact mode.
+      const parent = dirname(link.path);
+      chmodSync(parent, (lstatSync(parent).mode & 0o777) | 0o700);
+      rmSync(link.path);
+    }
     symlinkSync(join(dest, sourceRelative), link.path);
     rewritten.push(link.rel);
   };
@@ -383,11 +436,45 @@ function detectUpstream(repo: string, branch: string | null, targetBranch: strin
   return null;
 }
 
+// Hash of the user-authored gitdir metadata that HEAD/refs/workspace hashes
+// miss: config, info/exclude, info/attributes, and non-sample hooks.
+function nestedGitMetadata(gitdir: string): string {
+  const parts: string[] = [];
+  for (const rel of ["config", "info/exclude", "info/attributes"]) {
+    try {
+      parts.push(`${rel}\n${readFileSync(join(gitdir, rel), "utf8")}`);
+    } catch {
+      parts.push(`${rel}\nabsent`);
+    }
+  }
+  let hooks: string[] = [];
+  try {
+    hooks = readdirSync(join(gitdir, "hooks"))
+      .filter((name) => !name.endsWith(".sample"))
+      .sort();
+  } catch {}
+  for (const name of hooks) {
+    const path = join(gitdir, "hooks", name);
+    const stat = lstatSync(path);
+    parts.push(`hooks/${name}\n${stat.isFile() ? sha256(readFileSync(path)) : `${stat.mode}:${stat.size}`}`);
+  }
+  return sha256(parts.join("\n---\n"));
+}
+
 // A digest that pins an untracked nested repository's provable state: HEAD,
-// every ref (branches, tags, stash), and its own recursive workspace state.
-// null means the state cannot be proven and loss detection must fail closed.
+// every ref (branches, tags, stash), user-authored gitdir metadata, and its
+// own recursive workspace state. null means the state cannot be proven and
+// loss detection must fail closed.
 function nestedRepoDigest(path: string): string | null {
   try {
+    const canonical = realpathSync(path);
+    // Git must be describing this directory itself: a gitdir whose
+    // core.worktree redirects elsewhere (e.g. back to the source) would make
+    // baseline and re-check digest the wrong tree and hide agent work.
+    const toplevel = spawnGit(["-C", path, "rev-parse", "--show-toplevel"]);
+    if (toplevel.exitCode !== 0 || realpathSync(toplevel.stdout.toString().trim()) !== canonical) return null;
+    const gitdir = spawnGit(["-C", path, "rev-parse", "--absolute-git-dir"]);
+    if (gitdir.exitCode !== 0) return null;
     const refs = spawnGit(["-C", path, "for-each-ref", "--format=%(refname) %(objectname)"]);
     if (refs.exitCode !== 0) return null;
     const head = spawnGit(["-C", path, "rev-parse", "--quiet", "--verify", "HEAD"]);
@@ -397,6 +484,7 @@ function nestedRepoDigest(path: string): string | null {
       [
         head.exitCode === 0 ? head.stdout.toString().trim() : "no-head",
         refs.stdout.toString(),
+        nestedGitMetadata(gitdir.stdout.toString().trim()),
         state.index,
         state.worktree,
         state.untracked,
@@ -543,6 +631,9 @@ export function cloneWorktreeCow(
     }
 
     const links = classifyAndRetargetSymlinks(source, dest, normalized.externalSymlinks);
+    // After the symlink pass: retargeting may need to write into directories
+    // whose source mode is read-only, so exact modes are restored only now.
+    mirrorDirModes(source, dest);
     const upstream = detectUpstream(dest, branch, normalized.targetBranch);
     const provenance: CloneProvenance = {
       schema: "orch.worktree-clone/v1",
@@ -681,7 +772,9 @@ function restoreParked(moves: Array<{ from: string; to: string }>, parkRoot: str
 }
 
 function worktreeRegistered(source: string, dest: string): boolean {
-  const list = spawnGit(["-C", source, "worktree", "list", "--porcelain"]);
+  // NUL-delimited so a path containing a newline cannot split into unmatched
+  // lines and misread a still-registered worktree as unregistered.
+  const list = spawnGit(["-C", source, "worktree", "list", "--porcelain", "-z"]);
   if (list.exitCode !== 0) return true;
   let canonical = dest;
   try {
@@ -689,8 +782,8 @@ function worktreeRegistered(source: string, dest: string): boolean {
   } catch {}
   return list.stdout
     .toString()
-    .split("\n")
-    .some((line) => line === `worktree ${dest}` || line === `worktree ${canonical}`);
+    .split("\0")
+    .some((field) => field === `worktree ${dest}` || field === `worktree ${canonical}`);
 }
 
 function sweepDetached(path: string): void {

@@ -404,7 +404,7 @@ test("an untracked nested repository is digest-pinned: pristine removes, new wor
   expect(removeWorktreeClone(src, pristine)).toBe(true);
   expect(existsSync(join(src, "vendor", "lib.ts"))).toBe(true);
 
-  for (const mutate of ["commit", "branch", "dirty"] as const) {
+  for (const mutate of ["commit", "branch", "tag", "dirty", "hook", "config"] as const) {
     const dest = join(root, `nested-${mutate}`);
     cloneWorktreeCow(src, dest, null, {}, portableBackend);
     if (mutate === "commit") {
@@ -412,6 +412,12 @@ test("an untracked nested repository is digest-pinned: pristine removes, new wor
       await sh(join(dest, "vendor"), "git", "commit", "-qam", "agent work");
     } else if (mutate === "branch") {
       await sh(join(dest, "vendor"), "git", "branch", "agent-work");
+    } else if (mutate === "tag") {
+      await sh(join(dest, "vendor"), "git", "tag", "agent-tag");
+    } else if (mutate === "hook") {
+      writeFileSync(join(dest, "vendor", ".git", "hooks", "pre-commit"), "#!/bin/sh\nexit 0\n", "utf8");
+    } else if (mutate === "config") {
+      await sh(join(dest, "vendor"), "git", "config", "agent.marker", "1");
     } else {
       writeFileSync(join(dest, "vendor", "lib.ts"), "export {}\n// dirty\n", "utf8");
     }
@@ -419,6 +425,54 @@ test("an untracked nested repository is digest-pinned: pristine removes, new wor
     expect(removeWorktreeClone(src, dest)).toBe(false);
     expect(existsSync(join(dest, "vendor", ".git"))).toBe(true);
   }
+});
+
+test("a nested repo whose git resolution redirects elsewhere stays fail-closed", async () => {
+  const { root, src } = await fixture();
+  const gitdir = join(root, "gd-vendor");
+  const vendor = join(src, "vendor");
+  await sh(root, "git", "init", "-q", `--separate-git-dir=${gitdir}`, vendor);
+  writeFileSync(join(vendor, "f.txt"), "v\n", "utf8");
+  await sh(vendor, "git", "add", ".");
+  await sh(vendor, "git", "commit", "-q", "-m", "vendored");
+  // Redirect the nested repo's worktree back at the SOURCE: git commands run
+  // in the clone's copy would then describe the source tree, not the clone.
+  await sh(root, "git", `--git-dir=${gitdir}`, "config", "core.worktree", vendor);
+  const dest = join(root, "redirected");
+  cloneWorktreeCow(src, dest, null, {}, portableBackend);
+  writeFileSync(join(dest, "vendor", "f.txt"), "v\nAGENT WORK\n", "utf8");
+  expect(inspectWorktreeLosses(src, dest).losses.some((loss) => loss.includes("nested repository"))).toBe(true);
+  expect(removeWorktreeClone(src, dest)).toBe(false);
+  expect(await Bun.file(join(dest, "vendor", "f.txt")).text()).toBe("v\nAGENT WORK\n");
+});
+
+test("warm-head cache ancestors mirror private source directory modes", async () => {
+  const { root, src } = await fixture();
+  const priv = join(src, "priv");
+  mkdirSync(join(priv, "cache"), { recursive: true });
+  writeFileSync(join(priv, "cache", "data.bin"), "d\n", "utf8");
+  writeFileSync(join(src, ".gitignore"), "priv/\n", "utf8");
+  await sh(src, "git", "add", ".gitignore");
+  await sh(src, "git", "commit", "-q", "-m", "ignore priv");
+  chmodSync(priv, 0o700);
+  for (const exclude of [[], ["nomatch/**"]] as string[][]) {
+    const dest = join(root, `warm-priv-${exclude.length}`);
+    cloneWorktreeCow(src, dest, null, { mode: "warm-head", cachePaths: ["priv/cache"], exclude }, portableBackend);
+    expect(statSync(join(dest, "priv")).mode & 0o777).toBe(0o700);
+    expect(await Bun.file(join(dest, "priv", "cache", "data.bin")).text()).toBe("d\n");
+  }
+});
+
+test("a still-registered worktree with a newline in its path is not force-removed", async () => {
+  const { root, src } = await fixture({ ignoredBuild: true });
+  const dest = join(root, "nl\nclone");
+  cloneWorktreeCow(src, dest, null, { cachePaths: ["build"] }, portableBackend);
+  await sh(src, "git", "worktree", "lock", dest);
+  expect(removeWorktreeClone(src, dest)).toBe(false);
+  expect(await Bun.file(join(dest, "build", "out.bin")).text()).toBe("artifact\n");
+  await sh(src, "git", "worktree", "unlock", dest);
+  expect(removeWorktreeClone(src, dest)).toBe(true);
+  expect(existsSync(dest)).toBe(false);
 });
 
 test("removal recovers when git unregisters but cannot delete a read-only directory", async () => {
