@@ -16,6 +16,7 @@ import {
   topicHelp,
   topLevelHelp,
   usageHelp,
+  worktreeCloneHelp,
   unknownTopicHelp,
 } from "./help.ts";
 
@@ -54,6 +55,15 @@ test("fanout help covers the three commands, agent flag, and examples", () => {
   expect(text).toContain("orch cross-review --thread review-123");
   expect(text).toContain("orch fanout --thread verify-123 --role verifier");
   expect(text).toContain("orch investigate --thread research-1");
+});
+
+test("worktree clone help exposes lifecycle policies", () => {
+  const text = worktreeCloneHelp();
+  for (const flag of ["--mode", "--cache-path", "--exclude", "--external-symlinks", "--target-branch"]) {
+    expect(text).toContain(flag);
+  }
+  expect(text).toContain("registered before materialization");
+  expect(text).toContain("origin/HEAD");
 });
 
 test("command help exposes flags and runnable examples", () => {

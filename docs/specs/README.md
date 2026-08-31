@@ -44,3 +44,7 @@ ones, and fewer seams over more.
 ## Cross-Reference Rule
 
 Specs cite ADRs. ADRs never cite specs.
+
+## Current Specs
+
+- [Worktree Clone Lifecycle](worktree-lifecycle.md)

@@ -82,16 +82,18 @@ it the moment its round ends — `git worktree list` must stay clean.
 sibling `<repo>-<slug>`): a CoW clone — APFS or reflink, probed — in seconds
 at near-zero disk that carries untracked build output, so incremental builds
 start warm, registered as an isolated git worktree — own index/HEAD, no lock
-contention with the source, branch tracking origin/main. Same teardown:
+contention with the source, branch tracking the explicit target, `origin/HEAD`,
+or a `main`/`master`/`trunk` fallback. Same teardown:
 `git -C <repo> worktree remove --force <dest>`.
 
 **Read-only fan-outs**: `cross-review`/`investigate`/`fanout --clone`
-dispatch every worker against ONE shared CoW clone under `/tmp/orch-clones`
-instead of the live worktree — the review target can't shift while you keep
-editing, and workers never take index locks in your tree. `cross-review
---auto` removes the clone once all runs settle; otherwise the payload's
-`clone.remove_with` has the teardown. Writable roles are refused (use
-per-agent `orch worktree clone`).
+dispatch every worker against ONE shared CoW clone under the private sibling
+root `<repo-parent>/.orch-worktrees/<repo-name>` instead of the live worktree.
+The review target cannot shift while you keep editing, workers never take
+index locks in your tree, and Linux does not lose reflink support merely
+because `/tmp` is tmpfs. `cross-review --auto` removes the clone once all runs
+settle; otherwise the payload's `clone.remove_with` has the teardown. Writable
+roles are refused (use per-agent `orch worktree clone`).
 
 ## Local VCS: jj first
 A worktree with a Jujutsu workspace (`.jj`, colocated included) is driven

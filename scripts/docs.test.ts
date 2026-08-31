@@ -41,9 +41,9 @@ async function fixture(files: Record<string, string | Uint8Array>) {
 }
 
 describe("documentation inventory and mapping", () => {
-  test("covers the current 10 Markdown, 1 JSON, and 2 text sources", async () => {
+  test("covers the current 11 Markdown, 1 JSON, and 2 text sources", async () => {
     const sources = await getTrackedDocsSources();
-    expect(sources.filter((source) => source.endsWith(".md"))).toHaveLength(10);
+    expect(sources.filter((source) => source.endsWith(".md"))).toHaveLength(11);
     expect(sources.filter((source) => source.endsWith(".json"))).toHaveLength(1);
     expect(sources.filter((source) => source.endsWith(".txt"))).toHaveLength(2);
     expect(renderedOutputForSource("orch.md")).toBe("orch.html");

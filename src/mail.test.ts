@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { repoKeyFromRemote } from "./paths.ts";
 import { mailThreadDir } from "./mail.ts";
 import type { ImplementerResult, RunStatus } from "./types.ts";
@@ -483,8 +483,7 @@ test.skipIf(process.platform !== "darwin")("cross-review --clone dispatches agai
     clone: { dest: string; removed: boolean };
   };
   const cloneDest = payload.fanout.clone.dest;
-  // clone paths come back realpath-normalized (/tmp -> /private/tmp on macOS)
-  expect(dirname(cloneDest)).toBe(join(realpathSync("/tmp"), "orch-clones"));
+  expect(dirname(cloneDest)).toBe(join(dirname(worktree), ".orch-worktrees", basename(worktree)));
   expect(payload.runs).toHaveLength(2);
   for (const run of payload.runs) expect(run.decision).toBe("accept");
   // Runs recorded the clone as their worktree, and --auto tore it down after
@@ -497,7 +496,7 @@ test.skipIf(process.platform !== "darwin")("cross-review --clone dispatches agai
   expect(payload.clone).toMatchObject({ dest: cloneDest, removed: true });
   expect(existsSync(cloneDest)).toBe(false);
   const wtProc = Bun.spawn(["git", "-C", worktree, "worktree", "list"], { stdout: "pipe", stderr: "pipe" });
-  expect(await new Response(wtProc.stdout).text()).not.toContain("orch-clones");
+  expect(await new Response(wtProc.stdout).text()).not.toContain(".orch-worktrees");
   await wtProc.exited;
 });
 
