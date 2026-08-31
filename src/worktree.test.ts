@@ -389,7 +389,7 @@ test("loss detection catches edits, staging, and restoring inherited dirt to HEA
   expect(inspectWorktreeLosses(src, restored).losses).toContain("worktree differs from the inherited baseline");
 });
 
-test("an untracked nested repository always blocks automatic removal", async () => {
+test("an untracked nested repository is digest-pinned: pristine removes, new work blocks", async () => {
   const { root, src } = await fixture();
   const vendor = join(src, "vendor");
   mkdirSync(vendor);
@@ -397,15 +397,61 @@ test("an untracked nested repository always blocks automatic removal", async () 
   writeFileSync(join(vendor, "lib.ts"), "export {}\n", "utf8");
   await sh(vendor, "git", "add", ".");
   await sh(vendor, "git", "commit", "-q", "-m", "vendored");
-  const dest = join(root, "nested");
-  cloneWorktreeCow(src, dest, null, {}, portableBackend);
-  // The manifest cannot see inside the nested repo, so even the untouched
-  // inherited state is unprovable — presence alone fails closed.
-  expect(inspectWorktreeLosses(src, dest).losses.some((loss) => loss.includes("nested repository"))).toBe(true);
-  writeFileSync(join(dest, "vendor", "lib.ts"), "export {}\n// agent work\n", "utf8");
-  await sh(join(dest, "vendor"), "git", "commit", "-qam", "agent work");
-  expect(removeWorktreeClone(src, dest)).toBe(false);
-  expect(existsSync(join(dest, "vendor", ".git"))).toBe(true);
+
+  const pristine = join(root, "nested-pristine");
+  cloneWorktreeCow(src, pristine, null, {}, portableBackend);
+  expect(inspectWorktreeLosses(src, pristine)).toEqual({ safe: true, losses: [] });
+  expect(removeWorktreeClone(src, pristine)).toBe(true);
+  expect(existsSync(join(src, "vendor", "lib.ts"))).toBe(true);
+
+  for (const mutate of ["commit", "branch", "dirty"] as const) {
+    const dest = join(root, `nested-${mutate}`);
+    cloneWorktreeCow(src, dest, null, {}, portableBackend);
+    if (mutate === "commit") {
+      writeFileSync(join(dest, "vendor", "lib.ts"), "export {}\n// agent work\n", "utf8");
+      await sh(join(dest, "vendor"), "git", "commit", "-qam", "agent work");
+    } else if (mutate === "branch") {
+      await sh(join(dest, "vendor"), "git", "branch", "agent-work");
+    } else {
+      writeFileSync(join(dest, "vendor", "lib.ts"), "export {}\n// dirty\n", "utf8");
+    }
+    expect(inspectWorktreeLosses(src, dest).safe).toBe(false);
+    expect(removeWorktreeClone(src, dest)).toBe(false);
+    expect(existsSync(join(dest, "vendor", ".git"))).toBe(true);
+  }
+});
+
+test("removal recovers when git unregisters but cannot delete a read-only directory", async () => {
+  const { root, src } = await fixture({ ignoredBuild: true });
+  const ro = join(src, "ro");
+  mkdirSync(ro);
+  writeFileSync(join(ro, "f.txt"), "x\n", "utf8");
+  await sh(src, "git", "add", "ro");
+  await sh(src, "git", "commit", "-q", "-m", "ro dir");
+  chmodSync(ro, 0o555);
+  const dest = join(root, "ro-remove");
+  try {
+    cloneWorktreeCow(src, dest, null, { cachePaths: ["build"], exclude: ["nomatch/**"] }, portableBackend);
+    expect(inspectWorktreeLosses(src, dest)).toEqual({ safe: true, losses: [] });
+    expect(removeWorktreeClone(src, dest)).toBe(true);
+    expect(existsSync(dest)).toBe(false);
+    expect((await sh(src, "git", "worktree", "list"))).not.toContain(dest);
+  } finally {
+    chmodSync(ro, 0o755);
+    if (existsSync(join(dest, "ro"))) chmodSync(join(dest, "ro"), 0o755);
+  }
+});
+
+test("clone-internal chains through dangling symlinks are not external", async () => {
+  const { root, src } = await fixture();
+  symlinkSync("missing-file", join(src, "mid"));
+  symlinkSync("mid", join(src, "outer"));
+  symlinkSync(join("mid-dir", "file"), join(src, "outer2"));
+  symlinkSync("missing-dir", join(src, "mid-dir"));
+  const dest = join(root, "dangling");
+  const outcome = cloneWorktreeCow(src, dest, null, { externalSymlinks: "reject" }, portableBackend);
+  expect(outcome.external_symlinks).toEqual([]);
+  expect(readlinkSync(join(dest, "outer"))).toBe("mid");
 });
 
 test("rollback survives read-only directories and keeps the original error", async () => {
@@ -444,6 +490,26 @@ test("exclude copies preserve read-only directory modes without failing", async 
     chmodSync(ro, 0o755);
     if (existsSync(join(dest, "ro"))) chmodSync(join(dest, "ro"), 0o755);
   }
+});
+
+test("filtered copies never widen a private directory during the copy", async () => {
+  const { root, src } = await fixture();
+  const secret = join(src, "secret");
+  mkdirSync(secret);
+  writeFileSync(join(secret, "key.txt"), "k\n", "utf8");
+  chmodSync(secret, 0o700);
+  const dest = join(root, "private-window");
+  const observed: number[] = [];
+  const observingBackend: CowBackendFactory = () => ({
+    copy(source: string, target: string): void {
+      if (dirname(target) === join(dest, "secret")) observed.push(statSync(dirname(target)).mode & 0o777);
+      portableBackend(dirname(target)).copy(source, target);
+    },
+  });
+  cloneWorktreeCow(src, dest, null, { exclude: ["nomatch/**"] }, observingBackend);
+  expect(observed.length).toBeGreaterThan(0);
+  expect(observed.every((mode) => (mode & 0o077) === 0)).toBe(true);
+  expect(statSync(join(dest, "secret")).mode & 0o777).toBe(0o700);
 });
 
 test("an unreachable detached commit blocks automatic removal", async () => {

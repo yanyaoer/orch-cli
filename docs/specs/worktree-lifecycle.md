@@ -115,8 +115,9 @@ This detects ordinary edits, staging-only work, new untracked content, changing
 an inherited dirty file, and restoring inherited dirt to HEAD. An unreachable
 detached commit blocks removal. A clean commit on a named branch is retained by
 that branch and does not block removal. An untracked nested repository — a
-directory `git ls-files --others` does not enter — can never be proven
-unchanged, so its presence always blocks automatic removal. Git-ignored content
+directory `git ls-files --others` does not enter — is pinned by a digest of
+its HEAD, refs, and recursive workspace state; when that digest cannot be
+computed, or no longer matches, removal is blocked. Git-ignored content
 sits outside loss detection by contract: caches are disposable, and removal
 discards them. Missing or mismatched provenance fails
 closed; an operator can still use Git's explicit force-removal command to
@@ -132,9 +133,13 @@ Safe removal follows `park -> unregister -> sweep`:
 3. Sweep the parked content in a detached one-shot process.
 
 The park directory persists an index-to-path manifest before the first rename,
-so a crash mid-park leaves enough to reassemble the clone by hand.
-If unregister fails, all parked paths are renamed back before removal reports
-failure. Trash directories use the same real-directory and `0700` checks as
+so a crash mid-park leaves enough to reassemble the clone by hand; the
+manifest outlives any entry that cannot be restored.
+If unregister fails while the worktree is still registered (for example a
+locked worktree), all parked paths are renamed back before removal reports
+failure. Git can also destroy the registration even though content deletion
+failed; safety was proven before parking, so removal then completes the
+deletion itself rather than leaving an orphaned tree. Trash directories use the same real-directory and `0700` checks as
 fanout storage. A killed sweep may leave reclaimable disk usage but cannot make
 Git state or workspace content incorrect.
 

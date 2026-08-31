@@ -114,16 +114,22 @@ function inside(root: string, candidate: string): string | null {
   return rel;
 }
 
+// Canonicalizes the longest resolvable prefix and joins the rest lexically.
+// A dangling symlink component makes realpathSync throw even though lstat
+// sees it; climb past it instead of failing, or a clone-internal chain
+// through a dangling link would be misclassified as external.
 function canonicalizeAllowMissing(path: string): string {
   let cursor = resolve(path);
   const suffix: string[] = [];
-  while (!pathExists(cursor)) {
+  while (true) {
+    try {
+      return join(realpathSync(cursor), ...suffix);
+    } catch {}
     const parent = dirname(cursor);
     if (parent === cursor) return resolve(path);
     suffix.unshift(basename(cursor));
     cursor = parent;
   }
-  return join(realpathSync(cursor), ...suffix);
 }
 
 function ensurePrivateDirectory(path: string): string {
@@ -149,15 +155,18 @@ function privateWorktreeRoot(source: string): string {
 function systemCowBackend(destParent: string): CowCopyBackend {
   const probe = join(destParent, `.orch-cowprobe-${randomHex(4)}`);
   const clone = `${probe}.clone`;
+  // Per-platform binary and flag: on some older GNU coreutils builds `cp -c`
+  // is `--preserve=context` and exits 0 with a full copy, which would defeat
+  // the fail-closed CoW contract — so Linux only ever probes reflink, and
+  // darwin pins the system cp (a PATH-shadowing GNU cp would either reject
+  // -c or silently full-copy).
+  const cpBin = process.platform === "darwin" ? "/bin/cp" : "cp";
   let flag: string | null = null;
   try {
     writeFileSync(probe, "");
-    // Per-platform candidates: on some older GNU coreutils builds `cp -c` is
-    // `--preserve=context` and exits 0 with a full copy, which would defeat
-    // the fail-closed CoW contract if probed on Linux.
     const candidates = process.platform === "darwin" ? ["-c"] : ["--reflink=always"];
     for (const candidate of candidates) {
-      const proc = Bun.spawnSync(["cp", candidate, probe, clone], { stdout: "pipe", stderr: "pipe" });
+      const proc = Bun.spawnSync([cpBin, candidate, probe, clone], { stdout: "pipe", stderr: "pipe" });
       if (proc.exitCode === 0) {
         flag = candidate;
         break;
@@ -175,7 +184,7 @@ function systemCowBackend(destParent: string): CowCopyBackend {
   }
   return {
     copy(source: string, dest: string): void {
-      const proc = Bun.spawnSync(["cp", flag!, "-R", "-P", source, dest], { stdout: "pipe", stderr: "pipe" });
+      const proc = Bun.spawnSync([cpBin, flag!, "-R", "-P", source, dest], { stdout: "pipe", stderr: "pipe" });
       if (proc.exitCode !== 0) {
         throw new CliError(
           `cp ${flag} failed (source and dest must be on the same CoW filesystem): ${proc.stderr.toString().trim().slice(0, 500)}`,
@@ -236,10 +245,11 @@ function copyFiltered(
     copier.copy(source, dest);
     return;
   }
-  mkdirSync(dest, { recursive: true });
+  // Owner-write is forced so children can be copied into a read-only source
+  // directory; group/other bits never widen beyond the source's own mode.
+  mkdirSync(dest, { recursive: true, mode: (stat.mode & 0o777) | 0o700 });
   for (const entry of readdirSync(source)) copyFiltered(sourceRoot, destRoot, join(rel, entry), copier, matchers);
-  // Restore the directory mode only after its children are copied: a source
-  // directory without owner-write would otherwise block every child copy.
+  // Restore the exact source mode only after its children are copied.
   chmodSync(dest, stat.mode & 0o777);
 }
 
@@ -373,6 +383,30 @@ function detectUpstream(repo: string, branch: string | null, targetBranch: strin
   return null;
 }
 
+// A digest that pins an untracked nested repository's provable state: HEAD,
+// every ref (branches, tags, stash), and its own recursive workspace state.
+// null means the state cannot be proven and loss detection must fail closed.
+function nestedRepoDigest(path: string): string | null {
+  try {
+    const refs = spawnGit(["-C", path, "for-each-ref", "--format=%(refname) %(objectname)"]);
+    if (refs.exitCode !== 0) return null;
+    const head = spawnGit(["-C", path, "rev-parse", "--quiet", "--verify", "HEAD"]);
+    const state = workspaceState(path);
+    if (state.untracked_unverifiable.length > 0) return null;
+    return sha256(
+      [
+        head.exitCode === 0 ? head.stdout.toString().trim() : "no-head",
+        refs.stdout.toString(),
+        state.index,
+        state.worktree,
+        state.untracked,
+      ].join("\n"),
+    );
+  } catch {
+    return null;
+  }
+}
+
 function untrackedManifest(repo: string): { manifest: string; unverifiable: string[] } {
   const paths = gitRaw(["-C", repo, "ls-files", "--others", "--exclude-standard", "-z"])
     .split("\0")
@@ -385,9 +419,10 @@ function untrackedManifest(repo: string): { manifest: string; unverifiable: stri
     if (stat.isSymbolicLink()) return [rel, "symlink", sha256(readlinkSync(path))];
     if (stat.isFile()) return [rel, "file", git(["-C", repo, "hash-object", "--", rel])];
     if (stat.isDirectory()) {
-      // ls-files emits a bare directory only for an untracked nested repository;
-      // its contents are invisible to this manifest, so it can never be proven
-      // unchanged — record it as unverifiable and let loss detection fail closed.
+      // ls-files emits a bare directory only for an untracked nested
+      // repository; pin it by digest when provable, fail closed otherwise.
+      const digest = nestedRepoDigest(path);
+      if (digest) return [rel, "nested-repo", digest];
       unverifiable.push(rel);
       return [rel, "nested-repo", "unverifiable"];
     }
@@ -436,22 +471,29 @@ function readProvenance(dest: string): CloneProvenance | null {
   }
 }
 
-// Never throws: it runs inside a catch block, and a rollback error must not
-// replace the original failure or skip the remaining cleanup steps.
-function rollbackClone(source: string, dest: string, branch: string | null, registered: boolean): void {
-  if (registered) gitOk(["-C", source, "worktree", "remove", "--force", dest]);
+// Every step is individually guarded: this runs inside a catch block, and no
+// cleanup failure (including a spawn that fails to launch) may replace the
+// original error or skip the remaining steps.
+function attempt(step: () => unknown): void {
   try {
-    rmSync(dest, { recursive: true, force: true });
-  } catch {
-    // A copied read-only directory blocks unlink of its children; repair the
-    // partial clone's modes (never the source's) and retry.
-    Bun.spawnSync(["chmod", "-R", "u+w", dest], { stdout: "pipe", stderr: "pipe" });
-    try {
-      rmSync(dest, { recursive: true, force: true });
-    } catch {}
-  }
-  gitOk(["-C", source, "worktree", "prune"]);
-  if (registered && branch) gitOk(["-C", source, "branch", "-D", branch]);
+    step();
+  } catch {}
+}
+
+// A copied read-only directory blocks unlink of its children; repair the
+// doomed tree's modes (never the source's) and retry.
+function forceRemoveTree(path: string): void {
+  attempt(() => rmSync(path, { recursive: true, force: true }));
+  if (!pathExists(path)) return;
+  attempt(() => Bun.spawnSync(["chmod", "-R", "u+w", path], { stdout: "pipe", stderr: "pipe" }));
+  attempt(() => rmSync(path, { recursive: true, force: true }));
+}
+
+function rollbackClone(source: string, dest: string, branch: string | null, registered: boolean): void {
+  if (registered) attempt(() => gitOk(["-C", source, "worktree", "remove", "--force", dest]));
+  forceRemoveTree(dest);
+  attempt(() => gitOk(["-C", source, "worktree", "prune"]));
+  if (registered && branch) attempt(() => gitOk(["-C", source, "branch", "-D", branch]));
 }
 
 // Register the real worktree first, then materialize content around its .git
@@ -631,8 +673,24 @@ function restoreParked(moves: Array<{ from: string; to: string }>, parkRoot: str
     mkdirSync(dirname(move.from), { recursive: true });
     renameSync(move.to, move.from);
   }
-  rmSync(join(parkRoot, "manifest.json"), { force: true });
-  if (pathExists(parkRoot) && readdirSync(parkRoot).length === 0) rmSync(parkRoot, { recursive: true, force: true });
+  if (!pathExists(parkRoot)) return;
+  // The manifest is the only index -> original-path map; it must outlive any
+  // entry that could not be restored (e.g. its original path was recreated).
+  const leftover = readdirSync(parkRoot).filter((name) => name !== "manifest.json");
+  if (leftover.length === 0) rmSync(parkRoot, { recursive: true, force: true });
+}
+
+function worktreeRegistered(source: string, dest: string): boolean {
+  const list = spawnGit(["-C", source, "worktree", "list", "--porcelain"]);
+  if (list.exitCode !== 0) return true;
+  let canonical = dest;
+  try {
+    canonical = realpathSync(dest);
+  } catch {}
+  return list.stdout
+    .toString()
+    .split("\n")
+    .some((line) => line === `worktree ${dest}` || line === `worktree ${canonical}`);
 }
 
 function sweepDetached(path: string): void {
@@ -676,8 +734,18 @@ export function removeWorktreeClone(source: string, dest: string): boolean {
       }
     }
     if (!gitOk(["-C", source, "worktree", "remove", "--force", dest])) {
-      if (parkRoot) restoreParked(moves, parkRoot);
-      return false;
+      // git deletes the worktree registration even when content deletion
+      // fails ("there's no going back from here"): once the slot is gone,
+      // the only consistent forward path is to finish the removal — safety
+      // was proven before parking. A still-registered failure (e.g. a
+      // locked worktree) restores the parked paths and reports failure.
+      if (worktreeRegistered(source, dest)) {
+        if (parkRoot) restoreParked(moves, parkRoot);
+        return false;
+      }
+      forceRemoveTree(dest);
+      gitOk(["-C", source, "worktree", "prune"]);
+      if (pathExists(dest)) return false;
     }
     if (parkRoot) sweepDetached(parkRoot);
     return true;
