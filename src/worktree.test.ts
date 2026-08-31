@@ -1,10 +1,12 @@
 import { afterEach, expect, test } from "bun:test";
 import {
+  chmodSync,
   existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   readlinkSync,
   realpathSync,
   rmSync,
@@ -206,6 +208,24 @@ test("external symlinks can be preserved, warned, or rejected", async () => {
   expect(existsSync(rejectDest)).toBe(false);
 });
 
+test("a relative link that exits and re-enters the source retargets to the clone", async () => {
+  const { root, src } = await fixture();
+  // Leaves the repo root lexically, re-enters by directory name: internal in
+  // the source's frame, but resolved from the clone it points at the SOURCE.
+  symlinkSync(`../${basename(src)}/a.txt`, join(src, "loop-link"));
+  mkdirSync(join(src, "sub"));
+  symlinkSync("../a.txt", join(src, "sub", "in-link"));
+  const dest = join(root, "reenter");
+  const outcome = cloneWorktreeCow(src, dest, null, { externalSymlinks: "reject" }, portableBackend);
+  expect(outcome.external_symlinks).toEqual([]);
+  expect(outcome.rewritten_symlinks).toContain("loop-link");
+  expect(readlinkSync(join(dest, "loop-link"))).toBe(join(dest, "a.txt"));
+  // A legitimately internal relative link stays relative.
+  expect(readlinkSync(join(dest, "sub", "in-link"))).toBe("../a.txt");
+  writeFileSync(join(dest, "loop-link"), "written from clone\n");
+  expect(await Bun.file(join(src, "a.txt")).text()).toBe("a-dirty\n");
+});
+
 test("an absolute link that escapes through an intermediate symlink is external", async () => {
   const { root, src } = await fixture();
   const external = tempDir("orch-wt-escape-");
@@ -369,6 +389,63 @@ test("loss detection catches edits, staging, and restoring inherited dirt to HEA
   expect(inspectWorktreeLosses(src, restored).losses).toContain("worktree differs from the inherited baseline");
 });
 
+test("an untracked nested repository always blocks automatic removal", async () => {
+  const { root, src } = await fixture();
+  const vendor = join(src, "vendor");
+  mkdirSync(vendor);
+  await sh(vendor, "git", "init", "-q");
+  writeFileSync(join(vendor, "lib.ts"), "export {}\n", "utf8");
+  await sh(vendor, "git", "add", ".");
+  await sh(vendor, "git", "commit", "-q", "-m", "vendored");
+  const dest = join(root, "nested");
+  cloneWorktreeCow(src, dest, null, {}, portableBackend);
+  // The manifest cannot see inside the nested repo, so even the untouched
+  // inherited state is unprovable — presence alone fails closed.
+  expect(inspectWorktreeLosses(src, dest).losses.some((loss) => loss.includes("nested repository"))).toBe(true);
+  writeFileSync(join(dest, "vendor", "lib.ts"), "export {}\n// agent work\n", "utf8");
+  await sh(join(dest, "vendor"), "git", "commit", "-qam", "agent work");
+  expect(removeWorktreeClone(src, dest)).toBe(false);
+  expect(existsSync(join(dest, "vendor", ".git"))).toBe(true);
+});
+
+test("rollback survives read-only directories and keeps the original error", async () => {
+  const { root, src } = await fixture();
+  const ro = join(src, "ro");
+  mkdirSync(ro);
+  writeFileSync(join(ro, "f.txt"), "x\n", "utf8");
+  chmodSync(ro, 0o555);
+  const external = tempDir("orch-wt-ro-external-");
+  symlinkSync(external, join(src, "ext-link"));
+  const dest = join(root, "ro-rollback");
+  try {
+    expect(() =>
+      cloneWorktreeCow(src, dest, "feat/ro-rollback", { externalSymlinks: "reject" }, portableBackend),
+    ).toThrow("external symlink rejected");
+    expect(existsSync(dest)).toBe(false);
+    expect(shSync(src, "git", "show-ref", "--verify", "--quiet", "refs/heads/feat/ro-rollback").exitCode).not.toBe(0);
+    expect((await sh(src, "git", "worktree", "list"))).not.toContain("ro-rollback");
+  } finally {
+    chmodSync(ro, 0o755);
+  }
+});
+
+test("exclude copies preserve read-only directory modes without failing", async () => {
+  const { root, src } = await fixture();
+  const ro = join(src, "ro");
+  mkdirSync(ro);
+  writeFileSync(join(ro, "f.txt"), "x\n", "utf8");
+  chmodSync(ro, 0o555);
+  const dest = join(root, "ro-exclude");
+  try {
+    cloneWorktreeCow(src, dest, null, { exclude: ["nomatch/**"] }, portableBackend);
+    expect(await Bun.file(join(dest, "ro", "f.txt")).text()).toBe("x\n");
+    expect(statSync(join(dest, "ro")).mode & 0o777).toBe(0o555);
+  } finally {
+    chmodSync(ro, 0o755);
+    if (existsSync(join(dest, "ro"))) chmodSync(join(dest, "ro"), 0o755);
+  }
+});
+
 test("an unreachable detached commit blocks automatic removal", async () => {
   const { root, src } = await fixture({ ignoredBuild: true });
   const dest = join(root, "detached-commit");
@@ -399,6 +476,9 @@ test("parked caches are restored when unregister fails", async () => {
   await sh(src, "git", "worktree", "lock", dest);
   expect(removeWorktreeClone(src, dest)).toBe(false);
   expect(await Bun.file(join(dest, "build", "out.bin")).text()).toBe("artifact\n");
+  // The park manifest and directory are cleaned up with the restore.
+  const trash = join(root, ".orch-worktrees", basename(src), ".trash");
+  expect(!existsSync(trash) || readdirSync(trash).length === 0).toBe(true);
   await sh(src, "git", "worktree", "unlock", dest);
   expect(removeWorktreeClone(src, dest)).toBe(true);
 });

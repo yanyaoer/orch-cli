@@ -53,6 +53,7 @@ interface WorkspaceState {
   index_clean: boolean;
   worktree_clean: boolean;
   untracked_empty: boolean;
+  untracked_unverifiable: string[];
 }
 
 interface CloneProvenance {
@@ -151,7 +152,11 @@ function systemCowBackend(destParent: string): CowCopyBackend {
   let flag: string | null = null;
   try {
     writeFileSync(probe, "");
-    for (const candidate of ["-c", "--reflink=always"]) {
+    // Per-platform candidates: on some older GNU coreutils builds `cp -c` is
+    // `--preserve=context` and exits 0 with a full copy, which would defeat
+    // the fail-closed CoW contract if probed on Linux.
+    const candidates = process.platform === "darwin" ? ["-c"] : ["--reflink=always"];
+    for (const candidate of candidates) {
       const proc = Bun.spawnSync(["cp", candidate, probe, clone], { stdout: "pipe", stderr: "pipe" });
       if (proc.exitCode === 0) {
         flag = candidate;
@@ -231,9 +236,11 @@ function copyFiltered(
     copier.copy(source, dest);
     return;
   }
-  mkdirSync(dest, { recursive: true, mode: stat.mode & 0o777 });
-  chmodSync(dest, stat.mode & 0o777);
+  mkdirSync(dest, { recursive: true });
   for (const entry of readdirSync(source)) copyFiltered(sourceRoot, destRoot, join(rel, entry), copier, matchers);
+  // Restore the directory mode only after its children are copied: a source
+  // directory without owner-write would otherwise block every child copy.
+  chmodSync(dest, stat.mode & 0o777);
 }
 
 function copySnapshot(source: string, dest: string, copier: CowCopyBackend, exclude: string[]): void {
@@ -293,37 +300,57 @@ function classifyAndRetargetSymlinks(
 ): { rewritten: string[]; external: string[] } {
   const rewritten: string[] = [];
   const external: string[] = [];
+  const links: Array<{ path: string; rel: string; target: string }> = [];
   const visit = (dir: string): void => {
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
       if (dir === dest && entry.name === ".git") continue;
       const path = join(dir, entry.name);
-      const rel = relative(dest, path);
       const stat = lstatSync(path);
       if (stat.isDirectory()) {
         visit(path);
         continue;
       }
-      if (!stat.isSymbolicLink()) continue;
-      const target = readlinkSync(path);
-      const sourceLink = join(source, rel);
-      const lexicalTarget = isAbsolute(target) ? resolve(target) : resolve(dirname(sourceLink), target);
-      let sourceRelative: string | null = null;
-      try {
-        sourceRelative = inside(source, canonicalizeAllowMissing(lexicalTarget));
-      } catch {}
-      if (sourceRelative !== null) {
-        if (isAbsolute(target)) {
-          rmSync(path);
-          symlinkSync(join(dest, sourceRelative), path);
-          rewritten.push(rel);
-        }
-        continue;
-      }
-      external.push(rel);
-      if (policy === "reject") throw new CliError(`external symlink rejected: ${rel} -> ${target}`);
+      if (stat.isSymbolicLink()) links.push({ path, rel: relative(dest, path), target: readlinkSync(path) });
     }
   };
   visit(dest);
+  const retargetToClone = (link: { path: string; rel: string }, sourceRelative: string): void => {
+    rmSync(link.path);
+    symlinkSync(join(dest, sourceRelative), link.path);
+    rewritten.push(link.rel);
+  };
+  const markExternal = (link: { rel: string; target: string }): void => {
+    external.push(link.rel);
+    if (policy === "reject") throw new CliError(`external symlink rejected: ${link.rel} -> ${link.target}`);
+  };
+  // Pass 1 — absolute links, classified in the source's frame: a target inside
+  // the source retargets to the clone so writes can never land in the source.
+  for (const link of links.filter((entry) => isAbsolute(entry.target))) {
+    let sourceRelative: string | null = null;
+    try {
+      sourceRelative = inside(source, canonicalizeAllowMissing(resolve(link.target)));
+    } catch {}
+    if (sourceRelative !== null) retargetToClone(link, sourceRelative);
+    else markExternal(link);
+  }
+  // Pass 2 — relative links, classified in the CLONE's frame, the only frame
+  // that matters at runtime (after pass 1 so absolute-internal intermediates
+  // already resolve inside the clone). A link that lexically stays inside the
+  // source can still exit the clone and re-enter the source by name; when it
+  // does, retarget it to the clone like an absolute-internal link.
+  for (const link of links.filter((entry) => !isAbsolute(entry.target))) {
+    let canonical: string;
+    try {
+      canonical = canonicalizeAllowMissing(resolve(dirname(link.path), link.target));
+    } catch {
+      markExternal(link);
+      continue;
+    }
+    if (inside(dest, canonical) !== null) continue;
+    const sourceRelative = inside(source, canonical);
+    if (sourceRelative !== null) retargetToClone(link, sourceRelative);
+    else markExternal(link);
+  }
   if (policy === "warn" && external.length > 0) {
     process.stderr.write(
       `orch: warning: clone preserves ${external.length} external symlink(s): ${external.slice(0, 5).join(", ")}${external.length > 5 ? ", ..." : ""}\n`,
@@ -346,19 +373,27 @@ function detectUpstream(repo: string, branch: string | null, targetBranch: strin
   return null;
 }
 
-function untrackedManifest(repo: string): string {
+function untrackedManifest(repo: string): { manifest: string; unverifiable: string[] } {
   const paths = gitRaw(["-C", repo, "ls-files", "--others", "--exclude-standard", "-z"])
     .split("\0")
     .filter(Boolean)
     .sort();
+  const unverifiable: string[] = [];
   const records = paths.map((rel) => {
-    const path = join(repo, rel);
+    const path = join(repo, rel.replace(/\/$/, ""));
     const stat = lstatSync(path);
     if (stat.isSymbolicLink()) return [rel, "symlink", sha256(readlinkSync(path))];
     if (stat.isFile()) return [rel, "file", git(["-C", repo, "hash-object", "--", rel])];
+    if (stat.isDirectory()) {
+      // ls-files emits a bare directory only for an untracked nested repository;
+      // its contents are invisible to this manifest, so it can never be proven
+      // unchanged — record it as unverifiable and let loss detection fail closed.
+      unverifiable.push(rel);
+      return [rel, "nested-repo", "unverifiable"];
+    }
     return [rel, "special", `${stat.mode}:${stat.size}`];
   });
-  return JSON.stringify(records);
+  return { manifest: JSON.stringify(records), unverifiable };
 }
 
 function workspaceState(repo: string): WorkspaceState {
@@ -368,10 +403,11 @@ function workspaceState(repo: string): WorkspaceState {
   return {
     index: sha256(indexPatch),
     worktree: sha256(worktreePatch),
-    untracked: sha256(untracked),
+    untracked: sha256(untracked.manifest),
     index_clean: indexPatch.length === 0,
     worktree_clean: worktreePatch.length === 0,
-    untracked_empty: untracked === "[]",
+    untracked_empty: untracked.manifest === "[]",
+    untracked_unverifiable: untracked.unverifiable,
   };
 }
 
@@ -400,9 +436,20 @@ function readProvenance(dest: string): CloneProvenance | null {
   }
 }
 
+// Never throws: it runs inside a catch block, and a rollback error must not
+// replace the original failure or skip the remaining cleanup steps.
 function rollbackClone(source: string, dest: string, branch: string | null, registered: boolean): void {
   if (registered) gitOk(["-C", source, "worktree", "remove", "--force", dest]);
-  rmSync(dest, { recursive: true, force: true });
+  try {
+    rmSync(dest, { recursive: true, force: true });
+  } catch {
+    // A copied read-only directory blocks unlink of its children; repair the
+    // partial clone's modes (never the source's) and retry.
+    Bun.spawnSync(["chmod", "-R", "u+w", dest], { stdout: "pipe", stderr: "pipe" });
+    try {
+      rmSync(dest, { recursive: true, force: true });
+    } catch {}
+  }
   gitOk(["-C", source, "worktree", "prune"]);
   if (registered && branch) gitOk(["-C", source, "branch", "-D", branch]);
 }
@@ -534,6 +581,9 @@ export function inspectWorktreeLosses(sourceArg: string, destArg: string): Workt
     }
     const head = git(["-C", dest, "rev-parse", "HEAD"]);
     const state = workspaceState(dest);
+    for (const rel of state.untracked_unverifiable) {
+      losses.push(`untracked nested repository cannot be verified: ${rel}`);
+    }
     if (head === provenance.head) {
       if (state.index !== provenance.baseline.index) losses.push("index differs from the inherited baseline");
       if (state.worktree !== provenance.baseline.worktree) losses.push("worktree differs from the inherited baseline");
@@ -581,6 +631,7 @@ function restoreParked(moves: Array<{ from: string; to: string }>, parkRoot: str
     mkdirSync(dirname(move.from), { recursive: true });
     renameSync(move.to, move.from);
   }
+  rmSync(join(parkRoot, "manifest.json"), { force: true });
   if (pathExists(parkRoot) && readdirSync(parkRoot).length === 0) rmSync(parkRoot, { recursive: true, force: true });
 }
 
@@ -610,6 +661,13 @@ export function removeWorktreeClone(source: string, dest: string): boolean {
     if (paths.length > 0) {
       const trash = ensurePrivateDirectory(join(privateWorktreeRoot(provenance.source), ".trash"));
       parkRoot = ensurePrivateDirectory(join(trash, `${basename(dest)}-${randomHex(4)}`));
+      // Persist the index -> original-path map before the first rename: a crash
+      // mid-park must leave enough to reassemble the clone by hand.
+      writeFileSync(
+        join(parkRoot, "manifest.json"),
+        `${JSON.stringify(paths.map((rel, index) => ({ index, rel })))}\n`,
+        { mode: 0o600 },
+      );
       for (const [index, rel] of paths.entries()) {
         const from = join(dest, rel);
         const to = join(parkRoot, String(index));

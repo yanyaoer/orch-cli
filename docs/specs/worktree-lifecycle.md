@@ -13,6 +13,8 @@ discarding work that cannot be proven safe to remove.
 - Tree-sitter parsing or symbol anchoring
 - A daemon, database, or other resident cleanup service
 - Adopting an existing branch implicitly
+- Submodule repositories: a copied submodule `.git` pointer resolves against
+  the clone's worktree gitdir and breaks; cloning them is unsupported
 
 ## Constraints
 
@@ -62,9 +64,11 @@ copying those entries first.
 
 - An absolute symlink whose canonical target is inside the source is rewritten
   to the corresponding target inside the clone.
-- A relative internal symlink remains relative.
-- A link that resolves outside the source, including one that escapes through
-  an intermediate symlink, is external.
+- A relative symlink is classified in the clone's own frame, the only frame
+  that matters at runtime. One that resolves inside the clone stays relative;
+  one that exits the clone and re-enters the source by name is rewritten to
+  the corresponding target inside the clone; anything else is external.
+- A link that escapes through an intermediate symlink is external.
 - External links use one explicit policy: `preserve`, `warn`, or `reject`.
   `warn` is the default and preserves the link while reporting it.
 
@@ -110,7 +114,11 @@ Automatic removal is allowed only when one of these conditions is proven:
 This detects ordinary edits, staging-only work, new untracked content, changing
 an inherited dirty file, and restoring inherited dirt to HEAD. An unreachable
 detached commit blocks removal. A clean commit on a named branch is retained by
-that branch and does not block removal. Missing or mismatched provenance fails
+that branch and does not block removal. An untracked nested repository — a
+directory `git ls-files --others` does not enter — can never be proven
+unchanged, so its presence always blocks automatic removal. Git-ignored content
+sits outside loss detection by contract: caches are disposable, and removal
+discards them. Missing or mismatched provenance fails
 closed; an operator can still use Git's explicit force-removal command to
 discard the clone deliberately.
 
@@ -123,6 +131,8 @@ Safe removal follows `park -> unregister -> sweep`:
 2. Unregister and remove the much smaller worktree through Git.
 3. Sweep the parked content in a detached one-shot process.
 
+The park directory persists an index-to-path manifest before the first rename,
+so a crash mid-park leaves enough to reassemble the clone by hand.
 If unregister fails, all parked paths are renamed back before removal reports
 failure. Trash directories use the same real-directory and `0700` checks as
 fanout storage. A killed sweep may leave reclaimable disk usage but cannot make
@@ -132,8 +142,9 @@ Git state or workspace content incorrect.
 
 - Registration exists before the first workspace entry is copied.
 - Snapshot and warm-head produce their documented status and cache behavior.
-- Internal absolute links cannot write back into the source through their old
-  target, and intermediate-link escapes obey external policy.
+- No link in the clone writes back into the source: absolute-internal and
+  source-re-entering relative links are retargeted to the clone, and
+  intermediate-link escapes obey external policy.
 - Fanout clone paths never use `/tmp` and reject storage symlink substitution.
 - Failure after registration leaves no clone, temporary slot, worktree entry,
   or newly created branch.
