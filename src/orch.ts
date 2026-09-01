@@ -1982,7 +1982,7 @@ async function crossReview(args: ParsedArgs): Promise<number> {
     command: "cross-review",
     role: "reviewer",
     defaultAgentIds: ["claude-reviewer", "omp-reviewer"],
-    extraFlags: ["auto", "execute", "wait-sec"],
+    extraFlags: ["auto", "execute", "wait-sec", "rework"],
   });
   if (!auto || outcome.code !== 0 || outcome.dry_run) {
     printJson(outcome.payload);
