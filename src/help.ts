@@ -39,6 +39,7 @@ export function topLevelHelp(): string {
     "  orch dispatch      reconcile: run the unsandboxed host reconciler for a sandboxed controller (config sandbox on)",
     "  orch workspace     Add or list project workspaces for mail routing",
     "  orch worktree clone  CoW-clone a worktree into an isolated per-agent checkout (APFS/reflink, keeps build output)",
+    "  orch worktree gc   Inventory this repo's orch clones and trash; remove the proven-safe ones with --execute",
     "  orch update        Self-update to the latest GitHub release (--check to only compare)",
     "",
     "Quickstart:",
@@ -615,10 +616,42 @@ export function worktreeCloneHelp(): string {
     "  Submodules are not rewired: a copied submodule .git pointer resolves against the",
     "  clone's worktree gitdir and breaks — treat submodule repos as unsupported.",
     "  Teardown: git -C <source> worktree remove --force <dest> (plus git branch -D <name>)",
+    "  Leftovers: orch worktree gc inventories this repo's clones and trash and removes proven-safe ones.",
     "",
     "Examples:",
     "  orch worktree clone --source ~/mi/osbot --branch feat/agent2   # dest: ~/mi/osbot-feat_agent2",
     "  orch run create --mr 123 --role implementer --agent pi --worktree ~/mi/osbot-feat_agent2 --task task.md",
+  ]);
+}
+
+export function worktreeGcHelp(): string {
+  return lines([
+    "orch worktree gc: inventory this repo's orch clones and remove the proven-safe ones",
+    "",
+    "Usage:",
+    "  orch worktree gc [--source <path>] [--min-age-days <n>] [--execute]",
+    "",
+    "Flags:",
+    "  --source <path>       Repo whose clones to inventory; resolved to its git toplevel.",
+    "                        Defaults to the current directory",
+    "  --min-age-days <n>    Only remove/sweep entries at least this old (default 0: all)",
+    "  --execute             Apply the plan. Without it gc only prints what it would do",
+    "  --help                Show this help",
+    "",
+    "Behavior:",
+    "  Scans every registered worktree carrying orch clone provenance (wherever its dest",
+    "  lives) plus the private fanout root <repo-parent>/.orch-worktrees/<repo-name>.",
+    "  A clone is removed only when loss detection proves it safe (same gate as automatic",
+    "  teardown); anything else is kept and listed with its losses and the explicit",
+    "  git force-removal command. Registrations whose directory is gone are pruned.",
+    "  Trash entries left by an interrupted sweep are deleted once their clone is gone;",
+    "  a trash entry whose clone still exists may hold an unrestored partial and is kept.",
+    "  Unregistered directories under the fanout root are reported, never deleted.",
+    "  The bare orch overview suggests this command when clones sit unremoved for a week.",
+    "",
+    "Examples:",
+    "  orch worktree gc                   # print the plan",
+    "  orch worktree gc --execute         # remove proven-safe clones and stale trash",
   ]);
 }
 

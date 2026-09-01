@@ -67,6 +67,7 @@ import {
   newHelp,
   workspaceHelp,
   worktreeCloneHelp,
+  worktreeGcHelp,
   resultCommandHelp,
   runCancelHelp,
   runCreateHelp,
@@ -119,7 +120,14 @@ import {
   type MailctlContext,
 } from "./mailctl.ts";
 import { workspace } from "./workspace-cli.ts";
-import { inspectWorktreeLosses, removeWorktreeClone, worktreeClone } from "./worktree.ts";
+import {
+  inspectWorktreeLosses,
+  removeWorktreeClone,
+  scanWorktreeClones,
+  STALE_CLONE_DAYS,
+  worktreeClone,
+  worktreeGc,
+} from "./worktree.ts";
 import { assertKnownFlags, CliError, collectFlags, flagBool, flagNumber, flagString, hasHelp, parseArgs, printJson, readStdinText, type ParsedArgs } from "./cli.ts";
 import { buildPrompt, buildProviderExecutionPlan, type ProviderExecutionPlan } from "../drivers/driver-common.ts";
 import { sandboxPosture, sandboxRunIdentity, SEATBELT_ENGINE, seatbeltUnsupportedReason } from "../drivers/sandbox.ts";
@@ -3085,6 +3093,29 @@ async function overviewCommand(args: ParsedArgs): Promise<number> {
   // Cross-repo suggestions need --worktree to resolve the right repo_key when
   // they are executed from elsewhere; same-repo suggestions stay short.
   const overview = buildOverview(repoKeys, all, { attentionDays, archived });
+  // Durable clone storage plus fail-closed removal means leftovers accumulate
+  // silently; surface them here so the backlog stays visible. Cheap scan only
+  // (provenance + directory listing) — safety assessment happens in gc itself.
+  try {
+    const scan = scanWorktreeClones(worktree);
+    const staleClones = scan.clones.filter(
+      (clone) => !clone.dest_exists || clone.age_days === null || clone.age_days >= STALE_CLONE_DAYS,
+    ).length;
+    const sweepableTrash = scan.trash.length + scan.orphans.length;
+    if (staleClones + sweepableTrash > 0) {
+      const parts = [
+        staleClones > 0 ? `${staleClones} clone${staleClones > 1 ? "s" : ""} ≥${STALE_CLONE_DAYS}d or damaged` : "",
+        sweepableTrash > 0 ? `${sweepableTrash} trash/orphan entr${sweepableTrash > 1 ? "ies" : "y"}` : "",
+      ].filter(Boolean);
+      overview.actions.push({
+        kind: "worktree_gc",
+        reason: `worktree clones: ${parts.join(", ")}`,
+        argv: ["orch", "worktree", "gc"],
+        repo_key: repoIdentity.repo_key,
+        mr: "worktree",
+      });
+    }
+  } catch {}
   if (flagBool(args, "json")) {
     printJson(overview);
   } else {
@@ -4029,7 +4060,7 @@ async function main(): Promise<number> {
       return 0;
     }
     if (first === "worktree") {
-      process.stdout.write(worktreeCloneHelp());
+      process.stdout.write(second === "gc" ? worktreeGcHelp() : worktreeCloneHelp());
       return 0;
     }
     if (first === "mirror" && second === "sync") {
@@ -4096,6 +4127,7 @@ async function main(): Promise<number> {
   if (first === "mailctl") return mailctl(args, { orchCommand, locateRun, readMirrorResult });
   if (first === "workspace") return workspace(args);
   if (first === "worktree" && second === "clone") return worktreeClone(args);
+  if (first === "worktree" && second === "gc") return worktreeGc(args);
   if (first === "chatgpt-bridge") return chatgptBridge(args);
   if (first === "handoff-pro") return handoffPro(args);
   if (first === "update") return updateCommand(args);

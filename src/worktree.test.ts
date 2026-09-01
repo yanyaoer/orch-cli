@@ -23,6 +23,7 @@ import {
   defaultCloneDest,
   inspectWorktreeLosses,
   removeWorktreeClone,
+  scanWorktreeClones,
   type CowBackendFactory,
 } from "./worktree.ts";
 
@@ -640,6 +641,81 @@ test("fanout storage and removal trash reject symlink substitution", async () =>
   symlinkSync(externalTrash, join(privateRoot, ".trash"));
   expect(removeWorktreeClone(second.src, dest)).toBe(false);
   expect(existsSync(join(dest, "build", "out.bin"))).toBe(true);
+});
+
+test("scanWorktreeClones inventories clones, orphans, and trash", async () => {
+  const { root, src } = await fixture({ ignoredBuild: true });
+  const safe = join(root, "gc-safe");
+  cloneWorktreeCow(src, safe, null, { cachePaths: ["build"] }, portableBackend);
+  const edited = join(root, "gc-edited");
+  cloneWorktreeCow(src, edited, null, {}, portableBackend);
+  writeFileSync(join(edited, "a.txt"), "agent edit\n", "utf8");
+  const missing = join(root, "gc-missing");
+  cloneWorktreeCow(src, missing, null, {}, portableBackend);
+  rmSync(missing, { recursive: true, force: true });
+
+  const storageRoot = join(root, ".orch-worktrees", basename(src));
+  mkdirSync(join(storageRoot, "orphan-debris"), { recursive: true });
+  const trashRoot = join(storageRoot, ".trash");
+  const sweepable = join(trashRoot, "gone-1234");
+  mkdirSync(join(sweepable, "0"), { recursive: true });
+  writeFileSync(
+    join(sweepable, "manifest.json"),
+    JSON.stringify({ dest: join(storageRoot, "gone"), entries: [{ index: 0, rel: "build" }] }),
+    "utf8",
+  );
+  const partial = join(trashRoot, "partial-5678");
+  mkdirSync(join(partial, "0"), { recursive: true });
+  writeFileSync(join(partial, "manifest.json"), JSON.stringify({ dest: edited, entries: [{ index: 0, rel: "build" }] }), "utf8");
+  const unknown = join(trashRoot, "unknown-9abc");
+  mkdirSync(unknown, { recursive: true });
+
+  const scan = scanWorktreeClones(src);
+  expect(scan.clones.map((clone) => clone.dest).sort()).toEqual([edited, missing, safe].sort());
+  expect(scan.clones.find((clone) => clone.dest === missing)?.dest_exists).toBe(false);
+  expect(scan.orphans).toEqual([join(storageRoot, "orphan-debris")]);
+  const trashByPath = new Map(scan.trash.map((entry) => [entry.path, entry]));
+  expect(trashByPath.get(sweepable)?.clone_exists).toBe(false);
+  expect(trashByPath.get(partial)?.clone_exists).toBe(true);
+  expect(trashByPath.get(unknown)?.dest).toBeNull();
+});
+
+test.skipIf(process.platform !== "darwin")("worktree gc plans, then executes only proven-safe removals", async () => {
+  const { root, src } = await fixture({ ignoredBuild: true });
+  const runGc = async (...extra: string[]) => {
+    const proc = Bun.spawn(
+      [process.execPath, "src/orch.ts", "worktree", "gc", "--source", src, ...extra],
+      { cwd: process.cwd(), stdout: "pipe", stderr: "pipe", env: gitEnv(src) },
+    );
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    expect(exitCode, stderr).toBe(0);
+    return JSON.parse(stdout);
+  };
+  const safe = join(root, "gc-cli-safe");
+  cloneWorktreeCow(src, safe, null, {});
+  const edited = join(root, "gc-cli-edited");
+  cloneWorktreeCow(src, edited, null, {});
+  writeFileSync(join(edited, "a.txt"), "agent edit\n", "utf8");
+
+  const plan = await runGc();
+  expect(plan.executed).toBe(false);
+  expect(plan.clones.find((clone: { dest: string }) => clone.dest === safe)?.action).toBe("remove");
+  expect(plan.clones.find((clone: { dest: string }) => clone.dest === edited)?.action).toBe("keep");
+  expect(plan.execute_with).toBe("orch worktree gc --execute");
+  expect(existsSync(safe)).toBe(true);
+
+  const applied = await runGc("--execute");
+  expect(applied.clones.find((clone: { dest: string }) => clone.dest === safe)?.removed).toBe(true);
+  const kept = applied.clones.find((clone: { dest: string }) => clone.dest === edited);
+  expect(kept?.action).toBe("keep");
+  expect(kept?.losses.length).toBeGreaterThan(0);
+  expect(existsSync(safe)).toBe(false);
+  expect(existsSync(edited)).toBe(true);
+  expect((await sh(src, "git", "worktree", "list"))).not.toContain("gc-cli-safe");
 });
 
 test.skipIf(process.platform !== "darwin")("native APFS clone backend smoke", async () => {

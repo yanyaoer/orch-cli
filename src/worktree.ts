@@ -13,7 +13,7 @@ import {
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { randomHex, sha256 } from "./hash.ts";
-import { assertKnownFlags, CliError, collectFlags, flagString, printJson, type ParsedArgs } from "./cli.ts";
+import { assertKnownFlags, CliError, collectFlags, flagBool, flagNumber, flagString, printJson, type ParsedArgs } from "./cli.ts";
 
 export type WorktreeMaterializationMode = "snapshot" | "warm-head";
 export type ExternalSymlinkPolicy = "preserve" | "warn" | "reject";
@@ -154,6 +154,11 @@ function ensurePrivateDirectory(path: string): string {
   }
   chmodSync(path, 0o700);
   return realpathSync(path);
+}
+
+// Read-only path of the fanout storage root; never creates directories.
+function fanoutRootPath(source: string): string {
+  return join(dirname(source), ".orch-worktrees", basename(source));
 }
 
 function privateWorktreeRoot(source: string): string {
@@ -556,10 +561,18 @@ function writeProvenance(dest: string, provenance: CloneProvenance): string {
   return path;
 }
 
+function readProvenanceFile(path: string): CloneProvenance | null {
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as CloneProvenance;
+    return parsed.schema === "orch.worktree-clone/v1" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
 function readProvenance(dest: string): CloneProvenance | null {
   try {
-    const parsed = JSON.parse(readFileSync(provenancePath(dest), "utf8")) as CloneProvenance;
-    return parsed.schema === "orch.worktree-clone/v1" ? parsed : null;
+    return readProvenanceFile(provenancePath(dest));
   } catch {
     return null;
   }
@@ -818,11 +831,13 @@ export function removeWorktreeClone(source: string, dest: string): boolean {
     if (paths.length > 0) {
       const trash = ensurePrivateDirectory(join(privateWorktreeRoot(provenance.source), ".trash"));
       parkRoot = ensurePrivateDirectory(join(trash, `${basename(dest)}-${randomHex(4)}`));
-      // Persist the index -> original-path map before the first rename: a crash
-      // mid-park must leave enough to reassemble the clone by hand.
+      // Persist the origin and index -> original-path map before the first
+      // rename: a crash mid-park must leave enough to reassemble the clone by
+      // hand, and gc uses `dest` to tell a swept-clone leftover (deletable)
+      // from a partial restore (worth keeping).
       writeFileSync(
         join(parkRoot, "manifest.json"),
-        `${JSON.stringify(paths.map((rel, index) => ({ index, rel })))}\n`,
+        `${JSON.stringify({ dest, entries: paths.map((rel, index) => ({ index, rel })) })}\n`,
         { mode: 0o600 },
       );
       for (const [index, rel] of paths.entries()) {
@@ -856,6 +871,168 @@ export function removeWorktreeClone(source: string, dest: string): boolean {
     }
     return false;
   }
+}
+
+// Clones older than this are surfaced in the bare `orch` overview: fail-closed
+// removal plus durable storage means unnoticed leftovers accumulate silently.
+export const STALE_CLONE_DAYS = 7;
+
+export interface WorktreeCloneScanEntry {
+  dest: string;
+  created_at: string | null;
+  age_days: number | null;
+  dest_exists: boolean;
+}
+
+export interface WorktreeTrashScanEntry {
+  path: string;
+  dest: string | null;
+  clone_exists: boolean;
+  age_days: number | null;
+}
+
+export interface WorktreeCloneScan {
+  source: string;
+  clones: WorktreeCloneScanEntry[];
+  orphans: string[];
+  trash: WorktreeTrashScanEntry[];
+}
+
+function ageDays(sinceMs: number): number | null {
+  return Number.isFinite(sinceMs) ? Math.floor((Date.now() - sinceMs) / 86400000) : null;
+}
+
+// Read-only inventory of this repo's orch clones: every registered worktree
+// carrying orch provenance (wherever its dest lives), plus unregistered
+// directories and trash leftovers under the private fanout root.
+export function scanWorktreeClones(sourceArg: string): WorktreeCloneScan {
+  const source = realpathSync(git(["-C", resolve(sourceArg), "rev-parse", "--show-toplevel"]));
+  const commonDir = resolve(source, git(["-C", source, "rev-parse", "--git-common-dir"]));
+  const clones: WorktreeCloneScanEntry[] = [];
+  const registered = new Set<string>();
+  const worktreesDir = join(commonDir, "worktrees");
+  if (pathExists(worktreesDir)) {
+    for (const name of readdirSync(worktreesDir)) {
+      const provenance = readProvenanceFile(join(worktreesDir, name, "orch-clone.json"));
+      if (!provenance || provenance.source !== source) continue;
+      registered.add(provenance.dest);
+      clones.push({
+        dest: provenance.dest,
+        created_at: provenance.created_at ?? null,
+        age_days: ageDays(Date.parse(provenance.created_at ?? "")),
+        dest_exists: pathExists(provenance.dest),
+      });
+    }
+  }
+  const orphans: string[] = [];
+  const trash: WorktreeTrashScanEntry[] = [];
+  const root = fanoutRootPath(source);
+  if (pathExists(root)) {
+    for (const entry of readdirSync(root)) {
+      if (entry === ".trash") continue;
+      let path = join(root, entry);
+      try {
+        path = realpathSync(path);
+      } catch {}
+      if (!registered.has(path)) orphans.push(path);
+    }
+    const trashRoot = join(root, ".trash");
+    if (pathExists(trashRoot)) {
+      for (const entry of readdirSync(trashRoot)) {
+        const path = join(trashRoot, entry);
+        let dest: string | null = null;
+        try {
+          const manifest = JSON.parse(readFileSync(join(path, "manifest.json"), "utf8")) as { dest?: unknown };
+          if (typeof manifest?.dest === "string") dest = manifest.dest;
+        } catch {}
+        let mtime = Number.NaN;
+        try {
+          mtime = lstatSync(path).mtimeMs;
+        } catch {}
+        trash.push({ path, dest, clone_exists: dest !== null && pathExists(dest), age_days: ageDays(mtime) });
+      }
+    }
+  }
+  return { source, clones, orphans, trash };
+}
+
+interface GcCloneReport extends WorktreeCloneScanEntry {
+  action: "remove" | "prune" | "keep";
+  losses: string[];
+  removed?: boolean;
+  remove_with?: string;
+}
+
+interface GcTrashReport extends WorktreeTrashScanEntry {
+  action: "sweep" | "keep";
+  reason: string;
+  swept?: boolean;
+}
+
+export async function worktreeGc(args: ParsedArgs): Promise<number> {
+  assertKnownFlags(args, "worktree gc", ["source", "execute", "min-age-days"]);
+  const source = resolve(flagString(args, "source", process.cwd()));
+  const execute = flagBool(args, "execute");
+  const minAgeDays = flagNumber(args, "min-age-days") ?? 0;
+  if (!Number.isFinite(minAgeDays) || minAgeDays < 0) {
+    throw new CliError("--min-age-days must be a non-negative number");
+  }
+  const scan = scanWorktreeClones(source);
+  const oldEnough = (age: number | null): boolean => age === null || age >= minAgeDays;
+
+  const clones: GcCloneReport[] = scan.clones.map((clone) => {
+    if (!clone.dest_exists) return { ...clone, action: "prune", losses: [] };
+    const assessment = inspectWorktreeLosses(scan.source, clone.dest);
+    if (assessment.safe && oldEnough(clone.age_days)) return { ...clone, action: "remove", losses: [] };
+    return {
+      ...clone,
+      action: "keep",
+      losses: assessment.losses,
+      remove_with: `git -C ${scan.source} worktree remove --force ${clone.dest}`,
+    };
+  });
+  const trash: GcTrashReport[] = scan.trash.map((entry) => {
+    if (entry.dest === null) {
+      return { ...entry, action: "keep", reason: "origin unknown (no manifest); inspect and delete manually" };
+    }
+    if (entry.clone_exists) {
+      return { ...entry, action: "keep", reason: "clone still exists: parked content may be an unrestored partial; see manifest.json" };
+    }
+    if (!oldEnough(entry.age_days)) return { ...entry, action: "keep", reason: `younger than --min-age-days ${minAgeDays}` };
+    return { ...entry, action: "sweep", reason: "clone was removed as proven-safe; leftover from an interrupted sweep" };
+  });
+
+  if (execute) {
+    for (const clone of clones) {
+      if (clone.action === "remove" || clone.action === "prune") {
+        clone.removed = removeWorktreeClone(scan.source, clone.dest);
+      }
+    }
+    for (const entry of trash) {
+      if (entry.action !== "sweep") continue;
+      forceRemoveTree(entry.path);
+      entry.swept = !pathExists(entry.path);
+    }
+  }
+
+  const removable = clones.filter((clone) => clone.action !== "keep").length + trash.filter((entry) => entry.action === "sweep").length;
+  printJson({
+    worktree: "gc",
+    source: scan.source,
+    executed: execute,
+    clones,
+    trash,
+    orphans: scan.orphans,
+    summary: {
+      clones: clones.length,
+      trash: trash.length,
+      orphans: scan.orphans.length,
+      removable,
+      removed: execute ? clones.filter((clone) => clone.removed).length + trash.filter((entry) => entry.swept).length : 0,
+    },
+    ...(execute || removable === 0 ? {} : { execute_with: "orch worktree gc --execute" }),
+  });
+  return 0;
 }
 
 export function defaultCloneDest(source: string, branch: string | null): string {
