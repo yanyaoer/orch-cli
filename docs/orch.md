@@ -30,7 +30,9 @@ permissions, model/effort tiers, result schemas — live in the CLI:
   (below) for a second opinion.
 - **Fan one task across agents** → `orch cross-review` (claude+omp review one
   diff; `--auto` records the unambiguous decisions and queues ONE merged MR
-  comment), `orch investigate` (researcher role, omp+claude),
+  comment; re-review rounds add `--rework` to auto-append prior rounds'
+  adjudicated findings and the diff range since the last reviewed head),
+  `orch investigate` (researcher role, omp+claude),
   `orch fanout --role <r>` (generic).
 - **Bounded, testable task on a budget** → `orch prewalk --task <f>
   --executor-model <m>`: a guide model plans a validated TODO and lands the

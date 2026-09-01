@@ -52,6 +52,7 @@ test("fanout help covers the three commands, agent flag, and examples", () => {
   expect(text).toContain("--to-agent");
   expect(text).toContain("--role");
   expect(text).toContain("--dry-run");
+  expect(text).toContain("--rework");
   expect(text).toContain("orch cross-review --thread review-123");
   expect(text).toContain("orch fanout --thread verify-123 --role verifier");
   expect(text).toContain("orch investigate --thread research-1");
