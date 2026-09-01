@@ -797,9 +797,9 @@ export async function mailFanout(args: ParsedArgs, context: MailCliContext, opts
       runs.push(...claimed);
     }
   } catch (error) {
-    // A clone no run ever started against is torn down with the failure; once
-    // any run holds it, it stays (payload/remove_with is lost on throw, but
-    // /tmp self-cleans and the next --clone prunes the stale registration).
+    // A clone no run ever started against is torn down with the failure. Once
+    // a run holds it, keep it: the private sibling root is durable, and the
+    // next --clone prunes stale registrations without risking an active run.
     if (clone && runs.length === 0) removeWorktreeClone(worktree, clone.dest);
     throw error;
   }

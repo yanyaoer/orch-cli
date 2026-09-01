@@ -119,7 +119,7 @@ import {
   type MailctlContext,
 } from "./mailctl.ts";
 import { workspace } from "./workspace-cli.ts";
-import { removeWorktreeClone, worktreeClone } from "./worktree.ts";
+import { inspectWorktreeLosses, removeWorktreeClone, worktreeClone } from "./worktree.ts";
 import { assertKnownFlags, CliError, collectFlags, flagBool, flagNumber, flagString, hasHelp, parseArgs, printJson, readStdinText, type ParsedArgs } from "./cli.ts";
 import { buildPrompt, buildProviderExecutionPlan, type ProviderExecutionPlan } from "../drivers/driver-common.ts";
 import { sandboxPosture, sandboxRunIdentity, SEATBELT_ENGINE, seatbeltUnsupportedReason } from "../drivers/sandbox.ts";
@@ -2520,7 +2520,12 @@ async function crossReviewAuto(args: ParsedArgs, outcome: MailFanoutOutcome): Pr
     const removed = removeWorktreeClone(outcome.clone.source, outcome.clone.dest);
     cloneReport = removed
       ? { dest: outcome.clone.dest, removed: true }
-      : { dest: outcome.clone.dest, removed: false, remove_with: outcome.clone.remove_with };
+      : {
+          dest: outcome.clone.dest,
+          removed: false,
+          losses: inspectWorktreeLosses(outcome.clone.source, outcome.clone.dest).losses,
+          remove_with: outcome.clone.remove_with,
+        };
   }
 
   const mrDir = mrStateDir(repoKey, mr);
