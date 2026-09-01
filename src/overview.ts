@@ -27,7 +27,7 @@ export interface OverviewRun {
   worktree: string;
 }
 
-export type ActionKind = "decision" | "inspect" | "reap" | "mirror_sync" | "mailctl";
+export type ActionKind = "decision" | "inspect" | "reap" | "mirror_sync" | "mailctl" | "worktree_gc";
 
 export interface OverviewAction {
   kind: ActionKind;
@@ -484,7 +484,7 @@ export function renderOverview(overview: Overview): string {
   const runPrefix = (run: OverviewRun): string => (multiRepo ? `${run.repo_key}  ` : "");
   const actionHeading = (action: OverviewAction): string => {
     const prefix = multiRepo && action.repo_key ? `${action.repo_key} · ` : "";
-    if (action.kind === "mailctl") return `${prefix}${action.reason}`;
+    if (action.kind === "mailctl" || action.kind === "worktree_gc") return `${prefix}${action.reason}`;
     return `${prefix}${action.mr} · ${action.reason}`;
   };
 

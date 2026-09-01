@@ -84,7 +84,10 @@ at near-zero disk that carries untracked build output, so incremental builds
 start warm, registered as an isolated git worktree — own index/HEAD, no lock
 contention with the source, branch tracking the explicit target, `origin/HEAD`,
 or a `main`/`master`/`trunk` fallback. Same teardown:
-`git -C <repo> worktree remove --force <dest>`.
+`git -C <repo> worktree remove --force <dest>`. Leftovers accumulate
+silently (removal is fail-closed): `orch worktree gc` inventories this
+repo's clones and trash and `--execute` removes the proven-safe ones —
+the bare `orch` overview nudges when clones sit unremoved for a week.
 
 **Read-only fan-outs**: `cross-review`/`investigate`/`fanout --clone`
 dispatch every worker against ONE shared CoW clone under the private sibling
