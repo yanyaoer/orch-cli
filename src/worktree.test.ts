@@ -620,7 +620,9 @@ test("fanout clones use a private same-filesystem root instead of /tmp", async (
   const storage = join(root, ".orch-worktrees");
   const repoRoot = join(storage, basename(src));
   expect(outcome.dest.startsWith(`${repoRoot}/review_a-`)).toBe(true);
-  expect(outcome.dest.startsWith("/tmp/")).toBe(false);
+  // The retired default root, matched exactly: on Linux the whole fixture
+  // legitimately lives under /tmp, so a bare /tmp prefix check is wrong.
+  expect(outcome.dest.startsWith("/tmp/orch-clones/")).toBe(false);
   expect(lstatSync(storage).isSymbolicLink()).toBe(false);
   expect(statSync(storage).mode & 0o777).toBe(0o700);
   expect(statSync(repoRoot).mode & 0o777).toBe(0o700);
