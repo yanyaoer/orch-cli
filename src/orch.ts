@@ -68,6 +68,7 @@ import {
   workspaceHelp,
   worktreeCloneHelp,
   worktreeGcHelp,
+  worktreeRemoveHelp,
   resultCommandHelp,
   runCancelHelp,
   runCreateHelp,
@@ -127,6 +128,7 @@ import {
   STALE_CLONE_DAYS,
   worktreeClone,
   worktreeGc,
+  worktreeRemove,
 } from "./worktree.ts";
 import { assertKnownFlags, CliError, collectFlags, flagBool, flagNumber, flagString, hasHelp, parseArgs, printJson, readStdinText, type ParsedArgs } from "./cli.ts";
 import { buildPrompt, buildProviderExecutionPlan, type ProviderExecutionPlan } from "../drivers/driver-common.ts";
@@ -4060,7 +4062,7 @@ async function main(): Promise<number> {
       return 0;
     }
     if (first === "worktree") {
-      process.stdout.write(second === "gc" ? worktreeGcHelp() : worktreeCloneHelp());
+      process.stdout.write(second === "gc" ? worktreeGcHelp() : second === "remove" ? worktreeRemoveHelp() : worktreeCloneHelp());
       return 0;
     }
     if (first === "mirror" && second === "sync") {
@@ -4128,6 +4130,7 @@ async function main(): Promise<number> {
   if (first === "workspace") return workspace(args);
   if (first === "worktree" && second === "clone") return worktreeClone(args);
   if (first === "worktree" && second === "gc") return worktreeGc(args);
+  if (first === "worktree" && second === "remove") return worktreeRemove(args);
   if (first === "chatgpt-bridge") return chatgptBridge(args);
   if (first === "handoff-pro") return handoffPro(args);
   if (first === "update") return updateCommand(args);

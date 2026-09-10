@@ -649,6 +649,7 @@
 <span class="p">$</span> <span class="c">orch fanout</span> <span class="f">--thread</span> verify-1 <span class="f">--role</span> verifier <span class="f">--task</span> verify.md
 <span class="p">$</span> <span class="c">orch investigate</span> <span class="f">--thread</span> research-1 <span class="f">--task</span> question.md
 <span class="p">$</span> <span class="c">orch worktree clone</span> <span class="f">--branch</span> fix/x               <span class="cm"># per-agent CoW checkout (APFS/reflink), builds start warm</span>
+<span class="p">$</span> <span class="c">orch worktree remove</span> <span class="f">--dest</span> ../repo-fix_x        <span class="cm"># loss-gated teardown; --force discards, merged branch tidied</span>
 <span class="p">$</span> <span class="c">orch worktree gc</span> <span class="f">--execute</span>                        <span class="cm"># sweep leftover clones — loss detection keeps anything unproven</span>
 
 <span class="cm"># follow the runs (mr == thread)</span>
@@ -693,7 +694,7 @@
             <ul>
               <li>bare <code>orch</code> (overview) · <code>new</code> · <code>verdict --wait</code> · <code>wait</code></li>
               <li><code>run create [--resume-from]</code> · <code>run list</code> · <code>run cancel</code> · <code>run reap</code> · <code>status</code></li>
-              <li><code>cross-review [--auto] [--rework]</code> · <code>fanout</code> · <code>investigate</code> (each with <code>--clone</code>) · <code>worktree clone</code> · <code>worktree gc</code></li>
+              <li><code>cross-review [--auto] [--rework]</code> · <code>fanout</code> · <code>investigate</code> (each with <code>--clone</code>) · <code>worktree clone</code> · <code>worktree remove</code> · <code>worktree gc</code></li>
               <li><code>search</code> · <code>usage</code></li>
               <li><code>mail submit</code> · <code>mail route</code> · <code>mail claim</code> · <code>mail reply result</code></li>
               <li><code>mailctl init</code> · <code>poll</code> · <code>watch</code> · <code>sync</code> · <code>status</code> · <code>reply</code> · <code>ack</code> · <code>guidance</code> · <code>delta</code> · <code>draft</code></li>

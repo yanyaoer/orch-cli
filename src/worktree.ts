@@ -12,6 +12,8 @@ import {
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { getSystemErrorName } from "node:util";
+import { dlopen, FFIType, ptr, read } from "bun:ffi";
 import { randomHex, sha256 } from "./hash.ts";
 import { assertKnownFlags, CliError, collectFlags, flagBool, flagNumber, flagString, printJson, type ParsedArgs } from "./cli.ts";
 
@@ -166,6 +168,46 @@ function privateWorktreeRoot(source: string): string {
   return ensurePrivateDirectory(join(storage, basename(source)));
 }
 
+type CopyFn = (source: string, dest: string) => void;
+
+const CLONE_NOFOLLOW = 0x0001;
+
+// clonefile(2) clones a whole directory tree in one kernel call — an order of
+// magnitude faster than `cp -c` walking every file (3.9 GB / 13k files: 0.17 s
+// vs 2.1 s) — and fails closed (EXDEV/ENOTSUP) wherever CoW is impossible.
+// CLONE_NOFOLLOW clones a symlink argument itself, matching `cp -P`. Loaded
+// lazily; a missing symbol falls back to /bin/cp -c.
+let darwinClonefileFn: CopyFn | null | undefined;
+function darwinClonefile(): CopyFn | null {
+  if (darwinClonefileFn !== undefined) return darwinClonefileFn;
+  try {
+    const lib = dlopen("/usr/lib/libSystem.dylib", {
+      clonefile: { args: [FFIType.ptr, FFIType.ptr, FFIType.u32], returns: FFIType.i32 },
+      __error: { args: [], returns: FFIType.ptr },
+    });
+    darwinClonefileFn = (source, dest) => {
+      const rc = lib.symbols.clonefile(ptr(Buffer.from(`${source}\0`)), ptr(Buffer.from(`${dest}\0`)), CLONE_NOFOLLOW);
+      if (rc === 0) return;
+      const errno = read.i32(lib.symbols.__error()!, 0);
+      throw new CliError(`clonefile ${source} -> ${dest} failed: ${getSystemErrorName(-errno)}`);
+    };
+  } catch {
+    darwinClonefileFn = null;
+  }
+  return darwinClonefileFn;
+}
+
+function cpCowCopy(cpBin: string, flag: string): CopyFn {
+  return (source, dest) => {
+    const proc = Bun.spawnSync([cpBin, flag, "-R", "-P", source, dest], { stdout: "pipe", stderr: "pipe" });
+    if (proc.exitCode !== 0) {
+      throw new CliError(
+        `cp ${flag} failed (source and dest must be on the same CoW filesystem): ${proc.stderr.toString().trim().slice(0, 500)}`,
+      );
+    }
+  };
+}
+
 // Probe where the clone will live. No silent full-copy fallback: an unattended
 // "seconds" operation must not turn into a multi-minute copy of a large tree.
 function systemCowBackend(destParent: string): CowCopyBackend {
@@ -176,38 +218,40 @@ function systemCowBackend(destParent: string): CowCopyBackend {
   // the fail-closed CoW contract — so Linux only ever probes reflink, and
   // darwin pins the system cp (a PATH-shadowing GNU cp would either reject
   // -c or silently full-copy).
+  const native = process.platform === "darwin" ? darwinClonefile() : null;
   const cpBin = process.platform === "darwin" ? "/bin/cp" : "cp";
-  let flag: string | null = null;
+  const candidates = process.platform === "darwin" ? ["-c"] : ["--reflink=always"];
+  let copy: CopyFn | null = null;
+  let detail = "";
   try {
     writeFileSync(probe, "");
-    const candidates = process.platform === "darwin" ? ["-c"] : ["--reflink=always"];
-    for (const candidate of candidates) {
-      const proc = Bun.spawnSync([cpBin, candidate, probe, clone], { stdout: "pipe", stderr: "pipe" });
-      if (proc.exitCode === 0) {
-        flag = candidate;
-        break;
+    if (native) {
+      try {
+        native(probe, clone);
+        copy = native;
+      } catch (error) {
+        detail = `: ${error instanceof Error ? error.message : String(error)}`;
       }
-      rmSync(clone, { force: true });
+    } else {
+      for (const candidate of candidates) {
+        const proc = Bun.spawnSync([cpBin, candidate, probe, clone], { stdout: "pipe", stderr: "pipe" });
+        if (proc.exitCode === 0) {
+          copy = cpCowCopy(cpBin, candidate);
+          break;
+        }
+        rmSync(clone, { force: true });
+      }
     }
   } finally {
     rmSync(probe, { force: true });
     rmSync(clone, { force: true });
   }
-  if (!flag) {
+  if (!copy) {
     throw new CliError(
-      `no copy-on-write support on ${destParent} (needs APFS clonefile or reflink: Btrfs/XFS/ZFS); refusing a slow full copy — cp -R manually if that is acceptable`,
+      `no copy-on-write support on ${destParent} (needs APFS clonefile or reflink: Btrfs/XFS/ZFS); refusing a slow full copy — cp -R manually if that is acceptable${detail}`,
     );
   }
-  return {
-    copy(source: string, dest: string): void {
-      const proc = Bun.spawnSync([cpBin, flag!, "-R", "-P", source, dest], { stdout: "pipe", stderr: "pipe" });
-      if (proc.exitCode !== 0) {
-        throw new CliError(
-          `cp ${flag} failed (source and dest must be on the same CoW filesystem): ${proc.stderr.toString().trim().slice(0, 500)}`,
-        );
-      }
-    },
-  };
+  return { copy };
 }
 
 // "parked path" covers filenames enumerated from git itself: they may contain
@@ -304,12 +348,32 @@ function copyFiltered(
   // mirrorDirModes after the symlink pass, which may still rewrite links here.
 }
 
+// Claude Code keeps its own linked worktrees under .claude/worktrees. Copied,
+// each would be a second checkout of a slot registered to the source path —
+// dead weight at best, so they are skipped like VCS metadata.
+const CLAUDE_WORKTREES_PARENT = ".claude";
+const CLAUDE_WORKTREES_DIR = "worktrees";
+
 function copySnapshot(source: string, dest: string, copier: CowCopyBackend, exclude: string[]): void {
   const matchers = exclude.map((pattern) => new Bun.Glob(pattern));
+  const copyEntry = (rel: string): void => {
+    if (matchers.length === 0) {
+      ensureDestDir(source, dest, dirname(rel));
+      copier.copy(join(source, rel), join(dest, rel));
+    } else {
+      copyFiltered(source, dest, rel, copier, matchers);
+    }
+  };
   for (const entry of readdirSync(source)) {
     if (entry === ".git" || entry === ".jj") continue;
-    if (matchers.length === 0) copier.copy(join(source, entry), join(dest, entry));
-    else copyFiltered(source, dest, entry, copier, matchers);
+    if (entry === CLAUDE_WORKTREES_PARENT && lstatSync(join(source, entry)).isDirectory()) {
+      ensureDestDir(source, dest, entry);
+      for (const child of readdirSync(join(source, entry))) {
+        if (child !== CLAUDE_WORKTREES_DIR) copyEntry(join(entry, child));
+      }
+      continue;
+    }
+    copyEntry(entry);
   }
 }
 
@@ -814,15 +878,76 @@ function sweepDetached(path: string): void {
   }
 }
 
+export interface BranchCleanup {
+  name: string;
+  deleted: boolean;
+  reason?: string;
+}
+
+export interface WorktreeRemoval {
+  removed: boolean;
+  branch: BranchCleanup | null;
+}
+
+// Only the branch the clone was created with, and only `git branch -d`: git
+// refuses a branch not merged into its upstream (or HEAD when none), so the
+// tidy-up can never lose a commit. Anything refused is reported, not forced.
+function deleteMergedBranch(source: string, branch: string | null): BranchCleanup | null {
+  if (!branch) return null;
+  if (!gitOk(["-C", source, "show-ref", "--verify", "--quiet", `refs/heads/${branch}`])) {
+    return { name: branch, deleted: false, reason: "branch no longer exists" };
+  }
+  const proc = spawnGit(["-C", source, "branch", "-d", branch]);
+  if (proc.exitCode === 0) return { name: branch, deleted: true };
+  // git wraps its refusal over several lines ("warning: ... not yet merged to\n
+  // 'origin/main' ..." then "error: ..."); keep the error line when present.
+  const lines = proc.stderr.toString().trim().split("\n").map((line) => line.trim());
+  const reason = lines.find((line) => line.startsWith("error:"))?.replace(/^error:\s*/, "") ?? lines.join(" ");
+  return { name: branch, deleted: false, reason: reason.slice(0, 200) || "git branch -d failed" };
+}
+
+// Registered-but-provenance-less worktree (pre-0.0.12 clone, or a plain
+// `git worktree add`): git's own removal is the only path, and only when forced.
+function removeRegisteredWorktree(source: string, dest: string): boolean {
+  if (!worktreeRegistered(source, dest)) return false;
+  if (!gitOk(["-C", source, "worktree", "remove", "--force", dest]) && worktreeRegistered(source, dest)) return false;
+  forceRemoveTree(dest);
+  gitOk(["-C", source, "worktree", "prune"]);
+  return !pathExists(dest);
+}
+
 export function removeWorktreeClone(source: string, dest: string): boolean {
-  const assessment = inspectWorktreeLosses(source, dest);
-  if (!assessment.safe) return false;
+  return removeClone(source, dest, false).removed;
+}
+
+// force skips loss detection — the caller has already decided the work is
+// disposable — but never identity: the clone must still be registered to
+// this source (and, when provenance exists, describe exactly this pair), so a
+// forced removal cannot be pointed at an arbitrary directory.
+export function removeClone(source: string, dest: string, force: boolean): WorktreeRemoval {
+  const branch = pathExists(dest) ? (readProvenance(dest)?.branch ?? null) : null;
+  const removed = removeCloneContent(source, dest, force);
+  return { removed, branch: removed ? deleteMergedBranch(source, branch) : null };
+}
+
+function removeCloneContent(source: string, dest: string, force: boolean): boolean {
+  if (!force) {
+    const assessment = inspectWorktreeLosses(source, dest);
+    if (!assessment.safe) return false;
+  }
   if (!pathExists(dest)) {
     gitOk(["-C", source, "worktree", "prune"]);
     return true;
   }
   const provenance = readProvenance(dest);
-  if (!provenance) return false;
+  if (!provenance) return force ? removeRegisteredWorktree(source, dest) : false;
+  if (force) {
+    let canonical = dest;
+    try {
+      canonical = realpathSync(dest);
+    } catch {}
+    if (provenance.dest !== canonical || !worktreeRegistered(source, dest)) return false;
+  }
 
   let parkRoot: string | null = null;
   const moves: Array<{ from: string; to: string }> = [];
@@ -879,6 +1004,7 @@ export const STALE_CLONE_DAYS = 7;
 
 export interface WorktreeCloneScanEntry {
   dest: string;
+  branch: string | null;
   created_at: string | null;
   age_days: number | null;
   dest_exists: boolean;
@@ -918,6 +1044,7 @@ export function scanWorktreeClones(sourceArg: string): WorktreeCloneScan {
       registered.add(provenance.dest);
       clones.push({
         dest: provenance.dest,
+        branch: provenance.branch ?? null,
         created_at: provenance.created_at ?? null,
         age_days: ageDays(Date.parse(provenance.created_at ?? "")),
         dest_exists: pathExists(provenance.dest),
@@ -960,7 +1087,12 @@ interface GcCloneReport extends WorktreeCloneScanEntry {
   action: "remove" | "prune" | "keep";
   losses: string[];
   removed?: boolean;
+  branch_cleanup?: BranchCleanup | null;
   remove_with?: string;
+}
+
+export function removeWith(dest: string, force = false): string {
+  return `orch worktree remove --dest ${dest}${force ? " --force" : ""}`;
 }
 
 interface GcTrashReport extends WorktreeTrashScanEntry {
@@ -988,7 +1120,7 @@ export async function worktreeGc(args: ParsedArgs): Promise<number> {
       ...clone,
       action: "keep",
       losses: assessment.losses,
-      remove_with: `git -C ${scan.source} worktree remove --force ${clone.dest}`,
+      remove_with: removeWith(clone.dest, true),
     };
   });
   const trash: GcTrashReport[] = scan.trash.map((entry) => {
@@ -1005,7 +1137,9 @@ export async function worktreeGc(args: ParsedArgs): Promise<number> {
   if (execute) {
     for (const clone of clones) {
       if (clone.action === "remove" || clone.action === "prune") {
-        clone.removed = removeWorktreeClone(scan.source, clone.dest);
+        const result = removeClone(scan.source, clone.dest, false);
+        clone.removed = result.removed;
+        clone.branch_cleanup = result.branch;
       }
     }
     for (const entry of trash) {
@@ -1070,7 +1204,40 @@ export async function worktreeClone(args: ParsedArgs): Promise<number> {
   printJson({
     worktree: "cloned",
     ...outcome,
-    remove_with: `git -C ${outcome.source} worktree remove --force ${outcome.dest}`,
+    remove_with: removeWith(outcome.dest),
   });
   return 0;
+}
+
+export async function worktreeRemove(args: ParsedArgs): Promise<number> {
+  assertKnownFlags(args, "worktree remove", ["dest", "source", "force"]);
+  const destArg = resolve(flagString(args, "dest"));
+  const force = flagBool(args, "force");
+  let dest = destArg;
+  try {
+    dest = realpathSync(destArg);
+  } catch {}
+  const provenance = pathExists(dest) ? readProvenance(dest) : null;
+  const source = args.flags.has("source") ? realpathSync(git(["-C", resolve(flagString(args, "source")), "rev-parse", "--show-toplevel"])) : provenance?.source;
+  if (!source) {
+    throw new CliError(`no orch clone provenance at ${dest}; pass --source <repo> (plus --force for a worktree orch did not create)`);
+  }
+  const losses = force ? [] : inspectWorktreeLosses(source, dest).losses;
+  const result = losses.length === 0 ? removeClone(source, dest, force) : { removed: false, branch: null };
+  printJson({
+    worktree: result.removed ? "removed" : "kept",
+    source,
+    dest,
+    forced: force,
+    removed: result.removed,
+    losses,
+    branch: result.branch,
+    ...(result.removed
+      ? {}
+      : {
+          reason: losses.length > 0 ? "loss detection blocked removal" : "not a registered clone of this source, or removal failed",
+          remove_with: removeWith(dest, true),
+        }),
+  });
+  return result.removed ? 0 : 1;
 }
