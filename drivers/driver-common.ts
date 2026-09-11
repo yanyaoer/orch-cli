@@ -403,7 +403,11 @@ function recordCoercion(coercions: ResultCoercion[], field: string, from: unknow
   coercions.push({ field, from: compactFrom, to: compactTo, reason });
 }
 
-function findJsonObjectEnd(text: string, start: number): number | null {
+// Balanced-object end for the `{` at `start`. `bracesInStrings` collects the
+// positions of every `{` the scan passed inside a string literal: those are
+// not object starts, and a scan started from one runs with inverted quote
+// state to the end of the text.
+function findJsonObjectEnd(text: string, start: number, bracesInStrings: number[]): number | null {
   let depth = 0;
   let inString = false;
   let escaped = false;
@@ -417,6 +421,8 @@ function findJsonObjectEnd(text: string, start: number): number | null {
         escaped = true;
       } else if (char === '"') {
         inString = false;
+      } else if (char === "{") {
+        bracesInStrings.push(index);
       }
       continue;
     }
@@ -443,24 +449,36 @@ function parsedJsonCandidates(text: string): unknown[] {
   if (direct !== null) return [direct];
 
   const candidates: unknown[] = [];
-  const seen = new Set<string>();
-  const pushJson = (json: string): void => {
+  const seen = new Map<string, boolean>();
+  const pushJson = (json: string): boolean => {
     const key = json.trim();
-    if (!key || seen.has(key)) return;
-    seen.add(key);
+    if (!key) return false;
+    const known = seen.get(key);
+    if (known !== undefined) return known;
     const parsed = tryParseJson(key);
+    seen.set(key, parsed !== null);
     if (parsed !== null) candidates.push(parsed);
+    return parsed !== null;
   };
 
   for (const fenced of trimmed.matchAll(/```(?:json)?\s*([\s\S]*?)```/g)) {
     if (fenced[1]) pushJson(fenced[1]);
   }
 
+  // Native streams are JSONL whose string payloads (tool output: code, JSON,
+  // diffs) are full of braces; restarting the scan at each of them cost
+  // O(braces × text). A scan whose substring parses as JSON had its string
+  // boundaries right, so the braces it passed inside strings are dropped as
+  // starts. Nothing else is trusted: a scan that failed or closed on a
+  // non-JSON substring may have run with inverted quote state, so prose
+  // candidates with unbalanced quotes are read exactly as before.
+  const skippedStarts = new Set<number>();
   for (let start = 0; start < trimmed.length; start++) {
-    if (trimmed[start] !== "{") continue;
-    const end = findJsonObjectEnd(trimmed, start);
-    if (end === null) continue;
-    pushJson(trimmed.slice(start, end + 1));
+    if (trimmed[start] !== "{" || skippedStarts.has(start)) continue;
+    const bracesInStrings: number[] = [];
+    const end = findJsonObjectEnd(trimmed, start, bracesInStrings);
+    if (end === null || !pushJson(trimmed.slice(start, end + 1))) continue;
+    for (const index of bracesInStrings) skippedStarts.add(index);
   }
 
   return candidates;
@@ -924,15 +942,20 @@ export async function maybeWriteFakeResult(runDir: string, spec: RunSpec, provid
   return true;
 }
 
-// pi/omp emit one message_update line per streaming delta, each embedding the
-// full accumulated partial message — O(n²) bytes per message that no reader
-// consumes (native-events.ts normalizes message_end/turn_end/agent_end only),
-// so those lines never reach disk. Matching is structural like the read side:
-// top-level JSONL events serialize their type key first.
-const droppedNativeLinePrefix = Buffer.from('{"type":"message_update"');
+// pi/omp emit one line per streaming delta that re-embeds the accumulated state
+// so far: message_update carries the partial message, tool_execution_update the
+// tool call's args plus its partial result (a subagent call was seen to emit
+// 10k of them, each repeating its full prompt) — O(n²) bytes per message/call
+// that no reader consumes (native-events.ts normalizes message_end/turn_end/
+// agent_end and tool_execution_start/end only; the end lines carry the complete
+// message/result), so those lines never reach disk. Matching is structural like
+// the read side: top-level JSONL events serialize their type key first.
+const droppedNativeLinePrefixes = ['{"type":"message_update"', '{"type":"tool_execution_update"'].map((prefix) =>
+  Buffer.from(prefix),
+);
 
 function keepsNativeLine(line: Buffer): boolean {
-  return !line.subarray(0, droppedNativeLinePrefix.length).equals(droppedNativeLinePrefix);
+  return !droppedNativeLinePrefixes.some((prefix) => line.subarray(0, prefix.length).equals(prefix));
 }
 
 export async function pipeToFile(stream: ReadableStream<Uint8Array> | null, path: string): Promise<void> {

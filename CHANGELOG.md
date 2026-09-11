@@ -12,6 +12,11 @@ All notable user-facing changes are recorded here.
 
 - macOS worktree clones copy with `clonefile(2)` (via `bun:ffi`) instead of `/bin/cp -c`: one kernel call clones a whole directory tree, measured 0.17 s vs 2.1 s for a 3.9 GB / 13k-file Rust `target/` (end-to-end `orch worktree clone` ~3 s → 0.8 s; cargo still reports every crate `Fresh` in the clone). Symlink entries are cloned as links (`CLONE_NOFOLLOW`), errno is surfaced (`EXDEV`, `ENOTSUP`, ...), the CoW probe stays fail-closed, and `/bin/cp -c` remains the fallback when the symbol cannot be loaded. The Linux reflink path is unchanged.
 - Snapshot clones skip `.claude/worktrees` (Claude Code's nested checkouts, each a second checkout of a slot registered to the source path) alongside `.git`/`.jj`; the rest of `.claude` is still carried.
+- `native.jsonl` no longer stores pi/omp `tool_execution_update` streaming deltas, the sibling of the 0.0.10 `message_update` filter: each one re-embeds the tool call's args plus its accumulated partial result (a bash call's cumulative output; a subagent call repeating its full prompt — one such call emitted 10.6k updates), no reader consumes them (the normalizer reads `tool_execution_start`/`end` only, and the end line carries the complete result), and they were 71% (2.7 GB) of a 3.8 GB state tree — 92% of the largest single run. Existing run dirs are left as written.
+
+### Fixes
+
+- Result extraction no longer restarts its JSON object scan from braces inside string literals. The candidate scanner started a balanced-brace scan at every `{` in a text; in a native stream every brace in tool output (code, JSON, diffs) sits inside a JSON string, and a scan started there runs with inverted quote state to the end of the text — O(braces × size), measured 7.7 s at 8 MB, 37 s at 20 MB, and over five minutes for a 381 MB stream, burnt at the end of every run whose structured candidates carried no result (exit 0 but no valid result: 81 runs in one state tree). A scan whose substring parses as JSON had its string boundaries right, so the braces it passed inside strings are now excluded as starts; nothing else is trusted (a failed scan, or one that closed on a non-JSON substring, may have run with inverted quote state), so prose candidates with unbalanced quotes are read exactly as before.
 
 ## [0.0.12] - 2026-09-02
 
