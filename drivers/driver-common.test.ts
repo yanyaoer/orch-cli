@@ -621,6 +621,40 @@ test("buildProviderArgv gives researcher a read-only web-research posture on cla
   );
 });
 
+test("extractResultFromText does not restart the object scan from braces inside string literals", () => {
+  // native.jsonl shape: one JSON object per line whose string payload is full
+  // of braces (tool output). A scan restarted from a brace inside a string
+  // runs with inverted quote state to the end of the text, so this input
+  // cost O(braces × text) — about a minute — before the trailing result was
+  // reached; the closed enclosing objects now rule those braces out.
+  const runSpec = spec("researcher", "research-braces");
+  const payload = "{ ".repeat(100);
+  const lines = Array.from({ length: 2000 }, (_, i) =>
+    JSON.stringify({ type: "tool_execution_end", toolCallId: `c-${i}`, result: { content: [{ type: "text", text: payload }] } }),
+  );
+  lines.push(
+    JSON.stringify({
+      schema: "orch.result/researcher/v1",
+      verdict: "completed",
+      recommendation: "adopt approach B",
+      risks: [],
+      alternatives: [],
+      open_questions: [],
+    }),
+  );
+  const started = performance.now();
+  const result = extractResultFromText(lines.join("\n"), runSpec);
+  expect(performance.now() - started).toBeLessThan(5_000);
+  expect(result).toMatchObject({ schema: "orch.result/researcher/v1", run_id: "research-braces", verdict: "completed" });
+
+  // Prose with a dangling fragment: the scan restarted from the brace inside
+  // "y{z" runs with inverted quote state and closes on the result's own
+  // brace, but that substring is not JSON, so nothing is ruled out and the
+  // result is still read.
+  const prose = `Draft: {"x": "y{z\n\nFinal:\n${lines.at(-1)!.replace('"recommendation":"adopt approach B"', '"recommendation":"say \\"hi\\""')}`;
+  expect(extractResultFromText(prose, runSpec)).toMatchObject({ run_id: "research-braces", recommendation: 'say "hi"' });
+});
+
 test("extractResultFromText coerces researcher alias fields and missing arrays", () => {
   const runSpec = spec("researcher", "research-coerce");
   const result = extractResultFromText(
@@ -1663,18 +1697,29 @@ test("extractResultFromText accepts a fenced gemini-style result with finding/sc
   });
 });
 
-test("pipeToFile drops message_update lines, including ones split across chunks", async () => {
+test("pipeToFile drops message_update and tool_execution_update lines, including ones split across chunks", async () => {
   const kept1 = '{"type":"session","session_id":"s-1"}\n';
   const droppedWhole = `{"type":"message_update","assistantMessageEvent":{"partial":"${"x".repeat(50)}"}}\n`;
   const droppedSplit = `{"type":"message_update","assistantMessageEvent":{"partial":"${"y".repeat(50)}"}}\n`;
+  const keptStart = '{"type":"tool_execution_start","toolCallId":"c-1","toolName":"bash","args":{"command":"ls"}}\n';
+  const droppedTool = `{"type":"tool_execution_update","toolCallId":"c-1","toolName":"bash","args":{"command":"ls"},"partialResult":{"content":[{"type":"text","text":"${"z".repeat(50)}"}]}}\n`;
+  // The sibling end line shares all but the last word of the prefix and must stay.
+  const keptEnd = '{"type":"tool_execution_end","toolCallId":"c-1","toolName":"bash","result":{"content":[{"type":"text","text":"a\\nb"}]}}\n';
   const kept2 = '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"done"}]}}\n';
   const keptTail = "plain trailing line without newline";
 
   const encoder = new TextEncoder();
   const half = Math.floor(droppedSplit.length / 2);
-  const chunks = [kept1 + droppedWhole, droppedSplit.slice(0, 10), droppedSplit.slice(10, half), droppedSplit.slice(half) + kept2, keptTail].map(
-    (part) => encoder.encode(part),
-  );
+  const chunks = [
+    kept1 + droppedWhole,
+    droppedSplit.slice(0, 10),
+    droppedSplit.slice(10, half),
+    droppedSplit.slice(half) + keptStart + droppedTool,
+    // Split inside the type key, before the prefix is decidable.
+    droppedTool.slice(0, 20),
+    droppedTool.slice(20) + keptEnd + kept2,
+    keptTail,
+  ].map((part) => encoder.encode(part));
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
       for (const chunk of chunks) controller.enqueue(chunk);
@@ -1684,5 +1729,5 @@ test("pipeToFile drops message_update lines, including ones split across chunks"
 
   const path = join(tempDir(), "native.jsonl");
   await pipeToFile(stream, path);
-  expect(readFileSync(path, "utf8")).toBe(kept1 + kept2 + keptTail);
+  expect(readFileSync(path, "utf8")).toBe(kept1 + keptStart + keptEnd + kept2 + keptTail);
 });
