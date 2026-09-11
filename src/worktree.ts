@@ -80,7 +80,7 @@ export interface WorktreeLossAssessment {
   losses: string[];
 }
 
-function spawnGit(args: string[]): ReturnType<typeof Bun.spawnSync> {
+function spawnGit(args: string[]): Bun.SyncSubprocess<"pipe", "pipe"> {
   // An ambient GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE would redirect every -C
   // call — and make loss-detection digests describe an unrelated repository.
   const env = { ...process.env };

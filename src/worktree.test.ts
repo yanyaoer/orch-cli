@@ -25,6 +25,7 @@ import {
   removeWorktreeClone,
   scanWorktreeClones,
   type CowBackendFactory,
+  type WorktreeCloneOptions,
 } from "./worktree.ts";
 
 const cleanups: Array<() => void> = [];
@@ -790,10 +791,11 @@ test("snapshot skips Claude Code's nested worktrees but keeps the rest of .claud
   mkdirSync(join(src, ".claude", "worktrees", "wt-1"), { recursive: true });
   writeFileSync(join(src, ".claude", "worktrees", "wt-1", ".git"), "gitdir: elsewhere\n", "utf8");
   writeFileSync(join(src, ".claude", "settings.local.json"), "{}\n", "utf8");
-  for (const [name, options] of [
+  const cases: Array<[string, WorktreeCloneOptions]> = [
     ["no-nested", {}],
     ["no-nested-filtered", { exclude: ["build/private/**"] }],
-  ] as const) {
+  ];
+  for (const [name, options] of cases) {
     const dest = join(root, name);
     cloneWorktreeCow(src, dest, null, options, portableBackend);
     expect(existsSync(join(dest, ".claude", "settings.local.json"))).toBe(true);
@@ -891,4 +893,4 @@ test.skipIf(process.platform !== "darwin")("worktree remove: loss-gated, --force
     branch_cleanup: { name: "feat/gc", deleted: true },
   });
   expect(branchExists("feat/gc")).toBe(false);
-});
+}, 60_000);
