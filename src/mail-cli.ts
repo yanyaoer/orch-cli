@@ -31,7 +31,7 @@ import type { AgentName, RoleResult, RunRole, RunStatus } from "./types.ts";
 import { isRunRole } from "./types.ts";
 import { acquirePidfileLockWait, type PidfileLock } from "./locks.ts";
 import { vcsHead } from "./vcs.ts";
-import { cloneForFanout, removeWorktreeClone, type WorktreeCloneOutcome } from "./worktree.ts";
+import { cloneForFanout, removeWith, removeWorktreeClone, type WorktreeCloneOutcome } from "./worktree.ts";
 
 interface LocatedRun {
   mr: string;
@@ -862,7 +862,7 @@ export async function mailFanout(args: ParsedArgs, context: MailCliContext, opts
       );
     }
     const cloned = cloneForFanout(worktree, thread);
-    clone = { ...cloned, remove_with: `git -C ${cloned.source} worktree remove --force ${cloned.dest}` };
+    clone = { ...cloned, remove_with: removeWith(cloned.dest) };
   }
   const dispatchWorktree = clone?.dest ?? worktree;
 

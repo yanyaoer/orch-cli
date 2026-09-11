@@ -25,6 +25,7 @@ import {
   removeWorktreeClone,
   scanWorktreeClones,
   type CowBackendFactory,
+  type WorktreeCloneOptions,
 } from "./worktree.ts";
 
 const cleanups: Array<() => void> = [];
@@ -722,10 +723,22 @@ test.skipIf(process.platform !== "darwin")("worktree gc plans, then executes onl
 
 test.skipIf(process.platform !== "darwin")("native APFS clone backend smoke", async () => {
   const { root, src } = await fixture();
+  // Top-level entries are cloned one clonefile(2) call each: a symlink entry
+  // must be cloned as the link (CLONE_NOFOLLOW), not as its target's content.
+  symlinkSync("a.txt", join(src, "rel-link"));
+  mkdirSync(join(src, "ro-dir"));
+  writeFileSync(join(src, "ro-dir", "f"), "ro\n", "utf8");
+  chmodSync(join(src, "ro-dir"), 0o555);
+  cleanups.unshift(() => chmodSync(join(src, "ro-dir"), 0o755));
   const dest = join(root, "native");
   const outcome = cloneWorktreeCow(src, dest, null);
   expect(outcome.dest).toBe(dest);
   expect(await Bun.file(join(dest, "a.txt")).text()).toBe("a-dirty\n");
+  expect(readlinkSync(join(dest, "rel-link"))).toBe("a.txt");
+  expect(await Bun.file(join(dest, "build", "out.bin")).text()).toBe("artifact\n");
+  expect(lstatSync(join(dest, "ro-dir")).mode & 0o777).toBe(0o555);
+  chmodSync(join(dest, "ro-dir"), 0o755);
+  expect(() => cloneWorktreeCow(src, dest, null)).toThrow(/already exists/);
 });
 
 test.skipIf(process.platform !== "darwin")("worktree clone CLI accepts lifecycle policy flags", async () => {
@@ -772,3 +785,112 @@ test("defaultCloneDest uses a sibling named after the branch", () => {
   expect(defaultCloneDest("/Users/x/mi/osbot", "feat/agent2")).toBe("/Users/x/mi/osbot-feat_agent2");
   expect(defaultCloneDest("/Users/x/mi/osbot", null)).toMatch(/^\/Users\/x\/mi\/osbot-wt-[0-9a-f]{6}$/);
 });
+
+test("snapshot skips Claude Code's nested worktrees but keeps the rest of .claude", async () => {
+  const { root, src } = await fixture();
+  mkdirSync(join(src, ".claude", "worktrees", "wt-1"), { recursive: true });
+  writeFileSync(join(src, ".claude", "worktrees", "wt-1", ".git"), "gitdir: elsewhere\n", "utf8");
+  writeFileSync(join(src, ".claude", "settings.local.json"), "{}\n", "utf8");
+  const cases: Array<[string, WorktreeCloneOptions]> = [
+    ["no-nested", {}],
+    ["no-nested-filtered", { exclude: ["build/private/**"] }],
+  ];
+  for (const [name, options] of cases) {
+    const dest = join(root, name);
+    cloneWorktreeCow(src, dest, null, options, portableBackend);
+    expect(existsSync(join(dest, ".claude", "settings.local.json"))).toBe(true);
+    expect(existsSync(join(dest, ".claude", "worktrees"))).toBe(false);
+    expect(inspectWorktreeLosses(src, dest).safe).toBe(true);
+  }
+});
+
+test.skipIf(process.platform !== "darwin")("worktree remove: loss-gated, --force, merged-branch tidy, identity fail-closed", async () => {
+  const { root, src } = await fixture({ ignoredBuild: true });
+  const run = async (...argv: string[]) => {
+    const proc = Bun.spawn([process.execPath, "src/orch.ts", "worktree", ...argv], {
+      cwd: process.cwd(),
+      stdout: "pipe",
+      stderr: "pipe",
+      env: gitEnv(src),
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    return { exitCode, stderr, payload: stdout.trim() ? JSON.parse(stdout) : null };
+  };
+  const branchExists = (name: string): boolean => shSync(src, "git", "show-ref", "--verify", "--quiet", `refs/heads/${name}`).exitCode === 0;
+
+  // Pristine clone: removed, and its branch (still at HEAD, hence merged) deleted.
+  const safe = join(root, "rm-safe");
+  cloneWorktreeCow(src, safe, "feat/safe", {});
+  const r1 = await run("remove", "--dest", safe);
+  expect(r1.exitCode, r1.stderr).toBe(0);
+  expect(r1.payload).toMatchObject({ worktree: "removed", removed: true, forced: false, branch: { name: "feat/safe", deleted: true } });
+  expect(existsSync(safe)).toBe(false);
+  expect(branchExists("feat/safe")).toBe(false);
+
+  // Edited clone: kept with losses and the --force hint; --force discards it.
+  const edited = join(root, "rm-edited");
+  cloneWorktreeCow(src, edited, "feat/edited", {});
+  writeFileSync(join(edited, "a.txt"), "agent edit\n", "utf8");
+  const r2 = await run("remove", "--dest", edited);
+  expect(r2.exitCode).toBe(1);
+  expect(r2.payload).toMatchObject({ worktree: "kept", removed: false, remove_with: `orch worktree remove --dest ${edited} --force` });
+  expect(r2.payload.losses.length).toBeGreaterThan(0);
+  expect(existsSync(edited)).toBe(true);
+  const r3 = await run("remove", "--dest", edited, "--force");
+  expect(r3.exitCode, r3.stderr).toBe(0);
+  expect(r3.payload).toMatchObject({ worktree: "removed", forced: true, branch: { name: "feat/edited", deleted: true } });
+  expect(existsSync(edited)).toBe(false);
+
+  // Committed work: the worktree goes (retained by its branch) but the unmerged branch stays.
+  const committed = join(root, "rm-committed");
+  cloneWorktreeCow(src, committed, "feat/committed", {});
+  writeFileSync(join(committed, "b.txt"), "new\n", "utf8");
+  await sh(committed, "git", "add", "b.txt");
+  await sh(committed, "git", "commit", "-q", "-am", "clone work");
+  const r4 = await run("remove", "--dest", committed);
+  expect(r4.exitCode, r4.stderr).toBe(0);
+  expect(r4.payload.branch).toMatchObject({ name: "feat/committed", deleted: false });
+  expect(r4.payload.branch.reason).toMatch(/not fully merged/);
+  expect(existsSync(committed)).toBe(false);
+  expect(branchExists("feat/committed")).toBe(true);
+
+  // Identity stays fail-closed under --force: a directory that is not a registered worktree is untouched.
+  const stranger = join(root, "stranger");
+  mkdirSync(stranger);
+  writeFileSync(join(stranger, "keep.txt"), "keep\n", "utf8");
+  const r5 = await run("remove", "--dest", stranger, "--source", src, "--force");
+  expect(r5.exitCode).toBe(1);
+  expect(r5.payload).toMatchObject({ worktree: "kept", removed: false });
+  expect(existsSync(join(stranger, "keep.txt"))).toBe(true);
+  const r6 = await run("remove", "--dest", stranger);
+  expect(r6.exitCode).not.toBe(0);
+  expect(r6.stderr).toContain("provenance");
+
+  // A plain git worktree without provenance needs --source and --force.
+  const plain = join(root, "plain-wt");
+  await sh(src, "git", "worktree", "add", "--quiet", "--detach", plain);
+  const r7 = await run("remove", "--dest", plain, "--source", src);
+  expect(r7.exitCode).toBe(1);
+  expect(existsSync(plain)).toBe(true);
+  const r8 = await run("remove", "--dest", plain, "--source", src, "--force");
+  expect(r8.exitCode, r8.stderr).toBe(0);
+  expect(r8.payload).toMatchObject({ worktree: "removed", branch: null });
+  expect(existsSync(plain)).toBe(false);
+  expect(await sh(src, "git", "worktree", "list")).not.toContain("plain-wt");
+
+  // gc tidies the branch of a removed clone the same way.
+  const viaGc = join(root, "rm-gc");
+  cloneWorktreeCow(src, viaGc, "feat/gc", {});
+  const r9 = await run("gc", "--source", src, "--execute");
+  expect(r9.exitCode, r9.stderr).toBe(0);
+  expect(r9.payload.clones.find((clone: { dest: string }) => clone.dest === viaGc)).toMatchObject({
+    removed: true,
+    branch: "feat/gc",
+    branch_cleanup: { name: "feat/gc", deleted: true },
+  });
+  expect(branchExists("feat/gc")).toBe(false);
+}, 60_000);

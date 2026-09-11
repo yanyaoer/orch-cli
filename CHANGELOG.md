@@ -2,6 +2,17 @@
 
 All notable user-facing changes are recorded here.
 
+## [Unreleased]
+
+### Features
+
+- `orch worktree remove --dest <path> [--source <path>] [--force]` — tear one clone down behind the same loss-detection gate as gc and automatic fan-out teardown: a kept clone lists its losses, exits 1, and carries the `--force` command. `--force` skips loss detection but never identity — the dest must be a worktree registered to the source, and provenance, when present, must describe exactly that pair — so a forced removal cannot be pointed at an arbitrary directory; a worktree without provenance needs `--force` plus an explicit `--source`. After removal the branch the clone was created with is deleted via `git branch -d` only when git considers it merged into its upstream (or HEAD); a refused branch is reported (`branch.reason`), never forced. `worktree gc --execute` tidies branches the same way (`branch_cleanup`). Every `remove_with` hint (clone payload, gc keep entries, fan-out `clone.remove_with`) now names this command. Shaped to be the body of a Claude Code `WorktreeRemove` hook, which fires only after the session's own dirty check.
+
+### Changes
+
+- macOS worktree clones copy with `clonefile(2)` (via `bun:ffi`) instead of `/bin/cp -c`: one kernel call clones a whole directory tree, measured 0.17 s vs 2.1 s for a 3.9 GB / 13k-file Rust `target/` (end-to-end `orch worktree clone` ~3 s → 0.8 s; cargo still reports every crate `Fresh` in the clone). Symlink entries are cloned as links (`CLONE_NOFOLLOW`), errno is surfaced (`EXDEV`, `ENOTSUP`, ...), the CoW probe stays fail-closed, and `/bin/cp -c` remains the fallback when the symbol cannot be loaded. The Linux reflink path is unchanged.
+- Snapshot clones skip `.claude/worktrees` (Claude Code's nested checkouts, each a second checkout of a slot registered to the source path) alongside `.git`/`.jj`; the rest of `.claude` is still carried.
+
 ## [0.0.12] - 2026-09-02
 
 ### Features

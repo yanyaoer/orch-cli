@@ -25,7 +25,8 @@ discarding work that cannot be proven safe to remove.
   filesystem.
 - Existing callers keep the three-argument clone function and boolean removal
   result. New policy is optional and defaults to snapshot semantics.
-- Root `.git` and `.jj` entries are never copied.
+- Root `.git` and `.jj` entries are never copied, nor is `.claude/worktrees`
+  (Claude Code's nested checkouts); the rest of `.claude` is carried.
 - Policy paths are relative to the worktree. They cannot escape with `..` or
   select VCS metadata.
 
@@ -34,7 +35,10 @@ discarding work that cannot be proven safe to remove.
 Creation is register-first:
 
 1. Resolve the source and destination to canonical paths and probe CoW support
-   in the destination parent.
+   in the destination parent. On macOS the backend is `clonefile(2)` (one
+   kernel call per top-level entry, whole subtrees included, symlink entries
+   cloned as links); `/bin/cp -c` is the fallback when the symbol cannot be
+   loaded. Linux uses `cp --reflink=always`.
 2. Register the final destination using `git worktree add --no-checkout`.
 3. Materialize one of the two supported modes around that worktree's real
    `.git` pointer.
@@ -122,8 +126,8 @@ describe the directory itself (a redirected worktree) is unverifiable. When
 the digest cannot be computed, or no longer matches, removal is blocked.
 Git-ignored content sits outside loss detection by contract: caches are
 disposable, and removal discards them. Missing or mismatched provenance fails
-closed; an operator can still use Git's explicit force-removal command to
-discard the clone deliberately.
+closed; an operator discards the clone deliberately with
+`orch worktree remove --dest <path> --force` (or Git's explicit force-removal).
 
 ## Removal
 
@@ -146,6 +150,18 @@ Trash directories use the same real-directory and `0700` checks as
 fanout storage. A killed sweep may leave reclaimable disk usage but cannot make
 Git state or workspace content incorrect.
 
+`orch worktree remove --dest <path>` exposes this flow for one clone. `--force`
+skips loss detection but never identity: the destination must be a worktree
+registered to the source, and provenance, when present, must describe exactly
+that pair — a forced removal cannot be pointed at an arbitrary directory. A
+worktree without provenance is removed only with `--force` and an explicit
+`--source`, through Git itself.
+
+After a successful removal (`remove` or `gc --execute`) the branch the clone
+was created with is deleted with `git branch -d` — Git refuses a branch not
+merged into its upstream (or HEAD when none), so the tidy-up cannot lose a
+commit. A refused branch is reported, never forced.
+
 ## Acceptance
 
 - Registration exists before the first workspace entry is copied.
@@ -161,6 +177,11 @@ Git state or workspace content incorrect.
 - Automatic removal rejects potentially lossy states, preserves named-branch
   commits, restores parked caches on unregister failure, and removes proven-safe
   clones.
+- A forced removal still refuses a directory that is not a worktree registered
+  to the source.
+- Branch tidy-up deletes only merged branches; an unmerged branch survives the
+  removal of its worktree.
+- Snapshot clones never contain `.claude/worktrees`.
 
 ## Test Plan
 
