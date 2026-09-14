@@ -485,6 +485,20 @@ $ XDG_STATE_HOME=/tmp/orch-demo-state orch run list --mr demo
 $ XDG_STATE_HOME=/tmp/orch-demo-state orch status --mr demo --json
 ```
 
+### Source layout
+
+- `src/orch.ts`: entry point and command dispatch only.
+- `src/commands/*.ts`: one file per command family (`run`, `status`, `events`, `decision`, `mirror`, `fanout`, `new`, `mailctl`, `search`, `usage`, `trajectory`, `bridge`, `update`).
+- `src/run-store.ts`: run-state readers shared by commands (locate runs, list an MR's runs, outbox and forge-ref helpers).
+- `src/render.ts`: terminal summaries and PR/MR comment bodies.
+- `src/supervisor.ts` + `drivers/`: the run engine (spawn, heartbeat, result extraction, sandbox).
+- `src/mailctl.ts`, `src/mail*.ts`, `src/imap.ts`, `src/smtp.ts`, `src/mime.ts`: the mail control plane.
+- `src/worktree.ts`: CoW clone lifecycle.
+
+### Golden fixtures
+
+`fixtures/` holds data-only contract cases (worker text → `result.json`, result → comment body) run by `src/golden.test.ts`. Add a case by adding a directory; after an intentional behaviour change regenerate with `UPDATE_FIXTURES=1 bun test src/golden.test.ts` and review the diff. See `fixtures/README.md`.
+
 ## Roadmap
 
 The current MVP intentionally avoids a daemon. Natural next steps are:

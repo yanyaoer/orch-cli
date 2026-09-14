@@ -1,0 +1,1 @@
+{"schema":"orch.result/researcher/v1","verdict":"complete","summary":"Compared two cache strategies.","proposal":"Adopt write-through; it removes the invalidation path.","sources":["https://example.com/caching"]}

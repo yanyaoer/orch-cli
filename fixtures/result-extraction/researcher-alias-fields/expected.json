@@ -1,0 +1,14 @@
+{
+  "schema": "orch.result/researcher/v1",
+  "verdict": "completed",
+  "summary": "Compared two cache strategies.",
+  "proposal": "Adopt write-through; it removes the invalidation path.",
+  "sources": [
+    "https://example.com/caching"
+  ],
+  "run_id": "research-1",
+  "alternatives": [],
+  "open_questions": [],
+  "risks": [],
+  "recommendation": "Adopt write-through; it removes the invalidation path."
+}
