@@ -16,9 +16,12 @@ export interface MaildirTransportConfig {
 }
 
 // mailctl's cursor skips uids at or below the last processed one, so uids
-// must grow with delivery. mbsync keeps the IMAP UID in the filename
-// (",U=<uid>"); other fetchers get the Maildir timestamp prefix plus its
-// per-second sequence, which grows with delivery time.
+// must grow with delivery. mbsync writes its own per-store UID into the
+// filename (",U=<n>", monotonic for that Maildir; not the server UID — a
+// fresh store starts at 1 whatever UIDNEXT is); other fetchers get the
+// Maildir timestamp prefix plus its per-second sequence, which grows with
+// delivery time. Switching mailboxes therefore needs the cursor re-seeded
+// to the new store's highest local uid, or every old message is "new".
 export function maildirUid(name: string): number {
   const imapUid = name.match(/,U=(\d+)/);
   if (imapUid) return Number(imapUid[1]);
