@@ -1,0 +1,18 @@
+{
+  "schema": "orch.result/reviewer/v1",
+  "run_id": "review-1",
+  "verdict": "request_changes",
+  "reviews_run_id": "impl-1",
+  "blocking_findings": [
+    {
+      "id": "F1",
+      "severity": "high",
+      "file": "src/a.ts:12",
+      "body": "Null dereference when the list is empty."
+    }
+  ],
+  "non_blocking_findings": [],
+  "suggested_tests": [
+    "empty list case"
+  ]
+}

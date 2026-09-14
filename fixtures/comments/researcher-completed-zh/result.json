@@ -1,0 +1,1 @@
+{"schema":"orch.result/researcher/v1","run_id":"research-1","verdict":"completed","summary":"Compared two cache strategies.","recommendation":"Adopt write-through.","alternatives":["write-back with invalidation"],"sources":["https://example.com/caching"],"open_questions":["cold-start cost"],"risks":[]}

@@ -1,0 +1,2 @@
+I could not finish the review: the worktree was missing the generated client
+and the build failed before any test ran. Please regenerate and re-dispatch.

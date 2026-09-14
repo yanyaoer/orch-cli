@@ -1,0 +1,1 @@
+{"schema":"orch.result/implementer/v1","run_id":"impl-1","verdict":"completed","summary":"Added retry with backoff to fetch.","base_sha":"abc123","head_sha":"def456","changed_files":["src/fetch.ts","src/fetch.test.ts"],"tests":["bun test src/fetch.test.ts"],"acceptance":["retries 3 times"],"risks":["backoff caps at 30s"],"rollback":"git revert def456"}

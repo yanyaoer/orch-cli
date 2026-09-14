@@ -1,0 +1,14 @@
+Review complete.
+
+```json
+{
+  "schema": "orch.result/reviewer/v1",
+  "verdict": "approve",
+  "reviews_run_id": "impl-1",
+  "blocking_findings": [],
+  "non_blocking_findings": [
+    { "body": "Consider a comment on the retry budget." }
+  ],
+  "suggested_tests": []
+}
+```

@@ -1,0 +1,1 @@
+{"schema":"orch.result/reviewer/v1","verdict":"APPROVED","reviews_run_id":"impl-1","blocking_findings":[],"non_blocking_findings":["Consider renaming foo to fetchOnce"],"suggested_tests":[{"cmd":"bun test src/foo.test.ts"}]}

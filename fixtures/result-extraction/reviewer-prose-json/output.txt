@@ -1,0 +1,5 @@
+I reviewed the diff against the acceptance criteria. Here is my verdict:
+
+{"schema":"orch.result/reviewer/v1","run_id":"whatever-the-model-invented","verdict":"request_changes","reviews_run_id":"impl-1","blocking_findings":[{"id":"F1","severity":"high","file":"src/a.ts:12","body":"Null dereference when the list is empty."}],"non_blocking_findings":[],"suggested_tests":["empty list case"]}
+
+Let me know if you need more detail.
