@@ -3,21 +3,17 @@ import { existsSync, readdirSync } from "node:fs";
 import { resolve } from "node:path";
 import type { RunStatus } from "../types.ts";
 import { getRepoIdentity, mrStateDir } from "../paths.ts";
-import { readJsonFile } from "../json.ts";
+
 import { DEFAULT_ATTENTION_DAYS, buildOverview, collectMrRuns, collectRepoKeys, isGoodVerdict, isTerminal, mergedBranchMrs, renderArgv, renderOverview, suggestedRunAction } from "../overview.ts";
 import { STALE_CLONE_DAYS, scanWorktreeClones } from "../worktree.ts";
 import { CliError, flagBool, flagNumber, flagString, printJson, type ParsedArgs } from "../cli.ts";
-import { looksStale, mrIdsForRepo } from "../run-store.ts";
+import { mrIdsForRepo, scanMrRuns } from "../run-store.ts";
 
 function mrStatusSection(repoKey: string, mr: string): { mr: string; state_dir: string; runs: Array<RunStatus & { stale: boolean }> } {
   const root = mrStateDir(repoKey, mr);
-  const runsRoot = `${root}/runs`;
-  const runs = existsSync(runsRoot)
-    ? readdirSync(runsRoot)
-        .map((id) => readJsonFile<RunStatus | null>(`${runsRoot}/${id}/status.json`, null))
-        .filter((item): item is RunStatus => item !== null)
-        .map((run) => ({ ...run, stale: looksStale(run) }))
-    : [];
+  const runs = scanMrRuns(repoKey, mr)
+    .filter((record): record is typeof record & { status: RunStatus } => record.status !== null)
+    .map((record) => ({ ...record.status, stale: record.stale }));
   // Prefer the raw mr recorded in the runs over the sanitized directory name.
   return { mr: runs[0]?.mr ?? mr, state_dir: root, runs };
 }

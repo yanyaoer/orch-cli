@@ -6,7 +6,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { orchLanguage } from "./config.ts";
 import type { RoleResult } from "./types.ts";
-import { isGoodVerdict, isTerminal, type OverviewRun } from "./overview.ts";
+import { isAcceptableOutcome, isTerminal, type OverviewRun } from "./overview.ts";
 
 // The reviewer fallback the driver writes when the worker's answer doesn't fit
 // the canonical schema (drivers/driver-common.ts synthesizeResult): exactly one
@@ -110,7 +110,7 @@ export function planAutoDecision(run: AutoRun, fallback: boolean): AutoDecisionP
   if (run.verdict === null) {
     return { decision: null, reason: null, attention: `done without a result verdict; ack with: orch decision close --run ${run.run_id}` };
   }
-  if (isGoodVerdict(run.verdict) && (run.blocking ?? 0) === 0) {
+  if (isAcceptableOutcome(run.verdict, run.blocking)) {
     return { decision: "accept", reason: `cross-review --auto: reviewer ${run.verdict}`, attention: null };
   }
   return {

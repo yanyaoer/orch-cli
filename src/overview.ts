@@ -6,9 +6,9 @@
 
 import { existsSync, readdirSync, statSync } from "node:fs";
 import type { RunState, RunStatus } from "./types.ts";
+import { mailControlStateDir,  orchStateRoot, statePathSegment } from "./paths.ts";
 import { readJsonFile } from "./json.ts";
-import { mailControlStateDir, mrStateDir, orchStateRoot, statePathSegment } from "./paths.ts";
-import { isPidAlive } from "./locks.ts";
+import { looksStale, nonTerminalStates, scanMrRuns } from "./run-store.ts";
 import { vcsKind } from "./vcs.ts";
 
 export interface OverviewRun {
@@ -62,8 +62,6 @@ export interface OverviewOptions {
 
 export const DEFAULT_ATTENTION_DAYS = 14;
 
-const nonTerminal = new Set<RunState>(["created", "starting", "running"]);
-
 // Verdicts that mean "this run's work is acceptable" across the role schemas.
 const goodVerdicts = new Set(["approve", "pass", "completed"]);
 
@@ -71,29 +69,23 @@ export function isGoodVerdict(verdict: string | null): boolean {
   return verdict !== null && goodVerdicts.has(verdict);
 }
 
-export function looksStale(status: RunStatus): boolean {
-  if (!nonTerminal.has(status.state)) return false;
-  if (status.pid !== null) return !isPidAlive(status.pid);
-  // Orphaned before spawn: no pid was ever recorded and the run has not moved
-  // in over an hour (same heuristic as `orch run reap`).
-  const ageMs = Date.now() - Date.parse(status.updated_at ?? "");
-  return Number.isFinite(ageMs) && ageMs > 60 * 60 * 1000;
+// The one accept/rework rubric: acceptable work is a good verdict with no
+// blocking findings. The bare overview, decision sweep, and cross-review
+// --auto all ask this instead of restating it.
+export function isAcceptableOutcome(verdict: string | null, blocking: number | null): boolean {
+  return isGoodVerdict(verdict) && (blocking ?? 0) === 0;
 }
 
+export { looksStale };
+
 export function isTerminal(state: RunState): boolean {
-  return !nonTerminal.has(state);
+  return !nonTerminalStates.has(state);
 }
 
 export function collectMrRuns(repoKey: string, mr: string): OverviewRun[] {
-  const runsRoot = `${mrStateDir(repoKey, mr)}/runs`;
-  if (!existsSync(runsRoot)) return [];
   const runs: OverviewRun[] = [];
-  for (const entry of readdirSync(runsRoot, { withFileTypes: true })) {
-    if (!entry.isDirectory()) continue;
-    const runDir = `${runsRoot}/${entry.name}`;
-    const status = readJsonFile<RunStatus | null>(`${runDir}/status.json`, null);
+  for (const { status, result, decision, stale } of scanMrRuns(repoKey, mr)) {
     if (!status) continue;
-    const result = readJsonFile<{ verdict?: unknown; blocking_findings?: unknown } | null>(`${runDir}/result.json`, null);
     runs.push({
       repo_key: repoKey,
       mr: status.mr,
@@ -101,16 +93,16 @@ export function collectMrRuns(repoKey: string, mr: string): OverviewRun[] {
       role: status.role,
       agent: status.agent,
       state: status.state,
-      stale: looksStale(status),
+      stale,
       verdict: typeof result?.verdict === "string" ? result.verdict : null,
-      blocking: Array.isArray(result?.blocking_findings) ? result.blocking_findings.length : null,
-      decided: existsSync(`${runDir}/decision.json`),
+      blocking: result && "blocking_findings" in result && Array.isArray(result.blocking_findings) ? result.blocking_findings.length : null,
+      decided: decision !== null,
       started_at: status.started_at,
       updated_at: status.updated_at,
       worktree: status.worktree,
     });
   }
-  return runs.sort((a, b) => (a.started_at ?? "").localeCompare(b.started_at ?? "") || a.run_id.localeCompare(b.run_id));
+  return runs;
 }
 
 // Directory names under <repo>/mrs are sanitized at write time; the raw mr id
@@ -157,7 +149,7 @@ export function suggestedRunAction(run: OverviewRun, withWorktree: boolean): Ove
   if (run.state === "stale" || run.state === "cancelled") return null;
   const worktreeFlags = withWorktree ? ["--worktree", run.worktree] : [];
   if (run.state === "done") {
-    const good = run.verdict !== null && goodVerdicts.has(run.verdict) && (run.blocking ?? 0) === 0;
+    const good = isAcceptableOutcome(run.verdict, run.blocking);
     const verdictText = run.verdict ?? "no verdict";
     const blockingText = run.blocking !== null ? ` · blocking ${run.blocking}` : "";
     return {

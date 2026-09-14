@@ -2,13 +2,13 @@
 import { existsSync, readdirSync } from "node:fs";
 import { basename, resolve } from "node:path";
 import type { RoleResult, RunStatus } from "../types.ts";
-import { getRepoIdentity, mrStateDir } from "../paths.ts";
+import { getRepoIdentity } from "../paths.ts";
 import { createFileFollower, readJsonFile } from "../json.ts";
 import { createNativeNormalizer } from "../native-events.ts";
 import { collectRepoKeys, mrDirsForRepo } from "../overview.ts";
 import { CliError, flagBool, flagNumber, flagString, type ParsedArgs } from "../cli.ts";
 import { printEvidenceSummary, printResultSummary } from "../render.ts";
-import { locateRun, looksStale, nonTerminalStates, readTextFile } from "../run-store.ts";
+import { locateRun, looksStale, nonTerminalStates, readTextFile, scanMrRuns } from "../run-store.ts";
 
 function parseTailLines(args: ParsedArgs): number | null {
   if (!args.flags.has("n")) return null;
@@ -85,22 +85,17 @@ async function eventsTailAll(args: ParsedArgs, repoKeys: string[]): Promise<numb
   const discover = (firstPass: boolean): void => {
     for (const repoKey of repoKeys) {
       for (const mrName of mrNamesFor(repoKey)) {
-        const runsRoot = `${mrStateDir(repoKey, mrName)}/runs`;
-        if (!existsSync(runsRoot)) continue;
-        for (const entry of readdirSync(runsRoot, { withFileTypes: true })) {
-          if (!entry.isDirectory()) continue;
-          const runDir = `${runsRoot}/${entry.name}`;
+        for (const { run_dir: runDir, status, stale } of scanMrRuns(repoKey, mrName)) {
           if (seen.has(runDir)) continue;
-          const status = readJsonFile<RunStatus | null>(`${runDir}/status.json`, null);
           // A run mid-creation (directory exists, status.json not yet written)
           // stays out of `seen` so the next pass re-examines it instead of
           // skipping it for its whole lifetime.
           if (status === null) continue;
           seen.add(runDir);
-          const active = nonTerminalStates.has(status.state) && !looksStale(status);
+          const active = nonTerminalStates.has(status.state) && !stale;
           // On the first pass terminal runs are history; later they are news.
           if (firstPass && !active) continue;
-          track(`${labelPrefix(repoKey)}${mrName}/${entry.name}`, runDir, firstPass);
+          track(`${labelPrefix(repoKey)}${mrName}/${runDir.slice(runDir.lastIndexOf("/") + 1)}`, runDir, firstPass);
         }
       }
     }

@@ -4,7 +4,7 @@ import { basename } from "node:path";
 import type { RoleResult, RunStatus } from "../types.ts";
 import { acquirePidfileLockWait } from "../locks.ts";
 import { ensureStateLayout, mrStateDir } from "../paths.ts";
-import { readJsonFile, writeJsonExclusive } from "../json.ts";
+import {  writeJsonExclusive } from "../json.ts";
 import { argvForDisplay, createForgeAdapter, detectForge } from "../forge.ts";
 import { findPrivateLeak, privateLeakAllowed } from "../leak.ts";
 import { collectMrRuns, isTerminal } from "../overview.ts";
@@ -13,7 +13,7 @@ import { fallbackRawReview, planAutoDecision, sanitizeCommentBody, withheldSecti
 import { inspectWorktreeLosses, removeWorktreeClone } from "../worktree.ts";
 import { CliError, flagBool, flagNumber, printJson, type ParsedArgs } from "../cli.ts";
 import { MIRROR_BODY_MAX_CHARS, mirrorBody, zhComments } from "../render.ts";
-import { assertMirrorBodySafe, enqueueComment, forgeRefFor, pendingOutboxFiles,  sentOutboxDir } from "../run-store.ts";
+import { assertMirrorBodySafe, enqueueComment, forgeRefFor, pendingOutboxFiles, scanMrRuns, sentOutboxDir } from "../run-store.ts";
 
 import { mailFanoutContext } from "./mailctl.ts";
 
@@ -143,6 +143,7 @@ async function crossReviewAuto(args: ParsedArgs, outcome: MailFanoutOutcome): Pr
   const mrDir = mrStateDir(repoKey, mr);
   ensureStateLayout(mrDir);
   const runsRoot = `${mrDir}/runs`;
+  const records = new Map(scanMrRuns(repoKey, mr).map((record) => [record.run_id, record]));
   const ts = new Date().toISOString();
 
   // Pass 1 — read-only: results, decision plans, comment sections. Nothing is
@@ -157,8 +158,8 @@ async function crossReviewAuto(args: ParsedArgs, outcome: MailFanoutOutcome): Pr
   for (const run of tracked) {
     // failed/timeout/stale runs may never have written result.json; surface
     // them instead of crashing — and never decide a run without a result.
-    const result = readJsonFile<RoleResult | null>(`${runsRoot}/${run.run_id}/result.json`, null);
-    const status = readJsonFile<RunStatus | null>(`${runsRoot}/${run.run_id}/status.json`, null);
+    const result = records.get(run.run_id)?.result ?? null;
+    const status = records.get(run.run_id)?.status ?? null;
     const raw = result ? fallbackRawReview(`${runsRoot}/${run.run_id}`, result) : null;
     const plan =
       result === null

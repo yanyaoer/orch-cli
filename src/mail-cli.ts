@@ -10,7 +10,7 @@ import {
   writeMailAgentsConfig,
   type MailAgentDefinition,
 } from "./config.ts";
-import { readJsonFile, writeJsonAtomic, writeTextAtomic } from "./json.ts";
+import { readJsonFile,  writeTextAtomic } from "./json.ts";
 import { sha256 } from "./hash.ts";
 import {
   deliverLocalMail,
@@ -27,6 +27,7 @@ import {
   type TaskRequestedMailEvent,
 } from "./mail.ts";
 import { getRepoIdentity, mrStateDir, orchStateRoot } from "./paths.ts";
+import { scanMrRuns } from "./run-store.ts";
 import type { AgentName, RoleResult, RunRole, RunStatus } from "./types.ts";
 import { isRunRole } from "./types.ts";
 import { acquirePidfileLockWait, type PidfileLock } from "./locks.ts";
@@ -693,33 +694,26 @@ function reviewRoundOf(runId: string): string {
 // verdicts, adjudicated findings, the diff range since the last reviewed
 // head, and a stop warning when rounds pile up.
 export function buildReworkAppendix(repoKey: string, mr: string, currentHead: string | null): string {
-  const runsRoot = `${mrStateDir(repoKey, mr)}/runs`;
   const priors: PriorReviewerRun[] = [];
-  if (existsSync(runsRoot)) {
-    for (const entry of readdirSync(runsRoot, { withFileTypes: true })) {
-      if (!entry.isDirectory()) continue;
-      const runDir = `${runsRoot}/${entry.name}`;
-      const status = readJsonFile<RunStatus | null>(`${runDir}/status.json`, null);
-      if (!status || status.role !== "reviewer") continue;
-      if (status.state === "created" || status.state === "starting" || status.state === "running") continue;
-      const result = readJsonFile<Record<string, unknown> | null>(`${runDir}/result.json`, null);
-      const decision = readJsonFile<Record<string, unknown> | null>(`${runDir}/decision.json`, null);
-      priors.push({
-        run_id: status.run_id,
-        agent: status.agent,
-        state: status.state,
-        started_at: status.started_at,
-        base_sha: status.base_sha ?? null,
-        verdict: typeof result?.verdict === "string" ? result.verdict : null,
-        blocking: Array.isArray(result?.blocking_findings)
-          ? (result.blocking_findings as Array<Record<string, unknown>>)
+  for (const { status, result, decision } of scanMrRuns(repoKey, mr)) {
+    if (!status || status.role !== "reviewer") continue;
+    if (status.state === "created" || status.state === "starting" || status.state === "running") continue;
+    priors.push({
+      run_id: status.run_id,
+      agent: status.agent,
+      state: status.state,
+      started_at: status.started_at,
+      base_sha: status.base_sha ?? null,
+      verdict: typeof result?.verdict === "string" ? result.verdict : null,
+      blocking:
+        result && "blocking_findings" in result && Array.isArray(result.blocking_findings)
+          ? (result.blocking_findings as unknown as Array<Record<string, unknown>>)
           : [],
-        non_blocking_count: Array.isArray(result?.non_blocking_findings) ? result.non_blocking_findings.length : 0,
-        // decision.json stores the controller's call under `verdict`
-        // (accept/rework/close), distinct from the run result's verdict.
-        decision: typeof decision?.verdict === "string" ? decision.verdict : null,
-      });
-    }
+      non_blocking_count: result && "non_blocking_findings" in result && Array.isArray(result.non_blocking_findings) ? result.non_blocking_findings.length : 0,
+      // decision.json stores the controller's call under `verdict`
+      // (accept/rework/close), distinct from the run result's verdict.
+      decision: decision?.verdict ?? null,
+    });
   }
   if (priors.length === 0) {
     throw new CliError(`--rework found no settled reviewer runs for thread ${mr}; drop --rework for the first round`);

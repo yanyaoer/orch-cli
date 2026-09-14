@@ -1,12 +1,12 @@
 // orch trajectory: normalize a run/thread's provider session into role-based records.
-import { readFileSync, readdirSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import type { RunStatus } from "../types.ts";
-import { getRepoIdentity, mrStateDir } from "../paths.ts";
+import { getRepoIdentity } from "../paths.ts";
 import { readJsonFile, writeTextAtomic } from "../json.ts";
 import { CliError, assertKnownFlags, flagBool, flagString, type ParsedArgs } from "../cli.ts";
 import { TRAJECTORY_SOURCES, locateSessionFile, normalizeSession, type TrajectoryRecord } from "../trajectory.ts";
-import { locateRun } from "../run-store.ts";
+import { locateRun, scanMrRuns } from "../run-store.ts";
 
 const TRAJECTORY_FLAGS = ["run", "thread", "mr", "worktree", "jsonl", "archive"] as const;
 
@@ -91,19 +91,13 @@ export async function trajectoryCommand(args: ParsedArgs): Promise<number> {
     if (flagBool(args, "archive")) throw new CliError("--archive applies to --run only");
     if (args.flags.has("mr")) throw new CliError("--mr applies to --run; --thread already names the thread");
     const mr = flagString(args, "thread");
-    const runsDir = `${mrStateDir(repo.repo_key, mr)}/runs`;
-    let entries: string[];
-    try {
-      entries = readdirSync(runsDir);
-    } catch {
-      throw new CliError(`no runs found for thread ${mr}`);
-    }
+    const records = scanMrRuns(repo.repo_key, mr);
+    if (records.length === 0) throw new CliError(`no runs found for thread ${mr}`);
     // Chained runs share one provider session: dedupe by session path so the
     // thread view lists each transcript once with every run that rode it.
     const sessions = new Map<string, TrajectorySession>();
     const skipped: { run_id: string; reason: string }[] = [];
-    for (const entry of entries.sort()) {
-      const status = readJsonFile<RunStatus | null>(`${runsDir}/${entry}/status.json`, null);
+    for (const { status } of records) {
       if (!status) continue;
       try {
         const session = trajectoryForStatus(status);
