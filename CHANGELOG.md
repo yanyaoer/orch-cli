@@ -20,6 +20,10 @@ All notable user-facing changes are recorded here.
 
 ## [Unreleased]
 
+### Features
+
+- `orch mailctl` Maildir transport: `"transport": {"kind": "maildir", "path", "sync_cmd"?, "send_cmd"?}` in `mail-control.json` hands IMAP to an external fetcher (mbsync, getmail, fdm, a mail-routing worker) and SMTP to an external submitter (msmtp `-t`); orch reads `<path>/new`, moves processed mail to `cur/` as seen, and runs `sync_cmd` before every listing so a scheduled `poll` stays self-contained. Without `send_cmd` the built-in SMTP client still sends; with a Maildir transport `imap.*` is no longer required. Poll cursor stays monotonic through mbsync's `,U=<uid>` filenames (timestamp + sequence otherwise). Motivation: every mail incident on record — a half-open IMAP socket holding the ingest lock for 20 hours, 421 failed SMTP submissions and 20 replies dropped after eight retries — lived in the built-in client; a directory cannot hang.
+
 ### Changes
 
 - One run store: every command that walks an MR's `runs/` (bare overview, `status`, `run list`, `run reap`, `decision sweep`, `cross-review --auto`, `--rework`, `events tail`, `trajectory`, `orch new`) now projects from a single `scanMrRuns` read of spec/status/result/decision per run, the accept/rework rubric is one function (`isAcceptableOutcome`), and the stale rule is one function. Two divergences this closes: `orch status`/`run list`/`events tail` previously used an older stale rule that did not count runs orphaned before spawn (the overview and `run reap` did), and the mail bus's result summary lacked the 中文 branch the mirror comment had.

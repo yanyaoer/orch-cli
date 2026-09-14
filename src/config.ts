@@ -88,6 +88,11 @@ export interface MailControlConfig {
   account: { user: string; password?: string; password_cmd?: string[] };
   imap: { host: string; port: number };
   smtp: { host: string; port: number; mode: "implicit" | "starttls"; from?: string };
+  // Absent = the built-in IMAP/SMTP client. "maildir": an external fetcher
+  // fills <path>/new (sync_cmd runs before every listing) and an external
+  // submitter takes rfc822 on stdin (send_cmd); without send_cmd the built-in
+  // SMTP client still sends, so imap.* is unused but smtp.* stays required.
+  transport?: { kind: "imap-smtp" } | { kind: "maildir"; path: string; sync_cmd?: string[]; send_cmd?: string[] };
   allowed_senders: string[];
   trusted_authserv_id: string;
   workspace: string;
@@ -188,18 +193,40 @@ export function validateMailControlConfig(cfg: MailControlConfig): void {
   }
   if (cfg.account.password_cmd !== undefined) assertStringArray(cfg.account.password_cmd, "account.password_cmd");
 
-  assertObject(cfg.imap, "imap");
-  assertNonEmptyString(cfg.imap.host, "imap.host");
-  assertTcpPort(cfg.imap.port, "imap.port");
-
-  assertObject(cfg.smtp, "smtp");
-  assertNonEmptyString(cfg.smtp.host, "smtp.host");
-  assertTcpPort(cfg.smtp.port, "smtp.port");
-  if (cfg.smtp.mode !== "implicit" && cfg.smtp.mode !== "starttls") {
-    throw new Error("mail control smtp.mode must be implicit or starttls");
+  const transport = cfg.transport;
+  if (transport !== undefined) {
+    assertObject(transport, "transport");
+    if (transport.kind !== "imap-smtp" && transport.kind !== "maildir") {
+      throw new Error("mail control transport.kind must be imap-smtp or maildir");
+    }
+    if (transport.kind === "maildir") {
+      assertNonEmptyString(transport.path, "transport.path");
+      for (const key of ["sync_cmd", "send_cmd"] as const) {
+        const argv = transport[key];
+        if (argv === undefined) continue;
+        assertStringArray(argv, `transport.${key}`);
+        if (argv.length === 0) throw new Error(`mail control transport.${key} must be a non-empty argv array`);
+      }
+    }
   }
-  if (cfg.smtp.from !== undefined && typeof cfg.smtp.from !== "string") {
-    throw new Error("mail control smtp.from must be a string when set");
+  const maildir = transport?.kind === "maildir" ? transport : null;
+
+  if (!maildir) {
+    assertObject(cfg.imap, "imap");
+    assertNonEmptyString(cfg.imap.host, "imap.host");
+    assertTcpPort(cfg.imap.port, "imap.port");
+  }
+
+  if (!maildir?.send_cmd) {
+    assertObject(cfg.smtp, "smtp");
+    assertNonEmptyString(cfg.smtp.host, "smtp.host");
+    assertTcpPort(cfg.smtp.port, "smtp.port");
+    if (cfg.smtp.mode !== "implicit" && cfg.smtp.mode !== "starttls") {
+      throw new Error("mail control smtp.mode must be implicit or starttls");
+    }
+    if (cfg.smtp.from !== undefined && typeof cfg.smtp.from !== "string") {
+      throw new Error("mail control smtp.from must be a string when set");
+    }
   }
 
   assertStringArray(cfg.allowed_senders, "allowed_senders");

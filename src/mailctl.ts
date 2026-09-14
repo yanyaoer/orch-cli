@@ -30,6 +30,7 @@ import {
   type ParsedAddress,
 } from "./mime.ts";
 import { ImapClient, filterNewUids, planUidScan } from "./imap.ts";
+import { MaildirMailTransport } from "./maildir-transport.ts";
 import {
   appendThreadEvent,
   heldReplyPath,
@@ -65,6 +66,7 @@ export interface MailMessageRef {
   mailbox?: string;
   message_id?: string;
   uidvalidity?: number | null;
+  key?: string; // transport-private handle (Maildir filename)
 }
 
 export interface MailTransport {
@@ -3737,7 +3739,9 @@ export async function mailctlWatch(ctx: MailctlContext, opts: WatchOptions = {})
 }
 
 export function createMailTransport(cfg: MailControlConfig): MailTransport {
-  return new ImapSmtpMailTransport(cfg);
+  const imapSmtp = new ImapSmtpMailTransport(cfg);
+  if (cfg.transport?.kind === "maildir") return new MaildirMailTransport(cfg.transport, (rfc822) => imapSmtp.sendReply(rfc822));
+  return imapSmtp;
 }
 
 class ImapSmtpMailTransport implements MailTransport {
