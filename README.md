@@ -282,6 +282,50 @@ $ orch mailctl attachment show --id att-<id>                         # print a s
 $ orch mailctl attachment promote --id att-<id> [--dest <dir>]       # copy a stored payload out of quarantine
 ```
 
+**Maildir transport (recommended).** The built-in IMAP/SMTP client is the one place orch holds a network socket, and every mail incident so far (a half-open IMAP connection holding the ingest lock for hours, SMTP submissions failing and replies dropped after eight retries) lived there. With `"transport": {"kind": "maildir", ...}` an external fetcher owns IMAP and an external submitter owns SMTP; orch reads and writes a directory. `sync_cmd` runs before every listing, so a scheduled `poll` stays self-contained; without `send_cmd` the built-in SMTP client still sends. mbsync keeps the IMAP UID in the filename, which keeps the poll cursor monotonic; processed mail moves to `cur/` as seen, which a two-way sync propagates to the server. There is no push channel: latency is the poll/watch interval unless an IMAP IDLE notifier (e.g. `goimapnotify`) triggers `orch mailctl poll`.
+
+```jsonc
+// ~/.config/orch/mail-control.json
+"transport": {
+  "kind": "maildir",
+  "path": "/Users/you/Mail/orch",
+  "sync_cmd": ["mbsync", "orch"],
+  "send_cmd": ["msmtp", "-t", "--read-envelope-from"]
+}
+```
+
+```ini
+# ~/.mbsyncrc — one channel, INBOX only, flags both ways
+IMAPAccount orch
+Host imap.gmail.com
+User you@example.com
+PassCmd "pass show orch-mail"
+TLSType IMAPS
+IMAPStore orch-remote
+Account orch
+MaildirStore orch-local
+Path ~/Mail/orch/
+Inbox ~/Mail/orch
+Channel orch
+Far :orch-remote:INBOX
+Near :orch-local:
+Create Near
+Expunge None
+SyncState *
+
+# ~/.msmtprc
+account orch
+host smtp.gmail.com
+port 465
+tls on
+tls_starttls off
+auth on
+user you@example.com
+passwordeval "pass show orch-mail"
+from you@example.com
+account default : orch
+```
+
 Notifications default to `{"enabled": false, "max_per_hour": 30}`; set `"to": "owner@example.com"` if needed.
 `orch mailctl sync [--mr <id>] [--json]` previews MR progress email; `--execute` requires notifications enabled, while `poll` and `watch` sync automatically.
 Each MR gets one subject root with dispatched/result/decision replies, with idempotency and backoff across retries. Policy checks are isolated per report: path-shaped private markers are redacted and revalidated, while genuinely unsafe bodies are fingerprint-quarantined once without blocking safe sibling updates.
