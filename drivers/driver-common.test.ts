@@ -17,6 +17,7 @@ import {
   ompModelChain,
   OMP_MODEL_CHAIN,
   pipeToFile,
+  resultValidationErrors,
   rawResultText,
   runProviderDriver,
   SEATBELT_ENV_MARKER,
@@ -636,6 +637,7 @@ test("extractResultFromText does not restart the object scan from braces inside 
     JSON.stringify({
       schema: "orch.result/researcher/v1",
       verdict: "completed",
+      summary: "compared approaches",
       recommendation: "adopt approach B",
       risks: [],
       alternatives: [],
@@ -655,15 +657,16 @@ test("extractResultFromText does not restart the object scan from braces inside 
   expect(extractResultFromText(prose, runSpec)).toMatchObject({ run_id: "research-braces", recommendation: 'say "hi"' });
 });
 
-test("extractResultFromText coerces researcher alias fields and missing arrays", () => {
+test("extractResultFromText keeps the unambiguous researcher coercions and rejects renamed deliverables", () => {
   const runSpec = spec("researcher", "research-coerce");
+  // Invented run_id, verdict synonym, omitted arrays: one reading each.
   const result = extractResultFromText(
     JSON.stringify({
       schema: "orch.result/researcher/v1",
       run_id: "invented",
       verdict: "complete",
       summary: "compared approaches",
-      proposal: "adopt approach B",
+      recommendation: "adopt approach B",
       sources: ["https://example.com/doc"],
     }),
     runSpec,
@@ -678,62 +681,32 @@ test("extractResultFromText coerces researcher alias fields and missing arrays",
     open_questions: [],
     risks: [],
   });
-});
 
-test("extractResultFromText derives a missing researcher summary from the recommendation", () => {
-  // Real plan-run failure shape (MR 3440): verdict and a full recommendation
-  // present, summary omitted. summary is descriptive, not control flow, so it
-  // is derived instead of discarding the result.
-  const result = extractResultFromText(
-    JSON.stringify({
-      schema: "orch.result/researcher/v1",
-      verdict: "completed",
-      recommendation: "## Destination\nMR 3440 完成 claude+omp 交叉评审:合并评审意见以一条评论发布。\n\n## Tasks (now)\n### review-a",
-      risks: ["评审重复已有评论"],
-      alternatives: [],
-      open_questions: [],
-    }),
-    spec("researcher", "research-no-summary"),
-  );
-  expect(result).toMatchObject({
-    schema: "orch.result/researcher/v1",
-    run_id: "research-no-summary",
-    verdict: "completed",
-    summary: "MR 3440 完成 claude+omp 交叉评审:合并评审意见以一条评论发布。",
-  });
-
-  // Bullet-only plans derive the first item's content without the marker;
-  // code fences are skipped like headings.
-  const bulletResult = extractResultFromText(
-    JSON.stringify({
-      schema: "orch.result/researcher/v1",
-      verdict: "completed",
-      recommendation: "## Tasks\n```ts\nignored()\n```\n- 先修 serverKey 归一化\n- 再补 eval",
-    }),
-    spec("researcher", "research-bullets"),
-  );
-  expect((bulletResult as { summary?: string } | null)?.summary).toBe("先修 serverKey 归一化");
-
-  // Tilde fences and `1)` lists behave like their backtick/`1.` twins; a line
-  // that is only a marker is noise, and an unclosed fence derives nothing.
-  const derive = (recommendation: string): string | undefined =>
-    (
-      extractResultFromText(
-        JSON.stringify({ schema: "orch.result/researcher/v1", verdict: "completed", recommendation }),
-        spec("researcher", "research-derive-edge"),
-      ) as { summary?: string } | null
-    )?.summary;
-  expect(derive("~~~ts\nignored()\n~~~\n1) 实际计划")).toBe("实际计划");
-  // A backtick fence is only closed by backticks: the ~~~ inside is content.
-  expect(derive("```\n~~~\nstill code\n```\n真 prose")).toBe("真 prose");
-  expect(derive("-\n\n1.\n- 真内容")).toBe("真内容");
-  expect(derive("~~~ts\nnever closed")).toBeUndefined();
-
-  // No recommendation prose at all -> nothing to derive from, still rejected.
+  // The deliverable under another name is not guessed at: the result is
+  // rejected and the repair round asks the model for `recommendation`.
   expect(
     extractResultFromText(
-      JSON.stringify({ schema: "orch.result/researcher/v1", verdict: "completed", recommendation: "### only-headings" }),
-      spec("researcher", "research-headings-only"),
+      JSON.stringify({ schema: "orch.result/researcher/v1", verdict: "completed", summary: "s", proposal: "adopt approach B" }),
+      runSpec,
+    ),
+  ).toBeNull();
+});
+
+test("extractResultFromText rejects a researcher result without summary instead of deriving one", () => {
+  // summary used to be derived from the recommendation's first prose line;
+  // that guessed a headline for the model. The validator now rejects it and
+  // the repair round asks for the field.
+  expect(
+    extractResultFromText(
+      JSON.stringify({
+        schema: "orch.result/researcher/v1",
+        verdict: "completed",
+        recommendation: "## Destination\nMR 3440 完成 claude+omp 交叉评审。",
+        risks: [],
+        alternatives: [],
+        open_questions: [],
+      }),
+      spec("researcher", "research-no-summary"),
     ),
   ).toBeNull();
 });
@@ -1251,48 +1224,52 @@ test("driver fails closed when the sandbox plan cannot be built: no provider spa
   expect(result.summary).toContain("sandbox seatbelt-v1");
 });
 
-test("extractResultFromText coerces benign schema deviations instead of discarding", () => {
+test("extractResultFromText repairs only deviations with one reading and rejects the rest", () => {
   const reviewSpec = spec("reviewer", "review-coerce");
-  const deviant = JSON.stringify({
+  // Case, invented run_id, numeric id, a bare string as a non-blocking body.
+  const unambiguous = JSON.stringify({
     schema: "orch.result/reviewer/v1",
     run_id: "model-invented-id",
     verdict: "Approved",
     reviews_run_id: 42,
-    blocking_findings: ["plain string finding"],
-    non_blocking_findings: [{ id: "nb-1", severity: "low", file: "a.ts", description: "body under wrong key" }],
-    suggested_tests: [{ id: "st-1", body: "object instead of string" }, "already a string"],
+    blocking_findings: [],
+    non_blocking_findings: ["plain string finding"],
+    suggested_tests: ["already a string"],
   });
-  const result = extractResultFromText(deviant, reviewSpec);
-  expect(result).not.toBeNull();
-  expect(result).toMatchObject({ run_id: "review-coerce", verdict: "approve", reviews_run_id: "42" });
-  const reviewer = result as import("../src/types.ts").ReviewerResult;
-  expect(reviewer.blocking_findings[0]).toMatchObject({
-    body: "plain string finding",
-    id: "finding-1",
-    severity: "unspecified",
-    file: "unspecified",
+  expect(extractResultFromText(unambiguous, reviewSpec)).toMatchObject({
+    run_id: "review-coerce",
+    verdict: "approve",
+    reviews_run_id: "42",
+    non_blocking_findings: [{ body: "plain string finding" }],
+    suggested_tests: ["already a string"],
   });
-  expect(reviewer.non_blocking_findings[0]?.body).toBe("body under wrong key");
-  expect(reviewer.suggested_tests).toEqual(["st-1: object instead of string", "already a string"]);
+
+  // A blocking finding without id/severity/file, a body under another key,
+  // an object where a string belongs: each would need a guess, so the whole
+  // result is rejected and goes to the repair round.
+  const guessy = [
+    { blocking_findings: ["plain string finding"] },
+    { non_blocking_findings: [{ id: "nb-1", severity: "low", file: "a.ts", description: "body under wrong key" }] },
+    { suggested_tests: [{ id: "st-1", body: "object instead of string" }] },
+  ];
+  for (const deviation of guessy) {
+    const text = JSON.stringify({ schema: "orch.result/reviewer/v1", verdict: "approve", reviews_run_id: "r", ...deviation });
+    expect(extractResultFromText(text, reviewSpec)).toBeNull();
+  }
 
   const controlSpec = spec("controller", "control-coerce");
-  const controller = extractResultFromText(
-    JSON.stringify({
-      schema: "orch.result/controller/v1",
-      run_id: "model-invented-id",
-      verdict: "Complete",
-      summary: "coordinated one batch",
-      actions: [{ id: "ack", summary: "acked inbound message" }, "queued worker"],
-    }),
-    controlSpec,
-  );
-  expect(controller).toMatchObject({
-    schema: "orch.result/controller/v1",
-    run_id: "control-coerce",
-    verdict: "completed",
-    summary: "coordinated one batch",
-    actions: ["ack: acked inbound message", "queued worker"],
-  });
+  expect(
+    extractResultFromText(
+      JSON.stringify({ schema: "orch.result/controller/v1", run_id: "model-invented-id", verdict: "Complete", summary: "coordinated one batch", actions: ["queued worker"] }),
+      controlSpec,
+    ),
+  ).toMatchObject({ run_id: "control-coerce", verdict: "completed", actions: ["queued worker"] });
+  expect(
+    extractResultFromText(
+      JSON.stringify({ schema: "orch.result/controller/v1", verdict: "completed", summary: "s", actions: [{ id: "ack", summary: "acked" }] }),
+      controlSpec,
+    ),
+  ).toBeNull();
 });
 
 test("runProviderDriver records result_coercion events for verdict synonym coercions", async () => {
@@ -1389,14 +1366,22 @@ test("extractResultFromText coerces a flattened findings list and omitted empty 
   const withFinding = JSON.stringify({
     schema: "orch.result/reviewer/v1",
     verdict: "request_changes",
-    findings: [{ body: "off-by-one in pager" }],
+    findings: [{ id: "F1", severity: "high", file: "src/pager.ts:8", body: "off-by-one in pager" }],
   });
   expect(extractResultFromText(withFinding, spec("reviewer", "flat-findings"))).toMatchObject({
     verdict: "request_changes",
     // Flattened findings surface as blocking so nothing is dropped.
-    blocking_findings: [{ body: "off-by-one in pager", id: "finding-1", severity: "unspecified", file: "unspecified" }],
+    blocking_findings: [{ id: "F1", severity: "high", file: "src/pager.ts:8", body: "off-by-one in pager" }],
     non_blocking_findings: [],
   });
+  // A flattened blocking finding missing id/severity/file is not defaulted
+  // to "unspecified" any more: rejected, repaired by the model.
+  expect(
+    extractResultFromText(
+      JSON.stringify({ schema: "orch.result/reviewer/v1", verdict: "request_changes", findings: [{ body: "off-by-one in pager" }] }),
+      spec("reviewer", "flat-findings-bare"),
+    ),
+  ).toBeNull();
 
   // An approving reviewer's flattened findings are non-blocking nits: routing
   // them to blocking would flip the downstream suggestion to rework.
@@ -1664,9 +1649,11 @@ test("extractResultFromRunDir accepts claude final text with prose before result
   expect(extractResultFromRunDir(runDir, spec("verifier", "verify-claude-prose"))).toEqual(verifier);
 });
 
-test("extractResultFromText accepts a fenced gemini-style result with finding/scenario prose", () => {
+test("a fenced gemini-style result with finding/scenario prose is rejected and the validator names the missing body", () => {
   // Observed live from omp/gemini: the whole result inside a ```json fence,
   // findings carrying finding (title) + scenario (detail) instead of body.
+  // Joining title and detail used to be guessed here; now the repair round
+  // hands the model the validator's errors instead.
   const raw = [
     "```json",
     JSON.stringify(
@@ -1686,15 +1673,73 @@ test("extractResultFromText accepts a fenced gemini-style result with finding/sc
     "```",
     "",
   ].join("\n");
+  const runSpec = spec("reviewer", "review-fenced");
+  expect(extractResultFromText(raw, runSpec)).toBeNull();
 
-  const result = extractResultFromText(raw, spec("reviewer", "review-fenced"));
-  expect(result).toMatchObject({
+  const runDir = join(tempDir(), "run");
+  mkdirSync(runDir, { recursive: true });
+  writeFileSync(join(runDir, "last_message.txt"), raw, "utf8");
+  expect(resultValidationErrors(runDir, runSpec)).toEqual([
+    "blocking_findings[0].body is required",
+    "blocking_findings[0].id is required",
+    "non_blocking_findings[0].body is required",
+  ]);
+  writeFileSync(join(runDir, "last_message.txt"), "I could not finish the review.", "utf8");
+  expect(resultValidationErrors(runDir, runSpec)).toEqual(["no JSON object was found in the final answer"]);
+});
+
+test("runProviderDriver runs one repair round with the validator's errors and accepts the corrected answer", async () => {
+  // Fake codex: first call answers with a finding under the wrong key, the
+  // repair call (recognized by the state file the first call left behind)
+  // answers with the corrected object.
+  const root = tempDir();
+  const runDir = join(root, "run");
+  const binDir = join(root, "bin");
+  const worktree = join(root, "worktree");
+  for (const dir of [runDir, binDir, worktree]) mkdirSync(dir, { recursive: true });
+  const stateFile = join(root, "first-call-done");
+  const invalid = JSON.stringify({ schema: "orch.result/reviewer/v1", verdict: "request_changes", reviews_run_id: "impl-1", blocking_findings: [{ id: "F1", severity: "high", file: "a.ts:1", finding: "Broken cooldown" }] });
+  const valid = JSON.stringify({ schema: "orch.result/reviewer/v1", verdict: "request_changes", reviews_run_id: "impl-1", blocking_findings: [{ id: "F1", severity: "high", file: "a.ts:1", body: "Broken cooldown" }], non_blocking_findings: [], suggested_tests: [] });
+  writeFileSync(
+    join(binDir, "codex"),
+    [
+      "#!/bin/sh",
+      "prompt=$(cat)",
+      `if [ -e ${shellQuote(stateFile)} ]; then`,
+      // The repair prompt must carry the validator's error and the previous answer.
+      `  printf '%s' "$prompt" | grep -q 'blocking_findings\\[0\\].body is required' || exit 9`,
+      `  printf '%s' "$prompt" | grep -q 'Broken cooldown' || exit 9`,
+      `  printf '%s\\n' ${shellQuote(valid)}`,
+      "else",
+      `  : > ${shellQuote(stateFile)}`,
+      `  printf '%s\\n' ${shellQuote(invalid)}`,
+      "fi",
+    ].join("\n") + "\n",
+    "utf8",
+  );
+  chmodSync(join(binDir, "codex"), 0o755);
+  const runSpec = spec("reviewer", "review-repair");
+  const specPath = join(runDir, "spec.json");
+  writeFileSync(specPath, `${JSON.stringify(runSpec, null, 2)}\n`, "utf8");
+  const previousPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${previousPath ?? ""}`;
+  try {
+    const exitCode = await runProviderDriver("codex", ["--spec", specPath, "--run-dir", runDir, "--worktree", worktree]);
+    expect(exitCode).toBe(0);
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+  }
+  expect(JSON.parse(readFileSync(join(runDir, "result.json"), "utf8"))).toMatchObject({
+    run_id: "review-repair",
     verdict: "request_changes",
-    blocking_findings: [
-      { id: "finding-1", severity: "critical", file: "src/x.ts:1", body: "Broken cooldown\n\nWhen X flaps, Y alerts forever." },
-    ],
-    non_blocking_findings: [{ body: "Doc gap\n\nZ is undocumented." }],
+    blocking_findings: [{ id: "F1", body: "Broken cooldown" }],
   });
+  const repair = readRunEvents(runDir).find((event) => event.type === "result_repair") as { errors?: string[]; outcome?: string } | undefined;
+  expect(repair?.outcome).toBe("valid");
+  expect(repair?.errors).toEqual(["blocking_findings[0].body is required"]);
+  // The repair stream is appended after a marker so the run stays inspectable.
+  expect(readFileSync(join(runDir, "native.jsonl"), "utf8")).toContain('{"type":"orch_result_repair","attempt":1');
 });
 
 test("pipeToFile drops message_update and tool_execution_update lines, including ones split across chunks", async () => {

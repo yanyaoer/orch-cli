@@ -18,6 +18,12 @@ All notable user-facing changes are recorded here.
 
 - Result extraction no longer restarts its JSON object scan from braces inside string literals. The candidate scanner started a balanced-brace scan at every `{` in a text; in a native stream every brace in tool output (code, JSON, diffs) sits inside a JSON string, and a scan started there runs with inverted quote state to the end of the text — O(braces × size), measured 7.7 s at 8 MB, 37 s at 20 MB, and over five minutes for a 381 MB stream, burnt at the end of every run whose structured candidates carried no result (exit 0 but no valid result: 81 runs in one state tree). A scan whose substring parses as JSON had its string boundaries right, so the braces it passed inside strings are now excluded as starts; nothing else is trusted (a failed scan, or one that closed on a non-JSON substring, may have run with inverted quote state), so prose candidates with unbalanced quotes are read exactly as before.
 
+## [Unreleased]
+
+### Changes
+
+- Result contract: the worker prompt now prints the exact result shape per role (`ROLE_RESULT_EXAMPLE`, next to the validator), and the driver stops guessing at deviations. Coercions that fabricated content are gone — finding title/detail aliases (`finding`/`scenario`/`description`/... joined into `body`), `"unspecified"` defaults for a blocking finding's id/severity/file, object-to-string array items, researcher `proposal`/`decision`/`conclusion` as `recommendation`, and a summary derived from the recommendation's first line. What stays is single-reading only: verdict case/synonyms, omitted arrays, numeric `*_run_id`, spec-owned `run_id`/`base_sha`, a bare string as a non-blocking finding body, the gemini single `findings` list. A result that does not validate after that is sent back to the model once with the validator's errors and its previous answer (fresh ephemeral session, same sandbox plan; `result_repair` event, stream appended to `native.jsonl` after an `orch_result_repair` marker; `ORCH_RESULT_REPAIR=0` disables). Motivation: 303 of 520 recorded runs had their result silently rewritten, and 81 runs that exited 0 without a parseable result failed outright where a repair round would have recovered them.
+
 ## [0.0.12] - 2026-09-02
 
 ### Features
