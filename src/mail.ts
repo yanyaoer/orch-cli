@@ -5,6 +5,7 @@ import { orchStateRoot } from "./paths.ts";
 import { appendJsonLine, readJsonFile, writeJsonAtomic, writeTextAtomic } from "./json.ts";
 import { randomHex, sha256 } from "./hash.ts";
 import type { RoleResult, RunStatus } from "./types.ts";
+import { resultSummary, resultVerdict } from "./render.ts";
 
 export interface MailIdentity {
   key_id: string;
@@ -253,21 +254,6 @@ function verifySignedEvent(signed: SignedMailEvent, identity: MailIdentity): boo
     identity.public_key_pem,
     Buffer.from(signed.signature.sig, "base64"),
   );
-}
-
-function resultVerdict(result: RoleResult): string {
-  return "verdict" in result && typeof result.verdict === "string" ? result.verdict : "unknown";
-}
-
-function resultSummary(result: RoleResult): string {
-  if ("summary" in result && typeof result.summary === "string") return result.summary;
-  if (result.schema === "orch.result/reviewer/v1") {
-    return `${result.blocking_findings.length} blocking finding(s), ${result.non_blocking_findings.length} non-blocking finding(s).`;
-  }
-  if (result.schema === "orch.result/verifier/v1") {
-    return `${result.commands.length} command(s), ${result.acceptance.length} acceptance item(s).`;
-  }
-  return "No summary in result.json.";
 }
 
 function normalizeHeaderValue(value: string): string {

@@ -1,5 +1,5 @@
 // orch run create|list|reap|cancel: provider session config, resume chains, sandbox compatibility, spawning the detached supervisor.
-import { existsSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { isRunRole, writeRoles, type AgentName, type ProviderSessionMode, type RunRole, type RunSpec, type RunStatus } from "../types.ts";
 import { acquirePidfileLockWait } from "../locks.ts";
@@ -14,7 +14,7 @@ import { orchLanguage, readOrchConfig, type RoleDefaults } from "../config.ts";
 import { CliError, assertKnownFlags, flagBool, flagString, printJson, readStdinText, type ParsedArgs } from "../cli.ts";
 import { buildPrompt, buildProviderExecutionPlan, type ProviderExecutionPlan } from "../../drivers/driver-common.ts";
 import { SEATBELT_ENGINE, sandboxPosture, sandboxRunIdentity, seatbeltUnsupportedReason } from "../../drivers/sandbox.ts";
-import { archivedIdempotency, formatTable, locateRun, looksStale, mrIdsForRepo, nonTerminalStates, orchCommand, readIdempotency, resolveMr, runId, runListRows, stateDirectoryHint, statusState, type IdempotencyRecord } from "../run-store.ts";
+import { archivedIdempotency, formatTable, locateRun, mrIdsForRepo, nonTerminalStates, orchCommand, readIdempotency, resolveMr, runId, runListRows, scanMrRuns, scanRunsRoot, stateDirectoryHint, statusState, type IdempotencyRecord } from "../run-store.ts";
 
 function isProviderSessionMode(value: string): value is ProviderSessionMode {
   return value === "ephemeral" || value === "fresh_persistent" || value === "resume_exact";
@@ -265,17 +265,9 @@ const SESSION_CHAIN_MAX_RUNS = 3;
 function assertSessionChainAllowed(mrDir: string, session: ProviderSessionConfig, tag: string, allow: boolean): void {
   if (allow || session.provider_session_mode !== "resume_exact" || !session.provider_session_id) return;
   const sessionId = session.provider_session_id;
-  let entries: string[];
-  try {
-    entries = readdirSync(`${mrDir}/runs`);
-  } catch {
-    return; // no runs yet — nothing to chain onto
-  }
   const bound: { run_id: string; tag: string }[] = [];
-  for (const entry of entries) {
-    const spec = readJsonFile<RunSpec | null>(`${mrDir}/runs/${entry}/spec.json`, null);
+  for (const { spec, status } of scanRunsRoot(`${mrDir}/runs`, "")) {
     if (!spec) continue;
-    const status = readJsonFile<RunStatus | null>(`${mrDir}/runs/${entry}/status.json`, null);
     // A run is on this session when it consumed it (spec pinned the id) or
     // created/continued it (terminal backfill recorded the provider id).
     if (spec.provider_session_id === sessionId || status?.provider_resume_id === sessionId) {
@@ -706,20 +698,15 @@ export async function runReap(args: ParsedArgs): Promise<number> {
   const reaped: Array<{ mr: string; run_id: string }> = [];
   const running: Array<{ mr: string; run_id: string }> = [];
   for (const mr of mrIds) {
-    const runsRoot = `${mrStateDir(repo.repo_key, mr)}/runs`;
-    if (!existsSync(runsRoot)) continue;
-    for (const id of readdirSync(runsRoot).sort()) {
-      const statusPath = `${runsRoot}/${id}/status.json`;
-      const status = readJsonFile<RunStatus | null>(statusPath, null);
+    for (const { status, stale, run_dir } of scanMrRuns(repo.repo_key, mr)) {
       if (!status || !nonTerminalStates.has(status.state)) continue;
-      const ageMs = Date.now() - Date.parse(status.updated_at ?? "");
-      const orphanedBeforeSpawn = status.pid === null && Number.isFinite(ageMs) && ageMs > 60 * 60 * 1000;
-      if (!looksStale(status) && !orphanedBeforeSpawn) {
+      const id = run_dir.slice(run_dir.lastIndexOf("/") + 1);
+      if (!stale) {
         running.push({ mr: status.mr, run_id: id });
         continue;
       }
-      writeJsonAtomic(statusPath, { ...status, state: "stale", updated_at: new Date().toISOString() });
-      const eventsPath = `${runsRoot}/${id}/events.jsonl`;
+      writeJsonAtomic(`${run_dir}/status.json`, { ...status, state: "stale", updated_at: new Date().toISOString() });
+      const eventsPath = `${run_dir}/events.jsonl`;
       appendJsonLine(eventsPath, { type: "stale", seq: countLines(eventsPath), ts: new Date().toISOString() });
       reaped.push({ mr: status.mr, run_id: id });
     }

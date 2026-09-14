@@ -2,7 +2,7 @@
 import { basename, resolve } from "node:path";
 import { ensureStateLayout, getRepoIdentity, mrStateDir } from "../paths.ts";
 import { readJsonFile, writeJsonExclusive } from "../json.ts";
-import { collectMrRuns, isGoodVerdict, isTerminal, mrDirsForRepo } from "../overview.ts";
+import { collectMrRuns, isAcceptableOutcome, isTerminal, mrDirsForRepo } from "../overview.ts";
 import { CliError, flagBool, flagString, printJson, type ParsedArgs } from "../cli.ts";
 import { decisionBody } from "../render.ts";
 import { assertMirrorBodySafe, enqueueComment, locateRun, readMirrorResult,  type DecisionRecord, type DecisionVerdict } from "../run-store.ts";
@@ -94,7 +94,7 @@ async function decisionSweep(args: ParsedArgs): Promise<number> {
         run.state === "done"
           ? run.verdict === null
             ? { verdict: "close" as const, reason: "sweep: done without result" }
-            : isGoodVerdict(run.verdict) && (run.blocking ?? 0) === 0
+            : isAcceptableOutcome(run.verdict, run.blocking)
               ? { verdict: "accept" as const, reason: `sweep: ${run.role} ${run.verdict}` }
               : { verdict: "rework" as const, reason: `sweep: ${run.role} ${run.verdict}${run.blocking ? ` · blocking ${run.blocking}` : ""}` }
           : { verdict: "close" as const, reason: `sweep: run ${run.state}` };

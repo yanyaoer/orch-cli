@@ -1,6 +1,6 @@
 // Run-state readers and outbox/forge-ref helpers shared by every command: locating runs, listing an MR's runs, idempotency records, decision and result readers.
 import { existsSync, readFileSync, readdirSync, type Dirent } from "node:fs";
-import type { RoleResult, RunState, RunStatus } from "./types.ts";
+import type { RoleResult, RunSpec, RunState, RunStatus } from "./types.ts";
 import { isPidAlive } from "./locks.ts";
 import { randomHex } from "./hash.ts";
 import { mrStateDir, orchStateRoot } from "./paths.ts";
@@ -8,7 +8,6 @@ import { readJsonFile, writeJsonAtomic, writeTextAtomic } from "./json.ts";
 import { findPrivateLeak, privateLeakAllowed, privateLeakErrorMessage } from "./leak.ts";
 import { vcsBranch } from "./vcs.ts";
 import { CliError, flagString, type ParsedArgs } from "./cli.ts";
-import { zhComments } from "./render.ts";
 
 export type IdempotencyRecord = {
   run_id: string;
@@ -172,21 +171,61 @@ export function enqueueComment(mrDir: string, payload: OutboxCommentPayload): st
 
 export const nonTerminalStates = new Set<RunState>(["created", "starting", "running"]);
 
-// Read-side reconcile (A7: display-only, never writes): a run whose recorded
-// pid is gone but whose state never reached a terminal one is flagged stale.
-// `orch run reap` persists the verdict.
+// The one stale rule (read-side, never writes; `orch run reap` persists it):
+// a non-terminal run whose recorded pid is gone, or that never got a pid and
+// has not moved in an hour (orphaned before spawn).
 export function looksStale(status: RunStatus): boolean {
-  return nonTerminalStates.has(status.state) && status.pid !== null && !isPidAlive(status.pid);
+  if (!nonTerminalStates.has(status.state)) return false;
+  if (status.pid !== null) return !isPidAlive(status.pid);
+  const ageMs = Date.now() - Date.parse(status.updated_at ?? "");
+  return Number.isFinite(ageMs) && ageMs > 60 * 60 * 1000;
+}
+
+// Everything a run directory says about itself, read once. Every command that
+// walks runs/ (overview, status, list, reap, sweep, fanout --auto, --rework,
+// events tail, trajectory, orch new) projects from this record instead of
+// re-reading its own subset of the files.
+export interface RunRecord {
+  mr: string;
+  run_id: string;
+  run_dir: string;
+  spec: RunSpec | null;
+  status: RunStatus | null;
+  result: RoleResult | null;
+  decision: DecisionRecord | null;
+  stale: boolean;
+}
+
+// Sorted by started_at then run_id; a directory without status.json is a run
+// mid-creation and is returned with status null so callers can decide.
+export function scanRunsRoot(runsRoot: string, mr: string): RunRecord[] {
+  return safeDirEntries(runsRoot)
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => {
+      const runDir = `${runsRoot}/${entry.name}`;
+      const status = readJsonFile<RunStatus | null>(`${runDir}/status.json`, null);
+      return {
+        mr: status?.mr ?? mr,
+        run_id: status?.run_id ?? entry.name,
+        run_dir: runDir,
+        spec: readJsonFile<RunSpec | null>(`${runDir}/spec.json`, null),
+        status,
+        result: readJsonFile<RoleResult | null>(`${runDir}/result.json`, null),
+        decision: readJsonFile<DecisionRecord | null>(`${runDir}/decision.json`, null),
+        stale: status ? looksStale(status) : false,
+      };
+    })
+    .sort((a, b) => (a.status?.started_at ?? "").localeCompare(b.status?.started_at ?? "") || a.run_id.localeCompare(b.run_id));
+}
+
+export function scanMrRuns(repoKey: string, mr: string): RunRecord[] {
+  return scanRunsRoot(`${mrStateDir(repoKey, mr)}/runs`, mr);
 }
 
 export function runListRows(runsRoot: string): RunListRow[] {
-  if (!existsSync(runsRoot)) return [];
-  return readdirSync(runsRoot, { withFileTypes: true })
-    .filter((entry) => entry.isDirectory())
-    .map((entry) => readJsonFile<RunStatus | null>(`${runsRoot}/${entry.name}/status.json`, null))
-    .filter((status): status is RunStatus => status !== null)
-    .sort((a, b) => (a.started_at ?? "").localeCompare(b.started_at ?? "") || a.run_id.localeCompare(b.run_id))
-    .map((status) => ({
+  return scanRunsRoot(runsRoot, "")
+    .filter((record): record is RunRecord & { status: RunStatus } => record.status !== null)
+    .map(({ status, stale }) => ({
       run_id: status.run_id,
       mr: status.mr,
       role: status.role,
@@ -195,12 +234,10 @@ export function runListRows(runsRoot: string): RunListRow[] {
       state: status.state,
       started_at: status.started_at,
       exit_code: status.exit_code,
-      stale: looksStale(status),
+      stale,
     }));
 }
 
-// Directory names under mrs/ (already sanitized at write time); used by the
-// aggregate views when --mr is omitted.
 export function mrIdsForRepo(repoKey: string): string[] {
   const root = repoMrsRoot(repoKey);
   if (!existsSync(root)) return [];
@@ -284,20 +321,7 @@ export function runLocation(repoKey: string, runId: string, mr?: string): RunLoc
 }
 
 export function runLocationsForMr(repoKey: string, mr: string): RunLocation[] {
-  const runsRoot = `${mrStateDir(repoKey, mr)}/runs`;
-  return safeDirEntries(runsRoot)
-    .filter((entry) => entry.isDirectory())
-    .map((entry) => {
-      const runDir = `${runsRoot}/${entry.name}`;
-      const status = readJsonFile<RunStatus | null>(`${runDir}/status.json`, null);
-      return {
-        mr: status?.mr ?? mr,
-        run_id: status?.run_id ?? entry.name,
-        run_dir: runDir,
-        status,
-      };
-    })
-    .sort((a, b) => (a.status?.started_at ?? "").localeCompare(b.status?.started_at ?? "") || a.run_id.localeCompare(b.run_id));
+  return scanMrRuns(repoKey, mr).map(({ mr: recordMr, run_id, run_dir, status }) => ({ mr: recordMr, run_id, run_dir, status }));
 }
 
 export function runLocationsForRepo(repoKey: string): RunLocation[] {
@@ -330,36 +354,11 @@ export function statusState(record: IdempotencyRecord): RunState | null {
   return status?.state ?? null;
 }
 
-export function resultSummary(result: RoleResult): string {
-  if ("summary" in result && typeof result.summary === "string") return result.summary;
-  const zh = zhComments();
-  if (result.schema === "orch.result/reviewer/v1") {
-    return zh
-      ? `阻断性发现 ${result.blocking_findings.length} 条,非阻断性发现 ${result.non_blocking_findings.length} 条。`
-      : `${result.blocking_findings.length} blocking finding(s), ${result.non_blocking_findings.length} non-blocking finding(s).`;
-  }
-  if (result.schema === "orch.result/verifier/v1") {
-    return zh
-      ? `命令 ${result.commands.length} 条,验收项 ${result.acceptance.length} 项。`
-      : `${result.commands.length} command(s), ${result.acceptance.length} acceptance item(s).`;
-  }
-  return zh ? "result.json 中无摘要。" : "No summary in result.json.";
-}
-
-export function resultVerdict(result: RoleResult): string {
-  return "verdict" in result && typeof result.verdict === "string" ? result.verdict : "unknown";
-}
-
 export function latestRunId(runsRoot: string): string | null {
-  if (!existsSync(runsRoot)) return null;
-  const candidates = readdirSync(runsRoot, { withFileTypes: true })
-    .filter((entry) => entry.isDirectory())
-    .map((entry) => {
-      const status = readJsonFile<RunStatus | null>(`${runsRoot}/${entry.name}/status.json`, null);
-      return { id: entry.name, updated_at: status?.updated_at ?? "" };
-    });
-  candidates.sort((a, b) => b.updated_at.localeCompare(a.updated_at) || b.id.localeCompare(a.id));
-  return candidates[0]?.id ?? null;
+  const latest = scanRunsRoot(runsRoot, "")
+    .map((record) => ({ id: record.run_dir.slice(record.run_dir.lastIndexOf("/") + 1), updated_at: record.status?.updated_at ?? "" }))
+    .sort((a, b) => b.updated_at.localeCompare(a.updated_at) || b.id.localeCompare(a.id))[0];
+  return latest?.id ?? null;
 }
 
 export function readMirrorResult(runsRoot: string, runId: string): { result: RoleResult; status: RunStatus | null } {

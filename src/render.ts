@@ -2,7 +2,7 @@
 import { existsSync } from "node:fs";
 import type { ControllerResult, ImplementerResult, ResearcherResult, ReviewerResult, RoleResult, RunStatus, VerifierResult } from "./types.ts";
 import { orchLanguage } from "./config.ts";
-import { resultSummary, resultVerdict,  type DecisionRecord } from "./run-store.ts";
+import type { DecisionRecord } from "./run-store.ts";
 
 function printFindings(label: string, findings: ReviewerResult["non_blocking_findings"]): void {
   process.stdout.write(`\n${label}:\n`);
@@ -14,6 +14,26 @@ function printFindings(label: string, findings: ReviewerResult["non_blocking_fin
     const head = [finding.severity, finding.id, finding.file].filter(Boolean).join(" | ");
     process.stdout.write(`  - [${head || "finding"}]\n    ${finding.body.replaceAll("\n", "\n    ")}\n`);
   }
+}
+
+export function resultSummary(result: RoleResult): string {
+  if ("summary" in result && typeof result.summary === "string") return result.summary;
+  const zh = zhComments();
+  if (result.schema === "orch.result/reviewer/v1") {
+    return zh
+      ? `阻断性发现 ${result.blocking_findings.length} 条,非阻断性发现 ${result.non_blocking_findings.length} 条。`
+      : `${result.blocking_findings.length} blocking finding(s), ${result.non_blocking_findings.length} non-blocking finding(s).`;
+  }
+  if (result.schema === "orch.result/verifier/v1") {
+    return zh
+      ? `命令 ${result.commands.length} 条,验收项 ${result.acceptance.length} 项。`
+      : `${result.commands.length} command(s), ${result.acceptance.length} acceptance item(s).`;
+  }
+  return zh ? "result.json 中无摘要。" : "No summary in result.json.";
+}
+
+export function resultVerdict(result: RoleResult): string {
+  return "verdict" in result && typeof result.verdict === "string" ? result.verdict : "unknown";
 }
 
 export function printResultSummary(result: RoleResult): void {

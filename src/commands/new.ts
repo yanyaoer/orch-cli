@@ -12,7 +12,8 @@ import { createInterface, type Interface as ReadlineInterface, type ReadLineOpti
 import { CliError, assertKnownFlags, flagBool, flagString, printJson, type ParsedArgs } from "../cli.ts";
 import { reconcileDispatchWatch } from "../dispatch.ts";
 import { classifyNewOpenQuestions, evaluateNewExecution, validateNewPlanMarkdown, type NewExecutionRun } from "../new-flow.ts";
-import { orchCommand, resultVerdict, writeForgeRef, type DecisionRecord } from "../run-store.ts";
+import { orchCommand, scanMrRuns, writeForgeRef } from "../run-store.ts";
+import { resultVerdict } from "../render.ts";
 
 const NEW_FLAGS = ["workspace", "worktree", "mr", "model", "timeout-sec", "yes"] as const;
 
@@ -258,21 +259,20 @@ function newRecommendedDefaults(result: ResearcherResult): { text: string; block
 }
 
 function newExecutionRuns(repoKey: string, mr: string, baseline: Set<string>, execRunId: string): NewExecutionRun[] {
-  return collectMrRuns(repoKey, mr)
-    .filter((run) => !baseline.has(run.run_id) && run.run_id !== execRunId)
-    .map((run) => {
-      const decision = readJsonFile<DecisionRecord | null>(`${mrStateDir(repoKey, mr)}/runs/${run.run_id}/decision.json`, null);
-      return {
-        run_id: run.run_id,
-        role: run.role,
-        state: run.state,
-        stale: run.stale,
-        verdict: run.verdict,
-        decision: decision && decision.run_id === run.run_id && (decision.verdict === "accept" || decision.verdict === "rework" || decision.verdict === "close")
+  return scanMrRuns(repoKey, mr)
+    .filter((record): record is typeof record & { status: RunStatus } => record.status !== null)
+    .filter((record) => !baseline.has(record.run_id) && record.run_id !== execRunId)
+    .map(({ status, result, decision, stale, run_id }) => ({
+      run_id,
+      role: status.role,
+      state: status.state,
+      stale,
+      verdict: typeof result?.verdict === "string" ? result.verdict : null,
+      decision:
+        decision && decision.run_id === run_id && (decision.verdict === "accept" || decision.verdict === "rework" || decision.verdict === "close")
           ? decision.verdict
           : null,
-      };
-    });
+    }));
 }
 
 export async function newCommand(args: ParsedArgs): Promise<number> {
