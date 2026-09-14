@@ -1,6 +1,6 @@
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync, writeSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync, writeSync } from "node:fs";
 import { isRunRole, type AgentName, type ResultCoercion, type RunSpec, type RoleResult, type SandboxEngine, type SandboxPosture } from "../src/types.ts";
-import { fallbackResult, resultSchemaName, ROLE_REQUIRED_FIELDS, ROLE_VERDICTS, validateRoleResult } from "../src/schema.ts";
+import { fallbackResult, resultSchemaName, ROLE_REQUIRED_FIELDS, ROLE_RESULT_EXAMPLE, ROLE_VERDICTS, validateRoleResult } from "../src/schema.ts";
 import { appendJsonLine, countLines, writeJsonAtomic } from "../src/json.ts";
 import { normalizeNativeText, type NativeEvent } from "../src/native-events.ts";
 import { sha256 } from "../src/hash.ts";
@@ -65,6 +65,7 @@ export function buildPrompt(spec: RunSpec, provider: string): string {
     `Required top-level fields — omitting any of them fails the run: ${required.map((field) => `"${field}"`).join(", ")}.`,
     `It must also include "verdict", exactly one of: ${verdicts.map((verdict) => `"${verdict}"`).join(" | ")}. Never omit "verdict".` +
       (failure ? ` Use "${failure}" when the task could not genuinely be completed; never claim success for ungrounded or partial work.` : ""),
+    `Shape to copy (array items are objects only where shown; findings carry "body", blocking ones also id/severity/file): ${ROLE_RESULT_EXAMPLE[role]}`,
     "Do not wrap the JSON in Markdown. Do not create or edit result files in the worktree; return the JSON as your final answer only.",
     ...(role === "implementer"
       ? [
@@ -485,17 +486,9 @@ function parsedJsonCandidates(text: string): unknown[] {
 }
 
 function roleResultFromCandidate(value: unknown, spec: RunSpec): ExtractedResult | null {
-  const normalized = normalizedRoleResult(value, spec);
-  if (normalized) return normalized;
-
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  if (!isRunRole(spec.role)) return null;
-
-  const obj = value as Record<string, unknown>;
-  const schemaName = resultSchemaName(spec.role);
-  for (const key of [schemaName, "result"]) {
-    const wrapped = normalizedRoleResult(obj[key], spec);
-    if (wrapped) return wrapped;
+  for (const candidate of unwrappedCandidates(value, spec)) {
+    const normalized = normalizedRoleResult(candidate, spec);
+    if (normalized) return normalized;
   }
   return null;
 }
@@ -504,64 +497,16 @@ function roleResultFromCandidate(value: unknown, spec: RunSpec): ExtractedResult
 // objects are expected and vice versa, invented run ids, verdict synonyms).
 // Real usage showed ~2/3 of runs losing their result to strict validation, so
 // coerce the unambiguous deviations instead of discarding the whole result.
-function coercedString(item: unknown): string {
-  if (typeof item === "string") return item;
-  if (item && typeof item === "object" && !Array.isArray(item)) {
-    const obj = item as Record<string, unknown>;
-    const body = [obj.body, obj.description, obj.text, obj.cmd, obj.summary].find(
-      (v) => typeof v === "string" && v.trim(),
-    ) as string | undefined;
-    if (body) return typeof obj.id === "string" && obj.id.trim() ? `${obj.id}: ${body}` : body;
-  }
-  return JSON.stringify(item);
-}
-
-function coerceStringArray(obj: Record<string, unknown>, field: string, coercions: ResultCoercion[]): void {
+// A bare string is unambiguously the finding body. Every other deviation —
+// title/detail under other keys, a blocking finding without id/severity/file —
+// goes back to the model through the repair round instead of being guessed here
+// (the old aliases and "unspecified" defaults fabricated content).
+function coerceFindings(obj: Record<string, unknown>, field: string, coercions: ResultCoercion[]): void {
   if (!Array.isArray(obj[field])) return;
   obj[field] = (obj[field] as unknown[]).map((item, index) => {
-    const coerced = coercedString(item);
-    if (typeof item !== "string" || item !== coerced) {
-      recordCoercion(coercions, `${field}[${index}]`, item, coerced, "string array item");
-    }
-    return coerced;
-  });
-}
-
-function coerceFindings(obj: Record<string, unknown>, field: string, blocking: boolean, coercions: ResultCoercion[]): void {
-  if (!Array.isArray(obj[field])) return;
-  obj[field] = (obj[field] as unknown[]).map((item, index) => {
-    const finding: Record<string, unknown> =
-      item && typeof item === "object" && !Array.isArray(item) ? { ...(item as Record<string, unknown>) } : { body: String(item) };
-    if (!item || typeof item !== "object" || Array.isArray(item)) {
-      recordCoercion(coercions, `${field}[${index}]`, item, finding, "finding object");
-    }
-    if (typeof finding.body !== "string" || !finding.body.trim()) {
-      // Models name the prose differently (gemini emits finding+scenario);
-      // when a title and a detail field coexist, keep both halves.
-      const isProse = (v: unknown): v is string => typeof v === "string" && v.trim().length > 0;
-      const title = [finding.finding, finding.title, finding.summary].find(isProse);
-      const detail = [finding.scenario, finding.description, finding.message, finding.detail, finding.text].find(isProse);
-      const body = [title, detail].filter(Boolean).join("\n\n");
-      if (body) {
-        recordCoercion(coercions, `${field}[${index}].body`, finding.body, body, "body alias");
-        finding.body = body;
-      }
-    }
-    if (blocking) {
-      if (typeof finding.id !== "string" || !finding.id.trim()) {
-        const next = `finding-${index + 1}`;
-        recordCoercion(coercions, `${field}[${index}].id`, finding.id, next, "required finding field default");
-        finding.id = next;
-      }
-      if (typeof finding.severity !== "string" || !finding.severity.trim()) {
-        recordCoercion(coercions, `${field}[${index}].severity`, finding.severity, "unspecified", "required finding field default");
-        finding.severity = "unspecified";
-      }
-      if (typeof finding.file !== "string" || !finding.file.trim()) {
-        recordCoercion(coercions, `${field}[${index}].file`, finding.file, "unspecified", "required finding field default");
-        finding.file = "unspecified";
-      }
-    }
+    if (typeof item !== "string") return item;
+    const finding = { body: item };
+    recordCoercion(coercions, `${field}[${index}]`, item, finding, "finding object");
     return finding;
   });
 }
@@ -584,7 +529,11 @@ function coerceMissingArrays(obj: Record<string, unknown>, fields: string[], coe
   }
 }
 
-function coerceRoleResult(role: RunSpec["role"], obj: Record<string, unknown>, coercions: ResultCoercion[]): void {
+// Only deviations with exactly one reading are repaired here (case, known
+// synonyms, arrays a model left out, ids it typed as numbers, facts the spec
+// owns). Anything that would need a guess is left for validation to reject and
+// the repair round to send back to the model.
+function coerceRoleResult(role: RunSpec["role"], obj: Record<string, unknown>, coercions: ResultCoercion[], spec: RunSpec): void {
   if (typeof obj.verdict === "string") {
     const original = obj.verdict;
     const verdict = original.trim().toLowerCase();
@@ -610,9 +559,8 @@ function coerceRoleResult(role: RunSpec["role"], obj: Record<string, unknown>, c
       delete obj.findings;
     }
     coerceMissingArrays(obj, ["blocking_findings", "non_blocking_findings", "suggested_tests"], coercions);
-    coerceFindings(obj, "blocking_findings", true, coercions);
-    coerceFindings(obj, "non_blocking_findings", false, coercions);
-    coerceStringArray(obj, "suggested_tests", coercions);
+    coerceFindings(obj, "blocking_findings", coercions);
+    coerceFindings(obj, "non_blocking_findings", coercions);
     if (typeof obj.reviews_run_id !== "string") {
       const next = obj.reviews_run_id == null ? "" : String(obj.reviews_run_id);
       recordCoercion(coercions, "reviews_run_id", obj.reviews_run_id, next, "stringified id");
@@ -620,68 +568,16 @@ function coerceRoleResult(role: RunSpec["role"], obj: Record<string, unknown>, c
     }
   } else if (role === "implementer") {
     coerceMissingArrays(obj, ["changed_files", "tests", "acceptance", "risks"], coercions);
-    coerceStringArray(obj, "changed_files", coercions);
-    coerceStringArray(obj, "risks", coercions);
+    if (typeof obj.base_sha !== "string" || !obj.base_sha.trim()) {
+      recordCoercion(coercions, "base_sha", obj.base_sha, spec.base_sha, "spec base_sha is authoritative");
+      obj.base_sha = spec.base_sha;
+    }
   } else if (role === "controller") {
     coerceMissingArrays(obj, ["actions"], coercions);
-    coerceStringArray(obj, "actions", coercions);
   } else if (role === "researcher") {
     coerceMissingArrays(obj, ["alternatives", "sources", "open_questions", "risks"], coercions);
-    for (const field of ["alternatives", "sources", "open_questions", "risks"]) {
-      coerceStringArray(obj, field, coercions);
-    }
-    if (typeof obj.recommendation !== "string" || !obj.recommendation.trim()) {
-      // Models name the deliverable differently; the aliases are unambiguous.
-      const alias = [obj.proposal, obj.decision, obj.conclusion].find(
-        (v): v is string => typeof v === "string" && v.trim().length > 0,
-      );
-      if (alias) {
-        recordCoercion(coercions, "recommendation", obj.recommendation, alias, "recommendation alias");
-        obj.recommendation = alias;
-      }
-    }
-    // summary is descriptive, not control flow: when it is missing but the
-    // deliverable exists, derive it from the recommendation's first prose line
-    // instead of discarding an otherwise valid result (a live plan run omitted
-    // summary while including verdict and a full recommendation).
-    if ((typeof obj.summary !== "string" || !obj.summary.trim()) && typeof obj.recommendation === "string") {
-      // First prose line: headings and fenced code blocks (including their
-      // contents) are skipped, list markers are stripped so a bullet-only
-      // plan still yields readable content.
-      let firstProse: string | undefined;
-      // Only the fence kind that opened a block closes it; the other kind is
-      // ordinary content inside (and gets skipped with the rest of the block).
-      let fence: "```" | "~~~" | null = null;
-      for (const raw of obj.recommendation.split("\n")) {
-        const line = raw.trim();
-        const mark = line.startsWith("```") ? "```" : line.startsWith("~~~") ? "~~~" : null;
-        if (mark && fence === null) {
-          fence = mark;
-          continue;
-        }
-        if (mark && mark === fence) {
-          fence = null;
-          continue;
-        }
-        if (fence !== null || !line || line.startsWith("#")) continue;
-        // Both `1.` and `1)` list styles; a line that is only a marker is noise.
-        const stripped = line.replace(/^(?:[-*+]|\d+[.)])(?:\s+|$)/, "");
-        if (stripped) {
-          firstProse = stripped;
-          break;
-        }
-      }
-      if (firstProse) {
-        const derived = firstProse.length > 200 ? `${firstProse.slice(0, 197)}...` : firstProse;
-        recordCoercion(coercions, "summary", obj.summary, derived, "summary derived from recommendation");
-        obj.summary = derived;
-      }
-    }
-    // Verdict is deliberately never defaulted: completed and failed require
-    // identical content fields, so a missing verdict is genuinely ambiguous
-    // and coercing it would let failed research dispatch write-role workers
-    // (orch new gates on completed). buildPrompt demands the field instead;
-    // a result without it fails closed with the raw output preserved.
+    // recommendation and summary are the deliverable; a missing or misnamed
+    // one is sent back through the repair round rather than derived here.
   } else if (role === "verifier") {
     coerceMissingArrays(obj, ["commands", "acceptance"], coercions);
     if (typeof obj.verifies_run_id !== "string") {
@@ -692,7 +588,7 @@ function coerceRoleResult(role: RunSpec["role"], obj: Record<string, unknown>, c
   }
 }
 
-function normalizedRoleResult(value: unknown, spec: RunSpec): ExtractedResult | null {
+function coerceCandidate(value: unknown, spec: RunSpec): { obj: Record<string, unknown>; coercions: ResultCoercion[] } | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   if (!isRunRole(spec.role)) return null;
 
@@ -706,14 +602,27 @@ function normalizedRoleResult(value: unknown, spec: RunSpec): ExtractedResult | 
     recordCoercion(coercions, "run_id", obj.run_id, spec.run_id, "spec run_id is authoritative");
     obj.run_id = spec.run_id;
   }
-  if (validateRoleResult(spec.role, obj).ok) return { result: obj as unknown as RoleResult, coercions };
+  if (validateRoleResult(spec.role, obj).ok) return { obj, coercions };
   if (obj.schema === undefined) {
     recordCoercion(coercions, "schema", obj.schema, schemaName, "missing schema");
     obj.schema = schemaName;
   }
-  coerceRoleResult(spec.role, obj, coercions);
+  coerceRoleResult(spec.role, obj, coercions, spec);
+  return { obj, coercions };
+}
 
-  return validateRoleResult(spec.role, obj).ok ? { result: obj as unknown as RoleResult, coercions } : null;
+function normalizedRoleResult(value: unknown, spec: RunSpec): ExtractedResult | null {
+  const coerced = coerceCandidate(value, spec);
+  if (!coerced) return null;
+  return validateRoleResult(spec.role, coerced.obj).ok ? { result: coerced.obj as unknown as RoleResult, coercions: coerced.coercions } : null;
+}
+
+// The candidate itself, then the same object wrapped under the schema name or
+// `result` (models sometimes envelope the answer).
+function unwrappedCandidates(value: unknown, spec: RunSpec): unknown[] {
+  if (!value || typeof value !== "object" || Array.isArray(value) || !isRunRole(spec.role)) return [];
+  const obj = value as Record<string, unknown>;
+  return [value, obj[resultSchemaName(spec.role)], obj.result].filter((v) => v && typeof v === "object" && !Array.isArray(v));
 }
 
 export function extractResultWithCoercionsFromText(text: string, spec: RunSpec): ExtractedResult | null {
@@ -773,19 +682,94 @@ export function extractResultFromRunDir(runDir: string, spec: RunSpec): RoleResu
   return extractResultWithCoercionsFromRunDir(runDir, spec)?.result ?? null;
 }
 
-export function appendResultCoercionEvent(runDir: string, coercions: ResultCoercion[]): void {
-  if (coercions.length === 0) return;
+// Why the run has no valid result yet, as the validator would say it: the
+// errors of the first candidate that looks like a result (carries schema or
+// verdict), else of the first JSON object at all, else a "no JSON" line. Fed
+// back to the model by the repair round.
+export function resultValidationErrors(runDir: string, spec: RunSpec): string[] {
+  let fallback: string[] | null = null;
+  for (const text of collectResultCandidates(runDir)) {
+    for (const candidate of parsedJsonCandidates(text)) {
+      for (const value of unwrappedCandidates(candidate, spec)) {
+        const coerced = coerceCandidate(value, spec);
+        if (!coerced) continue;
+        const { errors } = validateRoleResult(spec.role, coerced.obj);
+        if (errors.length === 0) return [];
+        const obj = value as Record<string, unknown>;
+        if ("schema" in obj || "verdict" in obj) return errors;
+        fallback ??= errors;
+      }
+    }
+  }
+  return fallback ?? ["no JSON object was found in the final answer"];
+}
+
+export function appendDriverEvent(runDir: string, event: Record<string, unknown>): void {
   try {
     const eventsPath = `${runDir}/events.jsonl`;
-    appendJsonLine(eventsPath, {
-      type: "result_coercion",
-      seq: countLines(eventsPath),
-      ts: new Date().toISOString(),
-      coercions,
-    });
+    appendJsonLine(eventsPath, { ...event, seq: countLines(eventsPath), ts: new Date().toISOString() });
   } catch {
-    // Coercion visibility is diagnostic only; extraction/result writing must win.
+    // Diagnostic only; extraction/result writing must win.
   }
+}
+
+export function appendResultCoercionEvent(runDir: string, coercions: ResultCoercion[]): void {
+  if (coercions.length === 0) return;
+  appendDriverEvent(runDir, { type: "result_coercion", coercions });
+}
+
+const REPAIR_PREVIOUS_MAX_CHARS = 16_000;
+
+function repairTaskText(spec: RunSpec, errors: string[], previous: string): string {
+  const role = isRunRole(spec.role) ? spec.role : "implementer";
+  const excerpt = previous.length > REPAIR_PREVIOUS_MAX_CHARS ? `${previous.slice(0, REPAIR_PREVIOUS_MAX_CHARS)}\n[truncated]` : previous;
+  return [
+    "Your previous final answer for this run did not validate as an orch result. Validator errors:",
+    ...errors.map((error) => `- ${error}`),
+    "",
+    "Return the corrected JSON object as your final answer and nothing else. Keep every fact from the previous answer; do not invent values you do not have — leave optional arrays empty instead. Do not run tools or edit files.",
+    `Required shape: ${ROLE_RESULT_EXAMPLE[role]}`,
+    "",
+    "--- previous answer ---",
+    excerpt,
+  ].join("\n");
+}
+
+// One extra provider call that only reformats: the model gets the validator's
+// own errors plus its previous answer and returns the corrected JSON. Fresh
+// ephemeral session, same sandbox plan; its stream is appended to native.jsonl
+// after a marker line so the run stays inspectable. Returns the provider exit
+// code, or null when no plan could be built.
+async function runResultRepair(input: {
+  provider: AgentName;
+  spec: RunSpec;
+  runDir: string;
+  worktree: string;
+  errors: string[];
+  previous: string;
+}): Promise<number | null> {
+  const spec: RunSpec = {
+    ...input.spec,
+    provider_session_mode: "ephemeral",
+    provider_session_id: null,
+    provider_session_name: null,
+    task_text: repairTaskText(input.spec, input.errors, input.previous),
+  };
+  const prompt = buildPrompt(spec, input.provider);
+  if (input.provider === "omp") writeFileSync(ompPromptPath(input.runDir), prompt, "utf8");
+  let plan: ProviderExecutionPlan;
+  try {
+    plan = buildProviderExecutionPlan({ provider: input.provider, spec, runDir: input.runDir, worktree: input.worktree, prompt });
+  } catch {
+    return null;
+  }
+  const nativePath = `${input.runDir}/native.jsonl`;
+  appendFileSync(nativePath, `${JSON.stringify({ type: "orch_result_repair", attempt: 1, errors: input.errors })}\n`, "utf8");
+  const proc = Bun.spawn(plan.argv, { cwd: input.worktree, stdin: "pipe", stdout: "pipe", stderr: "inherit", env: plan.env });
+  if (input.provider !== "omp") proc.stdin.write(prompt);
+  proc.stdin.end();
+  await pipeToFile(proc.stdout, nativePath, "a");
+  return await proc.exited;
 }
 
 // Best human-readable stand-in for the worker's final answer, used to preserve
@@ -958,9 +942,9 @@ function keepsNativeLine(line: Buffer): boolean {
   return !droppedNativeLinePrefixes.some((prefix) => line.subarray(0, prefix.length).equals(prefix));
 }
 
-export async function pipeToFile(stream: ReadableStream<Uint8Array> | null, path: string): Promise<void> {
+export async function pipeToFile(stream: ReadableStream<Uint8Array> | null, path: string, mode: "w" | "a" = "w"): Promise<void> {
   if (!stream) return;
-  const fd = openSync(path, "w");
+  const fd = openSync(path, mode);
   try {
     const reader = stream.getReader();
     let pending = Buffer.alloc(0);
@@ -1271,7 +1255,19 @@ export async function runProviderDriver(provider: AgentName, argv: string[]): Pr
   const code = await proc.exited;
   writeExitCode(args.runDir, code);
 
-  const extracted = extractResultWithCoercionsFromRunDir(args.runDir, spec);
+  let extracted = extractResultWithCoercionsFromRunDir(args.runDir, spec);
+  // A provider that finished normally but whose answer does not validate gets
+  // one repair round (ORCH_RESULT_REPAIR=0 disables it); a crashed or killed
+  // provider does not, its raw output is preserved below instead.
+  if (!extracted && code === 0 && process.env.ORCH_RESULT_REPAIR !== "0") {
+    const errors = resultValidationErrors(args.runDir, spec);
+    const previous = rawResultText(args.runDir);
+    if (previous) {
+      const repairCode = await runResultRepair({ provider, spec, runDir: args.runDir, worktree: args.worktree, errors, previous });
+      extracted = extractResultWithCoercionsFromRunDir(args.runDir, spec);
+      appendDriverEvent(args.runDir, { type: "result_repair", attempt: 1, errors, repair_exit_code: repairCode, outcome: extracted ? "valid" : "invalid" });
+    }
+  }
   if (extracted) {
     writeResult(args.runDir, spec, extracted.result);
     appendResultCoercionEvent(args.runDir, extracted.coercions);

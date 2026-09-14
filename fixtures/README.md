@@ -25,3 +25,7 @@ comment (`decisionBody`).
   With `decision` present the case renders the decision comment.
 - `result.json`: the run's `result.json`.
 - `expected.md`: the rendered markdown.
+
+An `expected.json` of `null` documents a shape the driver refuses to guess at:
+at run end such an answer is sent back to the model once with the validator's
+errors (the repair round) instead of being coerced.

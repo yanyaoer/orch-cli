@@ -136,6 +136,21 @@ export const ROLE_REQUIRED_FIELDS: Record<RunRole, readonly string[]> = {
   verifier: ["verdict"],
 };
 
+// One example per role, printed verbatim in the worker prompt and in the
+// result-repair prompt: models copy a shape far more reliably than they infer
+// it from a field list (live runs invented finding keys and object items).
+export const ROLE_RESULT_EXAMPLE: Record<RunRole, string> = {
+  implementer:
+    '{"schema":"orch.result/implementer/v1","run_id":"<run_id>","verdict":"completed|failed","summary":"what changed and why","base_sha":"<base sha from the task>","head_sha":"<HEAD after your commits>","changed_files":["path/one.ts"],"tests":[{"cmd":"bun test src/one.test.ts","exit_code":0,"summary":"12 pass"}],"acceptance":[{"id":"AC1","status":"met|unmet","evidence":"how you checked"}],"risks":["..."],"rollback":"git revert <head_sha>"}',
+  reviewer:
+    '{"schema":"orch.result/reviewer/v1","run_id":"<run_id>","verdict":"approve|request_changes","reviews_run_id":"<run id under review; empty string if none>","blocking_findings":[{"id":"F1","severity":"high|medium|low","file":"path/one.ts:42","body":"what breaks, how to reproduce, what to change"}],"non_blocking_findings":[{"body":"..."}],"suggested_tests":["..."]}',
+  controller: '{"schema":"orch.result/controller/v1","run_id":"<run_id>","verdict":"completed|failed","summary":"...","actions":["..."]}',
+  researcher:
+    '{"schema":"orch.result/researcher/v1","run_id":"<run_id>","verdict":"completed|failed","summary":"...","recommendation":"...","alternatives":["..."],"sources":["https://..."],"open_questions":["..."],"risks":["..."]}',
+  verifier:
+    '{"schema":"orch.result/verifier/v1","run_id":"<run_id>","verdict":"pass|fail","verifies_run_id":"<run id verified>","commands":[{"cmd":"...","exit_code":0,"summary":"..."}],"acceptance":[{"id":"AC1","status":"met|unmet","evidence":"..."}]}',
+};
+
 export function validateRoleResult(role: RunRole, value: unknown): ValidationResult {
   if (!isRunRole(role)) {
     return { ok: false, errors: [`role ${role} has no result schema`] };
