@@ -8,7 +8,7 @@ Daemonless multi-agent orchestration for coding work.
 
 中文：`orch` 是一个无常驻 daemon 的多 Agent 编排 CLI。它把 Codex/Claude 这类 headless worker 进程化运行，把状态落到本地目录，并用统一的 `result.json` 给主控或人类做裁决。
 
-Latest release: `v0.0.12` ([CHANGELOG.md](CHANGELOG.md)).
+Latest release: `v0.0.13` ([CHANGELOG.md](CHANGELOG.md)).
 
 ## Documentation map
 
