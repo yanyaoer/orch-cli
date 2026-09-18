@@ -119,6 +119,6 @@ the same setting. Code, commands, file paths, and identifiers stay as-is.
 
 ## Division of labor
 Strong model plans (via handoff-pro); tool-capable workers (codex / pi)
-execute; omp (gpt-5.6-sol at xhigh thinking, quota fallback claude-fable-5 →
-gemini-3.1-pro) covers review / research; claude escalates by role (reviewer opus/high, researcher
+execute; omp (gpt-6-astra at high thinking, quota fallback gemini-3.1-pro)
+covers review / research; claude escalates by role (reviewer opus/high, researcher
 fable/xhigh). orch orchestrates and keeps all run state auditable under XDG_STATE.

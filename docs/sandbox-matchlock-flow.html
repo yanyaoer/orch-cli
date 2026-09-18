@@ -7,35 +7,9 @@
   <title>orch-cli × matchlock — microVM sandbox 交互流程</title>
   <link rel="stylesheet" href="assets/site.css">
   <style>
-    :root {
-      --bg: #0b0f14; --panel: #10161d; --panel-2: #0e141b;
-      --line: #1d2833; --line-strong: #2c3b49;
-      --text: #dbe4ee; --muted: #8aa0b4; --faint: #5d7183;
-      --accent: #2dd4bf; --accent-dim: rgba(45,212,191,.14);
-      --amber: #f4b350; --green: #4ade80; --red: #f87171;
-      --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
-      --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
-    }
-    @media (prefers-color-scheme: light) {
-      :root {
-        --bg: #fbfcfd; --panel: #fff; --panel-2: #f2f5f8;
-        --line: #e2e8ee; --line-strong: #c6d2dc;
-        --text: #1a2632; --muted: #596b7d; --faint: #8496a6;
-        --accent: #0d9488; --accent-dim: rgba(13,148,136,.10);
-        --amber: #b45309; --green: #15803d; --red: #b91c1c;
-      }
-    }
-    * { box-sizing: border-box; }
-    body { margin: 0; background: var(--bg); color: var(--text);
-      font: 15.5px/1.65 var(--sans); -webkit-font-smoothing: antialiased; }
-    a { color: var(--accent); text-decoration: none; }
-    a:hover { text-decoration: underline; text-underline-offset: 3px; }
-    code { font-family: var(--mono); font-size: .86em; background: var(--panel-2);
-      border-radius: 4px; padding: .1em .4em; }
-    .wrap { width: min(1180px, calc(100% - 40px)); margin: 0 auto; }
-
+    /* Page-specific tool styles; the frame, tokens, and base come from assets/site.css. */
     .matchlock-heading { border-bottom: 1px solid var(--line); background: var(--panel-2); }
-    .matchlock-heading .wrap { padding: 20px 20px 22px; }
+    .matchlock-heading .site-wrap { padding: 20px 0 22px; }
     .brand { font: 700 14px var(--mono); color: var(--text); }
     .brand span { color: var(--accent); }
     h1 { font-size: 22px; margin: 10px 0 6px; letter-spacing: -.01em; }
@@ -48,7 +22,7 @@
     .chip b { color: var(--accent); font-weight: 700; }
     .chip.warn b { color: var(--amber); }
 
-    main .wrap { padding: 22px 20px 60px; }
+    main .site-wrap { padding: 22px 0 60px; }
 
     .toolbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
       margin-bottom: 14px; }
@@ -99,8 +73,6 @@
     .note p { margin: 0; font-size: 13px; color: var(--muted); }
     .note code { font-size: .82em; }
 
-    footer { border-top: 1px solid var(--line); color: var(--faint); font-size: 12.5px; }
-    footer .wrap { padding: 18px 20px 40px; }
     .toast { position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%);
       background: var(--text); color: var(--bg); font: 600 12.5px var(--sans);
       padding: 8px 16px; border-radius: 999px; opacity: 0; transition: opacity .2s;
@@ -113,23 +85,18 @@
 <header class="site-header">
   <nav class="site-nav site-wrap" aria-label="Primary">
     <a class="site-brand" href="index.html"><span>$</span> orch</a>
-    <details class="site-menu">
-      <summary>Menu</summary>
-      <div class="site-nav-links">
-        <a href="index.html">Home</a>
-        <a class="is-current" aria-current="page" href="contents.html">Docs</a>
-        <a href="adr/index.html">ADRs</a>
-        <a href="specs/index.html">Specs</a>
-        <a href="contents.html#reviews">Reviews</a>
-        <a href="contents.html#evidence">Evidence</a>
-        <a href="https://github.com/yanyaoer/orch-cli">GitHub</a>
-      </div>
-    </details>
+    <div class="site-nav-links">
+      <a href="index.html">Home</a>
+      <a href="contents.html" class="is-current" aria-current="page">Docs</a>
+      <a href="getting-started.html">Getting started</a>
+      <a href="https://github.com/yanyaoer/orch-cli">GitHub</a>
+      
+    </div>
   </nav>
 </header>
 
 <section class="matchlock-heading">
-  <div class="wrap">
+  <div class="site-wrap">
     <div class="brand">orch<span>-cli</span> × matchlock</div>
     <h1>microVM sandbox — 交互流程（PlantUML v1）</h1>
     <p class="sub">把 provider CLI（claude/codex/pi）塞进一次性硬件虚拟机；driver 留在宿主桥接产物；真实密钥经宿主 MITM proxy 注入，agent 全程只见 dummy key。</p>
@@ -143,7 +110,7 @@
 </section>
 
 <main id="main">
-  <div class="wrap">
+  <div class="site-wrap">
     <nav class="breadcrumbs" aria-label="Breadcrumb">
       <ol>
         <li><a href="index.html">Home</a></li>
@@ -205,11 +172,11 @@
   </div>
 </main>
 
-<footer>
-  <div class="wrap">
-    源码内嵌本页，渲染默认走 <code>plantuml.com</code>（会把图文外发）。介意就把上方 server 改成自建
-    <code>plantuml/plantuml-server</code>（同样支持 <code>~h</code> 十六进制编码）。
-    参考：<a href="https://github.com/jingkaihe/matchlock" target="_blank" rel="noreferrer">jingkaihe/matchlock</a>。
+<footer class="site-footer">
+  <div class="site-wrap">
+    <a href="https://github.com/yanyaoer/orch-cli">github.com/yanyaoer/orch-cli</a>
+    <span>state lives in ${XDG_STATE_HOME:-~/.local/state}/orch</span>
+    <span>no daemon · no queue · just files</span>
   </div>
 </footer>
 

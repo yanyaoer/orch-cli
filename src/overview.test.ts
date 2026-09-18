@@ -262,10 +262,14 @@ test("missing or corrupt mailctl cursor is ignored without throwing", () => {
   expect(overview.actions).toEqual([]);
 });
 
+const isolatedConfigHome = mkdtempSync(join(tmpdir(), "orch-test-config-"));
+
 async function runOrch(args: string[], env: Record<string, string>): Promise<{ stdout: string; stderr: string; exitCode: number }> {
   const proc = Bun.spawn([process.execPath, "src/orch.ts", ...args], {
     cwd: process.cwd(),
-    env: { ...process.env, ...env },
+    // Callers that do not name a config home must not read the developer's
+    // real ~/.config/orch: config.json warnings would land in stderr.
+    env: { ...process.env, XDG_CONFIG_HOME: isolatedConfigHome, ...env },
     stdout: "pipe",
     stderr: "pipe",
   });

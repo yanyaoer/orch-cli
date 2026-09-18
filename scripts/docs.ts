@@ -19,6 +19,10 @@ const DIST_ROOT = join(REPO_ROOT, "dist");
 export const OUTPUT_ROOT = join(DIST_ROOT, "docs-site");
 
 const RENDERED_EXTENSIONS = new Set([".md", ".json", ".txt"]);
+// Tracked under docs/ but not published on the site (no page, no raw copy, no
+// hub entry): kept in the repo for GitHub readers until there is content
+// worth binding a run to. Remove a prefix here to publish it again.
+export const UNPUBLISHED_SOURCE_PREFIXES: readonly string[] = ["adr/", "specs/"];
 const SAFE_SCHEMES = new Set(["http", "https", "mailto"]);
 const GITHUB_URL = "https://github.com/yanyaoer/orch-cli";
 
@@ -45,12 +49,22 @@ function normalizeSourcePath(source: string): string {
   return normalized;
 }
 
+// `<page>.zh.md` is the Chinese companion of `<page>.md`: it is copied raw
+// like every source but rendered into its sibling's page behind the same
+// EN/中文 toggle the home page uses, never as a page of its own.
+export function companionSource(source: string): string {
+  return source.replace(/\.md$/, ".zh.md");
+}
+
+export function isCompanionSource(source: string): boolean {
+  return source.endsWith(".zh.md");
+}
+
 export function renderedOutputForSource(source: string): string | undefined {
   const safeSource = normalizeSourcePath(source);
   const extension = extname(safeSource).toLowerCase();
   if (!RENDERED_EXTENSIONS.has(extension)) return undefined;
-  if (safeSource === "adr/README.md") return "adr/index.html";
-  if (safeSource === "specs/README.md") return "specs/index.html";
+  if (isCompanionSource(safeSource)) return undefined;
   return `${safeSource.slice(0, -extension.length)}.html`;
 }
 
@@ -100,6 +114,7 @@ export async function getTrackedDocsSources(): Promise<string[]> {
     .split("\0")
     .filter(Boolean)
     .map((file) => normalizeSourcePath(file.slice("docs/".length)))
+    .filter((source) => !UNPUBLISHED_SOURCE_PREFIXES.some((prefix) => source.startsWith(prefix)))
     .sort();
   // This asset is part of this change before it can be committed; after commit it is already listed above.
   if (!sources.includes("assets/site.css") && await Bun.file(join(DOCS_ROOT, "assets/site.css")).exists()) {
@@ -193,9 +208,10 @@ export function renderMarkdown(
   source: string,
   output: string,
   publicTargets: ReadonlyMap<string, string>,
+  // One slugger across both languages of a page keeps heading ids unique.
+  slugger: GithubSlugger = new GithubSlugger(),
 ): string {
   const renderer = new Renderer();
-  const slugger = new GithubSlugger();
   renderer.html = ({ text }) => escapeHtml(text);
   renderer.heading = function ({ tokens, depth }) {
     const text = this.parser.parseInline(tokens);
@@ -216,9 +232,7 @@ export function renderMarkdown(
   return marked.parse(markdown, { renderer, gfm: true, breaks: false, async: false }) as string;
 }
 
-function sectionFor(source: string): "docs" | "adrs" | "specs" | "reviews" | "evidence" {
-  if (source.startsWith("adr/")) return "adrs";
-  if (source.startsWith("specs/")) return "specs";
+function sectionFor(source: string): "docs" | "reviews" | "evidence" {
   if ([".json", ".txt"].includes(extname(source).toLowerCase())) return "evidence";
   if (source.startsWith("reviews/")) return "reviews";
   return "docs";
@@ -229,24 +243,62 @@ function navLink(output: string, target: string, label: string, current: boolean
   return `<a href="${escapeHtml(relativeSiteUrl(output, target))}"${currentAttributes}>${label}</a>`;
 }
 
-function siteNavigation(output: string, current: ReturnType<typeof sectionFor> | "home"): string {
+function languageToggle(): string {
+  return `<div class="lang" aria-label="Language">
+        <button type="button" class="active" data-set-lang="en">EN</button>
+        <button type="button" data-set-lang="zh">中文</button>
+      </div>`;
+}
+
+// Same behaviour as the home page: body.en/body.zh gates [data-lang] blocks,
+// the choice persists in localStorage under the key the home page uses.
+export const LANGUAGE_SCRIPT = `<script>
+    const root = document.body;
+    const buttons = Array.from(document.querySelectorAll("[data-set-lang]"));
+    function setLang(lang) {
+      root.classList.toggle("zh", lang === "zh");
+      root.classList.toggle("en", lang !== "zh");
+      document.documentElement.lang = lang === "zh" ? "zh-CN" : "en";
+      buttons.forEach((button) => {
+        button.classList.toggle("active", button.dataset.setLang === lang);
+      });
+      localStorage.setItem("orch-lang", lang);
+    }
+    buttons.forEach((button) => {
+      button.addEventListener("click", () => setLang(button.dataset.setLang));
+    });
+    const saved = localStorage.getItem("orch-lang");
+    if (saved === "zh" || saved === "en") setLang(saved);
+  </script>`;
+
+// The one header for every page. index.html (a raw source) must carry this
+// exact markup for output "index.html" — a docs test enforces it — so the
+// landing page and the generated pages can never drift apart. No <details>
+// wrapper: a closed <details> hides its content regardless of CSS, which is
+// how the desktop nav went missing before; the links simply wrap on phones.
+export function siteHeader(output: string, current: ReturnType<typeof sectionFor> | "home", bilingual = false): string {
   return `<header class="site-header">
   <nav class="site-nav site-wrap" aria-label="Primary">
     <a class="site-brand" href="${escapeHtml(relativeSiteUrl(output, "index.html"))}"><span>$</span> orch</a>
-    <details class="site-menu">
-      <summary>Menu</summary>
-      <div class="site-nav-links">
-        ${navLink(output, "index.html", "Home", current === "home")}
-        ${navLink(output, "contents.html", "Docs", current === "docs")}
-        ${navLink(output, "adr/index.html", "ADRs", current === "adrs")}
-        ${navLink(output, "specs/index.html", "Specs", current === "specs")}
-        ${navLink(output, "contents.html#reviews", "Reviews", current === "reviews")}
-        ${navLink(output, "contents.html#evidence", "Evidence", current === "evidence")}
-        <a href="${GITHUB_URL}">GitHub</a>
-      </div>
-    </details>
+    <div class="site-nav-links">
+      ${navLink(output, "index.html", "Home", current === "home")}
+      ${navLink(output, "contents.html", "Docs", current === "docs" || current === "reviews" || current === "evidence")}
+      ${navLink(output, "getting-started.html", "Getting started", false)}
+      <a href="${GITHUB_URL}">GitHub</a>
+      ${bilingual ? languageToggle() : ""}
+    </div>
   </nav>
 </header>`;
+}
+
+export function siteFooter(): string {
+  return `<footer class="site-footer">
+  <div class="site-wrap">
+    <a href="${GITHUB_URL}">github.com/yanyaoer/orch-cli</a>
+    <span>state lives in \${XDG_STATE_HOME:-~/.local/state}/orch</span>
+    <span>no daemon · no queue · just files</span>
+  </div>
+</footer>`;
 }
 
 function breadcrumb(output: string, source: string | undefined, title: string): string {
@@ -256,11 +308,7 @@ function breadcrumb(output: string, source: string | undefined, title: string): 
   if (output !== "contents.html") {
     crumbs.push(`<li><a href="${escapeHtml(relativeSiteUrl(output, "contents.html"))}">Docs</a></li>`);
   }
-  if (source?.startsWith("adr/") && output !== "adr/index.html") {
-    crumbs.push(`<li><a href="${escapeHtml(relativeSiteUrl(output, "adr/index.html"))}">ADRs</a></li>`);
-  } else if (source?.startsWith("specs/") && output !== "specs/index.html") {
-    crumbs.push(`<li><a href="${escapeHtml(relativeSiteUrl(output, "specs/index.html"))}">Specs</a></li>`);
-  } else if (source?.startsWith("reviews/")) {
+  if (source?.startsWith("reviews/")) {
     const anchor = [".json", ".txt"].includes(extname(source)) ? "#evidence" : "#reviews";
     crumbs.push(`<li><a href="${escapeHtml(relativeSiteUrl(output, `contents.html${anchor}`))}">${anchor === "#evidence" ? "Evidence" : "Reviews"}</a></li>`);
   }
@@ -274,10 +322,13 @@ function pageShell(
   current: ReturnType<typeof sectionFor>,
   content: string,
   source?: string,
+  companion?: string,
 ): string {
-  const sourceLink = source
-    ? `<p class="source-link"><a href="${escapeHtml(relativeSiteUrl(output, source))}">View raw source</a></p>`
-    : "";
+  const sourceLinks = [source, companion]
+    .filter((path): path is string => Boolean(path))
+    .map((path) => `<a href="${escapeHtml(relativeSiteUrl(output, path))}">${path === companion ? "View raw source (中文)" : "View raw source"}</a>`);
+  const sourceLink = sourceLinks.length ? `<p class="source-link">${sourceLinks.join(" · ")}</p>` : "";
+  const bilingual = Boolean(companion);
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -288,9 +339,9 @@ function pageShell(
   <title>${escapeHtml(title)} · orch-cli docs</title>
   <link rel="stylesheet" href="${escapeHtml(relativeSiteUrl(output, "assets/site.css"))}">
 </head>
-<body class="docs-page">
+<body class="docs-page${bilingual ? " en" : ""}">
   <a class="skip-link" href="#main">Skip to content</a>
-  ${siteNavigation(output, current)}
+  ${siteHeader(output, current, bilingual)}
   <main id="main" class="site-main site-wrap">
     ${breadcrumb(output, source, title)}
     <article class="doc-content">
@@ -298,7 +349,8 @@ ${content}
     </article>
     ${sourceLink}
   </main>
-  <footer class="site-footer"><div class="site-wrap">orch-cli · daemonless, file-first orchestration</div></footer>
+  ${siteFooter()}
+  ${bilingual ? LANGUAGE_SCRIPT : ""}
 </body>
 </html>
 `;
@@ -317,18 +369,53 @@ interface HubItem {
   title: string;
   source: string;
   output: string;
+  description?: string;
+  lang?: string;
+  external?: boolean;
+}
+
+// Content map for the root-level docs: which group a page belongs to, what it
+// is for, and its language. Pages under reviews/ are grouped by path; a root
+// page missing here lands in "Docs" so nothing is ever hidden.
+// The same map is written out in prose in README.md ("Documentation map").
+export const DOC_MAP: Record<string, { group: "start" | "design" | "archive"; description: string; lang: string }> = {
+  "getting-started.md": { group: "start", description: "First run, per-role defaults, custom providers, the author's daily loops.", lang: "EN · 中文" },
+  "orch.md": { group: "start", description: "Agent-facing quick reference: intent → command. ~/.agents/orch.md symlinks here.", lang: "EN" },
+  "sandbox-design.md": { group: "design", description: "macOS Seatbelt write jail (seatbelt-v1): what is confined, what is not, and why.", lang: "中文" },
+  "orch-mvp-spec.md": { group: "archive", description: "The v2 MVP spec this repository implements; kept for the constraints and acceptance list.", lang: "中文" },
+  "multi-agent.md": { group: "archive", description: "The earlier tmux + GitLab MR design that orch replaced. Historical context only.", lang: "中文" },
+};
+
+export const HUB_GROUPS: Array<{ id: string; title: string }> = [
+  { id: "start", title: "Start here" },
+  { id: "design", title: "Design" },
+  { id: "reviews", title: "Reviews" },
+  { id: "evidence", title: "Evidence" },
+  { id: "diagrams", title: "Diagrams" },
+  { id: "docs", title: "Docs" },
+  { id: "archive", title: "Archive" },
+];
+
+export function hubGroupFor(source: string): string {
+  const mapped = DOC_MAP[source];
+  if (mapped) return mapped.group;
+  if ([".json", ".txt"].includes(extname(source).toLowerCase())) return "evidence";
+  if (source.startsWith("reviews/")) return "reviews";
+  if (extname(source).toLowerCase() === ".html") return "diagrams";
+  return "docs";
 }
 
 function hubSection(output: string, id: string, title: string, items: HubItem[]): string {
-  const links = items.length
-    ? `<ul>${items
-        .map(
-          (item) =>
-            `<li><a href="${escapeHtml(relativeSiteUrl(output, item.output))}">${escapeHtml(item.title)}</a><code>${escapeHtml(item.source)}</code></li>`,
-        )
-        .join("")}</ul>`
-    : "<p>No documents in this section.</p>";
-  return `<section class="hub-section" id="${id}"><h2>${title}</h2>${links}</section>`;
+  if (items.length === 0) return "";
+  const links = items
+    .map((item) => {
+      const href = item.external ? item.output : relativeSiteUrl(output, item.output);
+      const lang = item.lang ? `<span class="hub-lang">${escapeHtml(item.lang)}</span>` : "";
+      const description = item.description ? `<p>${escapeHtml(item.description)}</p>` : "";
+      return `<li><a href="${escapeHtml(href)}">${escapeHtml(item.title)}</a>${lang}${description}<code>${escapeHtml(item.source)}</code></li>`;
+    })
+    .join("");
+  return `<section class="hub-section" id="${id}"><h2>${title}</h2><ul>${links}</ul></section>`;
 }
 
 async function documentationHub(plan: BuildPlan, sourceRoot: string): Promise<string> {
@@ -338,24 +425,32 @@ async function documentationHub(plan: BuildPlan, sourceRoot: string): Promise<st
     const title = extension === ".md"
       ? firstHeading(await readFile(join(sourceRoot, source), "utf8"), basename(source, extension))
       : basename(source);
-    items.push({ title, source, output });
+    items.push({ title, source, output, ...DOC_MAP[source] });
   }
-  const diagrams = plan.sources
-    .filter((source) => extname(source).toLowerCase() === ".html" && source !== "index.html")
-    .map((source) => ({ title: source === "sandbox-matchlock-flow.html" ? "matchlock microVM sandbox flow" : basename(source, ".html"), source, output: source }));
-  const group = (predicate: (item: HubItem) => boolean) => items.filter(predicate);
+  for (const source of plan.sources) {
+    if (extname(source).toLowerCase() !== ".html" || source === "index.html") continue;
+    items.push({ title: source === "sandbox-matchlock-flow.html" ? "matchlock microVM sandbox flow" : basename(source, ".html"), source, output: source });
+  }
+  // The README is the reference and lives outside docs/: link it, do not copy it.
+  items.push({
+    title: "README (reference)",
+    source: "README.md on GitHub",
+    output: `${GITHUB_URL}#readme`,
+    external: true,
+    description: "Install, commands, mail bus, mailctl, safety model, result contract. The place for details.",
+    lang: "EN",
+  });
+  const sections = HUB_GROUPS.map((group) => {
+    const members = items.filter((item) => (item.external ? group.id === "start" : hubGroupFor(item.source) === group.id));
+    return hubSection("contents.html", group.id, group.title, members);
+  }).filter(Boolean);
   const content = `<header class="hub-intro">
   <p class="eyebrow">Documentation index</p>
   <h1>orch-cli documentation</h1>
-  <p>Authored sources stay authoritative; this site provides generated, link-checked HTML views and byte-exact evidence downloads.</p>
+  <p>README on GitHub is the reference; this site is the landing page plus every file under docs/ rendered as-is and link-checked. Pages with a Chinese companion carry the EN/中文 toggle.</p>
 </header>
 <div class="hub-grid">
-  ${hubSection("contents.html", "root-docs", "Root docs", group((item) => posix.dirname(item.source) === "."))}
-  ${hubSection("contents.html", "adrs", "Architecture decisions", group((item) => item.source.startsWith("adr/")))}
-  ${hubSection("contents.html", "specs", "Specifications", group((item) => item.source.startsWith("specs/")))}
-  ${hubSection("contents.html", "reviews", "Reviews", group((item) => item.source.startsWith("reviews/") && extname(item.source) === ".md"))}
-  ${hubSection("contents.html", "evidence", "Evidence", group((item) => [".json", ".txt"].includes(extname(item.source))))}
-  ${hubSection("contents.html", "diagrams", "Diagrams", diagrams)}
+  ${sections.join("\n  ")}
 </div>`;
   return pageShell("contents.html", "Documentation", "docs", content);
 }
@@ -406,8 +501,18 @@ export async function buildSite(options: SiteOptions): Promise<BuildPlan> {
       if (extname(source).toLowerCase() === ".md") {
         const markdown = new TextDecoder().decode(bytes);
         const title = firstHeading(markdown, basename(source, ".md"));
-        const content = renderMarkdown(markdown, source, output, plan.publicTargets);
-        await writeFile(renderedTarget, pageShell(output, title, sectionFor(source), content, source));
+        const companion = plan.sources.includes(companionSource(source)) ? companionSource(source) : undefined;
+        if (companion) {
+          await assertRegularSource(sourceRoot, companion);
+          const slugger = new GithubSlugger();
+          const en = renderMarkdown(markdown, source, output, plan.publicTargets, slugger);
+          const zh = renderMarkdown(await readFile(join(sourceRoot, companion), "utf8"), source, output, plan.publicTargets, slugger);
+          const content = `<div data-lang="en">\n${en}</div>\n<div data-lang="zh" lang="zh-CN">\n${zh}</div>`;
+          await writeFile(renderedTarget, pageShell(output, title, sectionFor(source), content, source, companion));
+        } else {
+          const content = renderMarkdown(markdown, source, output, plan.publicTargets);
+          await writeFile(renderedTarget, pageShell(output, title, sectionFor(source), content, source));
+        }
       } else {
         await writeFile(renderedTarget, evidencePage(source, output, bytes));
       }

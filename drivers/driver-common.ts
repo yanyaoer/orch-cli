@@ -142,22 +142,27 @@ export function buildWorkerEnv(baseEnv: NodeJS.ProcessEnv = process.env): Record
 // recovery consumes it — `retry.modelFallback` (on by default) permits the
 // switch — advancing to the next model when the provider reports
 // quota/rate-limit exhaustion.
-// Primary is gpt-5.6-sol at xhigh thinking; gemini sits at the tail because
-// its provider intermittently geo-rejects behind the corporate VPN.
+// Primary is gpt-6-astra at high thinking; gemini is the only fallback and
+// sits last because its provider intermittently geo-rejects behind the
+// corporate VPN.
 export const OMP_MODEL_CHAIN: readonly string[] = [
-  "openai-codex/gpt-5.6-sol",
-  "zenmux/anthropic/claude-fable-5",
+  "openai-codex/gpt-6-astra",
   "google-antigravity/gemini-3.1-pro",
 ];
 
-export const OMP_THINKING = "--thinking=xhigh";
+export const OMP_THINKING = "--thinking=high";
 
-// pi default mirrors omp's primary: gpt-5.6-sol at xhigh thinking. pi has no
+// pi default mirrors omp's primary: gpt-6-astra at high thinking. pi has no
 // quota-fallback chain; an explicit --model overrides the default.
-export const PI_DEFAULT_MODEL = "openai-codex/gpt-5.6-sol";
+export const PI_DEFAULT_MODEL = "openai-codex/gpt-6-astra";
+export const PI_THINKING = "high";
 
 export function ompModelChain(model: string | null | undefined): { primary: string; fallbacks: string[] } {
   const primary = model ?? OMP_MODEL_CHAIN[0]!;
+  // A primary outside the built-in chain names a provider orch knows nothing
+  // about: no overlay is written, so omp's own retry.fallbackChains (its
+  // config.yml) governs instead of a chain of providers the user may not have.
+  if (!OMP_MODEL_CHAIN.includes(primary)) return { primary, fallbacks: [] };
   return { primary, fallbacks: OMP_MODEL_CHAIN.filter((entry) => entry !== primary) };
 }
 
@@ -198,13 +203,14 @@ export const CLAUDE_RESEARCHER_ALLOWED_TOOLS = "Bash(jina *),Bash(tvly *),WebSea
 export const CLAUDE_WRITE_ALLOWED_TOOLS =
   "Task,Bash,BashOutput,KillShell,Glob,Grep,LS,Read,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch,TodoWrite";
 
-// Researcher model per provider: codex pins gpt-5.6-sol and claude pins fable,
-// both at xhigh effort; omp rides its default quota-fallback chain
-// (gpt-5.6-sol primary at xhigh thinking).
-export const CODEX_RESEARCHER_MODEL = "gpt-5.6-sol";
+// Researcher model per provider: codex pins gpt-6-astra at high reasoning and
+// claude pins fable at xhigh effort; omp rides its default quota-fallback
+// chain (gpt-6-astra primary at high thinking).
+export const CODEX_RESEARCHER_MODEL = "gpt-6-astra";
+export const CODEX_RESEARCHER_EFFORT = "high";
 
 // claude model tier by role: reviewer escalates to opus (deep critique, paired
-// with omp's gpt-5.6-sol as a distinct model family in cross-review);
+// with omp's gpt-6-astra as a distinct model family in cross-review);
 // researcher escalates further to fable (deep research/architecture);
 // implementer/verifier stay on the claude CLI's default model (sonnet) and only dial --effort.
 const CLAUDE_ROLE_MODEL: Partial<Record<RunSpec["role"], string>> = {
@@ -328,11 +334,11 @@ function providerArgv(
         // blocked without an explicit -s); write-capable roles must ask for
         // workspace-write explicitly or implementers cannot edit anything.
         ["--sandbox", readOnly ? "read-only" : "workspace-write"];
-    // Researcher: pin the strong-reasoning model at xhigh effort and enable
+    // Researcher: pin the strong-reasoning model at high effort and enable
     // codex-native web search — the read-only sandbox blocks network for shell
     // commands, so web research must ride the Responses web_search tool.
     const researcherFlags =
-      spec.role === "researcher" ? ["-c", "model_reasoning_effort=xhigh", "-c", "tools.web_search=true"] : [];
+      spec.role === "researcher" ? ["-c", `model_reasoning_effort=${CODEX_RESEARCHER_EFFORT}`, "-c", "tools.web_search=true"] : [];
     const model = spec.model ?? (spec.role === "researcher" ? CODEX_RESEARCHER_MODEL : null);
     if (spec.provider_session_mode === "resume_exact" && spec.provider_session_id) {
       // `codex exec resume` has no --sandbox flag (exit 2 if passed); the
@@ -353,7 +359,7 @@ function providerArgv(
     return argv;
   }
 
-  const argv = ["pi", "--model", spec.model ?? PI_DEFAULT_MODEL, "--thinking", "xhigh"];
+  const argv = ["pi", "--model", spec.model ?? PI_DEFAULT_MODEL, "--thinking", PI_THINKING];
   argv.push("-p", "--mode", "json");
   if (readOnly) argv.push("--tools", "read,grep,find,ls");
   if (spec.provider_session_mode === "ephemeral") {

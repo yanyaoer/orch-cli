@@ -29,7 +29,9 @@ export interface OrchWorkspace {
 }
 
 // Per-role run defaults. A bare string is shorthand for { agent }. Explicit
-// run create flags always win; model here becomes spec.model (careful: for
+// run create flags always win. `model` is written in the agent's own ref
+// format, so it applies only when the run's agent is this entry's agent — a
+// `--agent` override never inherits it. It becomes spec.model (careful: for
 // claude that also overrides the role's model tier, e.g. reviewer/opus).
 export interface RoleDefaults {
   agent?: AgentName;
@@ -37,12 +39,25 @@ export interface RoleDefaults {
   timeout_sec?: number;
 }
 
+export interface OrchDefaults {
+  // `orch run create` falls back to these when the corresponding flag is
+  // omitted. Recommended profile: implementer -> pi (see README).
+  agents?: Partial<Record<RunRole, AgentName | RoleDefaults>>;
+  // Default model per agent, in that CLI's own ref format (pi/omp
+  // `<provider>/<model>`, codex bare name, claude alias or full id). Used when
+  // neither --model nor a matching role default names one; snapshotted into
+  // spec.model, so for claude it also replaces the reviewer/researcher tiers.
+  models?: Partial<Record<AgentName, string>>;
+  // Mail-agent ids the fixed-pair fan-outs dispatch to when --to-agent is
+  // omitted, replacing the built-in claude+omp pairs. Every id must exist in
+  // mail-agents.json.
+  fanout?: { "cross-review"?: string[]; investigate?: string[] };
+}
+
 export interface OrchConfig {
   version: 1;
   workspaces: Record<string, OrchWorkspace>;
-  // `orch run create` falls back to these when the corresponding flag is
-  // omitted. Recommended profile: implementer -> pi (see README).
-  defaults?: { agents?: Partial<Record<RunRole, AgentName | RoleDefaults>> };
+  defaults?: OrchDefaults;
   // Publication language for MR/PR comment bodies and worker result prose:
   // "中文" or "english". Missing or any other value behaves as english.
   language?: string;
@@ -302,8 +317,104 @@ export async function resolveMailPassword(cfg: MailControlConfig): Promise<strin
   throw new Error("mail control account.password or account.password_cmd is required");
 }
 
+const ORCH_CONFIG_KEYS = ["version", "workspaces", "defaults", "language", "sandbox", "sandbox_write_dirs"] as const;
+const ORCH_DEFAULTS_KEYS = ["agents", "models", "fanout"] as const;
+const ROLE_DEFAULT_KEYS = ["agent", "model", "timeout_sec"] as const;
+const FANOUT_KEYS = ["cross-review", "investigate"] as const;
+const RUN_ROLES: readonly string[] = ["implementer", "reviewer", "verifier", "controller", "researcher"];
+const AGENT_NAMES: readonly string[] = ["codex", "claude", "pi", "omp"];
+
+// Shape check for config.json. Unknown keys and unrecognized enum-like values
+// are warnings (the field is ignored, which is exactly what must not stay
+// silent: `default.agents` or `sandbox_wirte_dirs` otherwise looks like a
+// working config); a known key holding a value of the wrong type is an error,
+// since acting on it would be wrong rather than merely ineffective.
+export function validateOrchConfig(raw: unknown): { warnings: string[] } {
+  const warnings: string[] = [];
+  // Explicitly typed so TypeScript narrows after a bare `fail(...)` statement.
+  const fail: (message: string) => never = (message) => {
+    throw new Error(`config.json: ${message}`);
+  };
+  const isObject = (value: unknown): value is Record<string, unknown> => Boolean(value) && typeof value === "object" && !Array.isArray(value);
+  const unknownKeys = (obj: Record<string, unknown>, known: readonly string[], where: string): void => {
+    for (const key of Object.keys(obj)) {
+      if (!known.includes(key)) warnings.push(`unknown key ${where}${key} is ignored (known: ${known.join(", ")})`);
+    }
+  };
+  if (!isObject(raw)) return fail("must be a JSON object");
+  unknownKeys(raw, ORCH_CONFIG_KEYS, "");
+  if (raw.version !== undefined && raw.version !== 1) fail("version must be 1");
+  if (raw.workspaces !== undefined && !isObject(raw.workspaces)) fail("workspaces must be an object");
+  if (raw.language !== undefined && raw.language !== "中文" && raw.language !== "english") {
+    warnings.push(`language ${JSON.stringify(raw.language)} is not "中文" or "english"; english applies`);
+  }
+  if (raw.sandbox !== undefined && typeof raw.sandbox !== "boolean") {
+    warnings.push(`sandbox ${JSON.stringify(raw.sandbox)} is not a boolean; the sandbox stays off`);
+  }
+  if (raw.sandbox_write_dirs !== undefined && (!Array.isArray(raw.sandbox_write_dirs) || raw.sandbox_write_dirs.some((d) => typeof d !== "string"))) {
+    fail("sandbox_write_dirs must be an array of strings");
+  }
+  const defaults = raw.defaults;
+  if (defaults === undefined) return { warnings };
+  if (!isObject(defaults)) return fail("defaults must be an object");
+  unknownKeys(defaults, ORCH_DEFAULTS_KEYS, "defaults.");
+
+  if (defaults.agents !== undefined) {
+    if (!isObject(defaults.agents)) fail("defaults.agents must be an object");
+    for (const [role, entry] of Object.entries(defaults.agents)) {
+      const where = `defaults.agents.${role}`;
+      if (!RUN_ROLES.includes(role)) warnings.push(`unknown role ${where} is ignored (roles: ${RUN_ROLES.join(", ")})`);
+      if (typeof entry === "string") {
+        if (!AGENT_NAMES.includes(entry)) fail(`${where} names unknown agent ${JSON.stringify(entry)} (agents: ${AGENT_NAMES.join(", ")})`);
+        continue;
+      }
+      if (!isObject(entry)) return fail(`${where} must be an agent name or an object`);
+      unknownKeys(entry, ROLE_DEFAULT_KEYS, `${where}.`);
+      if (entry.agent !== undefined && (typeof entry.agent !== "string" || !AGENT_NAMES.includes(entry.agent))) {
+        fail(`${where}.agent names unknown agent ${JSON.stringify(entry.agent)} (agents: ${AGENT_NAMES.join(", ")})`);
+      }
+      if (entry.model !== undefined && (typeof entry.model !== "string" || entry.model === "")) fail(`${where}.model must be a non-empty string`);
+      if (entry.timeout_sec !== undefined && (typeof entry.timeout_sec !== "number" || !Number.isFinite(entry.timeout_sec) || entry.timeout_sec <= 0)) {
+        fail(`${where}.timeout_sec must be a positive number`);
+      }
+    }
+  }
+
+  if (defaults.models !== undefined) {
+    if (!isObject(defaults.models)) fail("defaults.models must be an object keyed by agent");
+    for (const [agent, model] of Object.entries(defaults.models)) {
+      if (!AGENT_NAMES.includes(agent)) warnings.push(`unknown agent defaults.models.${agent} is ignored (agents: ${AGENT_NAMES.join(", ")})`);
+      if (typeof model !== "string" || model === "") fail(`defaults.models.${agent} must be a non-empty string`);
+    }
+  }
+
+  if (defaults.fanout !== undefined) {
+    if (!isObject(defaults.fanout)) fail("defaults.fanout must be an object");
+    unknownKeys(defaults.fanout, FANOUT_KEYS, "defaults.fanout.");
+    for (const [command, ids] of Object.entries(defaults.fanout)) {
+      if (!Array.isArray(ids) || ids.length === 0 || ids.some((id) => typeof id !== "string" || id === "")) {
+        fail(`defaults.fanout.${command} must be a non-empty array of mail-agent ids`);
+      }
+    }
+  }
+  return { warnings };
+}
+
+// Each distinct warning is printed once per process: readOrchConfig is called
+// from many commands and repeatedly inside one, and a typo must be visible
+// without flooding stderr.
+const warnedConfigIssues = new Set<string>();
+
 export function readOrchConfig(): OrchConfig {
-  return readJsonFile<OrchConfig>(orchConfigPath(), { version: 1, workspaces: {} });
+  const raw = readJsonFile<unknown>(orchConfigPath(), { version: 1, workspaces: {} });
+  const { warnings } = validateOrchConfig(raw);
+  for (const warning of warnings) {
+    if (warnedConfigIssues.has(warning)) continue;
+    warnedConfigIssues.add(warning);
+    process.stderr.write(`[orch] config.json: ${warning}\n`);
+  }
+  const cfg = raw as OrchConfig;
+  return { ...cfg, version: 1, workspaces: cfg.workspaces ?? {} };
 }
 
 export type OrchLanguage = "中文" | "english";

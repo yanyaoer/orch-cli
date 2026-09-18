@@ -615,7 +615,7 @@ test("fanout forwards --model to spawned runs and honors --to-agent override", a
       "--to-agent",
       "pi-verifier",
       "--model",
-      "zenmux/test-model",
+      "myprov/test-model",
       "--task",
       taskPath,
       "--worktree",
@@ -635,7 +635,7 @@ test("fanout forwards --model to spawned runs and honors --to-agent override", a
     model: string | null;
     role: string;
   };
-  expect(spec.model).toBe("zenmux/test-model");
+  expect(spec.model).toBe("myprov/test-model");
   expect(spec.role).toBe("verifier");
 });
 
@@ -876,4 +876,39 @@ test("mail import quarantines unsigned local messages", async () => {
 
 test("mail thread paths reject repo traversal", () => {
   expect(() => mailThreadDir("../escape", "th_safe")).toThrow("mail repo key must be a relative path without dot segments");
+});
+
+test("cross-review takes its default pair from config defaults.fanout and refuses ids missing from the roster", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orch-fanout-config-"));
+  const stateHome = join(root, "state");
+  const configHome = join(root, "config");
+  const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
+  await initRepo(worktree, "git@github.com:example/repo.git");
+  const env = { XDG_STATE_HOME: stateHome, XDG_CONFIG_HOME: configHome };
+  const taskPath = join(root, "review.md");
+  writeFileSync(taskPath, "Review the diff.\n", "utf8");
+  await runOrch(["mail", "agent", "defaults"], env);
+  writeFileSync(
+    join(configHome, "orch", "config.json"),
+    JSON.stringify({ version: 1, workspaces: {}, defaults: { fanout: { "cross-review": ["claude-reviewer", "pi-reviewer"] } } }),
+  );
+
+  // A configured id that is not bound is an error, never a silent drop.
+  const missing = await runOrch(["cross-review", "--thread", "review-9", "--task", taskPath, "--worktree", worktree, "--dry-run"], env);
+  expect(missing.exitCode).toBe(1);
+  expect(missing.stderr).toContain("unknown mail agent: pi-reviewer");
+
+  const bound = await runOrch(
+    ["mail", "agent", "bind", "--id", "pi-reviewer", "--address", "orch+pi.reviewer@local.orch", "--provider", "pi", "--role", "reviewer", "--session-mode", "ephemeral"],
+    env,
+  );
+  expect(bound).toMatchObject({ exitCode: 0, stderr: "" });
+  const dry = await runOrch(["cross-review", "--thread", "review-9", "--task", taskPath, "--worktree", worktree, "--dry-run"], env);
+  expect(dry).toMatchObject({ exitCode: 0, stderr: "" });
+  const payload = JSON.parse(dry.stdout) as { agents: Array<{ agent_id: string }> };
+  expect(payload.agents.map((agent) => agent.agent_id)).toEqual(["claude-reviewer", "pi-reviewer"]);
+
+  // --to-agent still wins over the configured pair.
+  const explicit = await runOrch(["cross-review", "--thread", "review-9", "--task", taskPath, "--worktree", worktree, "--to-agent", "claude-reviewer", "--dry-run"], env);
+  expect(JSON.parse(explicit.stdout).agents.map((agent: { agent_id: string }) => agent.agent_id)).toEqual(["claude-reviewer"]);
 });

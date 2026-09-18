@@ -14,6 +14,7 @@ import {
   readBridgeConfig,
   readMailControlConfig,
   readOrchConfig,
+  validateOrchConfig,
   readMailAgentsConfig,
   resolveMailPassword,
   upsertMailAgent,
@@ -371,5 +372,75 @@ test("mail control notify.to must be a single lower-cased bare address", () => {
   expect(() => validateMailControlConfig(withTo("owner@example.com"))).not.toThrow();
   for (const bad of ["a@x.com,c@evil.com", "a@x.com;c@evil.com", "nodomain", "a@@x.com", "a@", "@x.com", "Owner@example.com"]) {
     expect(() => validateMailControlConfig(withTo(bad))).toThrow("single lower-cased bare address");
+  }
+});
+
+test("validateOrchConfig warns on ignored keys/values and rejects wrong types", () => {
+  const known = "version, workspaces, defaults, language, sandbox, sandbox_write_dirs";
+  expect(validateOrchConfig({ version: 1, workspaces: {}, sandbox_wirte_dirs: ["/x"] }).warnings).toEqual([
+    `unknown key sandbox_wirte_dirs is ignored (known: ${known})`,
+  ]);
+  expect(validateOrchConfig({ version: 1, workspaces: {}, default: { agents: {} } }).warnings[0]).toContain("unknown key default is ignored");
+  expect(validateOrchConfig({ version: 1, workspaces: {}, defaults: { agents: { implementor: "pi" } } }).warnings[0]).toContain(
+    "unknown role defaults.agents.implementor is ignored",
+  );
+  expect(validateOrchConfig({ version: 1, workspaces: {}, defaults: { agents: { implementer: { agent: "pi", modle: "x" } } } }).warnings[0]).toContain(
+    "unknown key defaults.agents.implementer.modle is ignored",
+  );
+  expect(validateOrchConfig({ version: 1, workspaces: {}, defaults: { models: { gemini: "x" } } }).warnings[0]).toContain("unknown agent defaults.models.gemini");
+  expect(validateOrchConfig({ version: 1, workspaces: {}, language: "chinese", sandbox: "true" }).warnings).toHaveLength(2);
+  // A complete, correct profile is silent.
+  expect(
+    validateOrchConfig({
+      version: 1,
+      workspaces: {},
+      language: "中文",
+      sandbox: false,
+      sandbox_write_dirs: ["/tmp/x"],
+      defaults: {
+        agents: { implementer: "pi", reviewer: { agent: "claude", model: "opus", timeout_sec: 900 } },
+        models: { pi: "myprov/coder", claude: "claude-sonnet-5" },
+        fanout: { "cross-review": ["claude-reviewer", "pi-reviewer"], investigate: ["claude-researcher"] },
+      },
+    }).warnings,
+  ).toEqual([]);
+  expect(() => validateOrchConfig([])).toThrow("config.json: must be a JSON object");
+  expect(() => validateOrchConfig({ version: 2 })).toThrow("version must be 1");
+  expect(() => validateOrchConfig({ defaults: { agents: { implementer: "gpt" } } })).toThrow("unknown agent \"gpt\"");
+  expect(() => validateOrchConfig({ defaults: { agents: { implementer: { agent: "gpt" } } } })).toThrow("defaults.agents.implementer.agent");
+  expect(() => validateOrchConfig({ defaults: { agents: { implementer: { model: "" } } } })).toThrow("defaults.agents.implementer.model");
+  expect(() => validateOrchConfig({ defaults: { agents: { implementer: { timeout_sec: -1 } } } })).toThrow("timeout_sec must be a positive number");
+  expect(() => validateOrchConfig({ defaults: { models: { pi: "" } } })).toThrow("defaults.models.pi must be a non-empty string");
+  expect(() => validateOrchConfig({ defaults: { fanout: { investigate: [] } } })).toThrow("defaults.fanout.investigate must be a non-empty array");
+  expect(() => validateOrchConfig({ sandbox_write_dirs: "/x" })).toThrow("sandbox_write_dirs must be an array of strings");
+});
+
+test("readOrchConfig prints each config warning once per process and rejects invalid values", () => {
+  const prev = process.env.XDG_CONFIG_HOME;
+  process.env.XDG_CONFIG_HOME = tempDir();
+  const written: string[] = [];
+  const realWrite = process.stderr.write;
+  process.stderr.write = ((chunk: string | Uint8Array) => {
+    written.push(String(chunk));
+    return true;
+  }) as typeof process.stderr.write;
+  try {
+    mkdirSync(dirname(orchConfigPath()), { recursive: true });
+    // The dedupe set is process-wide, so the key must be one no other test
+    // (or an unisolated read of the developer's real config) has warned about.
+    const typo = `sandbox_wirte_dirs_${Date.now().toString(36)}`;
+    writeFileSync(orchConfigPath(), JSON.stringify({ version: 1, workspaces: {}, [typo]: ["/x"], defaults: { agents: { implementer: "pi" } } }));
+    expect(readOrchConfig().defaults).toEqual({ agents: { implementer: "pi" } });
+    readOrchConfig();
+    const lines = written.filter((line) => line.includes(typo));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatch(/^\[orch\] config\.json: unknown key sandbox_wirte_dirs_\w+ is ignored/);
+
+    writeFileSync(orchConfigPath(), JSON.stringify({ version: 1, workspaces: {}, defaults: { models: { pi: 42 } } }));
+    expect(() => readOrchConfig()).toThrow("config.json: defaults.models.pi must be a non-empty string");
+  } finally {
+    process.stderr.write = realWrite;
+    if (prev === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = prev;
   }
 });

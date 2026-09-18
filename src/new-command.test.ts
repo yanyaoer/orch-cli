@@ -274,3 +274,41 @@ test("run create falls back to config.json defaults.agents when --agent is omitt
   );
   expect(JSON.parse(flagWins.stdout)).toMatchObject({ agent: "omp", model: "openai-codex/gpt-5.6-sol", timeout_sec: 900 });
 });
+
+test("run create model precedence: a role default's model stays with its agent, defaults.models fills per agent", async () => {
+  const root = tempDir();
+  const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
+  await initRepo(worktree, "git@github.com:example/repo.git");
+  const configHome = join(root, "config");
+  mkdirSync(join(configHome, "orch"), { recursive: true });
+  writeFileSync(
+    join(configHome, "orch", "config.json"),
+    JSON.stringify({
+      version: 1,
+      workspaces: {},
+      defaults: {
+        agents: { implementer: { agent: "pi", model: "myprov/coder" } },
+        models: { pi: "myprov/base", claude: "claude-sonnet-5" },
+      },
+    }),
+  );
+  const env = { XDG_STATE_HOME: join(root, "state"), XDG_CONFIG_HOME: configHome };
+  const dry = async (...extra: string[]) => {
+    const out = await runOrch(["run", "create", "--mr", "88", "--worktree", worktree, "--dry-run", "--json", ...extra], env);
+    expect(out).toMatchObject({ exitCode: 0, stderr: "" });
+    return JSON.parse(out.stdout) as { agent: string; model: string | null };
+  };
+
+  // Role default supplies agent + model.
+  expect(await dry("--role", "implementer")).toMatchObject({ agent: "pi", model: "myprov/coder" });
+  // Same agent named explicitly: the role model still applies.
+  expect(await dry("--role", "implementer", "--agent", "pi")).toMatchObject({ agent: "pi", model: "myprov/coder" });
+  // A different --agent must not inherit a pi-format ref; the claude per-agent default applies.
+  expect(await dry("--role", "implementer", "--agent", "claude")).toMatchObject({ agent: "claude", model: "claude-sonnet-5" });
+  // No per-agent default for codex: the driver's built-in stays (model null).
+  expect(await dry("--role", "implementer", "--agent", "codex")).toMatchObject({ agent: "codex", model: null });
+  // Another role with the same agent uses the per-agent default.
+  expect(await dry("--role", "reviewer", "--agent", "pi")).toMatchObject({ agent: "pi", model: "myprov/base" });
+  // --model beats everything.
+  expect(await dry("--role", "implementer", "--agent", "claude", "--model", "opus")).toMatchObject({ agent: "claude", model: "opus" });
+});
