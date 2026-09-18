@@ -634,6 +634,9 @@ export interface MailFanoutOptions {
   role?: string;
   // Default mail-agent ids when neither --to-agent nor role auto-invite applies.
   defaultAgentIds?: string[];
+  // Built-in defaults skip ids missing from the roster (a user may have
+  // removed one); ids the user configured themselves must resolve or fail.
+  strictDefaultAgentIds?: boolean;
   // Command-specific flags accepted on top of FANOUT_FLAGS (e.g. cross-review --auto).
   extraFlags?: readonly string[];
 }
@@ -807,7 +810,9 @@ export async function mailFanout(args: ParsedArgs, context: MailCliContext, opts
     requested.length > 0
       ? requested.map((id) => agentById(id))
       : opts.defaultAgentIds
-        ? opts.defaultAgentIds.map((id) => cfg.agents[id]).filter((agent): agent is MailAgentDefinition => Boolean(agent))
+        ? opts.strictDefaultAgentIds
+          ? opts.defaultAgentIds.map((id) => agentById(id))
+          : opts.defaultAgentIds.map((id) => cfg.agents[id]).filter((agent): agent is MailAgentDefinition => Boolean(agent))
         : autoInviteAgentsForRole(cfg, role);
 
   const seen = new Set<string>();

@@ -15,10 +15,14 @@ import { sha256 } from "./hash.ts";
 import { repoKeyFromRemote } from "./paths.ts";
 import type { ControllerResult, ImplementerResult, ReviewerResult, RoleResult, RunStatus, VerifierResult } from "./types.ts";
 
+const isolatedConfigHome = mkdtempSync(join(tmpdir(), "orch-test-config-"));
+
 async function runOrch(args: string[], env: Record<string, string>): Promise<{ stdout: string; stderr: string; exitCode: number }> {
   const proc = Bun.spawn([process.execPath, "src/orch.ts", ...args], {
     cwd: process.cwd(),
-    env: { ...process.env, ...env },
+    // Callers that do not name a config home must not read the developer's
+    // real ~/.config/orch: config.json warnings would land in stderr.
+    env: { ...process.env, XDG_CONFIG_HOME: isolatedConfigHome, ...env },
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -229,7 +233,7 @@ console.log(JSON.stringify({ type: "result", result: JSON.stringify(result(runId
   const pi = `#!/usr/bin/env bun
 ${common}
 const args = Bun.argv.slice(2);
-const expected = ["--model", "openai-codex/gpt-5.6-sol", "--thinking", "xhigh", "-p", "--mode", "json", "--no-session"];
+const expected = ["--model", "openai-codex/gpt-6-astra", "--thinking", "high", "-p", "--mode", "json", "--no-session"];
 if (JSON.stringify(args) !== JSON.stringify(expected)) {
   console.error("unexpected pi argv: " + JSON.stringify(args));
   process.exit(13);
@@ -561,7 +565,7 @@ test("run create dry-run passes explicit model to the pi provider plan", async (
   await initGitWorktree(worktree);
   const taskPath = join(root, "task.md");
   writeFileSync(taskPath, "review with selected pi model\n", "utf8");
-  const model = "zenmux-anthropic/anthropic/claude-fable-5";
+  const model = "myprov/reviewer-xl";
 
   const result = await runOrch(
     [
@@ -603,7 +607,7 @@ test("run create dry-run passes explicit model to the pi provider plan", async (
     "--model",
     model,
     "--thinking",
-    "xhigh",
+    "high",
     "-p",
     "--mode",
     "json",
@@ -1751,13 +1755,13 @@ test("decision mirror body renders the Chinese skeleton for language 中文 and 
     writeFileSync(join(runDir, "result.json"), `${JSON.stringify(result, null, 2)}\n`, "utf8");
   };
 
-  const decideAndReadBody = async (runId: string): Promise<string> => {
+  const decideAndReadBody = async (runId: string, expectedStderr = ""): Promise<string> => {
     seedRun(runId);
     const decision = await runOrch(
       ["decision", "rework", "--mr", mr, "--run", runId, "--worktree", worktree, "--reason", "blocking findings"],
       { XDG_STATE_HOME: stateHome, XDG_CONFIG_HOME: configHome },
     );
-    expect(decision).toMatchObject({ exitCode: 0, stderr: "" });
+    expect(decision).toMatchObject({ exitCode: 0, stderr: expectedStderr });
     for (const file of readdirSync(pendingDir)) {
       const body = JSON.parse(readFileSync(join(pendingDir, file), "utf8")).body as string;
       if (body.includes(runId)) return body;
@@ -1785,11 +1789,15 @@ test("decision mirror body renders the Chinese skeleton for language 中文 and 
   expect(defaultBody).toContain("Non-blocking findings (1):");
   expect(defaultBody).toContain("Suggested tests (1):");
 
-  // Explicit english and an invalid value produce the same english body.
+  // Explicit english and an invalid value produce the same english body; the
+  // invalid value is still lenient (exit 0) but no longer silent.
   writeFileSync(configPath, JSON.stringify({ version: 1, workspaces: {}, language: "english" }), "utf8");
   const englishBody = await decideAndReadBody("rev-a-20260713T120000Z-bbb222");
   writeFileSync(configPath, JSON.stringify({ version: 1, workspaces: {}, language: "chinese" }), "utf8");
-  const invalidBody = await decideAndReadBody("rev-a-20260713T120000Z-ccc333");
+  const invalidBody = await decideAndReadBody(
+    "rev-a-20260713T120000Z-ccc333",
+    '[orch] config.json: language "chinese" is not "中文" or "english"; english applies\n',
+  );
   expect(normalize(englishBody, "rev-a-20260713T120000Z-bbb222")).toBe(normalize(defaultBody, "rev-a-20260713T120000Z-aaa111"));
   expect(normalize(invalidBody, "rev-a-20260713T120000Z-ccc333")).toBe(normalize(defaultBody, "rev-a-20260713T120000Z-aaa111"));
 

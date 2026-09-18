@@ -8,17 +8,25 @@ Daemonless multi-agent orchestration for coding work.
 
 中文：`orch` 是一个无常驻 daemon 的多 Agent 编排 CLI。它把 Codex/Claude 这类 headless worker 进程化运行，把状态落到本地目录，并用统一的 `result.json` 给主控或人类做裁决。
 
-Project page: `docs/index.html` is ready for GitHub Pages and includes a bilingual animated overview.
-
 Latest release: `v0.0.12` ([CHANGELOG.md](CHANGELOG.md)).
 
-## Current Scope
+## Documentation map
 
-This repository is the v2 MVP described in [docs/orch-mvp-spec.md](docs/orch-mvp-spec.md).
+This README is the reference and is written by hand in English. Everything under `docs/` is rendered as-is into the GitHub Pages site by `bun run docs:build` (`docs:check` link-checks it; `.github/workflows/pages.yml` deploys `dist/docs-site`). Nothing is copied between the two: the site links here for detail, this file links there for the walkthroughs.
 
-## Workspace Decisions and Specs
+| Where | What | Language |
+|---|---|---|
+| `README.md` | Reference: install, quickstart, config, mail bus, `mailctl`, how it works, safety model, result contract, commands. | English |
+| `docs/index.html` | Landing page of the site: why, roles matrix, observability, quickstart, boundaries. Hand-written; shares its header/footer markup and stylesheet with the generated pages (a docs test enforces the header/footer). | EN / 中文 toggle |
+| `docs/getting-started.md` + `.zh.md` | First run, `defaults.agents` / `models` / `fanout`, custom providers per CLI, the author's daily loops, sharp edges. A `<page>.md` + `<page>.zh.md` pair renders into one page with the same toggle. | EN + 中文 |
+| `docs/orch.md` | Agent-facing quick reference (intent → command). `~/.agents/orch.md` is a symlink to it. | English |
+| `docs/sandbox-design.md` | Seatbelt sandbox design (`seatbelt-v1`). | 中文 |
+| `docs/adr/`, `docs/specs/` | Durable architecture decisions; task and feature specs. Kept in the repo, not published on the site until there is content worth binding a run to. When those constraints shape an `orch --task` file, inline the binding excerpts so the run stays replayable from `spec.json`. | English |
+| `docs/reviews/` | Review rounds and byte-exact evidence (`.json`, `.txt`). | mixed |
+| `docs/orch-mvp-spec.md`, `docs/multi-agent.md` | Design history: the v2 MVP spec this repository implements, and the earlier tmux + MR design it replaced. | 中文 |
+| `CHANGELOG.md` | Every user-facing change, newest first. | English |
 
-Durable architecture decisions live in [docs/adr/](docs/adr/README.md); task and feature specs live in [docs/specs/](docs/specs/README.md). When those constraints shape an `orch --task` file, inline the binding excerpts so the run remains replayable from `spec.json`.
+## Current scope
 
 Shipped on `main` (v0.0.8, see [CHANGELOG.md](CHANGELOG.md)):
 
@@ -33,7 +41,7 @@ Shipped on `main` (v0.0.8, see [CHANGELOG.md](CHANGELOG.md)):
 - `orch mail` provides the local message bus: signed mail events, Maildir delivery, router dispatch, atomic task claim, and result-driven review/verify follow-ups.
 - `orch cross-review`, `orch fanout`, and `orch investigate` fan one task across several agents in a single command. They route through the mail layer, so a `--thread <id>` supplies the mr and workspace context (no `--mr` needed). With `--clone`, all read-only workers share one CoW snapshot of the worktree under the private sibling root `<repo-parent>/.orch-worktrees/<repo-name>` — the review target can't shift mid-run and there is no `index.lock` contention with your own git. Re-review rounds add `cross-review --rework`: it auto-appends prior rounds' verdicts, decisions, and adjudicated findings (re-raise only with new evidence) plus the `git diff` range since the last reviewed head, and warns from round 4 on so review loops converge.
 - `orch worktree clone` CoW-clones a worktree (APFS `clonefile(2)` — a whole directory tree per kernel call, 3.9 GB / 13k files in 0.2 s — or Linux reflink) into an isolated per-agent checkout at near-zero disk cost, untracked build output included, so the clone's incremental builds start warm: a cloned Rust `target/`, Gradle `build/`, or `node_modules` stays valid at the new path (cargo reports every crate `Fresh`). Claude Code's own nested checkouts under `.claude/worktrees` are skipped like VCS metadata. Two modes (`snapshot` carries dirty/untracked/ignored state; `warm-head` is a clean HEAD plus configured ignored caches), an external-symlink policy (`preserve|warn|reject`; links resolving into the source are retargeted into the clone so writes can't leak back), and versioned provenance that gates removal: a clone is auto-removed only when loss detection proves nothing unrecorded would be lost. `orch worktree remove --dest <path>` tears one clone down behind that gate (`--force` discards deliberately but still refuses a directory that is not a registered worktree; the branch the clone was created with is deleted only when git considers it merged) and is shaped to be the body of a Claude Code `WorktreeRemove` hook. `orch worktree gc` inventories this repo's clones and trash and removes the proven-safe ones with `--execute`; the bare `orch` overview nudges when clones sit unremoved for a week. Disk sharing after clones rebuild independently is a build-cache concern, not a clone concern: for Rust repos a one-time global `kache init` ([Kache](https://github.com/kunobi-ninja/kache), content-addressed, reflink-restored) keeps identical artifacts shared across every clone.
-- The `researcher` role (architect / deep research) is read-only and web-research capable: it delivers a plan, not code, and takes no worktree lock. claude runs `fable` at `xhigh` effort under a `dontAsk` whitelist (`jina`/`tvly` CLIs + WebSearch/WebFetch + read-only repo tools, no Edit/Write); codex defaults to `gpt-5.6-sol` at `xhigh` reasoning with native `web_search` inside the read-only sandbox; omp rides its gemini quota-fallback chain read-only (repo-internal research, no web); pi is not supported.
+- The `researcher` role (architect / deep research) is read-only and web-research capable: it delivers a plan, not code, and takes no worktree lock. claude runs `fable` at `xhigh` effort under a `dontAsk` whitelist (`jina`/`tvly` CLIs + WebSearch/WebFetch + read-only repo tools, no Edit/Write); codex defaults to `gpt-6-astra` at `high` reasoning with native `web_search` inside the read-only sandbox; omp rides its gemini quota-fallback chain read-only (repo-internal research, no web); pi is not supported.
 - `orch new '<task description>'` — one-sentence task intake: a read-only Fable/xhigh researcher drafts a mechanically validated Destination / Out of scope / Tasks / Later plan. Enter or `--yes` resolves safe recommended defaults into one self-contained final plan; questions without a safe default block execution. The same Fable session resumes at controller/medium effort to dispatch workers, while final success is derived from persisted worker status/result/decision files rather than the controller's claim alone.
 - `--task -` on `orch run create` and the fanout commands reads the task text from stdin.
 - The `challenger`, `rework`, and `debugger` roles are removed: `implementer` is the only write role; rework/debug follow-ups are implementer runs dispatched via `--resume-from`.
@@ -42,7 +50,7 @@ Shipped on `main` (v0.0.8, see [CHANGELOG.md](CHANGELOG.md)):
 - Drivers exist for `codex`, `claude`, `pi`, and `omp`.
 - Permissions match the role: the read-only `reviewer` role launches each provider without write access (claude plan mode, codex `--sandbox read-only`, pi and omp read-only tools). `verifier` and write roles keep write-capable access — claude runs `--permission-mode dontAsk` under a broad write whitelist (edits and shell auto-run headless with claude's own guardrails on, rather than `bypassPermissions` which disables them), and codex keeps its `--sandbox workspace-write` jail.
 - claude model/effort match the role too: `reviewer` runs `--model opus --effort high`; `implementer` stays on the default model at `--effort medium`; `verifier` stays on the default model at `--effort low`.
-- `orch run create --model <ref>` records a provider model override in `spec.json` and passes it through to model-aware drivers such as pi, omp, codex, and claude.
+- `orch run create --model <ref>` records a provider model override in `spec.json` and passes it through to model-aware drivers such as pi, omp, codex, and claude. Without the flag the model comes from `defaults.agents.<role>.model` (only when the run's agent is that entry's agent — a model ref is written in one CLI's format and never follows a `--agent` override to another CLI), then `defaults.models.<agent>`, then the driver's built-in default.
 - Recommended default profile (`~/.config/orch/config.json`): set `defaults.agents.implementer` to `pi`, so `orch run create --role implementer` works without `--agent` and the mail roster auto-invites `pi-implementer`. In a same-model harness pilot (SWE-bench Verified subset, gpt-5.6-sol frozen across codex/omp/pi), resolve rates were indistinguishable while pi used ~45% of omp's and ~56% of codex's cache-read traffic — the cheapest implementer at equal quality:
 
 ```json
@@ -63,13 +71,27 @@ Shipped on `main` (v0.0.8, see [CHANGELOG.md](CHANGELOG.md)):
 
 Each role value is either a bare agent name or an object carrying default args, e.g. `{"agent": "omp", "model": "openai-codex/gpt-5.6", "timeout_sec": 1800}` — explicit `orch run create` flags always win. Leave `model` unset unless you mean to override the driver's role tier (a configured model becomes `spec.model`, which for claude also replaces the reviewer/researcher model escalation).
 
+Two sibling sections cover what per-role entries cannot express. `defaults.models.<agent>` is a default model per agent in that CLI's own ref format (pi/omp `<provider>/<model>`, codex bare name, claude alias or full id); it fills in whenever neither `--model` nor a matching role default names one, which is what makes a custom provider work for every role and for fan-out runs of that agent. `defaults.fanout` replaces the built-in agent pairs of `cross-review` (`claude-reviewer` + `omp-reviewer`) and `investigate` (`omp-researcher` + `claude-researcher`) with mail-agent ids of your own (`orch mail agent bind`); a configured id missing from the roster fails the command instead of being dropped:
+
+```json
+{
+  "defaults": {
+    "agents": { "implementer": "pi", "reviewer": "claude" },
+    "models": { "pi": "myprov/coder-large", "claude": "claude-opus-5" },
+    "fanout": { "cross-review": ["claude-reviewer", "pi-reviewer"] }
+  }
+}
+```
+
+`config.json` is shape-checked on every read: an unknown key (`default.agents`, `sandbox_wirte_dirs`), an unknown role or agent name used as a key, or an unrecognized `language`/`sandbox` value prints one `[orch] config.json: …` warning per process on stderr because the field is ignored; a known key holding the wrong type (a non-string model, a negative `timeout_sec`, an unknown agent name as a value) fails the command.
+
 An optional top-level `"language": "中文"` switches everything orch publishes to the MR/PR (mirror/decision/cross-review comments and worker result prose) to Chinese; code, commands, paths, and identifiers stay as-is. Missing or any other value (including `"english"`) keeps the current English output.
 
 An optional top-level `"sandbox": true` (macOS only) adds one OS-enforced filesystem write jail on top of the per-role permissions above — engine `seatbelt-v1`, design in [docs/sandbox-design.md](docs/sandbox-design.md). All four providers (`claude`, `codex`, `pi`, `omp`) run under the same orch-generated macOS Seatbelt (`sandbox-exec`) profile; provider-native OS sandboxes are switched to their official external-sandbox modes (codex `--dangerously-bypass-approvals-and-sandbox`, claude `--settings '{"sandbox":{"enabled":false}}'`) because macOS cannot nest `sandbox_apply` — those argv are generated atomically with the outer wrapper and never without it, while role tool permissions (plan mode, allowedTools whitelists) stay on as the intent layer. Writes are confined to: the worktree for `implementer`/`verifier` (read-only roles get no worktree writes; `.git` and `.jj` stay read-only — agents deliver uncommitted diffs, the supervisor collects them), the selected provider's own auth/session state (`~/.pi`, `~/.omp`, `~/.codex`, `~/.claude` + `~/.claude.json*` — host OAuth logins are reused, no API keys), a per-run `scratch/` that temp/caches are redirected into, `/private/tmp`, and for `controller` only its own `dispatch/pending/<run-id>` request directory. Every writable path derived from provider/controller state is realpath'd and re-validated; top-level provider-state symlinks are rejected even when their target looks narrow, and Claude's root state files must keep their exact HOME filename and not be symlinked or hardlinked. The host `$TMPDIR` exception is honored only when it is the real Darwin per-user temp owned by the current user. Reads, process exec, and network stay open. The engine is snapshotted into `spec.json` (`sandbox_engine`), joins the default idempotency fingerprint (sandboxed and unsandboxed runs never reuse each other's results), and is audited in `status.json` and `--dry-run` (`sandbox_engine`, `sandbox_posture`, `sandbox_profile_sha256`, `provider_native_sandbox`). Fail-closed, never a silent downgrade: off darwin, missing `sandbox-exec`, uninitialized provider state, a hardlink-containing worktree (a path-based policy cannot stop writes through shared inodes), or a profile-apply failure all refuse to start the provider. This is accidental-write blast-radius control, not a hostile-code boundary: it does not stop an agent from reading secrets or exfiltrating over the network — that needs a VM/container.
 
 Because a sandboxed `controller` cannot spawn a working worker (any process it spawns inherits its read-only Seatbelt, and macOS cannot nest `sandbox_apply`), a small mutation set is proxied through a **host-side dispatch queue**: `run create/cancel`, `fanout`, `cross-review`, `investigate`, `decision accept/rework`, and `mailctl reply/ack` (the last two only for a host-created mail controller). The controller can write only `pending/<controller-run-id>`; host-only `claims/` and `done/` hold execution ownership and results. All three endpoints must resolve to their exact canonical host-owned slots before and after creation; aliases are rejected before any Seatbelt grant. Requests are written under a non-`.json` temporary name and atomically linked into the visible queue only after serialization completes; the reconciler defers the brief two-link publication window, then retains its post-claim hardlink check. The reconciler does not trust request `cwd`, ids, or raw flags: it rebinds every request to the live controller's host-owned `spec.json`/`status.json`, exact canonical worktree and thread, rejects unknown/path-selecting operations, then reconstructs the allowed argv. The host orch executable/source entrypoint must itself resolve outside the controller worktree, so an agent editing orch's source cannot turn a later dispatch into unsandboxed code execution; self-hosted source checkouts must use an installed copy outside the checkout. A dead reconciler never blindly replays a claimed operation; it emits an explicit `outcome_unknown` result, while an already persisted valid result is preserved and a partial one is atomically replaced. `orch new` runs this reconciler in-process for its controller automatically; `orch mailctl poll` drains the queue on each cron tick and fails visibly on reconciler infrastructure errors, while `orch dispatch reconcile --watch` is the low-latency companion. Read-only `orch` commands (`wait`, `result`, `status`) still run in-sandbox.
 
-- `omp` (oh-my-pi) defaults to `openai-codex/gpt-5.6-sol` at `--thinking=xhigh` and falls back to `zenmux/anthropic/claude-fable-5`, then `google-antigravity/gemini-3.1-pro` when the active model's quota/rate limit is exhausted; an explicit `--model <ref>` becomes the primary and the rest of the chain stays as fallbacks.
+- `omp` (oh-my-pi) defaults to `openai-codex/gpt-6-astra` at `--thinking=high` and falls back to `google-antigravity/gemini-3.1-pro` when the active model's quota/rate limit is exhausted; an explicit `--model <ref>` from that chain becomes the primary and the rest stays as fallbacks, while a `--model` outside the chain gets no orch overlay at all — omp's own `retry.fallbackChains` in its `config.yml` governs, so a custom provider never falls back to providers you do not have.
 - `orch chatgpt-bridge` deploys a Cloudflare Worker (no tunnel) and connects ChatGPT (Developer Mode, e.g. `gpt-5.5-pro`) to a read-only view of the worktree.
 - Role result schemas exist for `implementer`, `reviewer`, `verifier`, `researcher` (read-only plan-not-code research, `orch.result/researcher/v1`), and `controller` (the `orch mailctl` mail controller; claude-only, orchestrate-not-edit).
 - Provider session/model controls are explicit: defaults avoid latest-session resume, exact resume requires `--session-mode resume_exact --session-id <id>`, `--model <ref>` selects a provider model when supported, and idempotency keys include session/model settings.
@@ -148,6 +170,8 @@ This is a sandbox policy issue, not a binary install issue. The installed `~/.lo
 
 ## Quickstart
 
+New here, or bringing your own provider? [docs/getting-started.md](docs/getting-started.md) (中文: [docs/getting-started.zh.md](docs/getting-started.zh.md)) walks a first run, the per-role `defaults.agents` config, custom providers per CLI, and the sharp edges.
+
 Create a worker task (the optional `MR:` header pins the state namespace; a merge-request/pull URL in the text works too):
 
 ```md
@@ -174,7 +198,7 @@ Preview a pi run with a non-default registered model:
 ```sh
 $ orch run create --mr demo --role reviewer --agent pi --tag pi-fable \
   --worktree . --task task.md \
-  --model zenmux-anthropic/anthropic/claude-fable-5 \
+  --model myprov/coder-large \
   --dry-run
 ```
 

@@ -258,9 +258,9 @@ test("buildProviderArgv keeps defaults fresh and only resumes exact sessions", (
   expect(buildProviderArgv("pi", { ...base, provider_session_mode: "ephemeral" }, "/run", "/worktree")).toEqual([
     "pi",
     "--model",
-    "openai-codex/gpt-5.6-sol",
+    "openai-codex/gpt-6-astra",
     "--thinking",
-    "xhigh",
+    "high",
     "-p",
     "--mode",
     "json",
@@ -313,19 +313,19 @@ test("buildProviderArgv keeps defaults fresh and only resumes exact sessions", (
       "/run",
       "/worktree",
     ),
-  ).toEqual(["pi", "--model", "openai-codex/gpt-5.6-sol", "--thinking", "xhigh", "-p", "--mode", "json", "--session-id", "pi-session"]);
+  ).toEqual(["pi", "--model", "openai-codex/gpt-6-astra", "--thinking", "high", "-p", "--mode", "json", "--session-id", "pi-session"]);
 });
 
 test("buildProviderArgv passes explicit model overrides to supporting providers", () => {
   const base = spec("reviewer", "model-override");
-  const model = "zenmux-anthropic/anthropic/claude-fable-5";
+  const model = "myprov/reviewer-xl";
 
   expect(buildProviderArgv("pi", { ...base, model, provider_session_mode: "ephemeral" }, "/run", "/worktree")).toEqual([
     "pi",
     "--model",
     model,
     "--thinking",
-    "xhigh",
+    "high",
     "-p",
     "--mode",
     "json",
@@ -394,8 +394,8 @@ test("buildProviderArgv runs omp with the default model chain and @file prompt",
   expect(buildProviderArgv("omp", { ...base, provider_session_mode: "ephemeral" }, "/run", "/worktree", "do review")).toEqual([
     "omp",
     "--model",
-    "openai-codex/gpt-5.6-sol",
-    "--thinking=xhigh",
+    "openai-codex/gpt-6-astra",
+    "--thinking=high",
     "--config",
     "/run/omp-fallback.yml",
     "-p",
@@ -418,8 +418,8 @@ test("buildProviderArgv runs omp with the default model chain and @file prompt",
   ).toEqual([
     "omp",
     "--model",
-    "openai-codex/gpt-5.6-sol",
-    "--thinking=xhigh",
+    "openai-codex/gpt-6-astra",
+    "--thinking=high",
     "--config",
     "/run/omp-fallback.yml",
     "-p",
@@ -438,8 +438,8 @@ test("buildProviderArgv runs omp with the default model chain and @file prompt",
   ).toEqual([
     "omp",
     "--model",
-    "openai-codex/gpt-5.6-sol",
-    "--thinking=xhigh",
+    "openai-codex/gpt-6-astra",
+    "--thinking=high",
     "--config",
     "/run/omp-fallback.yml",
     "-p",
@@ -452,23 +452,24 @@ test("buildProviderArgv runs omp with the default model chain and @file prompt",
 
 test("ompModelChain puts the requested model first and keeps the rest as quota fallbacks", () => {
   expect(ompModelChain(null)).toEqual({
-    primary: "openai-codex/gpt-5.6-sol",
-    fallbacks: ["zenmux/anthropic/claude-fable-5", "google-antigravity/gemini-3.1-pro"],
+    primary: "openai-codex/gpt-6-astra",
+    fallbacks: ["google-antigravity/gemini-3.1-pro"],
   });
-  expect(ompModelChain("zenmux/anthropic/claude-fable-5")).toEqual({
-    primary: "zenmux/anthropic/claude-fable-5",
-    fallbacks: ["openai-codex/gpt-5.6-sol", "google-antigravity/gemini-3.1-pro"],
+  expect(ompModelChain("google-antigravity/gemini-3.1-pro")).toEqual({
+    primary: "google-antigravity/gemini-3.1-pro",
+    fallbacks: ["openai-codex/gpt-6-astra"],
   });
-  // A model outside the chain keeps the full chain as fallbacks.
+  // A model outside the chain gets no orch overlay: omp's own config governs.
   expect(ompModelChain("openai/gpt-5.5-pro")).toEqual({
     primary: "openai/gpt-5.5-pro",
-    fallbacks: [...OMP_MODEL_CHAIN],
+    fallbacks: [],
   });
+  expect(OMP_MODEL_CHAIN).toHaveLength(2);
 });
 
 test("ompFallbackConfigYaml renders omp's native retry.fallbackChains overlay", () => {
-  expect(ompFallbackConfigYaml(["zenmux/anthropic/claude-fable-5", "openai-codex/gpt-5.6"])).toBe(
-    ["retry:", "  fallbackChains:", "    default:", "      - zenmux/anthropic/claude-fable-5", "      - openai-codex/gpt-5.6", ""].join(
+  expect(ompFallbackConfigYaml(["google-antigravity/gemini-3.1-pro", "openai-codex/gpt-5.6"])).toBe(
+    ["retry:", "  fallbackChains:", "    default:", "      - google-antigravity/gemini-3.1-pro", "      - openai-codex/gpt-5.6", ""].join(
       "\n",
     ),
   );
@@ -512,9 +513,9 @@ test("buildProviderArgv matches read-only posture to the reviewer role per provi
   expect(buildProviderArgv("pi", { ...base, provider_session_mode: "ephemeral" }, "/run", "/worktree")).toEqual([
     "pi",
     "--model",
-    "openai-codex/gpt-5.6-sol",
+    "openai-codex/gpt-6-astra",
     "--thinking",
-    "xhigh",
+    "high",
     "-p",
     "--mode",
     "json",
@@ -547,7 +548,7 @@ test("buildProviderArgv gives researcher a read-only web-research posture on cla
     "dontAsk",
   ]);
 
-  // codex researcher defaults to gpt-5.6-sol at xhigh reasoning with native
+  // codex researcher defaults to gpt-6-astra at high reasoning with native
   // web search enabled, inside the read-only sandbox.
   expect(buildProviderArgv("codex", base, "/run", "/worktree")).toEqual([
     "codex",
@@ -560,7 +561,7 @@ test("buildProviderArgv gives researcher a read-only web-research posture on cla
     "--model",
     CODEX_RESEARCHER_MODEL,
     "-c",
-    "model_reasoning_effort=xhigh",
+    "model_reasoning_effort=high",
     "-c",
     "tools.web_search=true",
     "--sandbox",
@@ -593,7 +594,7 @@ test("buildProviderArgv gives researcher a read-only web-research posture on cla
     "--model",
     CODEX_RESEARCHER_MODEL,
     "-c",
-    "model_reasoning_effort=xhigh",
+    "model_reasoning_effort=high",
     "-c",
     "tools.web_search=true",
     "sess-1",
@@ -604,8 +605,8 @@ test("buildProviderArgv gives researcher a read-only web-research posture on cla
   expect(buildProviderArgv("omp", { ...base, provider_session_mode: "ephemeral" }, "/run", "/worktree")).toEqual([
     "omp",
     "--model",
-    "openai-codex/gpt-5.6-sol",
-    "--thinking=xhigh",
+    "openai-codex/gpt-6-astra",
+    "--thinking=high",
     "--config",
     "/run/omp-fallback.yml",
     "-p",

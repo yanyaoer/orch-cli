@@ -351,7 +351,13 @@ export async function createRun(args: ParsedArgs): Promise<number> {
   }
   validateRunAgent(agent, role);
   if (!Number.isFinite(timeoutSec) || timeoutSec <= 0) throw new CliError("--timeout-sec must be positive");
-  const providerSession = resume ? resume.session : providerSessionConfig(args, agent, roleDefaults.model ?? null);
+  // Model precedence: --model, then the role default's model — only when the
+  // run's agent is that entry's agent, since a model ref is written in one
+  // CLI's format and must not follow a --agent override to another CLI — then
+  // the per-agent default (defaults.models.<agent>), then the driver's built-in.
+  const roleModel = agent === roleDefaults.agent ? roleDefaults.model : undefined;
+  const configModel = roleModel ?? readOrchConfig().defaults?.models?.[agent] ?? null;
+  const providerSession = resume ? resume.session : providerSessionConfig(args, agent, configModel);
 
   // Resolved exactly once here and threaded through to the spec, key,
   // compatibility check, dry-run, and startRun (F6): a config change between

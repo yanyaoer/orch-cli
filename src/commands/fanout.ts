@@ -9,6 +9,7 @@ import { argvForDisplay, createForgeAdapter, detectForge } from "../forge.ts";
 import { findPrivateLeak, privateLeakAllowed } from "../leak.ts";
 import { collectMrRuns, isTerminal } from "../overview.ts";
 import { mailFanout, type MailFanoutOutcome } from "../mail-cli.ts";
+import { readOrchConfig } from "../config.ts";
 import { fallbackRawReview, planAutoDecision, sanitizeCommentBody, withheldSection } from "../review-auto.ts";
 import { inspectWorktreeLosses, removeWorktreeClone } from "../worktree.ts";
 import { CliError, flagBool, flagNumber, printJson, type ParsedArgs } from "../cli.ts";
@@ -26,10 +27,12 @@ export async function crossReviewCommand(args: ParsedArgs): Promise<number> {
   for (const flag of ["execute", "wait-sec"]) {
     if (!auto && args.flags.has(flag)) throw new CliError(`--${flag} requires --auto`);
   }
+  const configured = readOrchConfig().defaults?.fanout?.["cross-review"];
   const outcome = await mailFanout(args, mailFanoutContext(), {
     command: "cross-review",
     role: "reviewer",
-    defaultAgentIds: ["claude-reviewer", "omp-reviewer"],
+    defaultAgentIds: configured ?? ["claude-reviewer", "omp-reviewer"],
+    strictDefaultAgentIds: Boolean(configured),
     extraFlags: ["auto", "execute", "wait-sec", "rework"],
   });
   if (!auto || outcome.code !== 0 || outcome.dry_run) {
@@ -50,10 +53,12 @@ export async function fanoutCommand(args: ParsedArgs): Promise<number> {
 // researchers. Researcher (not reviewer) role: research questions deliver a
 // recommendation, not an approve/request_changes verdict.
 export async function investigateCommand(args: ParsedArgs): Promise<number> {
+  const configured = readOrchConfig().defaults?.fanout?.investigate;
   const outcome = await mailFanout(args, mailFanoutContext(), {
     command: "investigate",
     role: "researcher",
-    defaultAgentIds: ["omp-researcher", "claude-researcher"],
+    defaultAgentIds: configured ?? ["omp-researcher", "claude-researcher"],
+    strictDefaultAgentIds: Boolean(configured),
   });
   printJson(outcome.payload);
   return outcome.code;

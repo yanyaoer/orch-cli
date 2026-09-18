@@ -7,351 +7,26 @@
   <meta name="description" content="orch runs headless coding agents (codex, claude, pi, omp) as supervised, auditable local jobs — no daemon, signed local mail bus, schema-validated results.">
   <title>orch-cli — daemonless multi-agent orchestration</title>
   <link rel="stylesheet" href="assets/site.css">
-  <style>
-    :root {
-      --bg: #0b0f14;
-      --panel: #10161d;
-      --panel-2: #0e141b;
-      --line: #1d2833;
-      --line-strong: #2c3b49;
-      --text: #dbe4ee;
-      --muted: #8aa0b4;
-      --faint: #5d7183;
-      --accent: #2dd4bf;
-      --accent-dim: rgba(45, 212, 191, 0.14);
-      --amber: #f4b350;
-      --green: #4ade80;
-      --red: #f87171;
-      --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
-      --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
-    }
-
-    @media (prefers-color-scheme: light) {
-      :root {
-        --bg: #fbfcfd;
-        --panel: #ffffff;
-        --panel-2: #f2f5f8;
-        --line: #e2e8ee;
-        --line-strong: #c6d2dc;
-        --text: #1a2632;
-        --muted: #596b7d;
-        --faint: #8496a6;
-        --accent: #0d9488;
-        --accent-dim: rgba(13, 148, 136, 0.10);
-        --amber: #b45309;
-        --green: #15803d;
-        --red: #b91c1c;
-      }
-    }
-
-    * { box-sizing: border-box; }
-
-    body {
-      margin: 0;
-      background: var(--bg);
-      color: var(--text);
-      font: 16.5px/1.7 var(--sans);
-      -webkit-font-smoothing: antialiased;
-      text-rendering: optimizeLegibility;
-    }
-
-    a { color: var(--accent); text-decoration: none; }
-    a:hover { text-decoration: underline; text-underline-offset: 3px; }
-
-    code {
-      font-family: var(--mono);
-      font-size: 0.88em;
-      background: var(--panel-2);
-      border-radius: 4px;
-      padding: 0.1em 0.4em;
-    }
-
-    .wrap { width: min(1020px, calc(100% - 48px)); margin: 0 auto; }
-    .narrow { max-width: 660px; }
-
-    /* ---------- header ---------- */
-    header {
-      position: sticky;
-      top: 0;
-      z-index: 10;
-      background: color-mix(in srgb, var(--bg) 88%, transparent);
-      backdrop-filter: blur(12px);
-      border-bottom: 1px solid var(--line);
-    }
-
-    nav {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 16px;
-      min-height: 60px;
-    }
-
-    .brand {
-      font: 700 15px var(--mono);
-      color: var(--text);
-      white-space: nowrap;
-    }
-    .brand span { color: var(--accent); }
-
-    .nav-links {
-      display: flex;
-      align-items: center;
-      gap: 2px;
-      font-size: 14px;
-      flex-wrap: wrap;
-      justify-content: flex-end;
-    }
-    .nav-links a { color: var(--muted); padding: 6px 11px; border-radius: 6px; }
-    .nav-links a:hover { color: var(--text); text-decoration: none; }
-
-    .lang {
-      display: inline-flex;
-      margin-left: 10px;
-      border: 1px solid var(--line);
-      border-radius: 999px;
-      overflow: hidden;
-    }
-    .lang button {
-      font: 600 12px var(--mono);
-      border: 0;
-      background: transparent;
-      color: var(--muted);
-      padding: 5px 12px;
-      cursor: pointer;
-    }
-    .lang button.active { background: var(--text); color: var(--bg); }
-
-    /* ---------- hero ---------- */
-    .hero { padding: 96px 0 64px; }
-
-    .eyebrow {
-      font: 600 13px var(--mono);
-      letter-spacing: 0.02em;
-      color: var(--accent);
-      margin: 0 0 20px;
-    }
-
-    h1 {
-      margin: 0;
-      font-size: clamp(36px, 5.2vw, 60px);
-      font-weight: 650;
-      line-height: 1.06;
-      letter-spacing: -0.028em;
-      max-width: 20ch;
-    }
-
-    .lead {
-      max-width: 620px;
-      margin: 26px 0 0;
-      color: var(--muted);
-      font-size: 18.5px;
-      line-height: 1.65;
-    }
-    .lead strong { color: var(--text); font-weight: 600; }
-
-    .hero-actions { display: flex; flex-wrap: wrap; gap: 10px; margin: 34px 0 0; }
-
-    .button {
-      display: inline-flex;
-      align-items: center;
-      font: 600 14px var(--sans);
-      color: var(--text);
-      border: 1px solid var(--line-strong);
-      border-radius: 8px;
-      padding: 10px 18px;
-      background: transparent;
-    }
-    .button:hover { border-color: var(--accent); color: var(--accent); text-decoration: none; }
-    .button.primary { background: var(--accent); border-color: var(--accent); color: var(--bg); }
-    .button.primary:hover { filter: brightness(1.07); color: var(--bg); }
-
-    /* ---------- architecture (svg flow) ---------- */
-    .flow { padding: 8px 0 0; }
-
-    .flow-figure { margin: 0; }
-    .flow-figure svg { display: block; width: 100%; height: auto; }
-
-    .flow-caption {
-      max-width: 640px;
-      margin: 18px auto 0;
-      text-align: center;
-      color: var(--faint);
-      font-size: 14px;
-    }
-    .flow-caption .rs { color: var(--amber); font-family: var(--mono); font-size: 0.92em; }
-
-    .n-box { fill: var(--panel); stroke: var(--line-strong); stroke-width: 1.25; }
-    .n-box.hot { stroke: var(--accent); fill: color-mix(in srgb, var(--accent-dim) 60%, var(--panel)); }
-    .n-box.opt { fill: var(--panel-2); stroke: var(--accent); stroke-dasharray: 5 4; }
-    .n-name { font: 600 15px var(--sans); fill: var(--text); }
-    .n-sub { font: 500 11.5px var(--mono); fill: var(--faint); }
-    .edge { stroke: var(--line-strong); stroke-width: 1.4; fill: none; }
-    .edge.back { stroke: color-mix(in srgb, var(--amber) 44%, var(--line-strong)); }
-    .edge.opt { stroke: color-mix(in srgb, var(--accent) 55%, var(--line-strong)); stroke-dasharray: 5 4; }
-    .e-label { font: 600 11px var(--mono); fill: var(--amber); }
-    .e-label.t { fill: var(--accent); }
-    .arrowhead { fill: var(--line-strong); }
-    .arrowhead.back { fill: color-mix(in srgb, var(--amber) 44%, var(--line-strong)); }
-
-    .particle { r: 4px; fill: var(--accent); opacity: 0; display: none; }
-    .particle.res { fill: var(--amber); }
-
-    @supports (offset-path: path("M0 0 H10")) {
-      .particle { display: block; animation: travel 5.6s linear infinite; }
-      .p1 { offset-path: path("M172 78 H268"); animation-delay: 0s; }
-      .p2 { offset-path: path("M436 78 H532"); animation-delay: 0.8s; }
-      .p3 { offset-path: path("M700 78 H796"); animation-delay: 1.6s; }
-      .p4 { offset-path: path("M862 110 V218"); animation-delay: 2.4s; }
-      .p5 { offset-path: path("M796 250 H436"); animation-delay: 3.2s; }
-      .p6 { offset-path: path("M352 218 V110"); animation-delay: 4.4s; }
-    }
-
-    @keyframes travel {
-      0%   { offset-distance: 0%; opacity: 0; }
-      2%   { opacity: 1; }
-      15%  { opacity: 1; }
-      19%  { offset-distance: 100%; opacity: 0; }
-      100% { offset-distance: 100%; opacity: 0; }
-    }
-    /* the long return edge gets a little more time */
-    .p5 { animation-duration: 5.6s; }
-
-    /* ---------- sections ---------- */
-    section { padding: 96px 0 0; }
-
-    .sec-no { font: 600 12.5px var(--mono); color: var(--faint); margin: 0 0 12px; letter-spacing: 0.04em; }
-    h2 {
-      margin: 0;
-      font-size: clamp(26px, 3.4vw, 36px);
-      font-weight: 650;
-      line-height: 1.15;
-      letter-spacing: -0.02em;
-    }
-    .sec-lead { max-width: 660px; color: var(--muted); margin: 16px 0 0; }
-    .sec-head { margin-bottom: 40px; }
-
-    .grid3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 36px; }
-    .point h3 { margin: 0 0 8px; font-size: 17px; font-weight: 650; }
-    .point p { margin: 0; color: var(--muted); font-size: 15px; }
-
-    /* roles matrix */
-    .table-scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; }
-    table { border-collapse: collapse; width: 100%; min-width: 700px; font-size: 14.5px; }
-    th, td { text-align: left; padding: 14px 18px; border-bottom: 1px solid var(--line); vertical-align: top; }
-    tr:last-child td { border-bottom: 0; }
-    th { color: var(--faint); font: 600 12.5px var(--mono); background: var(--panel-2); white-space: nowrap; }
-    td:first-child { font: 600 14px var(--mono); color: var(--text); white-space: nowrap; }
-    td { color: var(--muted); }
-    .yes { color: var(--green); }
-    .ro { color: var(--amber); }
-    .no { color: var(--red); }
-    .note { color: var(--faint); font-size: 14px; margin: 14px 2px 0; }
-
-    /* observe */
-    .duo { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: stretch; }
-    .pane {
-      border: 1px solid var(--line);
-      border-radius: 10px;
-      overflow: hidden;
-      display: flex;
-      flex-direction: column;
-      background: var(--panel);
-    }
-    .pane-title {
-      font: 600 12px var(--mono);
-      color: var(--faint);
-      padding: 11px 18px;
-      border-bottom: 1px solid var(--line);
-      background: var(--panel-2);
-      white-space: nowrap;
-      overflow-x: auto;
-    }
-    .pane pre { margin: 0; padding: 18px 20px; overflow-x: auto; font: 13px/1.85 var(--mono); color: var(--muted); flex: 1; }
-    .tf { color: var(--text); }
-    .tn { color: var(--faint); }
-    .auth { color: var(--accent); }
-    .k-tool { color: var(--amber); }
-    .k-final { color: var(--green); }
-
-    /* quickstart */
-    .steps { display: grid; grid-template-columns: 0.78fr 1.22fr; gap: 40px; align-items: start; }
-    .code-block { border: 1px solid var(--line); border-radius: 10px; overflow: hidden; background: var(--panel); }
-    .code-block pre { margin: 0; padding: 20px 22px; overflow-x: auto; font: 13.5px/1.8 var(--mono); color: var(--muted); }
-    .p { color: var(--faint); user-select: none; }
-    .c { color: var(--text); font-weight: 600; }
-    .f { color: var(--accent); }
-    .cm { color: var(--faint); }
-
-    /* status */
-    .split { display: grid; grid-template-columns: 1fr 1fr; gap: 36px; }
-    .col h3 { margin: 0 0 12px; font-size: 17px; font-weight: 650; }
-    .col ul { margin: 0; padding-left: 18px; color: var(--muted); font-size: 15px; }
-    .col li { margin: 7px 0; }
-    .col li::marker { color: var(--faint); }
-
-    footer {
-      margin-top: 110px;
-      border-top: 1px solid var(--line);
-      padding: 32px 0 56px;
-      color: var(--faint);
-      font: 500 13px var(--mono);
-    }
-    footer .wrap { display: flex; flex-wrap: wrap; gap: 8px 26px; }
-    footer a { color: var(--muted); }
-
-    /* language switch */
-    .zh [data-lang="en"], .en [data-lang="zh"] { display: none; }
-
-    @media (prefers-reduced-motion: reduce) {
-      .particle { display: none !important; }
-    }
-
-    @media (max-width: 880px) {
-      .grid3, .duo, .steps, .split { grid-template-columns: 1fr; }
-      .grid3 { gap: 26px; }
-      .hero { padding-top: 60px; }
-      section { padding-top: 72px; }
-      /* keep the flow diagram readable: scroll it instead of shrinking it */
-      .flow-figure { overflow-x: auto; -webkit-overflow-scrolling: touch; }
-      .flow-figure svg { min-width: 760px; }
-    }
-
-    @media (max-width: 560px) {
-      .wrap { width: calc(100% - 30px); }
-      nav { flex-wrap: wrap; padding: 10px 0; }
-      .nav-links { justify-content: flex-start; }
-    }
-  </style>
 </head>
-<body class="en">
-  <a class="skip-link" href="#top">Skip to content</a>
+<body class="landing en">
+  <a class="skip-link" href="#main">Skip to content</a>
   <header class="site-header">
-    <nav class="wrap site-wrap site-nav" aria-label="Primary">
-      <a class="brand site-brand" href="index.html"><span>$</span> orch</a>
-      <details class="site-menu">
-        <summary>Menu</summary>
-        <div class="nav-links site-nav-links">
-          <a class="is-current" aria-current="page" href="index.html">Home</a>
-          <a href="contents.html">Docs</a>
-          <a href="adr/index.html">ADRs</a>
-          <a href="specs/index.html">Specs</a>
-          <a href="contents.html#reviews">Reviews</a>
-          <a href="contents.html#evidence">Evidence</a>
-          <a href="https://github.com/yanyaoer/orch-cli">GitHub</a>
-          <div class="lang" aria-label="Language">
-            <button type="button" class="active" data-set-lang="en">EN</button>
-            <button type="button" data-set-lang="zh">中文</button>
-          </div>
-        </div>
-      </details>
-    </nav>
-  </header>
-
-  <main id="top">
-    <div class="wrap breadcrumbs landing-breadcrumb" role="navigation" aria-label="Breadcrumb">
-      <ol><li aria-current="page">Home</li></ol>
+  <nav class="site-nav site-wrap" aria-label="Primary">
+    <a class="site-brand" href="index.html"><span>$</span> orch</a>
+    <div class="site-nav-links">
+      <a href="index.html" class="is-current" aria-current="page">Home</a>
+      <a href="contents.html">Docs</a>
+      <a href="getting-started.html">Getting started</a>
+      <a href="https://github.com/yanyaoer/orch-cli">GitHub</a>
+      <div class="lang" aria-label="Language">
+        <button type="button" class="active" data-set-lang="en">EN</button>
+        <button type="button" data-set-lang="zh">中文</button>
+      </div>
     </div>
+  </nav>
+</header>
+
+  <main id="main">
     <div class="wrap hero">
       <p class="eyebrow" data-lang="en">daemonless multi-agent orchestration</p>
       <p class="eyebrow" data-lang="zh">无常驻服务的多 Agent 编排</p>
@@ -539,7 +214,7 @@
                 <td>codex</td>
                 <td><span class="yes">✓</span> default write</td>
                 <td><span class="ro">✓</span> --sandbox read-only</td>
-                <td><span class="ro">✓</span> gpt-5.6-sol · xhigh · web_search</td>
+                <td><span class="ro">✓</span> gpt-6-astra · high · web_search</td>
                 <td><span class="yes">✓</span></td>
               </tr>
               <tr>
@@ -625,11 +300,13 @@
             register default mail agents once, then publish, claim, and run ride the local mail bus
             in one shot. Or hand orch a real inbox with <code>orch mailctl</code>: an allowlisted,
             authenticated sender emails a task and a claude controller drives it end to end.
+            First time, or bringing your own provider? Start with <a href="getting-started.html">Getting started</a>.
           </p>
           <p class="sec-lead" data-lang="zh">
             一条 curl 命令安装 release binary（之后用 <code>orch update</code> 升级），注册一次默认
             mail agents，之后发布、claim、运行一条命令走完本地 mail bus。或用 <code>orch mailctl</code>
             把真实邮箱交给 orch：白名单内、已认证的发件人发一封任务邮件，一个 claude 主控就端到端把它跑完。
+            第一次用，或要接自己的 provider？先看 <a href="getting-started.html">Getting started</a>。
           </p>
         </div>
         <div class="code-block">
@@ -728,15 +405,13 @@
     </section>
   </main>
 
-  <footer>
-    <div class="wrap">
-      <span><a href="https://github.com/yanyaoer/orch-cli">github.com/yanyaoer/orch-cli</a></span>
-      <span data-lang="en">state lives in ${XDG_STATE_HOME:-~/.local/state}/orch</span>
-      <span data-lang="zh">状态位于 ${XDG_STATE_HOME:-~/.local/state}/orch</span>
-      <span data-lang="en">no daemon · no queue · just files</span>
-      <span data-lang="zh">无 daemon · 无队列 · 只有文件</span>
-    </div>
-  </footer>
+  <footer class="site-footer">
+  <div class="site-wrap">
+    <a href="https://github.com/yanyaoer/orch-cli">github.com/yanyaoer/orch-cli</a>
+    <span>state lives in ${XDG_STATE_HOME:-~/.local/state}/orch</span>
+    <span>no daemon · no queue · just files</span>
+  </div>
+</footer>
 
   <script>
     const root = document.body;
