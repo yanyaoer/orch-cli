@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { acquirePidfileLock, acquireWorktreeLock, LockHeldError, lockTestHooks } from "./locks.ts";
+import { acquirePidfileLock, acquireWorktreeLock, LockHeldError, lockTestHooks, worktreeLockBusy } from "./locks.ts";
 import { lockPathForWorktree } from "./paths.ts";
 
 const cleanups: Array<() => void> = [];
@@ -294,3 +294,44 @@ process.exit(0);
   expect(existsSync(recordPath)).toBe(false);
   lock.release();
 }, 30_000);
+
+// Create-time probe used by run create.
+test("the probe reports writers and readers by mode and publishes nothing", () => {
+  const dir = mkdtempSync(join(tmpdir(), "orch-lock-probe-"));
+  const path = join(dir, "worktree.lock");
+  expect(worktreeLockBusy(path, "exclusive")).toBeNull();
+  const reader = acquireWorktreeLock(path, "shared", "review-1");
+  const before = readdirSync(`${path}.owners`).sort();
+  expect(worktreeLockBusy(path, "shared")).toBeNull();
+  const busy = worktreeLockBusy(path, "exclusive");
+  expect(busy?.holderRunId).toBe("review-1");
+  expect(busy?.message).toContain("worktree read lock held (1 reader)");
+  expect(readdirSync(`${path}.owners`).sort()).toEqual(before);
+  reader.release();
+  const writer = acquireWorktreeLock(path, "exclusive", "impl-1");
+  expect(worktreeLockBusy(path, "shared")?.message).toContain("worktree write lock held");
+  writer.release();
+  expect(worktreeLockBusy(path, "shared")).toBeNull();
+});
+
+// Codex review of PR #28 (F1): a live pre-hardening pidfile has no nonce; the
+// probe must still see it in both modes, and must leave it in place.
+test("the probe sees a live nonce-less legacy pidfile and does not touch it", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "orch-lock-legacy-probe-"));
+  const path = join(dir, "worktree.lock");
+  const holder = Bun.spawn(["sleep", "30"], { stdio: ["ignore", "ignore", "ignore"] });
+  try {
+    const legacy = `${JSON.stringify({ pid: holder.pid, run_id: "old-orch-impl", ts: new Date().toISOString() })}\n`;
+    writeFileSync(path, legacy, "utf8");
+    for (const mode of ["shared", "exclusive"] as const) {
+      expect(worktreeLockBusy(path, mode)?.holderRunId).toBe("old-orch-impl");
+    }
+    expect(readFileSync(path, "utf8")).toBe(legacy);
+    // The real acquirers agree with the probe.
+    expect(() => acquireWorktreeLock(path, "shared", "review")).toThrow(LockHeldError);
+  } finally {
+    holder.kill("SIGKILL");
+    await holder.exited;
+  }
+  expect(worktreeLockBusy(path, "exclusive")).toBeNull();
+});
