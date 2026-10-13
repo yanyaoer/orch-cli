@@ -5,6 +5,7 @@ import { assertKnownFlags, CliError, flagBool, flagString, printJson, readStdinT
 import { randomHex } from "./hash.ts";
 import { readJsonFile } from "./json.ts";
 import { isTerminal } from "./overview.ts";
+import { gitEnv } from "./git-env.ts";
 import { vcsKind } from "./vcs.ts";
 import type { ImplementerResult, RoleResult, RunSpec, RunStatus } from "./types.ts";
 
@@ -344,7 +345,7 @@ export function captureBaselinePaths(worktree: string): string[] {
     vcsKind(worktree) === "jj"
       ? ["jj", "status"]
       : ["git", "-C", worktree, "status", "--porcelain=v1", "--untracked-files=all"];
-  const proc = Bun.spawnSync(argv, { cwd: worktree, stdout: "pipe", stderr: "pipe" });
+  const proc = Bun.spawnSync(argv, { cwd: worktree, stdout: "pipe", stderr: "pipe", env: gitEnv() });
   if (proc.exitCode !== 0) {
     throw new CliError(`cannot capture VCS baseline in ${worktree}: ${proc.stderr.toString().trim().slice(0, 300)}`);
   }

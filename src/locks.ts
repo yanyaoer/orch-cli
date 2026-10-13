@@ -18,6 +18,9 @@ export class LockHeldError extends Error {
 export interface PidfileLock {
   path: string;
   pid: number;
+  // Extend the holder to a child process group (the provider): the record
+  // stays live while either the owner pid or any member of that group lives.
+  adoptProcessGroup(pgid: number): void;
   release(): void;
 }
 
@@ -27,6 +30,7 @@ interface OwnerRecord {
   ts: string | null;
   nonce: string | null;
   mode?: LockMode;
+  pgid?: number | null;
 }
 
 // Cross-process lock built only from per-owner records, so no process ever
@@ -50,6 +54,12 @@ interface OwnerRecord {
 // never look at new shared holders; old reviewers took no lock at all. PID
 // reuse after a crash can make a dead record look alive (it then blocks; it
 // never lets two owners in).
+//
+// A worktree holder is a supervisor plus the detached provider process group
+// it spawns; killing only the supervisor leaves the provider running in the
+// checkout. The supervisor therefore adopts that group into its record
+// (`pgid`) before letting the driver proceed, and the record counts as live
+// while the group has any member.
 export type LockMode = "shared" | "exclusive";
 export type WorktreeLockMode = LockMode;
 
@@ -73,6 +83,16 @@ export function isPidAlive(pid: number): boolean {
   return processExists(pid);
 }
 
+export function isProcessGroupAlive(pgid: number): boolean {
+  if (!Number.isInteger(pgid) || pgid <= 1) return false;
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
 function readRecord(path: string): OwnerRecord | null {
   try {
     const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<OwnerRecord>;
@@ -82,6 +102,7 @@ function readRecord(path: string): OwnerRecord | null {
       ts: typeof parsed.ts === "string" ? parsed.ts : null,
       nonce: typeof parsed.nonce === "string" ? parsed.nonce : null,
       mode: parsed.mode === "shared" || parsed.mode === "exclusive" ? parsed.mode : undefined,
+      pgid: typeof parsed.pgid === "number" ? parsed.pgid : null,
     };
   } catch {
     return null;
@@ -89,6 +110,7 @@ function readRecord(path: string): OwnerRecord | null {
 }
 
 function isLive(path: string, record: OwnerRecord | null): boolean {
+  if (record && typeof record.pgid === "number" && isProcessGroupAlive(record.pgid)) return true;
   if (record && record.pid !== null) return processExists(record.pid);
   try {
     return Date.now() - statSync(path).mtimeMs <= UNPARSABLE_STALE_MS;
@@ -202,6 +224,10 @@ export function acquireLock(path: string, mode: LockMode, runId?: string, pid = 
   return {
     path: own,
     pid,
+    adoptProcessGroup(pgid: number) {
+      if (released) return;
+      publish(own, { ...record, pgid });
+    },
     release() {
       if (released) return;
       released = true;

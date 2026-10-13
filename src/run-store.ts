@@ -1,7 +1,7 @@
 // Run-state readers and outbox/forge-ref helpers shared by every command: locating runs, listing an MR's runs, idempotency records, decision and result readers.
 import { existsSync, readFileSync, readdirSync, type Dirent } from "node:fs";
 import type { RoleResult, RunSpec, RunState, RunStatus } from "./types.ts";
-import { isPidAlive } from "./locks.ts";
+import { isPidAlive, isProcessGroupAlive } from "./locks.ts";
 import { randomHex } from "./hash.ts";
 import { mrStateDir, orchStateRoot } from "./paths.ts";
 import { readJsonFile, writeJsonAtomic, writeTextAtomic } from "./json.ts";
@@ -188,6 +188,16 @@ export function looksStale(status: RunStatus): boolean {
   if (owner !== null) return !isPidAlive(owner);
   const ageMs = Date.now() - Date.parse(status.updated_at ?? "");
   return Number.isFinite(ageMs) && ageMs > 60 * 60 * 1000;
+}
+
+// Stale means the supervisor is gone, not that the work stopped: the provider
+// runs in its own process group and survives a killed supervisor. Anything
+// that would reuse the checkout (a clone removal) or call the run finished
+// must also see the group gone.
+export function runProcessesAlive(status: RunStatus): boolean {
+  if (typeof status.supervisor_pid === "number" && isPidAlive(status.supervisor_pid)) return true;
+  if (typeof status.pgid === "number" && isProcessGroupAlive(status.pgid)) return true;
+  return typeof status.pid === "number" && isPidAlive(status.pid);
 }
 
 // Everything a run directory says about itself, read once. Every command that

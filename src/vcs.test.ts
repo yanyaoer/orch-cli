@@ -169,3 +169,88 @@ test.skipIf(!hasJj)("vcsSnapshot (jj): empty @ reports its parent, edits make it
   expect(dirty.head).not.toBe(parent);
   expect(sameSnapshot(dirty, clean)).toBe(false);
 });
+
+test("vcsSnapshot (git): an inherited GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE never redirects it to another checkout", async () => {
+  const target = await gitFixture();
+  const foreign = await gitFixture();
+  writeFileSync(join(foreign, "f.txt"), "foreign\n", "utf8");
+  await sh(foreign, "git", "add", "f.txt");
+  await sh(foreign, "git", "commit", "-q", "-m", "foreign");
+  const expected = await vcsSnapshot(target);
+  const { canonicalWorktreeRoot, lockPathForWorktree } = await import("./paths.ts");
+  const expectedLock = lockPathForWorktree(target);
+  const saved = { GIT_DIR: process.env.GIT_DIR, GIT_WORK_TREE: process.env.GIT_WORK_TREE, GIT_INDEX_FILE: process.env.GIT_INDEX_FILE };
+  process.env.GIT_DIR = join(foreign, ".git");
+  process.env.GIT_WORK_TREE = foreign;
+  process.env.GIT_INDEX_FILE = join(foreign, ".git", "index");
+  try {
+    expect(await vcsSnapshot(target)).toEqual(expected);
+    expect(await vcsHead(target)).toBe(expected.head);
+    expect(await vcsResolveCommit(target, "HEAD")).toBe(expected.head);
+    expect(canonicalWorktreeRoot(target)).toBe(target);
+    expect(lockPathForWorktree(target)).toBe(expectedLock);
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test("vcsSnapshot (git): untracked nested repos bind their content; files and links never collide", async () => {
+  const dir = await gitFixture();
+  const nested = join(dir, "nested");
+  await sh(dir, "git", "init", "-q", "nested");
+  writeFileSync(join(nested, "code.ts"), "one\n", "utf8");
+  await sh(nested, "git", "add", "code.ts");
+  await sh(nested, "git", "commit", "-q", "-m", "nested");
+  const before = await vcsSnapshot(dir);
+  expect(before.dirty).toBe(true);
+  writeFileSync(join(nested, "code.ts"), "two\n", "utf8");
+  const edited = await vcsSnapshot(dir);
+  expect(edited.content_sha).not.toBe(before.content_sha);
+  writeFileSync(join(nested, "extra.ts"), "x\n", "utf8");
+  expect((await vcsSnapshot(dir)).content_sha).not.toBe(edited.content_sha);
+  rmSync(nested, { recursive: true, force: true });
+
+  // A regular file whose bytes spell the old "link:" encoding vs a real link.
+  writeFileSync(join(dir, "entry"), "link:x", "utf8");
+  const asFile = await vcsSnapshot(dir);
+  rmSync(join(dir, "entry"));
+  symlinkSync("x", join(dir, "entry"));
+  expect((await vcsSnapshot(dir)).content_sha).not.toBe(asFile.content_sha);
+});
+
+test("vcsSnapshot (git): a CoW clone of staged/unstaged/new work matches its source; real edits do not", async () => {
+  const { cloneWorktreeCow } = await import("./worktree.ts");
+  const dir = await gitFixture();
+  writeFileSync(join(dir, "staged.txt"), "base\n", "utf8");
+  writeFileSync(join(dir, "unstaged.txt"), "base\n", "utf8");
+  await sh(dir, "git", "add", ".");
+  await sh(dir, "git", "commit", "-q", "-m", "base");
+  writeFileSync(join(dir, "staged.txt"), "staged edit\n", "utf8");
+  writeFileSync(join(dir, "added.txt"), "staged new\n", "utf8");
+  await sh(dir, "git", "add", "staged.txt", "added.txt");
+  writeFileSync(join(dir, "unstaged.txt"), "unstaged edit\n", "utf8");
+  writeFileSync(join(dir, "untracked.txt"), "untracked\n", "utf8");
+  const source = await vcsSnapshot(dir);
+  expect(source.dirty).toBe(true);
+
+  const dest = join(tempDir("orch-vcs-clone-"), "clone");
+  const copy = (from: string, to: string) => {
+    const proc = Bun.spawnSync(["cp", "-R", "-P", from, to], { stdout: "pipe", stderr: "pipe" });
+    if (proc.exitCode !== 0) throw new Error(proc.stderr.toString());
+  };
+  cloneWorktreeCow(dir, dest, null, {}, () => ({ copy }));
+  cleanups.push(() => Bun.spawnSync(["git", "-C", dir, "worktree", "remove", "--force", dest]));
+  // reset --mixed in the clone unstaged everything; the bytes are the same.
+  expect(await sh(dest, "git", "status", "--porcelain")).not.toBe(await sh(dir, "git", "status", "--porcelain"));
+  expect(sameSnapshot(await vcsSnapshot(dest), source)).toBe(true);
+
+  for (const file of ["staged.txt", "added.txt", "unstaged.txt"]) {
+    writeFileSync(join(dir, file), "changed after review\n", "utf8");
+    expect(sameSnapshot(await vcsSnapshot(dest), await vcsSnapshot(dir))).toBe(false);
+    writeFileSync(join(dir, file), file === "staged.txt" ? "staged edit\n" : file === "added.txt" ? "staged new\n" : "unstaged edit\n", "utf8");
+    expect(sameSnapshot(await vcsSnapshot(dest), await vcsSnapshot(dir))).toBe(true);
+  }
+});

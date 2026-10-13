@@ -85,7 +85,7 @@ type AutoRun = OverviewRun;
 // guessed: --auto must not launder uncertain results into the decision ledger.
 export function planAutoDecision(run: AutoRun, fallback: boolean, candidate: CandidateResolution | null = null): AutoDecisionPlan {
   if (run.stale) {
-    return { decision: null, reason: null, attention: `supervisor gone; run: orch run reap --mr ${run.mr}` };
+    return { decision: null, reason: null, attention: `supervisor gone (its provider may still run); run: orch run reap --mr ${run.mr}, then orch run cancel --run ${run.run_id}` };
   }
   if (!isTerminal(run.state)) {
     return { decision: null, reason: null, attention: `still ${run.state}` };

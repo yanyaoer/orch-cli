@@ -7,6 +7,7 @@
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { evidenceRoles, isRunRole, type RunState, type RunStatus, type VcsSnapshot } from "./types.ts";
 import { mailControlStateDir,  orchStateRoot, statePathSegment } from "./paths.ts";
+import { gitEnv } from "./git-env.ts";
 import { readJsonFile } from "./json.ts";
 import { looksStale, nonTerminalStates, scanMrRuns, type DecisionVerdict } from "./run-store.ts";
 import { validateRoleResult } from "./schema.ts";
@@ -538,7 +539,7 @@ export function buildOverview(repoKeys: string[], withWorktree: boolean, options
 export async function mergedBranchMrs(worktree: string): Promise<Set<string> | null> {
   if (vcsKind(worktree) === "jj") return mergedBookmarkMrs(worktree);
   const git = (...args: string[]) =>
-    Bun.spawn(["git", "-C", worktree, ...args], { stdout: "pipe", stderr: "ignore" });
+    Bun.spawn(["git", "-C", worktree, ...args], { stdout: "pipe", stderr: "ignore", env: gitEnv() });
   try {
     const current = (await new Response(git("branch", "--show-current").stdout).text()).trim();
     const head = (await new Response(git("rev-parse", "HEAD").stdout).text()).trim();
@@ -566,7 +567,7 @@ async function mergedBookmarkMrs(worktree: string): Promise<Set<string> | null> 
   try {
     const proc = Bun.spawn(
       ["jj", "bookmark", "list", "-r", "::@- ~ @-", "--ignore-working-copy", "-T", 'if(remote, "", name ++ "\\n")'],
-      { cwd: worktree, stdout: "pipe", stderr: "ignore" },
+      { cwd: worktree, stdout: "pipe", stderr: "ignore", env: gitEnv() },
     );
     const out = await new Response(proc.stdout).text();
     if ((await proc.exited) !== 0) return null;

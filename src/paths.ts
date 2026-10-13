@@ -1,5 +1,6 @@
 import { basename, dirname, resolve } from "node:path";
 import { mkdirSync, realpathSync } from "node:fs";
+import { gitEnv } from "./git-env.ts";
 import { randomHex, sha256, shortHash } from "./hash.ts";
 import { jjWorkspaceRoot, vcsRemoteOriginUrl } from "./vcs.ts";
 
@@ -87,6 +88,7 @@ export function canonicalWorktreeRoot(worktree: string): string {
     const proc = Bun.spawnSync(["git", "-C", resolved, "rev-parse", "--show-toplevel"], {
       stdout: "pipe",
       stderr: "ignore",
+      env: gitEnv(),
     });
     const root = proc.exitCode === 0 ? proc.stdout.toString().trim() : "";
     if (root) return realpathSync(root);

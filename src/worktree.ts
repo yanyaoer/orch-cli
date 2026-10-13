@@ -14,6 +14,7 @@ import {
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { getSystemErrorName } from "node:util";
 import { dlopen, FFIType, ptr, read } from "bun:ffi";
+import { gitEnv } from "./git-env.ts";
 import { randomHex, sha256 } from "./hash.ts";
 import { assertKnownFlags, CliError, collectFlags, flagBool, flagNumber, flagString, printJson, type ParsedArgs } from "./cli.ts";
 
@@ -83,11 +84,7 @@ export interface WorktreeLossAssessment {
 function spawnGit(args: string[]): Bun.SyncSubprocess<"pipe", "pipe"> {
   // An ambient GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE would redirect every -C
   // call — and make loss-detection digests describe an unrelated repository.
-  const env = { ...process.env };
-  delete env.GIT_DIR;
-  delete env.GIT_WORK_TREE;
-  delete env.GIT_INDEX_FILE;
-  return Bun.spawnSync(["git", ...args], { stdout: "pipe", stderr: "pipe", env });
+  return Bun.spawnSync(["git", ...args], { stdout: "pipe", stderr: "pipe", env: gitEnv() });
 }
 
 function gitRaw(args: string[]): string {
@@ -540,7 +537,7 @@ function nestedGitMetadata(gitdir: string): string {
 // every ref (branches, tags, stash), user-authored gitdir metadata, and its
 // own recursive workspace state. null means the state cannot be proven and
 // loss detection must fail closed.
-function nestedRepoDigest(path: string): string | null {
+export function nestedRepoDigest(path: string): string | null {
   try {
     const canonical = realpathSync(path);
     // Git must be describing this directory itself: a gitdir whose

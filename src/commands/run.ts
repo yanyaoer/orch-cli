@@ -2,7 +2,7 @@
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { evidenceRoles, isRunRole, writeRoles, type AgentName, type ProviderSessionMode, type RunRole, type RunSpec, type RunStatus, type VcsSnapshot } from "../types.ts";
-import { acquirePidfileLockWait } from "../locks.ts";
+import { acquirePidfileLockWait, isProcessGroupAlive } from "../locks.ts";
 import { sha256 } from "../hash.ts";
 import { ensureStateLayout, getRepoIdentity, lockPathForWorktree, mrStateDir, type RepoIdentity } from "../paths.ts";
 import { appendJsonLine, countLines, jsonBytes, readJsonFile, writeJsonAtomic, writeTextAtomic } from "../json.ts";
@@ -14,7 +14,7 @@ import { orchLanguage, readOrchConfig, type RoleDefaults } from "../config.ts";
 import { CliError, assertKnownFlags, flagBool, flagString, printJson, readStdinText, type ParsedArgs } from "../cli.ts";
 import { buildPrompt, buildProviderExecutionPlan, type ProviderExecutionPlan } from "../../drivers/driver-common.ts";
 import { SEATBELT_ENGINE, sandboxPosture, sandboxRunIdentity, seatbeltUnsupportedReason } from "../../drivers/sandbox.ts";
-import { archivedIdempotency, formatTable, locateRun, mrIdsForRepo, nonTerminalStates, orchCommand, readIdempotency, resolveMr, runId, runListRows, scanMrRuns, scanRunsRoot, stateDirectoryHint, statusState, type IdempotencyRecord } from "../run-store.ts";
+import { archivedIdempotency, formatTable, locateRun, looksStale, mrIdsForRepo, nonTerminalStates, orchCommand, readIdempotency, resolveMr, runId, runListRows, scanMrRuns, scanRunsRoot, stateDirectoryHint, statusState, type IdempotencyRecord } from "../run-store.ts";
 
 function isProviderSessionMode(value: string): value is ProviderSessionMode {
   return value === "ephemeral" || value === "fresh_persistent" || value === "resume_exact";
@@ -814,7 +814,7 @@ export async function runReap(args: ParsedArgs): Promise<number> {
   const worktree = resolve(flagString(args, "worktree", process.cwd()));
   const repo = await getRepoIdentity(worktree);
   const mrIds = args.flags.has("mr") ? [flagString(args, "mr")] : mrIdsForRepo(repo.repo_key);
-  const reaped: Array<{ mr: string; run_id: string }> = [];
+  const reaped: Array<{ mr: string; run_id: string; provider_alive?: true; pgid?: number; cancel?: string }> = [];
   const running: Array<{ mr: string; run_id: string }> = [];
   for (const mr of mrIds) {
     for (const { status, stale, run_dir } of scanMrRuns(repo.repo_key, mr)) {
@@ -827,7 +827,14 @@ export async function runReap(args: ParsedArgs): Promise<number> {
       writeJsonAtomic(`${run_dir}/status.json`, { ...status, state: "stale", updated_at: new Date().toISOString() });
       const eventsPath = `${run_dir}/events.jsonl`;
       appendJsonLine(eventsPath, { type: "stale", seq: countLines(eventsPath), ts: new Date().toISOString() });
-      reaped.push({ mr: status.mr, run_id: id });
+      // The provider group can outlive its supervisor; it still holds the
+      // worktree lock and needs an explicit, verified stop.
+      const orphanPgid = typeof status.pgid === "number" && isProcessGroupAlive(status.pgid) ? status.pgid : null;
+      reaped.push(
+        orphanPgid === null
+          ? { mr: status.mr, run_id: id }
+          : { mr: status.mr, run_id: id, provider_alive: true, pgid: orphanPgid, cancel: `orch run cancel --run ${id} --mr ${status.mr}` },
+      );
     }
   }
   printJson({ reaped, still_running: running });
@@ -842,10 +849,14 @@ export async function runCancel(args: ParsedArgs): Promise<number> {
   const located = locateRun(repo.repo_key, runId, args.flags.has("mr") ? flagString(args, "mr") : undefined);
   const status = readJsonFile<RunStatus | null>(`${located.run_dir}/status.json`, null);
   if (!status) throw new CliError(`status.json not found for run: ${runId}`);
-  if (!nonTerminalStates.has(status.state)) {
+  // A stale run lost its supervisor, but its provider group may still run in
+  // the checkout (and hold the worktree lock); it stays cancellable.
+  const orphaned = status.state === "stale" || looksStale(status);
+  if (!nonTerminalStates.has(status.state) && status.state !== "stale") {
     printJson({ canceled: false, run_id: runId, state: status.state, reason: "already terminal" });
     return 0;
   }
+  if (orphaned) return cancelOrphan(args, located, status);
   if (status.pgid === null) {
     throw new CliError(
       `run ${runId} has no process group yet (state: ${status.state}); retry once it is running, or: orch run reap --mr ${located.mr}`,
@@ -875,6 +886,42 @@ export async function runCancel(args: ParsedArgs): Promise<number> {
     return 1;
   }
   printJson({ canceled: true, run_id: runId, mr: located.mr, signal, pgid: status.pgid });
+  return 0;
+}
+
+// No supervisor will finalize an orphaned run, so cancel itself signals the
+// provider group and confirms it is gone before reporting success; a group
+// that survives the grace period is a failure, never assumed stopped.
+async function cancelOrphan(args: ParsedArgs, located: { mr: string; run_dir: string }, status: RunStatus): Promise<number> {
+  const runId = status.run_id;
+  const pgid = typeof status.pgid === "number" && isProcessGroupAlive(status.pgid) ? status.pgid : null;
+  if (pgid === null) {
+    if (status.state === "stale") {
+      printJson({ canceled: false, run_id: runId, state: status.state, reason: "stale run has no live process group (already stopped)" });
+      return 0;
+    }
+    printJson({ canceled: false, run_id: runId, state: status.state, reason: `process group ${status.pgid ?? "none"} is gone; run: orch run reap --mr ${located.mr}` });
+    return 1;
+  }
+  const signal = flagBool(args, "force") ? "SIGKILL" : "SIGTERM";
+  try {
+    process.kill(-pgid, signal);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+  }
+  const deadline = Date.now() + (signal === "SIGKILL" ? 5_000 : 10_000);
+  while (isProcessGroupAlive(pgid) && Date.now() < deadline) await Bun.sleep(50);
+  if (isProcessGroupAlive(pgid)) {
+    printJson({ canceled: false, run_id: runId, mr: located.mr, signal, pgid, orphaned: true, reason: `process group ${pgid} still alive after ${signal}; retry with --force` });
+    return 1;
+  }
+  const ts = new Date().toISOString();
+  const eventsPath = `${located.run_dir}/events.jsonl`;
+  // Keep the supervisor-loss diagnosis: the run ends `stale`, with the stop
+  // recorded alongside it.
+  writeJsonAtomic(`${located.run_dir}/status.json`, { ...status, state: "stale", updated_at: ts });
+  appendJsonLine(eventsPath, { type: "stale", seq: countLines(eventsPath), ts, message: `orphaned process group ${pgid} stopped by orch run cancel (${signal})` });
+  printJson({ canceled: true, run_id: runId, mr: located.mr, signal, pgid, orphaned: true, stopped: true });
   return 0;
 }
 

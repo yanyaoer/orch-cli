@@ -1,7 +1,10 @@
 import { $ } from "bun";
 import { createHash } from "node:crypto";
 import { lstatSync, readFileSync, readlinkSync, realpathSync } from "node:fs";
+import { join } from "node:path";
+import { gitEnv } from "./git-env.ts";
 import type { VcsSnapshot } from "./types.ts";
+import { nestedRepoDigest } from "./worktree.ts";
 
 // jj-first local VCS seam. A worktree managed by Jujutsu answers every local
 // VCS question through jj — including colocated repos, where plain git
@@ -32,6 +35,7 @@ function probe(worktree: string): VcsProbe {
       cwd: worktree,
       stdout: "pipe",
       stderr: "ignore",
+      env: gitEnv(),
     });
     const root = proc.exitCode === 0 ? proc.stdout.toString().trim() : "";
     // Nearest-repo rule: a git checkout nested inside a jj workspace (e.g. a
@@ -57,6 +61,7 @@ function gitToplevel(worktree: string): string | null {
     const proc = Bun.spawnSync(["git", "-C", worktree, "rev-parse", "--show-toplevel"], {
       stdout: "pipe",
       stderr: "ignore",
+      env: gitEnv(),
     });
     const top = proc.exitCode === 0 ? proc.stdout.toString().trim() : "";
     return top ? realpathSync(top) : null;
@@ -78,9 +83,9 @@ export function jjWorkspaceRoot(worktree: string): string | null {
 // a later `jj diff --from <base>` then shows exactly what a run changed.
 export async function vcsHead(worktree: string): Promise<string> {
   if (vcsKind(worktree) === "jj") {
-    return (await $`jj log -r @ --no-graph -T commit_id`.cwd(worktree).quiet().text()).trim();
+    return (await $`jj log -r @ --no-graph -T commit_id`.cwd(worktree).env(gitEnv()).quiet().text()).trim();
   }
-  return (await $`git -C ${worktree} rev-parse HEAD`.quiet().text()).trim();
+  return (await $`git -C ${worktree} rev-parse HEAD`.env(gitEnv()).quiet().text()).trim();
 }
 
 // Non-empty iff the worktree carries uncommitted work; "" on any failure.
@@ -89,9 +94,9 @@ export async function vcsHead(worktree: string): Promise<string> {
 export async function vcsDirty(worktree: string): Promise<string> {
   try {
     if (vcsKind(worktree) === "jj") {
-      return (await $`jj diff --summary`.cwd(worktree).quiet().text()).trim();
+      return (await $`jj diff --summary`.cwd(worktree).env(gitEnv()).quiet().text()).trim();
     }
-    return (await $`git -C ${worktree} status --porcelain`.quiet().text()).trim();
+    return (await $`git -C ${worktree} status --porcelain`.env(gitEnv()).quiet().text()).trim();
   } catch {
     return "";
   }
@@ -105,11 +110,11 @@ export async function vcsBranch(worktree: string): Promise<string | null> {
     if (vcsKind(worktree) === "jj") {
       const out = await $`jj log -r ${"heads(::@ & bookmarks())"} --no-graph --ignore-working-copy -T ${'local_bookmarks.map(|b| b.name()).join("\\n") ++ "\\n"'}`
         .cwd(worktree)
-        .quiet()
+        .env(gitEnv()).quiet()
         .text();
       return out.split("\n").map((line) => line.trim()).find(Boolean) ?? null;
     }
-    const branch = (await $`git -C ${worktree} rev-parse --abbrev-ref HEAD`.quiet().text()).trim();
+    const branch = (await $`git -C ${worktree} rev-parse --abbrev-ref HEAD`.env(gitEnv()).quiet().text()).trim();
     return branch && branch !== "HEAD" ? branch : null;
   } catch {
     return null;
@@ -120,18 +125,18 @@ export async function vcsBranch(worktree: string): Promise<string | null> {
 // fallback (repo identity uses the root path).
 export async function vcsRemoteOriginUrl(repoRoot: string): Promise<string> {
   if (vcsKind(repoRoot) === "jj") {
-    const out = await $`jj git remote list`.cwd(repoRoot).quiet().text();
+    const out = await $`jj git remote list`.cwd(repoRoot).env(gitEnv()).quiet().text();
     for (const line of out.split("\n")) {
       const [name, ...rest] = line.trim().split(/\s+/);
       if (name === "origin" && rest.length > 0) return rest.join(" ");
     }
     return "";
   }
-  return (await $`git -C ${repoRoot} remote get-url origin`.quiet().text()).trim();
+  return (await $`git -C ${repoRoot} remote get-url origin`.env(gitEnv()).quiet().text()).trim();
 }
 
 // Host-captured identity of what a checkout currently contains: HEAD plus,
-// when dirty, a hash of the uncommitted diff and untracked file bytes. Throws
+// when dirty, a hash of the on-disk content of every changed/untracked path. Throws
 // when the worktree cannot be queried — callers must fail closed, never treat
 // a failed query as "unchanged".
 export async function vcsSnapshot(worktree: string): Promise<VcsSnapshot> {
@@ -141,34 +146,51 @@ export async function vcsSnapshot(worktree: string): Promise<VcsSnapshot> {
     // content. An empty @ on top of a single parent is that parent's tree:
     // report the parent so `jj new` churn does not look like a new candidate.
     const template = 'commit_id ++ " " ++ if(empty, "empty", "changed") ++ " " ++ parents.map(|c| c.commit_id()).join(",")';
-    const out = (await $`jj log -r @ --no-graph -T ${template}`.cwd(root).quiet().text()).trim();
+    const out = (await $`jj log -r @ --no-graph -T ${template}`.cwd(root).env(gitEnv()).quiet().text()).trim();
     const [id, state, parentList] = out.split(" ");
     if (!id || (state !== "empty" && state !== "changed")) throw new Error(`unexpected jj log output: ${out}`);
     const parents = (parentList ?? "").split(",").filter(Boolean);
     if (state === "empty" && parents.length === 1) return { vcs: "jj", head: parents[0]!, dirty: false, content_sha: parents[0]! };
     return { vcs: "jj", head: id, dirty: state === "changed", content_sha: state === "changed" ? `jj:${id}` : id };
   }
-  const head = (await $`git -C ${worktree} rev-parse --verify HEAD`.quiet().text()).trim();
-  const status = Buffer.from(await $`git -C ${worktree} status --porcelain=v1 -z --untracked-files=all`.quiet().arrayBuffer());
-  if (status.length === 0) return { vcs: "git", head, dirty: false, content_sha: head };
-  const root = (await $`git -C ${worktree} rev-parse --show-toplevel`.quiet().text()).trim();
-  const hash = createHash("sha256");
-  hash.update(`git\0${head}\0`);
-  hash.update(status);
-  hash.update(Buffer.from(await $`git -C ${worktree} diff --binary --no-ext-diff --no-textconv HEAD`.quiet().arrayBuffer()));
-  const entries = status.toString("utf8").split("\0");
-  for (let i = 0; i < entries.length; i += 1) {
-    const entry = entries[i]!;
-    // Renames/copies carry their source path as the next NUL field.
-    if (entry.startsWith("R") || entry.startsWith("C")) i += 1;
-    if (!entry.startsWith("?? ")) continue;
-    const path = `${root}/${entry.slice(3)}`;
-    const stat = lstatSync(path);
-    hash.update(`\0${entry.slice(3)}\0`);
-    if (stat.isSymbolicLink()) hash.update(`link:${readlinkSync(path)}`);
-    else if (stat.isFile()) hash.update(readFileSync(path));
+  const env = gitEnv();
+  const head = (await $`git -C ${worktree} rev-parse --verify HEAD`.env(env).quiet().text()).trim();
+  const root = (await $`git -C ${worktree} rev-parse --show-toplevel`.env(env).quiet().text()).trim();
+  // Content-only fingerprint: every path whose working-tree state may differ
+  // from HEAD (tracked edits staged or not, staged additions/deletions,
+  // untracked files), recorded by its on-disk content. Index state is not
+  // part of it, so a clone whose `reset --mixed` turned staged changes into
+  // unstaged/untracked ones still matches when the bytes are the same.
+  const changed = await $`git -C ${root} diff --name-only -z --no-renames --no-ext-diff HEAD --`.env(env).quiet().text();
+  const untracked = await $`git -C ${root} ls-files --others --exclude-standard -z`.env(env).quiet().text();
+  const paths = [...new Set(`${changed}\0${untracked}`.split("\0").filter(Boolean).map((rel) => rel.replace(/\/$/, "")))].sort();
+  if (paths.length === 0) return { vcs: "git", head, dirty: false, content_sha: head };
+  const records = paths.map((rel) => snapshotRecord(root, rel));
+  const digest = createHash("sha256").update(JSON.stringify(["orch.git-content/v2", head, records])).digest("hex");
+  return { vcs: "git", head, dirty: true, content_sha: `sha256:${digest}` };
+}
+
+// One typed record per path, so a regular file whose bytes spell a link
+// target can never collide with a symlink. A directory here is a nested
+// repository (untracked repo or submodule): pinned by its full digest, or
+// rejected when that state cannot be proven — never reduced to its name.
+function snapshotRecord(root: string, rel: string): unknown[] {
+  const path = join(root, rel);
+  let stat: ReturnType<typeof lstatSync>;
+  try {
+    stat = lstatSync(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [rel, "absent"];
+    throw error;
   }
-  return { vcs: "git", head, dirty: true, content_sha: `sha256:${hash.digest("hex")}` };
+  if (stat.isSymbolicLink()) return [rel, "symlink", readlinkSync(path)];
+  if (stat.isFile()) return [rel, "file", stat.mode & 0o111 ? "exec" : "plain", createHash("sha256").update(readFileSync(path)).digest("hex")];
+  if (stat.isDirectory()) {
+    const digest = nestedRepoDigest(path);
+    if (digest) return [rel, "repo", digest];
+    throw new Error(`cannot fingerprint nested directory ${rel}: its repository state is not provable; commit, ignore or remove it`);
+  }
+  throw new Error(`cannot fingerprint special file ${rel}`);
 }
 
 // Resolve a user-supplied revision (`--head`) to a full commit id; throws when
@@ -176,12 +198,12 @@ export async function vcsSnapshot(worktree: string): Promise<VcsSnapshot> {
 export async function vcsResolveCommit(worktree: string, rev: string): Promise<string> {
   if (vcsKind(worktree) === "jj") {
     const root = jjWorkspaceRoot(worktree) ?? worktree;
-    const out = (await $`jj log -r ${rev} --no-graph --ignore-working-copy -T ${'commit_id ++ "\\n"'}`.cwd(root).quiet().text()).trim();
+    const out = (await $`jj log -r ${rev} --no-graph --ignore-working-copy -T ${'commit_id ++ "\\n"'}`.cwd(root).env(gitEnv()).quiet().text()).trim();
     const ids = out.split("\n").filter(Boolean);
     if (ids.length !== 1) throw new Error(`revision ${rev} resolves to ${ids.length} commits`);
     return ids[0]!;
   }
-  return (await $`git -C ${worktree} rev-parse --verify --quiet ${`${rev}^{commit}`}`.quiet().text()).trim();
+  return (await $`git -C ${worktree} rev-parse --verify --quiet ${`${rev}^{commit}`}`.env(gitEnv()).quiet().text()).trim();
 }
 
 export function sameSnapshot(a: VcsSnapshot | null | undefined, b: VcsSnapshot | null | undefined): boolean {

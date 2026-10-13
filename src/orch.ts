@@ -1,9 +1,11 @@
 import pkg from "../package.json";
 import { runSupervisor } from "./supervisor.ts";
+import { scrubGitLocationEnv } from "./git-env.ts";
 
 import { HELP_TOPICS, chatgptBridgeHelp, decisionHelp, eventsTailHelp, fanoutHelp, handoffProHelp, mailHelp, mailctlHelp, mirrorHelp, mirrorSyncHelp, newHelp, prewalkHelp, resultCommandHelp, runCancelHelp, runCreateHelp, runHelp, runListHelp, searchHelp, statusHelp, topLevelHelp, topicHelp, trajectoryHelp, unknownTopicHelp, updateHelp, usageHelp, verdictHelp, waitHelp, workspaceHelp, worktreeCloneHelp, worktreeGcHelp, worktreeRemoveHelp, type HelpTopic } from "./help.ts";
 import { runCodexDriver } from "../drivers/codex-headless.ts";
 import { runClaudeDriver } from "../drivers/claude-headless.ts";
+import { awaitSupervisorHandshake } from "../drivers/driver-common.ts";
 import { runPiDriver } from "../drivers/pi-headless.ts";
 import { runOmpDriver } from "../drivers/omp-headless.ts";
 import { mail } from "./mail-cli.ts";
@@ -33,6 +35,11 @@ import { locateRun, orchCommand, readMirrorResult } from "./run-store.ts";
 // taking short-lived index.lock that races the user's own git. Workers inherit
 // this through buildWorkerEnv, covering non-seatbelt sandboxes too.
 process.env.GIT_OPTIONAL_LOCKS = "0";
+// Every repo question is answered from --worktree/cwd: an inherited GIT_DIR,
+// GIT_WORK_TREE or GIT_INDEX_FILE must not bind snapshots, repo identity or
+// locks to a different checkout than the one the provider runs in. Children
+// spawned with `env: process.env` (supervisor, run create) inherit the scrub.
+scrubGitLocationEnv(process.env);
 
 function isHelpTopic(value: string): value is HelpTopic {
   return (HELP_TOPICS as readonly string[]).includes(value);
@@ -68,6 +75,7 @@ async function main(): Promise<number> {
     return 0;
   }
   if (first === "__supervisor") return runSupervisor(flagString(args, "run-dir"), orchCommand());
+  if (first?.startsWith("__driver-") && !(await awaitSupervisorHandshake())) return 1;
   if (first === "__driver-codex") return runCodexDriver(process.argv.slice(3));
   if (first === "__driver-claude") return runClaudeDriver(process.argv.slice(3));
   if (first === "__driver-pi") return runPiDriver(process.argv.slice(3));

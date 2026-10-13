@@ -3,6 +3,7 @@ import { isRunRole, type AgentName, type ResultCoercion, type RunSpec, type Role
 import { fallbackResult, resultSchemaName, ROLE_REQUIRED_FIELDS, ROLE_RESULT_EXAMPLE, ROLE_VERDICTS, validateRoleResult } from "../src/schema.ts";
 import { appendJsonLine, countLines, writeJsonAtomic } from "../src/json.ts";
 import { normalizeNativeText, type NativeEvent } from "../src/native-events.ts";
+import { scrubGitLocationEnv } from "../src/git-env.ts";
 import { sha256 } from "../src/hash.ts";
 import {
   acceptableHostTmpDir,
@@ -117,6 +118,26 @@ const recursiveToolEnvKeys = [
   "ORCH_TOOL_SERVER_URL",
 ] as const;
 
+// Set by the supervisor on the driver it spawns: the driver must read a "go"
+// line on stdin (sent once its process group is registered in status and the
+// worktree lock) before doing anything. EOF means the supervisor died first.
+export const DRIVER_HANDSHAKE_ENV = "ORCH_DRIVER_HANDSHAKE";
+
+export async function awaitSupervisorHandshake(): Promise<boolean> {
+  if (process.env[DRIVER_HANDSHAKE_ENV] !== "1") return true;
+  delete process.env[DRIVER_HANDSHAKE_ENV];
+  const reader = Bun.stdin.stream().getReader();
+  const decoder = new TextDecoder();
+  let received = "";
+  while (!received.includes("\n")) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    received += decoder.decode(value, { stream: true });
+  }
+  reader.releaseLock();
+  return received.split("\n")[0] === "go";
+}
+
 export function buildWorkerEnv(baseEnv: NodeJS.ProcessEnv = process.env): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [key, value] of Object.entries(baseEnv)) {
@@ -124,6 +145,10 @@ export function buildWorkerEnv(baseEnv: NodeJS.ProcessEnv = process.env): Record
   }
 
   for (const key of recursiveToolEnvKeys) delete env[key];
+  delete env[DRIVER_HANDSHAKE_ENV];
+  // Workers run in spec.worktree; inherited GIT_DIR & co. would point their
+  // git at another checkout than the one snapshotted and locked.
+  scrubGitLocationEnv(env);
   // Claude-specific hardening: do not auto-connect nested IDE/tool sessions, and
   // restrict any child-started Claude MCP servers to their own explicit allowlist.
   env.CLAUDE_CODE_AUTO_CONNECT_IDE = "false";

@@ -414,3 +414,117 @@ process.exit(0);
   expect(looksStale({ ...base, pid: 999_999_999 })).toBe(true);
   expect(looksStale(base)).toBe(false);
 });
+
+async function orchEnv(fx: Fixture, extra: Record<string, string>, args: string[]): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  return runOrch({ ...fx, env: { ...fx.env, ...extra } }, args);
+}
+
+async function waitStatus(statusPath: string, done: (status: RunStatus) => boolean, ms = 15_000): Promise<RunStatus> {
+  const deadline = Date.now() + ms;
+  for (;;) {
+    const status = existsSync(statusPath) ? (JSON.parse(await Bun.file(statusPath).text()) as RunStatus) : null;
+    if (status && done(status)) return status;
+    if (Date.now() > deadline) throw new Error(`timed out waiting on ${statusPath}: ${JSON.stringify(status)}`);
+    await Bun.sleep(25);
+  }
+}
+
+test("an inherited GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE cannot rebind run create or dodge the checkout lock", async () => {
+  const fx = fixture();
+  const target = commit(fx.worktree, "target\n");
+  const foreign = tempDir("orch-hardening-foreign-");
+  git(foreign, "init", "-q");
+  commit(foreign, "foreign\n");
+  const polluted = { GIT_DIR: join(foreign, ".git"), GIT_WORK_TREE: foreign, GIT_INDEX_FILE: join(foreign, ".git", "index") };
+  const args = ["run", "create", "--mr", "mr-1", "--role", "reviewer", "--agent", "codex", "--tag", "rv", "--worktree", fx.worktree, "--dry-run", "--json"];
+  const normal = JSON.parse((await orchEnv(fx, {}, args)).stdout);
+  const redirected = await orchEnv(fx, polluted, [...args, "--head", target.head]);
+  expect(redirected).toMatchObject({ exitCode: 0 });
+  const plan = JSON.parse(redirected.stdout);
+  expect(plan.repo.repo_root).toBe(fx.worktree);
+  expect(plan.snapshot).toEqual(target);
+  expect(plan.worktree_lock).toBe(normal.worktree_lock);
+
+  // A writer started from the polluted environment contends on the target's
+  // real lock: held here (normal environment), the run fails with 75.
+  const { acquireWorktreeLock } = await import("./locks.ts");
+  const { lockPathForWorktree } = await import("./paths.ts");
+  const held = withState(fx, () => acquireWorktreeLock(lockPathForWorktree(fx.worktree), "exclusive", "holder"));
+  try {
+    const created = await orchEnv(fx, { ...polluted, ORCH_DRIVER_FAKE_RESULT: "1" }, ["run", "create", "--mr", "mr-1", "--role", "implementer", "--agent", "claude", "--tag", "impl", "--session-mode", "ephemeral", "--worktree", fx.worktree]);
+    expect(created.exitCode).toBe(0);
+    const status = await waitStatus(JSON.parse(created.stdout).status_path, (s) => !["created", "starting", "running"].includes(s.state));
+    expect(status).toMatchObject({ state: "failed", exit_code: 75 });
+  } finally {
+    held.release();
+  }
+}, 30_000);
+
+test("a provider outliving its SIGKILLed supervisor keeps the checkout locked until a verified cancel", async () => {
+  const fx = fixture();
+  commit(fx.worktree, "v1\n");
+  const { isPidAlive, isProcessGroupAlive } = await import("./locks.ts");
+  const { runProcessesAlive } = await import("./run-store.ts");
+  const create = async (tag: string, extra: Record<string, string>) => {
+    const out = await orchEnv(fx, { ORCH_DRIVER_FAKE_RESULT: "1", ...extra }, ["run", "create", "--mr", "mr-1", "--role", "implementer", "--agent", "claude", "--tag", tag, "--session-mode", "ephemeral", "--worktree", fx.worktree]);
+    expect(out.exitCode).toBe(0);
+    return JSON.parse(out.stdout) as { run_id: string; status_path: string; supervisor_pid: number };
+  };
+  const a = await create("owner-a", { ORCH_DRIVER_FAKE_SLEEP_MS: "60000" });
+  const running = await waitStatus(a.status_path, (s) => s.state === "running" && typeof s.pgid === "number");
+  const pgid = running.pgid!;
+  cleanups.push(() => {
+    try {
+      process.kill(-pgid, "SIGKILL");
+    } catch {}
+  });
+  process.kill(a.supervisor_pid, "SIGKILL");
+  for (let i = 0; i < 200 && isPidAlive(a.supervisor_pid); i += 1) await Bun.sleep(10);
+  expect(isPidAlive(a.supervisor_pid)).toBe(false);
+  expect(isProcessGroupAlive(pgid)).toBe(true);
+
+  // Second writer on the same checkout: refused while the orphan provider lives.
+  const b = await create("owner-b", {});
+  expect(await waitStatus(b.status_path, (s) => !["created", "starting", "running"].includes(s.state))).toMatchObject({ state: "failed", exit_code: 75 });
+
+  // reap keeps the supervisor-loss diagnosis and points at the live group.
+  const reaped = JSON.parse((await orchEnv(fx, {}, ["run", "reap", "--mr", "mr-1", "--worktree", fx.worktree])).stdout);
+  expect(reaped.reaped).toEqual([expect.objectContaining({ run_id: a.run_id, provider_alive: true, pgid })]);
+  const stale = await waitStatus(a.status_path, (s) => s.state === "stale");
+  expect(runProcessesAlive(stale)).toBe(true);
+  expect(isProcessGroupAlive(pgid)).toBe(true);
+
+  // A stale run stays cancellable; success means the group is confirmed gone.
+  const cancel = await orchEnv(fx, {}, ["run", "cancel", "--run", a.run_id, "--mr", "mr-1", "--worktree", fx.worktree]);
+  expect(cancel.exitCode).toBe(0);
+  expect(JSON.parse(cancel.stdout)).toMatchObject({ canceled: true, orphaned: true, stopped: true, pgid });
+  expect(isProcessGroupAlive(pgid)).toBe(false);
+  expect(runProcessesAlive(await waitStatus(a.status_path, (s) => s.state === "stale"))).toBe(false);
+
+  // Clean recovery: the checkout is free again.
+  const c = await create("owner-c", {});
+  expect(await waitStatus(c.status_path, (s) => !["created", "starting", "running"].includes(s.state))).toMatchObject({ state: "done", exit_code: 0 });
+}, 60_000);
+
+test("a driver whose supervisor dies before the handshake exits without starting work", async () => {
+  const fx = fixture();
+  const head = commit(fx.worktree, "v1\n");
+  const runDir = join(fx.stateHome, "orch", fx.repoKey, "mrs", "mr-1", "runs", "impl-orphan");
+  mkdirSync(runDir, { recursive: true });
+  const spec = {
+    version: 1, run_id: "impl-orphan", mr: "mr-1", role: "implementer", agent: "claude", model: null, tag: "impl-orphan",
+    provider_session_name: null, provider_session_id: null, provider_session_mode: "ephemeral", idempotency_key: "k",
+    repo_key: fx.repoKey, worktree: fx.worktree, task_path: null, task_text: "t", task_sha: "s", base_sha: head.head, timeout_sec: 60,
+    created_at: "2026-10-13T00:00:00Z", snapshot: head,
+  };
+  writeFileSync(join(runDir, "spec.json"), JSON.stringify(spec));
+  const proc = Bun.spawn([process.execPath, "src/orch.ts", "__driver-claude", "--spec", join(runDir, "spec.json"), "--run-dir", runDir, "--worktree", fx.worktree], {
+    env: { ...process.env, ...fx.env, ORCH_DRIVER_FAKE_RESULT: "1", ORCH_DRIVER_HANDSHAKE: "1" },
+    stdin: "pipe",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  proc.stdin.end();
+  expect(await proc.exited).toBe(1);
+  expect(existsSync(join(runDir, "result.json"))).toBe(false);
+}, 15_000);

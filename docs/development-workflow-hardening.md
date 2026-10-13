@@ -30,7 +30,9 @@ GitLab 新 Issue 发现、main 增量审查属于任务入口。已有 Claude �
 
 ### HEAD/内容绑定
 
-- `run create` 由主控代码捕获快照 `spec.snapshot = {vcs, head, dirty, content_sha}`；git 下 dirty 时 `content_sha` 覆盖未提交 diff 与未跟踪文件内容，jj 下以 `@` 的 commit（空 `@` 取其父）绑定。查询失败直接报错，不当作“未变化”。
+- `run create` 由主控代码捕获快照 `spec.snapshot = {vcs, head, dirty, content_sha}`；jj 下以 `@` 的 commit（空 `@` 取其父）绑定。查询失败直接报错，不当作“未变化”。
+- git 下 dirty 时 `content_sha` 只绑定内容：取相对 HEAD 可能变化的全部路径（`git diff HEAD` 的已暂存/未暂存修改、暂存新增与删除，加上未跟踪文件），按磁盘实际状态逐条记录带类型的条目（`file`+可执行位+字节哈希、`symlink`+目标、`absent`、`repo`+嵌套仓库摘要）。暂存区状态不进入指纹，所以 `cloneWorktreeCow` 的 `reset --mixed` 把暂存改动变成未暂存/未跟踪后，只要字节相同，clone 与源 checkout 的快照仍然一致；文件与链接分属不同类型，`link:x` 内容的普通文件不会与指向 `x` 的链接碰撞。未跟踪嵌套仓库或子模块按 HEAD、refs、gitdir 元数据及其工作区内容求摘要（与 worktree 丢失检测同一规则），无法证明其状态时 run create 直接报错。指纹格式已变化，旧版本记录的 dirty 快照不会与新快照相等，旧证据/幂等记录因此不能复用。
+- Git 定位环境：`GIT_DIR`、`GIT_WORK_TREE`、`GIT_INDEX_FILE`、`GIT_COMMON_DIR`、`GIT_OBJECT_DIRECTORY` 等（`git rev-parse --local-env-vars` 中的定位变量）在 orch 入口即被清除，所有 git/jj 调用也显式使用清理后的环境，worker/provider 环境同样清除。repo identity、锁路径、快照、`--head` 解析与 provider 的工作目录因此始终是同一个 checkout；依赖这些变量指向独立 gitdir 的用法不再受支持。
 - 默认幂等键加入实际 HEAD（reviewer/verifier 在 dirty checkout 上再加内容哈希）；显式 `--idempotency-key` 复用时也比较快照，不兼容或旧记录（无快照）一律拒绝，需 `--retry`。
 - `--head <rev>` 固定 commit：checkout 必须正处于该 commit，reviewer/verifier 还要求 checkout 干净。它只作用于本地 checkout，不读取也不绑定远端 MR/PR；主控在固定前、接受前都需回读远端 MR source SHA 并与之比对。
 - reviewer/verifier 的 supervisor 在拿到锁之后、启动 worker 之前比对快照（与 create 时及固定 head），worker 退出后再比对一次；任何漂移（包括 orch 之外的编辑）使 run 失败并记录 `snapshot_error`。`status.json` 保存 `start_snapshot`/`end_snapshot`。
@@ -50,12 +52,14 @@ GitLab 新 Issue 发现、main 增量审查属于任务入口。已有 Claude �
 - `implementer`/`verifier` 是写者（verifier 会产生构建产物），与任何读写者互斥；`reviewer` 为共享读者，可多个并行；`controller`/`researcher` 不加锁，避免长期运行的 controller 阻塞它自己派生的 worker。冲突时 run 以退出码 75 失败。
 - 实现：每个持有者在 `<lock>.owners/` 下发布自己唯一命名的记录（临时文件 + rename 到唯一名），然后列出其他记录判断冲突；“先登记后检查”保证任意两个重叠的竞争者中后检查的一方一定看到先登记的一方，不会同时进入（可能双方都退让，短临界区锁带随机抖动重试）。死进程的记录按唯一文件名忽略并删除，删除它不可能影响活的持有者；释放只删自己的唯一文件。不再存在“rename/删除共享路径来打破陈旧锁”的步骤——首轮实现的这一步在确定性交错下可让两个 owner 同时持锁（已由主控复现），现已移除。mr/outbox/mail 等锁同样使用此机制。
 - 兼容边界（旧版未加固实现，≤0.0.13 的单一 pidfile）：活的旧 pidfile 会阻止新持有者；新的独占持有者也会原子创建该 pidfile，使旧写者退让。但陈旧的旧 pidfile 只被忽略、不会被删除（删除正是要避免的抢锁窗口），此时旧写者仍会用其旧的竞态逻辑打破它，不能宣称与旧版本混用安全；旧写者不检查新读者，旧 reviewer 不加锁；pid 复用只会让死记录看似存活从而阻塞，不会放入第二个 owner。锁不能阻止非 orch 的外部编辑——由快照校验发现漂移。
+- 持有者包含 provider 进程组：supervisor 启动 driver（独立进程组）后，先把 pgid 写入 `status.json` 并通过 rename 原子更新自己的锁记录（`pgid` 字段），再经 stdin 发出 `go`；driver 收到 `go` 才继续（`ORCH_DRIVER_HANDSHAKE`）。锁记录在 supervisor 或该进程组任一存活时都算持有，所以单独杀死 supervisor 后，旧 provider 停止前同一 checkout 不会再授予冲突锁。supervisor 若在登记前死亡，pipe 关闭，driver 读到 EOF 直接退出，不会启动 provider。进程组 id 被复用只会让记录看似存活而阻塞，不会放入第二个持有者。
 - 需要评审与写入/构建并行时，使用固定 commit 的另一个 checkout。
 
 ### supervisor 与 provider 生命周期
 
 - `status.pid`/`pgid` 仍指 provider（driver）进程组，cancel/timeout 作用于它；新增 `status.supervisor_pid` 记录 supervisor。provider 退出后 supervisor 仍会收集证据、校验快照、写入结果，这段 finalization 期间 run 不再被判为 stale。
 - `looksStale` 优先看 `supervisor_pid`；旧状态文件没有该字段时沿用 provider pid 规则。`result --wait`、概览、`wait`、`events tail -f`、`run reap` 全部经由它。真正的 supervisor 死亡仍会被发现。
+- stale 只表示 supervisor 失联，不代表 provider 已停止。`run reap` 仍写入 `stale`，但对进程组仍存活的 run 报告 `provider_alive`/`pgid` 与取消命令，不自行 kill；`run cancel` 对 stale（或已失联未 reap）的 run 直接向进程组发信号，轮询确认整个进程组退出后才返回成功并保持 `stale`，宽限期后仍存活则退出码 1（可 `--force`）。`cross-review --clone --auto` 在 stale run 的进程组仍存活时保留 clone（`removed: false` 并给出原因），不会删除仍在运行的 provider 所在目录。
 
 ### 等待与裁决分离
 
@@ -75,5 +79,6 @@ GitLab 新 Issue 发现、main 增量审查属于任务入口。已有 Claude �
 
 - `snapshot_error`：checkout 在 create→start 或运行中发生变化；确认变化来源后对新快照重新发起（`--retry` 或新 run 并 `--supersedes`）。
 - `refusing to accept ...`：证据与候选不符、结果矛盾或 run 失败；按提示针对当前候选重跑评审/验证（用 `--supersedes` 声明替代），或记录 `rework`；`close` 只是 ack，不会解除阻塞。
-- 退出码 75：worktree 锁冲突；等待持有者结束，或改用独立 checkout。
+- 退出码 75：worktree 锁冲突；等待持有者结束，或改用独立 checkout。若持有者是 supervisor 已失联的 run，先 `orch run reap`，再 `orch run cancel --run <id>` 停止其 provider 进程组。
+- `cannot fingerprint nested directory`：checkout 中有无法证明状态的未跟踪嵌套目录；提交、忽略或移走它后重试。
 - `idempotent run already exists for a different worktree snapshot`：同一键对应旧快照；用 `--retry` 新建。

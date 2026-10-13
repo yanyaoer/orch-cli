@@ -7,7 +7,7 @@ import { countLines, appendJsonLine, readJsonFile, writeJsonAtomic } from "./jso
 import { fallbackResult, validateRoleResult } from "./schema.ts";
 import { lockPathForWorktree } from "./paths.ts";
 import { providerResumeIdFromNativeText } from "./native-events.ts";
-import { buildWorkerEnv } from "../drivers/driver-common.ts";
+import { buildWorkerEnv, DRIVER_HANDSHAKE_ENV } from "../drivers/driver-common.ts";
 import { sandboxPosture } from "../drivers/sandbox.ts";
 import { describeSnapshot, jjWorkspaceRoot, sameSnapshot, vcsHead, vcsKind, vcsSnapshot } from "./vcs.ts";
 
@@ -304,10 +304,10 @@ export async function runSupervisor(runDir: string, orchCommand: string[]): Prom
       {
         cwd: spec.worktree,
         detached: true,
-        stdin: "ignore",
+        stdin: "pipe",
         stdout: "pipe",
         stderr: "pipe",
-        env: buildWorkerEnv(),
+        env: { ...buildWorkerEnv(), [DRIVER_HANDSHAKE_ENV]: "1" },
       },
     );
     pgid = proc.pid;
@@ -319,6 +319,17 @@ export async function runSupervisor(runDir: string, orchCommand: string[]): Prom
       started_at: startedAt,
       last_event_seq: nextSeq(runDir),
     });
+    // The driver's process group outlives this supervisor if it is killed, so
+    // the worktree lock and status must name the group before the driver may
+    // start a provider. Dying before the go line closes the pipe: the driver
+    // reads EOF and exits without starting anything.
+    worktreeLock?.adoptProcessGroup(proc.pid);
+    try {
+      proc.stdin.write("go\n");
+      await proc.stdin.end();
+    } catch {
+      // The driver already exited; proc.exited below reports how.
+    }
     appendEvent(runDir, { type: "running", seq: nextSeq(runDir), ts: now() });
 
     const stdoutPath = runDirFile(runDir, "stdout.log");

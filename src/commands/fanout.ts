@@ -14,7 +14,7 @@ import { fallbackRawReview, planAutoDecision, sanitizeCommentBody, withheldSecti
 import { inspectWorktreeLosses, removeWorktreeClone } from "../worktree.ts";
 import { CliError, flagBool, flagNumber, printJson, type ParsedArgs } from "../cli.ts";
 import { MIRROR_BODY_MAX_CHARS, mirrorBody, zhComments } from "../render.ts";
-import { assertMirrorBodySafe, enqueueComment, forgeRefFor, pendingOutboxFiles, scanMrRuns, sentOutboxDir } from "../run-store.ts";
+import { assertMirrorBodySafe, enqueueComment, forgeRefFor, pendingOutboxFiles, runProcessesAlive, scanMrRuns, sentOutboxDir } from "../run-store.ts";
 
 import { mailFanoutContext } from "./mailctl.ts";
 
@@ -137,7 +137,21 @@ async function crossReviewAuto(args: ParsedArgs, outcome: MailFanoutOutcome): Pr
   // The timeout path above throws before this line, so runs that continue
   // past --wait-sec keep their clone (remove_with stays in the payload).
   let cloneReport: Record<string, unknown> | null = null;
-  if (outcome.clone) {
+  // A stale run only lost its supervisor; its provider group may still be
+  // running inside the clone, so the clone stays until every group is gone.
+  const busy = outcome.clone
+    ? scanMrRuns(repoKey, mr)
+        .filter((record) => runIds.has(record.run_id) && record.status !== null && (record.stale || record.status.state === "stale") && runProcessesAlive(record.status))
+        .map((record) => record.run_id)
+    : [];
+  if (outcome.clone && busy.length > 0) {
+    cloneReport = {
+      dest: outcome.clone.dest,
+      removed: false,
+      reason: `run process still alive: ${busy.join(", ")}; stop it with orch run cancel --run <id>`,
+      remove_with: outcome.clone.remove_with,
+    };
+  } else if (outcome.clone) {
     const removed = removeWorktreeClone(outcome.clone.source, outcome.clone.dest);
     cloneReport = removed
       ? { dest: outcome.clone.dest, removed: true }
