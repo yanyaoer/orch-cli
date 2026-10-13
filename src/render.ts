@@ -1,7 +1,8 @@
 // Text and markdown rendering of results: terminal summaries, mirror comment bodies, decision bodies (i18n per config language).
 import { existsSync } from "node:fs";
-import type { ControllerResult, ImplementerResult, ResearcherResult, ReviewerResult, RoleResult, RunStatus, VerifierResult } from "./types.ts";
+import type { CommandResult, ControllerResult, ImplementerResult, ResearcherResult, ReviewerResult, RoleResult, RunStatus, VerifierResult } from "./types.ts";
 import { orchLanguage } from "./config.ts";
+import { commandOutcome } from "./schema.ts";
 import type { DecisionRecord } from "./run-store.ts";
 
 function printFindings(label: string, findings: ReviewerResult["non_blocking_findings"]): void {
@@ -61,7 +62,7 @@ export function printResultSummary(result: RoleResult): void {
       process.stdout.write("  - none\n");
     } else {
       for (const command of verifier.commands) {
-        process.stdout.write(`  - ${command.cmd} (exit ${command.exit_code}): ${command.summary}\n`);
+        process.stdout.write(`  - ${command.cmd} (${commandStatusText(command)}): ${command.summary}\n`);
       }
     }
     process.stdout.write("\nacceptance:\n");
@@ -119,7 +120,7 @@ export function printResultSummary(result: RoleResult): void {
     process.stdout.write("  - none\n");
   } else {
     for (const test of implementer.tests) {
-      process.stdout.write(`  - ${test.cmd} (exit ${test.exit_code}): ${test.summary}\n`);
+      process.stdout.write(`  - ${test.cmd} (${commandStatusText(test)}): ${test.summary}\n`);
     }
   }
 }
@@ -170,8 +171,21 @@ function mirrorFindingLines(title: string, findings: Array<{ id: string; severit
   return lines;
 }
 
-function commandLine(command: { cmd: string; exit_code: number; summary: string }): string {
-  return `exit=${command.exit_code} \`${command.cmd}\` — ${command.summary}`;
+// "exit N" for legacy entries; "<status>, exit N" once a worker reports a
+// status or an expected non-zero exit, so skipped/negative checks are visible.
+function commandStatusText(command: CommandResult): string {
+  const exit = `exit ${command.exit_code === null ? "-" : command.exit_code}`;
+  if (command.status === undefined && command.expected_exit_code === undefined) return exit;
+  return `${commandOutcome(command)}, ${exit}${command.expected_exit_code !== undefined ? `, expected ${command.expected_exit_code}` : ""}`;
+}
+
+function commandLine(command: CommandResult): string {
+  // Legacy entries (no status/expected) keep the original line verbatim.
+  const detail =
+    command.status !== undefined || command.expected_exit_code !== undefined
+      ? ` (${commandOutcome(command)}${command.expected_exit_code !== undefined ? `, expected ${command.expected_exit_code}` : ""})`
+      : "";
+  return `exit=${command.exit_code === null ? "-" : command.exit_code}${detail} \`${command.cmd}\` — ${command.summary}`;
 }
 
 // The comment is the human-facing mirror of result.json: every structured

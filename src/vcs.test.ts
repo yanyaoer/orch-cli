@@ -1,8 +1,8 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { jjWorkspaceRoot, vcsBranch, vcsDirty, vcsHead, vcsKind, vcsRemoteOriginUrl } from "./vcs.ts";
+import { jjWorkspaceRoot, sameSnapshot, vcsBranch, vcsDirty, vcsHead, vcsKind, vcsRemoteOriginUrl, vcsResolveCommit, vcsSnapshot } from "./vcs.ts";
 
 const hasJj = Boolean(Bun.which("jj"));
 
@@ -123,4 +123,49 @@ test.skipIf(!hasJj)("jj repo: origin url comes from jj git remote list", async (
   expect(await vcsRemoteOriginUrl(dir)).toBe("");
   await sh(dir, "git", "remote", "add", "origin", "https://github.com/acme/demo.git");
   expect(await vcsRemoteOriginUrl(dir)).toBe("https://github.com/acme/demo.git");
+});
+
+test("vcsSnapshot (git): clean binds to HEAD, every content change moves content_sha, aliases agree", async () => {
+  const dir = await gitFixture();
+  const head = await vcsHead(dir);
+  const clean = await vcsSnapshot(dir);
+  expect(clean).toEqual({ vcs: "git", head, dirty: false, content_sha: head });
+  expect(await vcsResolveCommit(dir, "HEAD")).toBe(head);
+  await expect(vcsResolveCommit(dir, "no-such-ref")).rejects.toThrow();
+
+  writeFileSync(join(dir, "new.txt"), "one\n", "utf8");
+  const untracked = await vcsSnapshot(dir);
+  expect(untracked).toMatchObject({ head, dirty: true });
+  expect(untracked.content_sha).toMatch(/^sha256:/);
+  // Same bytes -> same snapshot; different untracked bytes -> different one.
+  expect(sameSnapshot(untracked, await vcsSnapshot(dir))).toBe(true);
+  writeFileSync(join(dir, "new.txt"), "two\n", "utf8");
+  const changed = await vcsSnapshot(dir);
+  expect(changed.content_sha).not.toBe(untracked.content_sha);
+
+  // A symlinked path to the same checkout reports the same snapshot.
+  const alias = join(tempDir("orch-vcs-alias-"), "wt");
+  symlinkSync(dir, alias);
+  expect(sameSnapshot(await vcsSnapshot(alias), changed)).toBe(true);
+
+  // Committing moves the head; a non-repo fails loudly instead of "clean".
+  await sh(dir, "git", "add", "new.txt");
+  await sh(dir, "git", "commit", "-q", "-m", "add");
+  const committed = await vcsSnapshot(dir);
+  expect(committed.head).not.toBe(head);
+  expect(committed.dirty).toBe(false);
+  await expect(vcsSnapshot(tempDir("orch-vcs-plain-"))).rejects.toThrow();
+});
+
+test.skipIf(!hasJj)("vcsSnapshot (jj): empty @ reports its parent, edits make it dirty", async () => {
+  const dir = await jjFixture();
+  const parent = (await sh(dir, "jj", "log", "-r", "@-", "--no-graph", "-T", "commit_id")).trim();
+  const clean = await vcsSnapshot(dir);
+  expect(clean).toEqual({ vcs: "jj", head: parent, dirty: false, content_sha: parent });
+  expect(await vcsResolveCommit(dir, "@-")).toBe(parent);
+  writeFileSync(join(dir, "b.txt"), "b\n", "utf8");
+  const dirty = await vcsSnapshot(dir);
+  expect(dirty.dirty).toBe(true);
+  expect(dirty.head).not.toBe(parent);
+  expect(sameSnapshot(dirty, clean)).toBe(false);
 });

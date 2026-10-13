@@ -68,6 +68,25 @@ export interface RunSpec {
   // fail-closed before granting; orch's own config dir and state root are
   // never grantable.
   sandbox_write_dirs?: string[];
+  // Worktree snapshot orch itself captured at create (never model-reported):
+  // the HEAD + content this run was dispatched against. Absent on legacy specs.
+  snapshot?: VcsSnapshot;
+  // Full commit id pinned with `run create --head`; the supervisor refuses to
+  // start a reviewer/verifier whose checkout is no longer at it.
+  pinned_head?: string;
+  // Earlier runs of the same role in this MR that this run replaces
+  // (--supersedes, --resume-from, --retry). Aggregation drops a superseded
+  // run's evidence once this run is done.
+  supersedes?: string[];
+}
+
+// Host-captured worktree identity. content_sha equals head when the checkout
+// is clean; otherwise it hashes the uncommitted diff plus untracked files.
+export interface VcsSnapshot {
+  vcs: "git" | "jj";
+  head: string;
+  dirty: boolean;
+  content_sha: string;
 }
 
 export interface RunStatus {
@@ -80,8 +99,14 @@ export interface RunStatus {
   provider_session_id: string | null;
   provider_session_mode: ProviderSessionMode;
   state: RunState;
+  // Provider (driver) process; its process group is what cancel/timeout kill.
   pid: number | null;
   pgid: number | null;
+  // The supervisor process that owns the run until it writes the terminal
+  // state. Liveness is judged on this, not on pid: the provider legitimately
+  // exits before the supervisor finishes collecting evidence and the result.
+  // Absent on runs created by older versions (pid is used instead).
+  supervisor_pid?: number | null;
   started_at: string | null;
   updated_at: string;
   exit_code: number | null;
@@ -99,6 +124,12 @@ export interface RunStatus {
   sandbox_posture?: SandboxPosture;
   sandbox_profile_sha256?: string | null;
   provider_native_sandbox?: boolean;
+  // Snapshots the supervisor captured after taking the worktree lock and after
+  // the worker exited. A reviewer/verifier result is evidence only for this
+  // snapshot, and only when both exist, match, and snapshot_error is unset.
+  start_snapshot?: VcsSnapshot | null;
+  end_snapshot?: VcsSnapshot | null;
+  snapshot_error?: string | null;
 }
 
 export interface ResultCoercion {
@@ -116,16 +147,28 @@ export interface OrchEvent {
   coercions?: ResultCoercion[];
 }
 
+export type CommandStatus = "passed" | "failed" | "skipped";
+
 export interface CommandResult {
   cmd: string;
-  exit_code: number;
+  // null only for status "skipped": a check that never ran has no exit code.
+  exit_code: number | null;
   summary: string;
+  // Absent on legacy results: derived from exit_code vs expected_exit_code.
+  status?: CommandStatus;
+  // Negative tests: the exit code that counts as passing (default 0).
+  expected_exit_code?: number;
+  // Marks a check the verdict does not depend on; only optional checks may be
+  // skipped under a verifier pass.
+  optional?: boolean;
 }
 
 export interface AcceptanceResult {
   id: string;
   status: string;
   evidence?: string;
+  // See CommandResult.optional.
+  optional?: boolean;
 }
 
 export interface ImplementerResult {
@@ -192,6 +235,16 @@ export type RoleResult = ImplementerResult | ReviewerResult | VerifierResult | C
 // on the same worktree, not race them lock-free. Kept in sync with
 // sandboxPosture by a test (src/schema.test.ts).
 export const writeRoles = new Set<RunRole>(["implementer", "verifier"]);
+
+// Read-only roles that take the worktree lock in shared mode: many reviewers
+// may read one checkout together, but never while a writer holds it.
+// controller/researcher take no lock — a long-lived controller must not block
+// the writers it dispatches onto its own checkout.
+export const sharedLockRoles = new Set<RunRole>(["reviewer"]);
+
+// Roles whose good verdict is evidence about a specific candidate snapshot:
+// their approval/pass counts only when bound to the current candidate.
+export const evidenceRoles = new Set<RunRole>(["reviewer", "verifier"]);
 
 // Runtime validator for role strings arriving from CLI flags, mail events, or
 // legacy spec.json files (which may carry retired roles such as debugger).

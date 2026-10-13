@@ -8,7 +8,7 @@ import { createNativeNormalizer } from "../native-events.ts";
 import { collectRepoKeys, mrDirsForRepo } from "../overview.ts";
 import { CliError, flagBool, flagNumber, flagString, type ParsedArgs } from "../cli.ts";
 import { printEvidenceSummary, printResultSummary } from "../render.ts";
-import { locateRun, looksStale, nonTerminalStates, readTextFile, scanMrRuns } from "../run-store.ts";
+import { locateRun, looksStale, nonTerminalStates, ownerPid, readTextFile, scanMrRuns } from "../run-store.ts";
 
 function parseTailLines(args: ParsedArgs): number | null {
   if (!args.flags.has("n")) return null;
@@ -182,7 +182,7 @@ export async function eventsTail(args: ParsedArgs): Promise<number> {
       emit(); // the worker may flush final lines right before going terminal
       if (text === null && !follower.sawFile()) throw new CliError(`${fileName} not found for run: ${runId}`);
       if (nonTerminalStates.has(status.state)) {
-        process.stderr.write(`orch events tail: run ${runId} looks stale (pid ${status.pid} is gone); stopping\n`);
+        process.stderr.write(`orch events tail: run ${runId} looks stale (supervisor pid ${ownerPid(status)} is gone); stopping\n`);
       }
       return 0;
     }
@@ -206,7 +206,7 @@ export async function resultCommand(args: ParsedArgs): Promise<number> {
       const status = readJsonFile<RunStatus | null>(`${located.run_dir}/status.json`, null);
       if (status && !nonTerminalStates.has(status.state)) break;
       if (status && looksStale(status)) {
-        throw new CliError(`run ${runId} looks stale (pid ${status.pid} is gone); run: orch run reap --mr ${located.mr}`);
+        throw new CliError(`run ${runId} looks stale (supervisor pid ${ownerPid(status)} is gone); run: orch run reap --mr ${located.mr}`);
       }
       if (Date.now() >= deadline) {
         throw new CliError(`run ${runId} did not reach a terminal state within ${waitSec}s (state: ${status?.state ?? "unknown"})`);

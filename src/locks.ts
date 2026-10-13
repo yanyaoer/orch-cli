@@ -1,15 +1,16 @@
-import { closeSync, existsSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { linkSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
-import { mkdirSync } from "node:fs";
+import { randomHex } from "./hash.ts";
 
 export class LockHeldError extends Error {
   constructor(
     public readonly lockPath: string,
     public readonly holderPid: number | null,
     public readonly holderRunId: string | null = null,
+    detail = "lock held",
   ) {
     super(
-      `lock held: ${lockPath}${holderPid ? ` by pid ${holderPid}` : ""}${holderRunId ? ` run_id ${holderRunId}` : ""}`,
+      `${detail}: ${lockPath}${holderPid ? ` by pid ${holderPid}` : ""}${holderRunId ? ` run_id ${holderRunId}` : ""}`,
     );
   }
 }
@@ -20,11 +21,42 @@ export interface PidfileLock {
   release(): void;
 }
 
-interface PidfileRecord {
+interface OwnerRecord {
   pid: number | null;
   run_id: string | null;
   ts: string | null;
+  nonce: string | null;
+  mode?: LockMode;
 }
+
+// Cross-process lock built only from per-owner records, so no process ever
+// deletes or renames a path another live owner depends on:
+//
+//   <path>.owners/<mode>-<nonce>.json   one file per holder, unique name
+//
+// Acquire = announce (atomically publish my own record) then check (list the
+// others). Of any two contenders that overlap, the later checker always sees
+// the earlier announcement, so they can never both proceed — at worst both
+// back off and retry. A dead holder's record is simply ignored, and may be
+// unlinked by anyone: its name is unique to that dead owner, so removing it
+// can never touch a live owner. Release unlinks only my own unique name.
+//
+// Pre-hardening orch (<= 0.0.13) used a single O_EXCL pidfile at <path>. An
+// exclusive holder also publishes that pidfile, so old writers see it and
+// back off, and a live old holder blocks new contenders. Boundaries: a stale
+// legacy pidfile left by a crash is ignored here but never deleted (deleting
+// it is exactly the steal race the owner records avoid), and while it sits
+// there old writers will "break" it with their own racy logic; old writers
+// never look at new shared holders; old reviewers took no lock at all. PID
+// reuse after a crash can make a dead record look alive (it then blocks; it
+// never lets two owners in).
+export type LockMode = "shared" | "exclusive";
+export type WorktreeLockMode = LockMode;
+
+// A record we cannot parse is normally a crashed pre-hardening writer (they
+// created the file empty and wrote it afterwards); treat it as held until it
+// is old enough that no live writer can still be mid-write.
+const UNPARSABLE_STALE_MS = 10_000;
 
 function processExists(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0) return false;
@@ -37,78 +69,156 @@ function processExists(pid: number): boolean {
   }
 }
 
-function readPidfile(path: string): PidfileRecord {
-  try {
-    const raw = readFileSync(path, "utf8");
-    const parsed = JSON.parse(raw) as { pid?: unknown; run_id?: unknown; ts?: unknown };
-    return {
-      pid: typeof parsed.pid === "number" ? parsed.pid : null,
-      run_id: typeof parsed.run_id === "string" ? parsed.run_id : null,
-      ts: typeof parsed.ts === "string" ? parsed.ts : null,
-    };
-  } catch {
-    return { pid: null, run_id: null, ts: null };
-  }
-}
-
-function readPid(path: string): number | null {
-  return readPidfile(path).pid;
-}
-
 export function isPidAlive(pid: number): boolean {
   return processExists(pid);
 }
 
-export function acquirePidfileLock(path: string, pid = process.pid, runId?: string): PidfileLock {
-  mkdirSync(dirname(path), { recursive: true });
+function readRecord(path: string): OwnerRecord | null {
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<OwnerRecord>;
+    return {
+      pid: typeof parsed.pid === "number" ? parsed.pid : null,
+      run_id: typeof parsed.run_id === "string" ? parsed.run_id : null,
+      ts: typeof parsed.ts === "string" ? parsed.ts : null,
+      nonce: typeof parsed.nonce === "string" ? parsed.nonce : null,
+      mode: parsed.mode === "shared" || parsed.mode === "exclusive" ? parsed.mode : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
 
-  for (let attempt = 0; attempt < 2; attempt += 1) {
+function isLive(path: string, record: OwnerRecord | null): boolean {
+  if (record && record.pid !== null) return processExists(record.pid);
+  try {
+    return Date.now() - statSync(path).mtimeMs <= UNPARSABLE_STALE_MS;
+  } catch {
+    return false;
+  }
+}
+
+function ownersDir(path: string): string {
+  return `${path}.owners`;
+}
+
+// Publish `record` at `dest` complete or not at all: write a private temp
+// file, then rename it onto a name nobody else uses.
+function publish(dest: string, record: OwnerRecord): void {
+  const tmp = `${dest}.tmp`;
+  writeFileSync(tmp, `${JSON.stringify(record)}\n`, { encoding: "utf8", mode: 0o600 });
+  renameSync(tmp, dest);
+}
+
+interface Holder {
+  mode: LockMode;
+  record: OwnerRecord | null;
+}
+
+// Live holders other than `self`; dead owner records are removed on sight.
+function liveHolders(path: string, self: string | null): Holder[] {
+  const dir = ownersDir(path);
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    names = [];
+  }
+  const holders: Holder[] = [];
+  for (const name of names) {
+    const match = /^(shared|exclusive)-[0-9a-f]+\.json$/.exec(name);
+    if (!match || name === self) continue;
+    const entry = `${dir}/${name}`;
+    const record = readRecord(entry);
+    if (isLive(entry, record)) holders.push({ mode: match[1] as LockMode, record });
+    else rmSync(entry, { force: true });
+  }
+  // A live pre-hardening pidfile is an exclusive holder; never deleted here.
+  const legacy = readRecord(path);
+  let legacyExists = legacy !== null;
+  if (!legacyExists) {
     try {
-      const fd = openSync(path, "wx", 0o600);
-      writeFileSync(
-        fd,
-        `${JSON.stringify({ pid, run_id: runId ?? null, ts: new Date().toISOString() })}\n`,
-        "utf8",
-      );
-      closeSync(fd);
-      let released = false;
-      return {
-        path,
-        pid,
-        release() {
-          if (released) return;
-          released = true;
-          try {
-            const holder = readPid(path);
-            if (holder === pid || holder === null) rmSync(path, { force: true });
-          } catch {
-            // Best effort cleanup only.
-          }
-        },
-      };
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code !== "EEXIST") throw error;
-      const holder = readPidfile(path);
-      const holderPid = holder.pid;
-      if (holderPid === null || !processExists(holderPid)) {
-        rmSync(path, { force: true });
-        continue;
-      }
-      throw new LockHeldError(path, holderPid, holder.run_id);
+      statSync(path);
+      legacyExists = true;
+    } catch {
+      // No legacy pidfile.
     }
   }
+  if (legacyExists && legacy?.nonce !== nonceOf(self) && isLive(path, legacy)) holders.push({ mode: "exclusive", record: legacy });
+  return holders;
+}
 
-  if (existsSync(path)) {
-    const holder = readPidfile(path);
-    throw new LockHeldError(path, holder.pid, holder.run_id);
+function nonceOf(name: string | null): string | null {
+  return name ? name.replace(/^(shared|exclusive)-/, "").replace(/\.json$/, "") : null;
+}
+
+// Test seam for deterministic interleavings: called after this contender's
+// record is published and before it looks at the others.
+export const lockTestHooks: { afterAnnounce?: (path: string, mode: LockMode) => void } = {};
+
+export function acquireLock(path: string, mode: LockMode, runId?: string, pid = process.pid): PidfileLock {
+  const dir = ownersDir(path);
+  mkdirSync(dir, { recursive: true });
+  const nonce = randomHex(8);
+  const record: OwnerRecord = { pid, run_id: runId ?? null, ts: new Date().toISOString(), nonce, mode };
+  const name = `${mode}-${nonce}.json`;
+  const own = `${dir}/${name}`;
+  publish(own, record);
+  // Exclusive holders also announce themselves to pre-hardening orch via the
+  // legacy pidfile (atomic create-if-absent). An existing file is left alone:
+  // live -> the check below backs off; dead -> ignored, never deleted.
+  let legacyMarker = false;
+  if (mode === "exclusive") {
+    const tmp = `${dir}/legacy-${nonce}.tmp`;
+    writeFileSync(tmp, `${JSON.stringify(record)}\n`, { encoding: "utf8", mode: 0o600 });
+    try {
+      linkSync(tmp, path);
+      legacyMarker = true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+        rmSync(own, { force: true });
+        throw error;
+      }
+    } finally {
+      rmSync(tmp, { force: true });
+    }
   }
-  throw new Error(`failed to acquire lock: ${path}`);
+  lockTestHooks.afterAnnounce?.(path, mode);
+
+  const releaseOwn = (): void => {
+    rmSync(own, { force: true });
+    // Nobody else deletes a live parseable legacy record, so if it still
+    // carries my nonce it is still mine.
+    if (legacyMarker && readRecord(path)?.nonce === nonce) rmSync(path, { force: true });
+  };
+  const conflicts = liveHolders(path, name).filter((holder) => mode === "exclusive" || holder.mode === "exclusive");
+  if (conflicts.length > 0) {
+    releaseOwn();
+    const first = conflicts[0]!;
+    const detail =
+      first.mode === "exclusive" ? (mode === "shared" ? "worktree write lock held" : "lock held") : `worktree read lock held (${conflicts.length} reader${conflicts.length > 1 ? "s" : ""})`;
+    throw new LockHeldError(path, first.record?.pid ?? null, first.record?.run_id ?? null, detail);
+  }
+  let released = false;
+  return {
+    path: own,
+    pid,
+    release() {
+      if (released) return;
+      released = true;
+      releaseOwn();
+    },
+  };
+}
+
+export function acquirePidfileLock(path: string, pid = process.pid, runId?: string): PidfileLock {
+  mkdirSync(dirname(path), { recursive: true });
+  return acquireLock(path, "exclusive", runId, pid);
 }
 
 // Bounded-wait variant for locks that guard short critical sections (mr lock,
 // mail route/fanout locks): a live contender is expected to release within
-// milliseconds, so waiting briefly beats failing the whole command.
+// milliseconds, so waiting briefly beats failing the whole command. The
+// jitter breaks the symmetric case where two contenders keep backing off.
 export async function acquirePidfileLockWait(
   path: string,
   waitMs: number,
@@ -121,7 +231,13 @@ export async function acquirePidfileLockWait(
       return acquirePidfileLock(path, pid, runId);
     } catch (error) {
       if (!(error instanceof LockHeldError) || Date.now() >= deadline) throw error;
-      await new Promise((resolve) => setTimeout(resolve, 25));
+      await new Promise((resolve) => setTimeout(resolve, 10 + Math.floor(Math.random() * 40)));
     }
   }
+}
+
+// Worktree reader/writer lock: reviewers share, implementer/verifier exclude.
+export function acquireWorktreeLock(path: string, mode: WorktreeLockMode, runId?: string, pid = process.pid): PidfileLock {
+  mkdirSync(dirname(path), { recursive: true });
+  return acquireLock(path, mode, runId, pid);
 }

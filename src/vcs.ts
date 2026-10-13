@@ -1,5 +1,7 @@
 import { $ } from "bun";
-import { realpathSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { lstatSync, readFileSync, readlinkSync, realpathSync } from "node:fs";
+import type { VcsSnapshot } from "./types.ts";
 
 // jj-first local VCS seam. A worktree managed by Jujutsu answers every local
 // VCS question through jj — including colocated repos, where plain git
@@ -126,4 +128,67 @@ export async function vcsRemoteOriginUrl(repoRoot: string): Promise<string> {
     return "";
   }
   return (await $`git -C ${repoRoot} remote get-url origin`.quiet().text()).trim();
+}
+
+// Host-captured identity of what a checkout currently contains: HEAD plus,
+// when dirty, a hash of the uncommitted diff and untracked file bytes. Throws
+// when the worktree cannot be queried — callers must fail closed, never treat
+// a failed query as "unchanged".
+export async function vcsSnapshot(worktree: string): Promise<VcsSnapshot> {
+  if (vcsKind(worktree) === "jj") {
+    const root = jjWorkspaceRoot(worktree) ?? worktree;
+    // jj snapshots on-disk edits into @ first, so @'s commit id already binds
+    // content. An empty @ on top of a single parent is that parent's tree:
+    // report the parent so `jj new` churn does not look like a new candidate.
+    const template = 'commit_id ++ " " ++ if(empty, "empty", "changed") ++ " " ++ parents.map(|c| c.commit_id()).join(",")';
+    const out = (await $`jj log -r @ --no-graph -T ${template}`.cwd(root).quiet().text()).trim();
+    const [id, state, parentList] = out.split(" ");
+    if (!id || (state !== "empty" && state !== "changed")) throw new Error(`unexpected jj log output: ${out}`);
+    const parents = (parentList ?? "").split(",").filter(Boolean);
+    if (state === "empty" && parents.length === 1) return { vcs: "jj", head: parents[0]!, dirty: false, content_sha: parents[0]! };
+    return { vcs: "jj", head: id, dirty: state === "changed", content_sha: state === "changed" ? `jj:${id}` : id };
+  }
+  const head = (await $`git -C ${worktree} rev-parse --verify HEAD`.quiet().text()).trim();
+  const status = Buffer.from(await $`git -C ${worktree} status --porcelain=v1 -z --untracked-files=all`.quiet().arrayBuffer());
+  if (status.length === 0) return { vcs: "git", head, dirty: false, content_sha: head };
+  const root = (await $`git -C ${worktree} rev-parse --show-toplevel`.quiet().text()).trim();
+  const hash = createHash("sha256");
+  hash.update(`git\0${head}\0`);
+  hash.update(status);
+  hash.update(Buffer.from(await $`git -C ${worktree} diff --binary --no-ext-diff --no-textconv HEAD`.quiet().arrayBuffer()));
+  const entries = status.toString("utf8").split("\0");
+  for (let i = 0; i < entries.length; i += 1) {
+    const entry = entries[i]!;
+    // Renames/copies carry their source path as the next NUL field.
+    if (entry.startsWith("R") || entry.startsWith("C")) i += 1;
+    if (!entry.startsWith("?? ")) continue;
+    const path = `${root}/${entry.slice(3)}`;
+    const stat = lstatSync(path);
+    hash.update(`\0${entry.slice(3)}\0`);
+    if (stat.isSymbolicLink()) hash.update(`link:${readlinkSync(path)}`);
+    else if (stat.isFile()) hash.update(readFileSync(path));
+  }
+  return { vcs: "git", head, dirty: true, content_sha: `sha256:${hash.digest("hex")}` };
+}
+
+// Resolve a user-supplied revision (`--head`) to a full commit id; throws when
+// it names nothing.
+export async function vcsResolveCommit(worktree: string, rev: string): Promise<string> {
+  if (vcsKind(worktree) === "jj") {
+    const root = jjWorkspaceRoot(worktree) ?? worktree;
+    const out = (await $`jj log -r ${rev} --no-graph --ignore-working-copy -T ${'commit_id ++ "\\n"'}`.cwd(root).quiet().text()).trim();
+    const ids = out.split("\n").filter(Boolean);
+    if (ids.length !== 1) throw new Error(`revision ${rev} resolves to ${ids.length} commits`);
+    return ids[0]!;
+  }
+  return (await $`git -C ${worktree} rev-parse --verify --quiet ${`${rev}^{commit}`}`.quiet().text()).trim();
+}
+
+export function sameSnapshot(a: VcsSnapshot | null | undefined, b: VcsSnapshot | null | undefined): boolean {
+  return Boolean(a && b && a.vcs === b.vcs && a.head === b.head && a.content_sha === b.content_sha);
+}
+
+export function describeSnapshot(snapshot: VcsSnapshot | null | undefined): string {
+  if (!snapshot) return "none";
+  return `${snapshot.head.slice(0, 12)}${snapshot.dirty ? `+dirty(${snapshot.content_sha.replace(/^(sha256|jj):/, "").slice(0, 12)})` : ""}`;
 }

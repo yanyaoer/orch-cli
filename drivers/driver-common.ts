@@ -70,8 +70,14 @@ export function buildPrompt(spec: RunSpec, provider: string): string {
     ...(role === "implementer"
       ? [
           // Repeated full builds inside implement loops dominated real run wall
-          // time on large repos; exhaustive verification is the verifier's job.
-          "Verification discipline: finish ALL edits first, then verify ONCE with checks scoped to the code you changed (one targeted build/test command). If that fails, fix and re-run the same scoped check. Never run repo-wide or full-module test suites — that exhaustive pass belongs to a separate verifier run.",
+          // time on large repos — but an unconditional ban left gaps whenever
+          // no verifier run followed, so required checks are always allowed.
+          "Verification discipline: finish ALL edits first, then run the checks this change needs: targeted tests for the code you changed, plus any broader suite or build the task explicitly requires. Do not loop full builds inside edit cycles. A necessary check you could not run is reported as skipped, never as passed.",
+        ]
+      : []),
+    ...(role === "implementer" || role === "verifier"
+      ? [
+          `Command evidence: every ${role === "verifier" ? "commands" : "tests"} entry carries "status": "passed" | "failed" | "skipped". A check that did not run is "skipped" with "exit_code": null — never exit_code 0. For a negative test whose expected outcome is a non-zero exit, set "expected_exit_code" to that code; "passed" then means exit_code equals it. A success verdict must not contain a failed check or an unmet acceptance item (acceptance status: met | unmet | skipped).${role === "verifier" ? ' A verifier "pass" also needs at least one command that actually ran and passed, and may skip a command or acceptance item only when it is marked "optional": true.' : ""} orch checks this JSON for consistency but does not re-run your commands: list only commands you actually ran.`,
         ]
       : []),
     ...(spec.language === "中文"
@@ -899,7 +905,7 @@ export async function maybeWriteFakeResult(runDir: string, spec: RunSpec, provid
             run_id: spec.run_id,
             verdict: "pass",
             verifies_run_id: spec.run_id,
-            commands: [],
+            commands: [{ cmd: `fake ${provider} check`, exit_code: 0, status: "passed", summary: "fake check passed" }],
             acceptance: [],
           }
       : spec.role === "researcher"

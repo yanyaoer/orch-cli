@@ -1,13 +1,13 @@
 // orch run create|list|reap|cancel: provider session config, resume chains, sandbox compatibility, spawning the detached supervisor.
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { isRunRole, writeRoles, type AgentName, type ProviderSessionMode, type RunRole, type RunSpec, type RunStatus } from "../types.ts";
+import { evidenceRoles, isRunRole, writeRoles, type AgentName, type ProviderSessionMode, type RunRole, type RunSpec, type RunStatus, type VcsSnapshot } from "../types.ts";
 import { acquirePidfileLockWait } from "../locks.ts";
 import { sha256 } from "../hash.ts";
 import { ensureStateLayout, getRepoIdentity, lockPathForWorktree, mrStateDir, type RepoIdentity } from "../paths.ts";
 import { appendJsonLine, countLines, jsonBytes, readJsonFile, writeJsonAtomic, writeTextAtomic } from "../json.ts";
 import { writeInitialRunFiles } from "../supervisor.ts";
-import { vcsDirty, vcsHead } from "../vcs.ts";
+import { describeSnapshot, vcsDirty, vcsHead, vcsResolveCommit, vcsSnapshot } from "../vcs.ts";
 import { isTerminal } from "../overview.ts";
 import { orchLanguage, readOrchConfig, type RoleDefaults } from "../config.ts";
 
@@ -157,6 +157,88 @@ function assertSandboxCompatible(existing: IdempotencyRecord, engine: typeof SEA
   );
 }
 
+// Default and explicit idempotency keys alike must never hand back a run that
+// was bound to another worktree snapshot: the HEAD must match for every
+// snapshot-bound role, and reviewer/verifier also need identical content.
+// Legacy runs carry no snapshot and are therefore never reusable here.
+function assertSnapshotCompatible(existing: IdempotencyRecord, snapshot: VcsSnapshot, pinnedHead: string | null, role: RunRole): void {
+  if (role !== "implementer" && !evidenceRoles.has(role)) return;
+  const spec = readJsonFile<Partial<RunSpec> | null>(`${existing.run_dir}/spec.json`, null);
+  const stored = spec?.snapshot ?? null;
+  const storedPin = spec?.pinned_head ?? null;
+  const problem =
+    storedPin !== pinnedHead
+      ? `existing run pinned head ${storedPin ?? "none"}, requested ${pinnedHead ?? "none"}`
+      : stored === null
+        ? "existing run has no recorded worktree snapshot (created before snapshot binding)"
+        : stored.head !== snapshot.head || (evidenceRoles.has(role) && stored.content_sha !== snapshot.content_sha)
+          ? `existing run is bound to ${describeSnapshot(stored)}, worktree is now ${describeSnapshot(snapshot)}`
+          : null;
+  if (problem) {
+    throw new CliError(
+      ["idempotent run already exists for a different worktree snapshot", problem, "Pass --retry to create a new run for the current snapshot."].join("\n"),
+    );
+  }
+}
+
+async function captureCreateSnapshot(worktree: string): Promise<VcsSnapshot> {
+  try {
+    return await vcsSnapshot(worktree);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message.split("\n")[0] : String(error);
+    throw new CliError(`cannot capture worktree snapshot for ${worktree} (orch needs a git or jj checkout): ${detail}`);
+  }
+}
+
+// --head <rev>: pin the commit this run is about. The checkout must be at it
+// now (the supervisor re-checks after taking the lock); reviewer/verifier on a
+// pinned head also need a clean checkout, or they would review more than it.
+async function resolvePinnedHead(worktree: string, rev: string, snapshot: VcsSnapshot, role: RunRole): Promise<string> {
+  let head: string;
+  try {
+    head = await vcsResolveCommit(worktree, rev);
+  } catch {
+    head = "";
+  }
+  if (!head) throw new CliError(`--head ${rev} does not name a commit in ${worktree}`);
+  if (snapshot.head !== head) {
+    throw new CliError(
+      `--head ${rev} is ${head.slice(0, 12)} but the worktree is at ${describeSnapshot(snapshot)}; check out the pinned commit (a separate checkout keeps parallel work isolated)`,
+    );
+  }
+  if (evidenceRoles.has(role) && snapshot.dirty) {
+    throw new CliError(`--head pins ${head.slice(0, 12)} but the worktree has uncommitted changes; a ${role} on a pinned head needs a clean checkout`);
+  }
+  return head;
+}
+
+// Runs this one replaces. Explicit --supersedes ids must be existing runs of
+// the same role in this MR; --resume-from of a same-role run implies it.
+function resolveSupersedes(args: ParsedArgs, mrDir: string, mr: string, role: RunRole, resume: { run_id: string; mr: string; role: RunRole } | null): string[] {
+  const ids = new Set<string>();
+  if (args.flags.has("supersedes")) {
+    for (const id of flagString(args, "supersedes").split(",").map((item) => item.trim()).filter(Boolean)) ids.add(id);
+    if (ids.size === 0) throw new CliError("--supersedes needs at least one run id");
+  }
+  for (const id of ids) {
+    const spec = readJsonFile<Partial<RunSpec> | null>(`${mrDir}/runs/${id}/spec.json`, null);
+    const status = readJsonFile<Partial<RunStatus> | null>(`${mrDir}/runs/${id}/status.json`, null);
+    const storedRole = spec?.role ?? status?.role;
+    if (!storedRole) throw new CliError(`--supersedes ${id}: no such run under MR ${mr}`);
+    if (storedRole !== role) throw new CliError(`--supersedes ${id}: it is a ${storedRole} run; a ${role} run can only supersede ${role} runs`);
+  }
+  if (resume && resume.role === role && resume.mr === mr) ids.add(resume.run_id);
+  return [...ids];
+}
+
+// --retry replaces the run this key pointed at: record it as superseded when
+// it is the same role, so its evidence leaves the aggregate.
+function withRetrySupersede(supersedes: string[], existing: IdempotencyRecord | undefined, role: RunRole): string[] {
+  if (!existing || supersedes.includes(existing.run_id)) return supersedes;
+  const storedRole = readJsonFile<Partial<RunSpec> | null>(`${existing.run_dir}/spec.json`, null)?.role;
+  return storedRole === role ? [...supersedes, existing.run_id] : supersedes;
+}
+
 const VALID_AGENTS: readonly AgentName[] = ["codex", "claude", "pi", "omp"];
 
 function validateRunAgent(agent: AgentName, _role: RunRole): void {
@@ -186,6 +268,8 @@ const RUN_CREATE_FLAGS = [
   "session-name",
   "session-id",
   "allow-session-chain",
+  "head",
+  "supersedes",
   "dry-run",
   "json",
 ] as const;
@@ -368,9 +452,16 @@ export async function createRun(args: ParsedArgs): Promise<number> {
   const repo = await getRepoIdentity(worktree);
   const mrDir = mrStateDir(repo.repo_key, mr);
   const taskSha = sha256(taskText);
+  // Captured by orch, never taken from a model: what this run is about.
+  const snapshot = await captureCreateSnapshot(worktree);
+  const pinnedHead = args.flags.has("head") ? await resolvePinnedHead(worktree, flagString(args, "head"), snapshot, role) : null;
+  const supersedes = resolveSupersedes(args, mrDir, mr, role, resume);
   // The engine version is part of the default fingerprint so sandboxed and
-  // unsandboxed requests can never reuse each other's runs.
-  const defaultIdempotencyKey = `mr${mr}:${tag}:${taskSha}:session-${providerSessionFingerprint(providerSession)}${sandboxIdentity.keySuffix}`;
+  // unsandboxed requests can never reuse each other's runs; the actual HEAD
+  // (plus content for reviewer/verifier on a dirty checkout) is too, so the
+  // same request against a new candidate is a new run.
+  const contentKey = evidenceRoles.has(role) && snapshot.dirty ? `:content-${sha256(snapshot.content_sha).slice(0, 12)}` : "";
+  const defaultIdempotencyKey = `mr${mr}:${tag}:${taskSha}:session-${providerSessionFingerprint(providerSession)}:head-${snapshot.head}${contentKey}${sandboxIdentity.keySuffix}`;
   const idempotencyKey = flagString(args, "idempotency-key", defaultIdempotencyKey);
   const idempotencyPath = `${mrDir}/idempotency.json`;
   const dryRun = flagBool(args, "dry-run");
@@ -381,6 +472,7 @@ export async function createRun(args: ParsedArgs): Promise<number> {
     const existing = readIdempotency(idempotencyPath)[idempotencyKey];
     const existingSession = existing && !retry ? assertProviderSessionCompatible(existing, providerSession, agent) : null;
     if (existing && !retry) assertSandboxCompatible(existing, sandboxEngine, role);
+    if (existing && !retry) assertSnapshotCompatible(existing, snapshot, pinnedHead, role);
     const effectiveSession = existingSession ?? providerSession;
     const idempotent = Boolean(existing && !retry);
     // Same guard as the real create; an idempotent hit reuses an existing run
@@ -388,6 +480,7 @@ export async function createRun(args: ParsedArgs): Promise<number> {
     if (!idempotent) assertSessionChainAllowed(mrDir, effectiveSession, tag, flagBool(args, "allow-session-chain"));
     const id = idempotent ? existing!.run_id : runId(tag);
     const runDir = idempotent ? existing!.run_dir : `${mrDir}/runs/${id}`;
+    const plannedSupersedes = retry ? withRetrySupersede(supersedes, existing, role) : supersedes;
     const specPath = `${runDir}/spec.json`;
     const specPreview: RunSpec = {
       version: 1,
@@ -408,6 +501,9 @@ export async function createRun(args: ParsedArgs): Promise<number> {
       base_sha: baseSha,
       timeout_sec: timeoutSec,
       created_at: new Date().toISOString(),
+      snapshot,
+      ...(pinnedHead ? { pinned_head: pinnedHead } : {}),
+      ...(plannedSupersedes.length > 0 ? { supersedes: plannedSupersedes } : {}),
     };
     const payload = {
       dry_run: true,
@@ -438,6 +534,9 @@ export async function createRun(args: ParsedArgs): Promise<number> {
       worktree_lock: lockPathForWorktree(worktree),
       dirty: dirty.length > 0,
       base_sha: baseSha,
+      snapshot,
+      pinned_head: pinnedHead,
+      supersedes: plannedSupersedes,
       timeout_sec: timeoutSec,
       supervisor_plan: idempotent
         ? null
@@ -489,6 +588,9 @@ export async function createRun(args: ParsedArgs): Promise<number> {
         `worktree_lock: ${payload.worktree_lock}`,
         `dirty: ${payload.dirty}`,
         `base_sha: ${baseSha}`,
+        `snapshot: ${describeSnapshot(snapshot)}`,
+        `pinned_head: ${pinnedHead ?? "none"}`,
+        `supersedes: ${plannedSupersedes.length > 0 ? plannedSupersedes.join(",") : "none"}`,
         `timeout_sec: ${timeoutSec}`,
       ];
       if (payload.supervisor_plan) lines.push(`supervisor: ${payload.supervisor_plan.argv.join(" ")}`);
@@ -529,6 +631,9 @@ export async function createRun(args: ParsedArgs): Promise<number> {
       idempotencyPath,
       sandboxEngine,
       sandboxWriteDirs,
+      snapshot,
+      pinnedHead,
+      supersedes,
     })),
   });
   return 0;
@@ -555,13 +660,16 @@ interface StartRunInput {
   // built from an earlier config read (F6).
   sandboxEngine: typeof SEATBELT_ENGINE | null;
   sandboxWriteDirs: string[];
+  snapshot: VcsSnapshot;
+  pinnedHead: string | null;
+  supersedes: string[];
 }
 
 // Spawns a single supervised run and returns its create payload. Shared by
 // `run create` and the fan-out commands (cross-review / fanout / investigate).
 async function startRun(input: StartRunInput): Promise<Record<string, unknown>> {
   const { args, mr, role, agent, tag, worktree, taskPath, taskText, taskSha, timeoutSec } = input;
-  const { providerSession, repo, mrDir, idempotencyKey, idempotencyPath, sandboxEngine, sandboxWriteDirs } = input;
+  const { providerSession, repo, mrDir, idempotencyKey, idempotencyPath, sandboxEngine, sandboxWriteDirs, snapshot, pinnedHead } = input;
   const sandboxIdentity = sandboxRunIdentity(sandboxEngine, sandboxWriteDirs);
 
   try {
@@ -579,6 +687,7 @@ async function startRun(input: StartRunInput): Promise<Record<string, unknown>> 
     if (existing && !flagBool(args, "retry")) {
       const existingSession = assertProviderSessionCompatible(existing, providerSession, agent);
       assertSandboxCompatible(existing, sandboxEngine, role);
+      assertSnapshotCompatible(existing, snapshot, pinnedHead, role);
       const existingState = statusState(existing);
       if (existingState === "failed" || existingState === "timeout") {
         process.stderr.write(
@@ -607,6 +716,7 @@ async function startRun(input: StartRunInput): Promise<Record<string, unknown>> 
       );
     }
     const baseSha = await vcsHead(worktree);
+    const supersedes = withRetrySupersede(input.supersedes, existing, role);
     const id = runId(tag);
     const runDir = `${mrDir}/runs/${id}`;
     mkdirSync(runDir, { recursive: true });
@@ -630,6 +740,9 @@ async function startRun(input: StartRunInput): Promise<Record<string, unknown>> 
       base_sha: baseSha,
       timeout_sec: timeoutSec,
       created_at: createdAt,
+      snapshot,
+      ...(pinnedHead ? { pinned_head: pinnedHead } : {}),
+      ...(supersedes.length > 0 ? { supersedes } : {}),
     };
     const specBytes = jsonBytes(spec);
     writeTextAtomic(`${runDir}/spec.json`, specBytes);

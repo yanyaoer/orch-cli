@@ -1568,6 +1568,10 @@ test("verifier acceptance evidence reaches the mirrored decision comment", async
   const remote = "git@github.com:example/repo.git";
   await runCmd(["git", "init"], worktree);
   await runCmd(["git", "remote", "add", "origin", remote], worktree);
+  await runCmd(["git", "-c", "user.email=t@example.com", "-c", "user.name=T", "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", "init"], worktree);
+  const head = Bun.spawnSync(["git", "-C", worktree, "rev-parse", "HEAD"]).stdout.toString().trim();
+  // Accept requires the verifier's host-captured snapshot to be the candidate.
+  const snapshot = { vcs: "git" as const, head, dirty: false, content_sha: head };
 
   const repoKey = repoKeyFromRemote(remote, worktree);
   const mr = "321";
@@ -1598,13 +1602,15 @@ test("verifier acceptance evidence reaches the mirrored decision comment", async
     worktree,
     base_sha: "base",
     head_sha: "head",
+    start_snapshot: snapshot,
+    end_snapshot: snapshot,
   };
   const result: VerifierResult = {
     schema: "orch.result/verifier/v1",
     run_id: runId,
     verdict: "pass",
     verifies_run_id: "impl-a",
-    commands: [],
+    commands: [{ cmd: "rg -n scheme McpServerKey.kt", exit_code: 0, summary: "digest ignores scheme" }],
     acceptance: [{ id: "f1", status: "CONFIRMED", evidence: "McpServerKey.kt:16-22 digest ignores scheme and port" }],
   };
   writeFileSync(join(runDir, "status.json"), `${JSON.stringify(status, null, 2)}\n`, "utf8");

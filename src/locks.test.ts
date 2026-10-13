@@ -1,0 +1,226 @@
+import { afterEach, expect, test } from "bun:test";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { acquirePidfileLock, acquireWorktreeLock, LockHeldError, lockTestHooks } from "./locks.ts";
+import { lockPathForWorktree } from "./paths.ts";
+
+const cleanups: Array<() => void> = [];
+afterEach(() => {
+  for (const cleanup of cleanups.splice(0)) cleanup();
+});
+
+function tempDir(prefix: string): string {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), prefix)));
+  cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+  return dir;
+}
+
+const DEAD_PID = 999_999_999;
+const locksModule = resolve(import.meta.dir, "locks.ts");
+
+// A separate OS process contending for the lock: waits until `startAt`, tries
+// once, prints ok/held, holds a granted lock for `holdMs`, then releases.
+function childScript(dir: string): string {
+  const path = join(dir, "lock-child.ts");
+  writeFileSync(
+    path,
+    `import { acquireWorktreeLock } from ${JSON.stringify(locksModule)};
+const [lockPath, mode, holdMs, startAt] = process.argv.slice(2);
+while (Date.now() < Number(startAt)) await Bun.sleep(1);
+try {
+  const lock = acquireWorktreeLock(lockPath, mode, "child-" + process.pid);
+  console.log("ok");
+  await Bun.sleep(Number(holdMs));
+  lock.release();
+} catch (error) {
+  console.log(error instanceof Error && error.name === "Error" && /lock held/.test(error.message) ? "held" : "error " + String(error));
+}
+`,
+    "utf8",
+  );
+  return path;
+}
+
+function spawnChild(script: string, lockPath: string, mode: "shared" | "exclusive", holdMs: number, startAt: number) {
+  return Bun.spawn([process.execPath, script, lockPath, mode, String(holdMs), String(startAt)], { stdout: "pipe", stderr: "pipe" });
+}
+
+async function firstLine(stream: ReadableStream<Uint8Array>): Promise<string> {
+  const reader = stream.getReader();
+  let text = "";
+  while (!text.includes("\n")) {
+    const chunk = await reader.read();
+    if (chunk.done) break;
+    text += new TextDecoder().decode(chunk.value);
+  }
+  reader.releaseLock();
+  return text.split("\n")[0]!.trim();
+}
+
+test("readers share a checkout across processes; a writer excludes and is excluded", async () => {
+  const dir = tempDir("orch-locks-");
+  const lockPath = join(dir, "wt.lock");
+  const script = childScript(dir);
+
+  // Another process holds a read lock.
+  const reader = spawnChild(script, lockPath, "shared", 1_500, 0);
+  expect(await firstLine(reader.stdout)).toBe("ok");
+  const mine = acquireWorktreeLock(lockPath, "shared", "reader-2");
+  expect(() => acquireWorktreeLock(lockPath, "exclusive", "writer")).toThrow(LockHeldError);
+  mine.release();
+  expect(() => acquireWorktreeLock(lockPath, "exclusive", "writer")).toThrow(/read lock held/);
+  await reader.exited;
+  // Reader gone: the writer gets in, and then nobody else does.
+  const writer = acquireWorktreeLock(lockPath, "exclusive", "writer");
+  const blocked = spawnChild(script, lockPath, "shared", 0, 0);
+  expect(await firstLine(blocked.stdout)).toBe("held");
+  await blocked.exited;
+  expect(() => acquireWorktreeLock(lockPath, "shared", "reader-3")).toThrow(/write lock held/);
+  expect(() => acquireWorktreeLock(lockPath, "exclusive", "writer-2")).toThrow(LockHeldError);
+  writer.release();
+  expect(existsSync(lockPath)).toBe(false);
+  acquireWorktreeLock(lockPath, "shared", "reader-4").release();
+});
+
+test("racing processes never run a writer alongside anyone", async () => {
+  const dir = tempDir("orch-locks-race-");
+  const script = childScript(dir);
+  for (let round = 0; round < 6; round += 1) {
+    const lockPath = join(dir, `race-${round}.lock`);
+    const startAt = Date.now() + 400;
+    const modes = ["exclusive", "shared", "shared", "exclusive", "shared"] as const;
+    const children = modes.map((mode) => spawnChild(script, lockPath, mode, 300, startAt));
+    const outcomes = await Promise.all(children.map(async (child) => (await new Response(child.stdout).text()).trim()));
+    for (const outcome of outcomes) expect(["ok", "held"]).toContain(outcome);
+    const writersOk = outcomes.filter((outcome, index) => outcome === "ok" && modes[index] === "exclusive").length;
+    const readersOk = outcomes.filter((outcome, index) => outcome === "ok" && modes[index] === "shared").length;
+    expect(writersOk).toBeLessThanOrEqual(1);
+    if (writersOk === 1) expect(readersOk).toBe(0);
+    // Everything released cleanly.
+    expect(existsSync(lockPath)).toBe(false);
+    expect(readdirSync(`${lockPath}.owners`)).toEqual([]);
+  }
+});
+
+test("dead owners are ignored and cleaned without touching live ones; release removes only its own record", () => {
+  const dir = tempDir("orch-locks-stale-");
+  const lockPath = join(dir, "wt.lock");
+  const owners = `${lockPath}.owners`;
+  mkdirSync(owners, { recursive: true });
+  // Dead reader and dead writer records (crashed supervisors).
+  writeFileSync(`${owners}/shared-dead01.json`, JSON.stringify({ pid: DEAD_PID, run_id: "gone-r", ts: "t", nonce: "dead01" }));
+  writeFileSync(`${owners}/exclusive-dead02.json`, JSON.stringify({ pid: DEAD_PID, run_id: "gone-w", ts: "t", nonce: "dead02" }));
+  const writer = acquireWorktreeLock(lockPath, "exclusive", "w");
+  expect(readdirSync(owners).filter((name) => name.includes("dead"))).toEqual([]);
+  writer.release();
+  expect(readdirSync(owners)).toEqual([]);
+
+  // Two holders in one process: releasing one leaves the other's record.
+  const a = acquireWorktreeLock(lockPath, "shared", "a");
+  const b = acquireWorktreeLock(lockPath, "shared", "b");
+  a.release();
+  a.release();
+  expect(readdirSync(owners)).toHaveLength(1);
+  expect(() => acquireWorktreeLock(lockPath, "exclusive", "w")).toThrow(/read lock held/);
+  b.release();
+  acquireWorktreeLock(lockPath, "exclusive", "w").release();
+});
+
+test("deterministic interleavings: a contender acting between another's announce and check never yields two owners", () => {
+  const dir = tempDir("orch-locks-interleave-");
+  const cases: Array<{ first: "shared" | "exclusive"; second: "shared" | "exclusive"; dead: boolean }> = [
+    { first: "exclusive", second: "exclusive", dead: false },
+    { first: "exclusive", second: "exclusive", dead: true },
+    { first: "exclusive", second: "shared", dead: false },
+    { first: "shared", second: "exclusive", dead: true },
+  ];
+  cases.forEach((c, index) => {
+    const lockPath = join(dir, `case-${index}.lock`);
+    if (c.dead) {
+      // The F2 setup: a stale record from a dead owner is already there.
+      mkdirSync(`${lockPath}.owners`, { recursive: true });
+      writeFileSync(`${lockPath}.owners/exclusive-dead.json`, JSON.stringify({ pid: DEAD_PID, run_id: "dead", ts: "t", nonce: "dead" }));
+      writeFileSync(lockPath, JSON.stringify({ pid: DEAD_PID, run_id: "dead", ts: "t", nonce: "dead" }));
+    }
+    const handles: Array<{ release(): void }> = [];
+    let inner: string = "not-run";
+    lockTestHooks.afterAnnounce = () => {
+      lockTestHooks.afterAnnounce = undefined;
+      // The second contender runs its whole acquisition inside the first one's
+      // announce->check gap.
+      try {
+        handles.push(acquireWorktreeLock(lockPath, c.second, "second"));
+        inner = "ok";
+      } catch (error) {
+        inner = error instanceof LockHeldError ? "held" : String(error);
+      }
+    };
+    let outer: string;
+    try {
+      handles.push(acquireWorktreeLock(lockPath, c.first, "first"));
+      outer = "ok";
+    } catch (error) {
+      outer = error instanceof LockHeldError ? "held" : String(error);
+    } finally {
+      lockTestHooks.afterAnnounce = undefined;
+    }
+    // The second contender saw the first's announcement and backed off; the
+    // first then proceeds alone.
+    expect([outer, inner]).toEqual(["ok", "held"]);
+    expect(handles).toHaveLength(1);
+    for (const handle of handles) handle.release();
+  });
+});
+
+test("pre-hardening pidfiles: a live legacy writer excludes everyone; exclusive holders publish one for old writers", () => {
+  const dir = tempDir("orch-locks-legacy-");
+  const lockPath = join(dir, "wt.lock");
+  // <=0.0.13 wrote {pid, run_id, ts} without a nonce.
+  writeFileSync(lockPath, JSON.stringify({ pid: process.pid, run_id: "legacy", ts: "t" }));
+  expect(() => acquireWorktreeLock(lockPath, "shared", "r")).toThrow(/write lock held/);
+  expect(() => acquireWorktreeLock(lockPath, "exclusive", "w")).toThrow(LockHeldError);
+  // The live legacy file is never deleted by new code.
+  expect(existsSync(lockPath)).toBe(true);
+
+  // An empty file may be an old writer between create and write: held...
+  writeFileSync(lockPath, "");
+  expect(() => acquirePidfileLock(lockPath, process.pid, "w")).toThrow(LockHeldError);
+  // ...until it is old enough to be a crash leftover; then it is ignored but
+  // left in place (deleting it is the steal race), so no marker is published.
+  const old = new Date(Date.now() - 60_000);
+  utimesSync(lockPath, old, old);
+  acquirePidfileLock(lockPath, process.pid, "w").release();
+  expect(existsSync(lockPath)).toBe(true);
+  rmSync(lockPath);
+
+  // With no legacy file, an exclusive holder publishes one (old writers see a
+  // live pid and back off) and removes it on release.
+  const writer = acquirePidfileLock(lockPath, process.pid, "w");
+  expect(JSON.parse(readFileSync(lockPath, "utf8"))).toMatchObject({ pid: process.pid, run_id: "w" });
+  writer.release();
+  expect(existsSync(lockPath)).toBe(false);
+});
+
+test("worktree lock path is canonical: symlinks and subdirectories map to one checkout", () => {
+  const stateHome = tempDir("orch-locks-state-");
+  const prev = process.env.XDG_STATE_HOME;
+  process.env.XDG_STATE_HOME = stateHome;
+  cleanups.push(() => {
+    if (prev === undefined) delete process.env.XDG_STATE_HOME;
+    else process.env.XDG_STATE_HOME = prev;
+  });
+  const worktree = tempDir("orch-locks-wt-");
+  expect(Bun.spawnSync(["git", "init", "-q", worktree]).exitCode).toBe(0);
+  mkdirSync(join(worktree, "sub"));
+  const alias = join(tempDir("orch-locks-alias-"), "link");
+  symlinkSync(worktree, alias);
+  const canonical = lockPathForWorktree(worktree);
+  expect(lockPathForWorktree(alias)).toBe(canonical);
+  expect(lockPathForWorktree(join(worktree, "sub"))).toBe(canonical);
+  expect(lockPathForWorktree(`${alias}/sub`)).toBe(canonical);
+  // So a writer through one path blocks a reader through the other.
+  const writer = acquireWorktreeLock(lockPathForWorktree(alias), "exclusive", "w");
+  expect(() => acquireWorktreeLock(lockPathForWorktree(worktree), "shared", "r")).toThrow(LockHeldError);
+  writer.release();
+});

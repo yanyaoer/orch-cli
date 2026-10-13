@@ -1,15 +1,15 @@
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync, writeSync } from "node:fs";
 import { dirname } from "node:path";
-import type { OrchEvent, RunSpec, RunState, RunStatus } from "./types.ts";
-import { writeRoles } from "./types.ts";
-import { acquirePidfileLock, LockHeldError, type PidfileLock } from "./locks.ts";
+import type { OrchEvent, RunSpec, RunState, RunStatus, VcsSnapshot } from "./types.ts";
+import { evidenceRoles, sharedLockRoles, writeRoles } from "./types.ts";
+import { acquireWorktreeLock, LockHeldError, type PidfileLock } from "./locks.ts";
 import { countLines, appendJsonLine, readJsonFile, writeJsonAtomic } from "./json.ts";
 import { fallbackResult, validateRoleResult } from "./schema.ts";
 import { lockPathForWorktree } from "./paths.ts";
 import { providerResumeIdFromNativeText } from "./native-events.ts";
 import { buildWorkerEnv } from "../drivers/driver-common.ts";
 import { sandboxPosture } from "../drivers/sandbox.ts";
-import { jjWorkspaceRoot, vcsHead, vcsKind } from "./vcs.ts";
+import { describeSnapshot, jjWorkspaceRoot, sameSnapshot, vcsHead, vcsKind, vcsSnapshot } from "./vcs.ts";
 
 function now(): string {
   return new Date().toISOString();
@@ -122,6 +122,29 @@ async function worktreeHead(worktree: string): Promise<string | null> {
   }
 }
 
+async function captureSnapshot(worktree: string): Promise<{ snapshot: VcsSnapshot | null; error: string | null }> {
+  try {
+    return { snapshot: await vcsSnapshot(worktree), error: null };
+  } catch (error) {
+    return { snapshot: null, error: error instanceof Error ? error.message.split("\n")[0]! : String(error) };
+  }
+}
+
+// Pre-start gate for evidence roles, evaluated after the worktree lock is
+// held: the checkout must still be exactly what run create recorded (and the
+// pinned head, if any). Returns the reason to refuse, or null.
+function startDrift(spec: RunSpec, start: VcsSnapshot): string | null {
+  if (spec.pinned_head && start.head !== spec.pinned_head) {
+    return `pinned head ${spec.pinned_head.slice(0, 12)} but worktree is at ${describeSnapshot(start)}`;
+  }
+  if (spec.snapshot && !sameSnapshot(spec.snapshot, start)) {
+    return `worktree changed between run create (${describeSnapshot(spec.snapshot)}) and start (${describeSnapshot(start)})`;
+  }
+  return null;
+}
+
+class SnapshotError extends Error {}
+
 async function writeEvidence(runDir: string, spec: RunSpec): Promise<void> {
   try {
     const baseSha = typeof spec.base_sha === "string" ? spec.base_sha.trim() : "";
@@ -233,16 +256,29 @@ export async function runSupervisor(runDir: string, orchCommand: string[]): Prom
   let timeout: ReturnType<typeof setTimeout> | null = null;
   let heartbeat: ReturnType<typeof setInterval> | null = null;
   let pgid: number | null = null;
+  let startSnapshot: VcsSnapshot | null = null;
 
   try {
     const spec = JSON.parse(readFileSync(specPath, "utf8")) as RunSpec;
     loadedSpec = spec;
+    // implementer/verifier write the checkout (exclusive); reviewers only read
+    // it (shared, so parallel reviews of one pinned checkout are fine).
     if (writeRoles.has(spec.role)) {
-      worktreeLock = acquirePidfileLock(lockPathForWorktree(spec.worktree), process.pid, spec.run_id);
+      worktreeLock = acquireWorktreeLock(lockPathForWorktree(spec.worktree), "exclusive", spec.run_id);
+    } else if (sharedLockRoles.has(spec.role)) {
+      worktreeLock = acquireWorktreeLock(lockPathForWorktree(spec.worktree), "shared", spec.run_id);
+    }
+    // Every run records what it started on; reviewer/verifier refuse to start
+    // on anything but the snapshot run create bound them to.
+    const start = await captureSnapshot(spec.worktree);
+    startSnapshot = start.snapshot;
+    if (evidenceRoles.has(spec.role)) {
+      const problem = start.snapshot ? startDrift(spec, start.snapshot) : `cannot capture worktree snapshot before start: ${start.error}`;
+      if (problem) throw new SnapshotError(problem);
     }
 
     const startedAt = now();
-    updateStatus(runDir, spec, { state: "starting", started_at: startedAt });
+    updateStatus(runDir, spec, { state: "starting", started_at: startedAt, supervisor_pid: process.pid, start_snapshot: startSnapshot });
     appendEvent(runDir, {
       type: "starting",
       seq: nextSeq(runDir),
@@ -316,7 +352,18 @@ export async function runSupervisor(runDir: string, orchCommand: string[]): Prom
 
     ensureResult(runDir, spec, exitCode === 0 ? "driver did not produce result.json" : `driver exited ${exitCode}`);
     const resultErrors = validateResultFile(runDir, spec);
-    const finalState: RunState = timedOut ? "timeout" : exitCode === 0 && resultErrors.length === 0 ? "done" : "failed";
+    // Still under the worktree lock: an evidence run whose checkout moved
+    // while it ran (an outside edit, a commit) proved nothing about either
+    // snapshot, so it fails closed instead of reporting done.
+    const end = await captureSnapshot(spec.worktree);
+    const snapshotError = !evidenceRoles.has(spec.role)
+      ? null
+      : end.snapshot === null
+        ? `cannot capture worktree snapshot at end: ${end.error}`
+        : !sameSnapshot(startSnapshot, end.snapshot)
+          ? `worktree drifted during run: start ${describeSnapshot(startSnapshot)}, end ${describeSnapshot(end.snapshot)}`
+          : null;
+    const finalState: RunState = timedOut ? "timeout" : exitCode === 0 && resultErrors.length === 0 && !snapshotError ? "done" : "failed";
     if (resultErrors.length > 0) {
       writeFileSync(runDirFile(runDir, "schema.errors.log"), `${resultErrors.join("\n")}\n`, "utf8");
     }
@@ -325,12 +372,14 @@ export async function runSupervisor(runDir: string, orchCommand: string[]): Prom
       type: finalState === "done" ? "done" : finalState === "timeout" ? "timeout" : "failed",
       seq: nextSeq(runDir),
       ts: now(),
-      message: resultErrors.length ? resultErrors.join("; ") : undefined,
+      message: [...resultErrors, ...(snapshotError ? [snapshotError] : [])].join("; ") || undefined,
     });
 
     updateStatus(runDir, spec, {
       state: finalState,
       exit_code: exitCode,
+      end_snapshot: end.snapshot,
+      snapshot_error: snapshotError,
       last_event_seq: nextSeq(runDir) - 1,
       provider_resume_id: readProviderResumeId(runDir),
       head_sha: await worktreeHead(spec.worktree),
@@ -348,6 +397,8 @@ export async function runSupervisor(runDir: string, orchCommand: string[]): Prom
     updateStatus(runDir, spec, {
       state: "failed",
       exit_code: exitCode,
+      start_snapshot: startSnapshot,
+      ...(error instanceof SnapshotError ? { snapshot_error: message } : {}),
       last_event_seq: nextSeq(runDir) - 1,
       provider_resume_id: readProviderResumeId(runDir),
       head_sha: await worktreeHead(spec.worktree),

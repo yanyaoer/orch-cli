@@ -171,12 +171,21 @@ export function enqueueComment(mrDir: string, payload: OutboxCommentPayload): st
 
 export const nonTerminalStates = new Set<RunState>(["created", "starting", "running"]);
 
+// The process whose death makes a non-terminal run stale: the supervisor when
+// recorded (it outlives the provider while it finalizes evidence/result), else
+// the provider pid of a run written by an older supervisor.
+export function ownerPid(status: RunStatus): number | null {
+  if (typeof status.supervisor_pid === "number") return status.supervisor_pid;
+  return status.pid;
+}
+
 // The one stale rule (read-side, never writes; `orch run reap` persists it):
-// a non-terminal run whose recorded pid is gone, or that never got a pid and
+// a non-terminal run whose owning process is gone, or that never got one and
 // has not moved in an hour (orphaned before spawn).
 export function looksStale(status: RunStatus): boolean {
   if (!nonTerminalStates.has(status.state)) return false;
-  if (status.pid !== null) return !isPidAlive(status.pid);
+  const owner = ownerPid(status);
+  if (owner !== null) return !isPidAlive(owner);
   const ageMs = Date.now() - Date.parse(status.updated_at ?? "");
   return Number.isFinite(ageMs) && ageMs > 60 * 60 * 1000;
 }

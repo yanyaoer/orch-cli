@@ -2,6 +2,17 @@
 
 All notable user-facing changes are recorded here.
 
+## [Unreleased]
+
+### Changes
+
+- Evidence-bound adjudication. `orch verdict`, the bare overview, `orch wait`, `orch decision accept|sweep`, and `cross-review --auto` now share one rubric (`assessRun`): only runs in force count — a run superseded by a done replacement (`run create --supersedes <id[,id]>`, same-role `--resume-from`, `--retry`) is history; `close` stays a pure ack and never clears a blocker; one reviewer's later approve never clears another reviewer's blocker. Failed/timed-out/cancelled/stale runs, missing results, and results that fail re-validation (contradictions included) suggest inspect; `decision accept` refuses them and `sweep` lists unbound or failed reviewer/verifier runs under `manual` instead of deciding them.
+- HEAD/content binding. `run create` records the host-captured snapshot (`spec.snapshot`) and `--head <rev>` pins a commit; the default idempotency key includes the actual HEAD (plus content for reviewer/verifier on a dirty checkout), and any key reuse is refused for a different or missing snapshot. Reviewer/verifier supervisors re-check the snapshot after taking the lock and when the worker exits (`start_snapshot`/`end_snapshot`/`snapshot_error` in `status.json`); drift fails the run. An approve/pass counts only when that snapshot equals the candidate (`--worktree` HEAD + content, or `verdict|decision --head <rev>`); runs created before snapshot binding are readable but never proof. `--head` is local and does not read the forge.
+- Result semantics. `tests[]`/`commands[]` entries carry `status` (`passed`|`failed`|`skipped`) and optional `expected_exit_code` for negative tests; skipped checks need `exit_code: null`. A `pass`/`completed` result with a failed check or an unmet acceptance item is rejected (v0.0.13 accepted verifier `pass` + exit 1 + unmet); a verifier `pass` also needs a command that actually ran and passed, and may skip only items marked `optional`. The implementer prompt no longer forbids the checks a change needs. Validation is consistency only: orch never re-runs commands.
+- Worktree reader/writer lock. Reviewers take a shared lock (parallel reviews of one checkout are fine), implementer/verifier an exclusive one, controller/researcher none; the lock key is the canonical checkout root. Every lock (also the mr/outbox/mail locks) is now per-owner records under `<lock>.owners/` (announce, then check the others), so a stale holder is never "broken" by renaming or deleting a shared path — the old pidfile scheme could hand two owners the same lock. A live ≤0.0.13 pidfile still blocks; exclusive holders publish one for old writers; a stale old pidfile is ignored, not deleted; old writers ignore new readers.
+- `orch result --wait`, the overview, `wait`, `events tail -f`, and `run reap` judge staleness by the supervisor (`status.supervisor_pid`), not the provider pid: a provider that exited while the supervisor is still collecting evidence and writing the result is no longer reported as stale. Older statuses without the field keep the provider-pid rule.
+- `orch wait --cursor start|now|<cursor>` returns every terminal or stale run exactly once per cursor lineage, decided or not, so notification no longer requires adjudication; without `--cursor` the decision-as-ack behaviour is unchanged.
+
 ## [0.0.13] - 2026-09-18
 
 ### Features
