@@ -45,9 +45,12 @@ async function fixture(files: Record<string, string | Uint8Array>) {
 }
 
 describe("documentation inventory and mapping", () => {
-  test("covers the current 9 Markdown, 1 JSON, and 2 text sources", async () => {
+  test("covers the current 10 Markdown, 1 JSON, and 2 text sources", async () => {
     const sources = await getTrackedDocsSources();
-    expect(sources.filter((source) => source.endsWith(".md"))).toHaveLength(9);
+    expect(sources.filter((source) => source.endsWith(".md"))).toHaveLength(10);
+    // The workflow hardening record is a published page, not an unlisted file.
+    expect(sources).toContain("development-workflow-hardening.md");
+    expect(renderedOutputForSource("development-workflow-hardening.md")).toBe("development-workflow-hardening.html");
     // adr/ and specs/ stay tracked in the repo but are not published on the site.
     expect(sources.some((source) => source.startsWith("adr/") || source.startsWith("specs/"))).toBe(false);
     expect(sources.filter((source) => source.endsWith(".json"))).toHaveLength(1);

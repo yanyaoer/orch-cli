@@ -4,6 +4,7 @@ import { randomBytes } from "node:crypto";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { RPC, isRpcRequest, type RpcRequest, type RpcResponse } from "../chatgpt-bridge/src/protocol.ts";
 import { buildBridgeUrls, parseWorkersUrl, type BridgeWorker } from "../src/config.ts";
+import { gitEnv } from "../src/git-env.ts";
 
 export interface ChatgptBridgeOptions {
   url: string;
@@ -74,6 +75,7 @@ export async function run(cmd: string[], cwd: string, stdin?: string): Promise<R
     cwd,
     stdout: "pipe",
     stderr: "pipe",
+    env: gitEnv(),
     // Feed secrets through stdin (kept out of argv) when provided.
     stdin: stdin === undefined ? "ignore" : new TextEncoder().encode(stdin),
   });

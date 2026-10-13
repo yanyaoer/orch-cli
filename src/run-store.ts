@@ -1,7 +1,7 @@
 // Run-state readers and outbox/forge-ref helpers shared by every command: locating runs, listing an MR's runs, idempotency records, decision and result readers.
 import { existsSync, readFileSync, readdirSync, type Dirent } from "node:fs";
 import type { RoleResult, RunSpec, RunState, RunStatus } from "./types.ts";
-import { isPidAlive } from "./locks.ts";
+import { isPidAlive, isProcessGroupAlive } from "./locks.ts";
 import { randomHex } from "./hash.ts";
 import { mrStateDir, orchStateRoot } from "./paths.ts";
 import { readJsonFile, writeJsonAtomic, writeTextAtomic } from "./json.ts";
@@ -171,14 +171,33 @@ export function enqueueComment(mrDir: string, payload: OutboxCommentPayload): st
 
 export const nonTerminalStates = new Set<RunState>(["created", "starting", "running"]);
 
+// The process whose death makes a non-terminal run stale: the supervisor when
+// recorded (it outlives the provider while it finalizes evidence/result), else
+// the provider pid of a run written by an older supervisor.
+export function ownerPid(status: RunStatus): number | null {
+  if (typeof status.supervisor_pid === "number") return status.supervisor_pid;
+  return status.pid;
+}
+
 // The one stale rule (read-side, never writes; `orch run reap` persists it):
-// a non-terminal run whose recorded pid is gone, or that never got a pid and
+// a non-terminal run whose owning process is gone, or that never got one and
 // has not moved in an hour (orphaned before spawn).
 export function looksStale(status: RunStatus): boolean {
   if (!nonTerminalStates.has(status.state)) return false;
-  if (status.pid !== null) return !isPidAlive(status.pid);
+  const owner = ownerPid(status);
+  if (owner !== null) return !isPidAlive(owner);
   const ageMs = Date.now() - Date.parse(status.updated_at ?? "");
   return Number.isFinite(ageMs) && ageMs > 60 * 60 * 1000;
+}
+
+// Stale means the supervisor is gone, not that the work stopped: the provider
+// runs in its own process group and survives a killed supervisor. Anything
+// that would reuse the checkout (a clone removal) or call the run finished
+// must also see the group gone.
+export function runProcessesAlive(status: RunStatus): boolean {
+  if (typeof status.supervisor_pid === "number" && isPidAlive(status.supervisor_pid)) return true;
+  if (typeof status.pgid === "number" && isProcessGroupAlive(status.pgid)) return true;
+  return typeof status.pid === "number" && isPidAlive(status.pid);
 }
 
 // Everything a run directory says about itself, read once. Every command that

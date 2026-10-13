@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { OverviewRun } from "./overview.ts";
 import { fallbackRawReview, planAutoDecision, sanitizeCommentBody, withheldSection } from "./review-auto.ts";
 import type { ReviewerResult } from "./types.ts";
 
@@ -71,21 +72,36 @@ test("fallbackRawReview ignores real reviewer results", () => {
   expect(fallbackRawReview(dir, realBlocking)).toBeNull();
 });
 
-const baseRun = {
+const snap = { vcs: "git" as const, head: "a".repeat(40), dirty: false, content_sha: "a".repeat(40) };
+const candidate = { candidate: { source: "worktree" as const, snapshot: snap }, error: null };
+
+const baseRun: OverviewRun = {
+  repo_key: "local/demo",
   run_id: "run-1",
   mr: "42",
+  role: "reviewer",
+  agent: "claude",
   state: "done" as const,
+  stale: false,
   verdict: "approve",
   blocking: 0,
-  stale: false,
   decided: false,
+  decision: null,
+  started_at: null,
+  updated_at: "2026-10-13T00:00:00.000Z",
+  worktree: "/tmp/wt",
+  result_errors: [],
+  supersedes: [],
+  superseded_by: null,
+  evidence_snapshot: snap,
+  evidence_problem: null,
 };
 
 test("planAutoDecision accepts clean approvals and reworks blocking reviews", () => {
-  const accept = planAutoDecision(baseRun, false);
+  const accept = planAutoDecision(baseRun, false, candidate);
   expect(accept.decision).toBe("accept");
   expect(accept.attention).toBeNull();
-  const rework = planAutoDecision({ ...baseRun, verdict: "request_changes", blocking: 2 }, false);
+  const rework = planAutoDecision({ ...baseRun, verdict: "request_changes", blocking: 2 }, false, candidate);
   expect(rework.decision).toBe("rework");
   expect(rework.reason).toContain("blocking 2");
 });
@@ -116,4 +132,16 @@ test("planAutoDecision never decides fallback, failed, stale, or decided runs", 
   const noVerdict = planAutoDecision({ ...baseRun, verdict: null }, false);
   expect(noVerdict.decision).toBeNull();
   expect(noVerdict.attention).toContain("orch decision close");
+});
+
+test("planAutoDecision only accepts approvals bound to the source checkout's current snapshot", () => {
+  // The source moved on after the fan-out: the approve is for another head.
+  const moved = { candidate: { source: "worktree" as const, snapshot: { ...snap, head: "b".repeat(40), content_sha: "b".repeat(40) } }, error: null };
+  const stale = planAutoDecision(baseRun, false, moved);
+  expect(stale.decision).toBeNull();
+  expect(stale.attention).toContain("stale");
+  // Legacy run without an orch-captured snapshot, and an unknown candidate.
+  expect(planAutoDecision({ ...baseRun, evidence_snapshot: null, evidence_problem: "no snapshot" }, false, candidate).decision).toBeNull();
+  expect(planAutoDecision(baseRun, false, { candidate: null, error: "not a repo" }).decision).toBeNull();
+  expect(planAutoDecision(baseRun, false, null).decision).toBeNull();
 });

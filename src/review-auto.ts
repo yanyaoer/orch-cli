@@ -6,7 +6,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { orchLanguage } from "./config.ts";
 import type { RoleResult } from "./types.ts";
-import { isAcceptableOutcome, isTerminal, type OverviewRun } from "./overview.ts";
+import { assessRun, isTerminal, type CandidateResolution, type OverviewRun } from "./overview.ts";
 
 // The reviewer fallback the driver writes when the worker's answer doesn't fit
 // the canonical schema (drivers/driver-common.ts synthesizeResult): exactly one
@@ -78,14 +78,14 @@ export interface AutoDecisionPlan {
   attention: string | null;
 }
 
-type AutoRun = Pick<OverviewRun, "run_id" | "mr" | "state" | "verdict" | "blocking" | "stale" | "decided">;
+type AutoRun = OverviewRun;
 
 // Only the two unambiguous outcomes are decided automatically. Everything else
 // (schema fallback, failed/timeout, stale, already decided) is surfaced, never
 // guessed: --auto must not launder uncertain results into the decision ledger.
-export function planAutoDecision(run: AutoRun, fallback: boolean): AutoDecisionPlan {
+export function planAutoDecision(run: AutoRun, fallback: boolean, candidate: CandidateResolution | null = null): AutoDecisionPlan {
   if (run.stale) {
-    return { decision: null, reason: null, attention: `supervisor gone; run: orch run reap --mr ${run.mr}` };
+    return { decision: null, reason: null, attention: `supervisor gone (its provider may still run); run: orch run reap --mr ${run.mr}, then orch run cancel --run ${run.run_id}` };
   }
   if (!isTerminal(run.state)) {
     return { decision: null, reason: null, attention: `still ${run.state}` };
@@ -110,12 +110,14 @@ export function planAutoDecision(run: AutoRun, fallback: boolean): AutoDecisionP
   if (run.verdict === null) {
     return { decision: null, reason: null, attention: `done without a result verdict; ack with: orch decision close --run ${run.run_id}` };
   }
-  if (isAcceptableOutcome(run.verdict, run.blocking)) {
-    return { decision: "accept", reason: `cross-review --auto: reviewer ${run.verdict}`, attention: null };
+  // Same rubric as decision accept: an approve counts only when its
+  // host-captured snapshot is the candidate the fan-out was asked about.
+  const assessment = assessRun(run, candidate);
+  if (assessment.outcome === "accept") {
+    return { decision: "accept", reason: `cross-review --auto: ${assessment.reason}`, attention: null };
   }
-  return {
-    decision: "rework",
-    reason: `cross-review --auto: ${run.verdict ?? "no verdict"}${run.blocking ? ` · blocking ${run.blocking}` : ""}`,
-    attention: null,
-  };
+  if (assessment.outcome === "rework") {
+    return { decision: "rework", reason: `cross-review --auto: ${assessment.reason}`, attention: null };
+  }
+  return { decision: null, reason: null, attention: `${assessment.reason}; inspect: orch result --run ${run.run_id}` };
 }

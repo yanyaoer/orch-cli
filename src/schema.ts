@@ -46,6 +46,17 @@ function validateStringArray(obj: Record<string, unknown>, field: string, errors
   });
 }
 
+const COMMAND_STATUSES = new Set(["passed", "failed", "skipped"]);
+
+// What a reported check actually amounted to. Legacy entries without status
+// derive it from exit_code vs expected_exit_code (default 0), so a negative
+// test that is supposed to exit non-zero can still pass.
+export function commandOutcome(item: { exit_code?: unknown; status?: unknown; expected_exit_code?: unknown }): "passed" | "failed" | "skipped" {
+  if (item.status === "passed" || item.status === "failed" || item.status === "skipped") return item.status;
+  const expected = typeof item.expected_exit_code === "number" ? item.expected_exit_code : 0;
+  return item.exit_code === expected ? "passed" : "failed";
+}
+
 function validateCommands(obj: Record<string, unknown>, field: string, errors: string[]): void {
   if (!array(obj[field])) {
     errors.push(`${field} must be an array`);
@@ -57,9 +68,86 @@ function validateCommands(obj: Record<string, unknown>, field: string, errors: s
       return;
     }
     if (!nonEmptyString(item.cmd)) errors.push(`${field}[${index}].cmd is required`);
-    if (typeof item.exit_code !== "number") errors.push(`${field}[${index}].exit_code must be a number`);
     if (!nonEmptyString(item.summary)) errors.push(`${field}[${index}].summary is required`);
+    if (item.status !== undefined && !COMMAND_STATUSES.has(item.status as string)) {
+      errors.push(`${field}[${index}].status must be passed|failed|skipped`);
+    }
+    if (item.optional !== undefined && typeof item.optional !== "boolean") errors.push(`${field}[${index}].optional must be a boolean`);
+    if (item.expected_exit_code !== undefined && !Number.isInteger(item.expected_exit_code)) {
+      errors.push(`${field}[${index}].expected_exit_code must be an integer`);
+    }
+    if (item.status === "skipped") {
+      // A check that never ran cannot encode success (exit_code 0).
+      if (item.exit_code !== null && item.exit_code !== undefined) {
+        errors.push(`${field}[${index}] is skipped, so exit_code must be null (a check that did not run has no exit code)`);
+      }
+      return;
+    }
+    if (typeof item.exit_code !== "number") {
+      errors.push(`${field}[${index}].exit_code must be a number`);
+      return;
+    }
+    const expected = typeof item.expected_exit_code === "number" ? item.expected_exit_code : 0;
+    if (item.status === "passed" && item.exit_code !== expected) {
+      errors.push(`${field}[${index}] is passed but exit_code ${item.exit_code} != expected_exit_code ${expected}`);
+    }
   });
+}
+
+// Acceptance status vocabulary: met|unmet|skipped, plus the synonyms live
+// results already use. null = unrecognized.
+export function acceptanceOutcome(status: unknown): "met" | "unmet" | "skipped" | null {
+  const value = typeof status === "string" ? status.trim().toLowerCase().replace(/[\s-]+/g, "_") : "";
+  if (["met", "pass", "passed", "ok", "done", "satisfied", "confirmed", "verified", "yes", "true"].includes(value)) return "met";
+  if (["unmet", "not_met", "fail", "failed", "blocked", "partial", "refuted", "missing", "no", "false"].includes(value)) return "unmet";
+  if (["skipped", "skip", "not_run", "n/a", "na", "deferred"].includes(value)) return "skipped";
+  return null;
+}
+
+// A success verdict must agree with its own evidence: no failed check, no
+// unmet or unrecognized acceptance item. This is semantic consistency of the
+// JSON only — orch does not re-run the commands; the raw logs and the
+// controller's own verification remain the proof that they ran.
+// A verifier pass is a claim that verification happened, which an all-skipped
+// result cannot make: at least one check must have run and passed, and a
+// skipped command or acceptance item is allowed only when explicitly marked
+// optional. (An implementer's completed may skip checks it leaves to the
+// controller/verifier — that is a different claim.)
+function validateVerifierPass(obj: Record<string, unknown>, errors: string[]): void {
+  const commands = Array.isArray(obj.commands) ? (obj.commands as unknown[]) : [];
+  if (!commands.some((item) => record(item) && commandOutcome(item) === "passed")) {
+    errors.push("verdict pass requires at least one command that actually ran and passed");
+  }
+  commands.forEach((item, index) => {
+    if (record(item) && commandOutcome(item) === "skipped" && item.optional !== true) {
+      errors.push(`verdict pass cannot skip required commands[${index}] (${String(item.cmd)}); mark it optional or run it`);
+    }
+  });
+  const acceptance = Array.isArray(obj.acceptance) ? (obj.acceptance as unknown[]) : [];
+  acceptance.forEach((item, index) => {
+    if (record(item) && acceptanceOutcome(item.status) === "skipped" && item.optional !== true) {
+      errors.push(`verdict pass cannot skip required acceptance[${index}] (${String(item.id)}); mark it optional or verify it`);
+    }
+  });
+}
+
+function validateSuccessConsistency(obj: Record<string, unknown>, verdict: string, commandField: string, errors: string[]): void {
+  const commands = obj[commandField];
+  if (Array.isArray(commands)) {
+    commands.forEach((item: unknown, index) => {
+      if (record(item) && commandOutcome(item) === "failed") {
+        errors.push(`verdict ${verdict} contradicts ${commandField}[${index}] (failed: ${String(item.cmd)})`);
+      }
+    });
+  }
+  if (Array.isArray(obj.acceptance)) {
+    obj.acceptance.forEach((item, index) => {
+      if (!record(item)) return;
+      const outcome = acceptanceOutcome(item.status);
+      if (outcome === null) errors.push(`acceptance[${index}].status must be met|unmet|skipped under verdict ${verdict}`);
+      else if (outcome === "unmet") errors.push(`verdict ${verdict} contradicts acceptance[${index}] (${String(item.id)} unmet)`);
+    });
+  }
 }
 
 function validateAcceptance(obj: Record<string, unknown>, field: string, errors: string[], evidenceAllowed: boolean): void {
@@ -76,6 +164,7 @@ function validateAcceptance(obj: Record<string, unknown>, field: string, errors:
     if (!nonEmptyString(item.status)) errors.push(`${field}[${index}].status is required`);
     if (!evidenceAllowed && item.evidence !== undefined) errors.push(`${field}[${index}].evidence is not supported`);
     if (item.evidence !== undefined && typeof item.evidence !== "string") errors.push(`${field}[${index}].evidence must be a string`);
+    if (item.optional !== undefined && typeof item.optional !== "boolean") errors.push(`${field}[${index}].optional must be a boolean`);
   });
 }
 
@@ -141,14 +230,14 @@ export const ROLE_REQUIRED_FIELDS: Record<RunRole, readonly string[]> = {
 // it from a field list (live runs invented finding keys and object items).
 export const ROLE_RESULT_EXAMPLE: Record<RunRole, string> = {
   implementer:
-    '{"schema":"orch.result/implementer/v1","run_id":"<run_id>","verdict":"completed|failed","summary":"what changed and why","base_sha":"<base sha from the task>","head_sha":"<HEAD after your commits>","changed_files":["path/one.ts"],"tests":[{"cmd":"bun test src/one.test.ts","exit_code":0,"summary":"12 pass"}],"acceptance":[{"id":"AC1","status":"met|unmet","evidence":"how you checked"}],"risks":["..."],"rollback":"git revert <head_sha>"}',
+    '{"schema":"orch.result/implementer/v1","run_id":"<run_id>","verdict":"completed|failed","summary":"what changed and why","base_sha":"<base sha from the task>","head_sha":"<HEAD after your commits>","changed_files":["path/one.ts"],"tests":[{"cmd":"bun test src/one.test.ts","exit_code":0,"status":"passed","summary":"12 pass"},{"cmd":"bun run build","exit_code":null,"status":"skipped","summary":"not run: why"}],"acceptance":[{"id":"AC1","status":"met|unmet|skipped","evidence":"how you checked"}],"risks":["..."],"rollback":"git revert <head_sha>"}',
   reviewer:
     '{"schema":"orch.result/reviewer/v1","run_id":"<run_id>","verdict":"approve|request_changes","reviews_run_id":"<run id under review; empty string if none>","blocking_findings":[{"id":"F1","severity":"high|medium|low","file":"path/one.ts:42","body":"what breaks, how to reproduce, what to change"}],"non_blocking_findings":[{"body":"..."}],"suggested_tests":["..."]}',
   controller: '{"schema":"orch.result/controller/v1","run_id":"<run_id>","verdict":"completed|failed","summary":"...","actions":["..."]}',
   researcher:
     '{"schema":"orch.result/researcher/v1","run_id":"<run_id>","verdict":"completed|failed","summary":"...","recommendation":"...","alternatives":["..."],"sources":["https://..."],"open_questions":["..."],"risks":["..."]}',
   verifier:
-    '{"schema":"orch.result/verifier/v1","run_id":"<run_id>","verdict":"pass|fail","verifies_run_id":"<run id verified>","commands":[{"cmd":"...","exit_code":0,"summary":"..."}],"acceptance":[{"id":"AC1","status":"met|unmet","evidence":"..."}]}',
+    '{"schema":"orch.result/verifier/v1","run_id":"<run_id>","verdict":"pass|fail","verifies_run_id":"<run id verified>","commands":[{"cmd":"...","exit_code":0,"status":"passed","summary":"..."},{"cmd":"<negative test>","exit_code":2,"expected_exit_code":2,"status":"passed","summary":"rejects bad input as expected"},{"cmd":"<optional check>","exit_code":null,"status":"skipped","optional":true,"summary":"not run: why"}],"acceptance":[{"id":"AC1","status":"met|unmet|skipped","evidence":"..."}]}',
 };
 
 export function validateRoleResult(role: RunRole, value: unknown): ValidationResult {
@@ -172,6 +261,7 @@ export function validateRoleResult(role: RunRole, value: unknown): ValidationRes
     validateCommands(obj, "tests", errors);
     validateAcceptance(obj, "acceptance", errors, true);
     validateStringArray(obj, "risks", errors);
+    if (obj.verdict === "completed") validateSuccessConsistency(obj, "completed", "tests", errors);
   } else if (role === "reviewer") {
     const missing = requireFields(obj, [...ROLE_REQUIRED_FIELDS.reviewer]);
     errors.push(...missing.map((field) => `${field} is required`));
@@ -198,6 +288,10 @@ export function validateRoleResult(role: RunRole, value: unknown): ValidationRes
     // A verifier's whole deliverable is evidence-backed checks; rejecting the
     // evidence field discarded an otherwise complete live result.
     validateAcceptance(obj, "acceptance", errors, true);
+    if (obj.verdict === "pass") {
+      validateSuccessConsistency(obj, "pass", "commands", errors);
+      validateVerifierPass(obj, errors);
+    }
   }
 
   return { ok: errors.length === 0, errors };

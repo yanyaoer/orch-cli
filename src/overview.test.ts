@@ -2,10 +2,31 @@ import { afterEach, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { RunState, RunStatus } from "./types.ts";
+import type { RunState, RunStatus, VcsSnapshot } from "./types.ts";
 import { buildOverview, collectMrRuns, collectRepoKeys, mergedBranchMrs, renderArgv, renderOverview } from "./overview.ts";
 
 const cleanups: Array<() => void> = [];
+
+// Fake host-captured snapshot: unit tests bind runs to it and judge them
+// against the same candidate; e2e tests use a real git checkout instead.
+const SNAP: VcsSnapshot = { vcs: "git", head: "a".repeat(40), dirty: false, content_sha: "a".repeat(40) };
+const CANDIDATES = new Map([["local/demo-abcd1234", { candidate: { source: "worktree" as const, snapshot: SNAP }, error: null }]]);
+
+async function gitWorktree(): Promise<{ worktree: string; snap: VcsSnapshot }> {
+  const worktree = realpathSync(mkdtempSync(join(tmpdir(), "orch-overview-wt-")));
+  cleanups.push(() => rmSync(worktree, { recursive: true, force: true }));
+  const git = (...args: string[]) => {
+    const proc = Bun.spawnSync(["git", "-C", worktree, "-c", "user.email=t@example.com", "-c", "user.name=T", "-c", "commit.gpgsign=false", ...args], { stdout: "pipe", stderr: "pipe" });
+    if (proc.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${proc.stderr.toString()}`);
+    return proc.stdout.toString().trim();
+  };
+  git("init", "-q");
+  writeFileSync(join(worktree, "README.md"), "x\n", "utf8");
+  git("add", "README.md");
+  git("commit", "-q", "-m", "init");
+  const head = git("rev-parse", "HEAD");
+  return { worktree, snap: { vcs: "git", head, dirty: false, content_sha: head } };
+}
 
 afterEach(() => {
   for (const cleanup of cleanups.splice(0)) cleanup();
@@ -43,6 +64,8 @@ function status(overrides: Partial<RunStatus> & { run_id: string; mr: string; st
     worktree: "/tmp/wt",
     base_sha: "base",
     head_sha: null,
+    start_snapshot: SNAP,
+    end_snapshot: SNAP,
     ...overrides,
   } as RunStatus;
 }
@@ -110,7 +133,7 @@ test("buildOverview groups active runs and emits runnable actions", () => {
   const stateHome = makeStateHome();
   seedMixedMr(stateHome);
 
-  const overview = buildOverview([REPO], false);
+  const overview = buildOverview([REPO], false, { candidates: CANDIDATES });
   expect(overview.active.map((run) => run.run_id)).toEqual(["r-running"]);
   expect(overview.settled).toBe(1);
   expect(overview.actions.map((action) => action.kind)).toEqual(["decision", "reap", "mirror_sync"]);
@@ -132,7 +155,7 @@ test("blocking findings and bad verdicts flip the suggestion to rework", () => {
   const stateHome = makeStateHome();
   writeRun(stateHome, REPO, "7", status({ run_id: "r-block", mr: "7", state: "done", exit_code: 0 }), { verdict: "request_changes", blocking: 2 });
 
-  const overview = buildOverview([REPO], false);
+  const overview = buildOverview([REPO], false, { candidates: CANDIDATES });
   expect(overview.actions).toHaveLength(1);
   expect(overview.actions[0]!.argv[2]).toBe("rework");
   expect(overview.actions[0]!.reason).toContain("blocking 2");
@@ -157,17 +180,17 @@ test("renderArgv quotes only what the shell needs", () => {
 test("healthy mailctl state emits no overview action", () => {
   const stateHome = makeStateHome();
 
-  expect(buildOverview([REPO], false).actions.filter((action) => action.kind === "mailctl")).toEqual([]);
+  expect(buildOverview([REPO], false, { candidates: CANDIDATES }).actions.filter((action) => action.kind === "mailctl")).toEqual([]);
 
   writeMailctlCursor(stateHome, { consecutive_failures: 2 });
-  expect(buildOverview([REPO], false).actions.filter((action) => action.kind === "mailctl")).toEqual([]);
+  expect(buildOverview([REPO], false, { candidates: CANDIDATES }).actions.filter((action) => action.kind === "mailctl")).toEqual([]);
 });
 
 test("mailctl poll failures emit one safe runnable status action", () => {
   const stateHome = makeStateHome();
   writeMailctlCursor(stateHome, { consecutive_failures: 3, last_error: `/token/${stateHome}` });
 
-  const overview = buildOverview([REPO], false);
+  const overview = buildOverview([REPO], false, { candidates: CANDIDATES });
   expect(overview.actions).toHaveLength(1);
   expect(overview.actions[0]).toMatchObject({
     kind: "mailctl",
@@ -182,7 +205,7 @@ test("dropped mailctl reply emits one status action", () => {
   const stateHome = makeStateHome();
   writeDroppedMailctlReply(stateHome);
 
-  const overview = buildOverview([REPO], false);
+  const overview = buildOverview([REPO], false, { candidates: CANDIDATES });
   expect(overview.actions).toHaveLength(1);
   expect(overview.actions[0]).toMatchObject({
     kind: "mailctl",
@@ -197,13 +220,13 @@ test("a sent marker suppresses a historical dropped mailctl action", () => {
   const sentDir = join(stateHome, "orch", "mail-control", "outbox-email", "sent");
   mkdirSync(sentDir, { recursive: true });
   writeFileSync(join(sentDir, "reply-1.json"), "{}", "utf8");
-  expect(buildOverview([REPO], false).actions).toEqual([]);
+  expect(buildOverview([REPO], false, { candidates: CANDIDATES }).actions).toEqual([]);
 });
 
 test("unresolved policy quarantine emits one status action", () => {
   const stateHome = makeStateHome();
   writeQuarantinedMailctlReply(stateHome);
-  expect(buildOverview([REPO], false).actions[0]).toMatchObject({
+  expect(buildOverview([REPO], false, { candidates: CANDIDATES }).actions[0]).toMatchObject({
     kind: "mailctl",
     reason: "mailctl: 1 policy-quarantined reply",
     argv: ["orch", "mailctl", "status"],
@@ -215,7 +238,7 @@ test("mailctl overview action is emitted once when failures and dropped replies 
   writeMailctlCursor(stateHome, { consecutive_failures: 4 });
   writeDroppedMailctlReply(stateHome);
 
-  const overview = buildOverview([REPO], false);
+  const overview = buildOverview([REPO], false, { candidates: CANDIDATES });
   expect(overview.actions).toHaveLength(1);
   expect(overview.actions.filter((action) => action.kind === "mailctl")).toHaveLength(1);
   expect(overview.actions[0]!.argv).toEqual(["orch", "mailctl", "status"]);
@@ -239,12 +262,12 @@ test("recent suspect rejected mail emits one status action; spam and stale rejec
   writeRejectedMarker(stateHome, "m-spam", "rejected_sender", recent);
   writeRejectedMarker(stateHome, "m-accepted", "accepted", recent);
   writeRejectedMarker(stateHome, "m-stale-token", "rejected_token", stale);
-  expect(buildOverview([REPO], false).actions.filter((action) => action.kind === "mailctl")).toEqual([]);
+  expect(buildOverview([REPO], false, { candidates: CANDIDATES }).actions.filter((action) => action.kind === "mailctl")).toEqual([]);
 
   writeRejectedMarker(stateHome, "m-token", "rejected_token", recent);
   writeRejectedMarker(stateHome, "m-token-2", "rejected_token", recent);
   writeRejectedMarker(stateHome, "m-auth", "rejected_auth", recent);
-  const overview = buildOverview([REPO], false);
+  const overview = buildOverview([REPO], false, { candidates: CANDIDATES });
   expect(overview.actions).toHaveLength(1);
   expect(overview.actions[0]).toMatchObject({
     kind: "mailctl",
@@ -255,10 +278,10 @@ test("recent suspect rejected mail emits one status action; spam and stale rejec
 
 test("missing or corrupt mailctl cursor is ignored without throwing", () => {
   const stateHome = makeStateHome();
-  expect(buildOverview([REPO], false).actions).toEqual([]);
+  expect(buildOverview([REPO], false, { candidates: CANDIDATES }).actions).toEqual([]);
 
   writeMailctlCursor(stateHome, "{not json");
-  const overview = buildOverview([REPO], false);
+  const overview = buildOverview([REPO], false, { candidates: CANDIDATES });
   expect(overview.actions).toEqual([]);
 });
 
@@ -283,13 +306,13 @@ async function runOrch(args: string[], env: Record<string, string>): Promise<{ s
 
 test("bare orch, verdict, and wait read the same aggregation end to end", async () => {
   const stateHome = makeStateHome();
-  const worktree = realpathSync(mkdtempSync(join(tmpdir(), "orch-overview-wt-")));
-  cleanups.push(() => rmSync(worktree, { recursive: true, force: true }));
+  const { worktree, snap } = await gitWorktree();
   const { repoKeyFromRemote } = await import("./paths.ts");
   const repoKey = repoKeyFromRemote(worktree, worktree);
+  const bound = { start_snapshot: snap, end_snapshot: snap };
 
-  writeRun(stateHome, repoKey, "th-1", status({ run_id: "rv-a", mr: "th-1", state: "done", exit_code: 0 }), { verdict: "approve" });
-  writeRun(stateHome, repoKey, "th-1", status({ run_id: "rv-b", mr: "th-1", state: "done", exit_code: 0 }), { verdict: "approve", decided: true });
+  writeRun(stateHome, repoKey, "th-1", status({ run_id: "rv-a", mr: "th-1", state: "done", exit_code: 0, ...bound }), { verdict: "approve" });
+  writeRun(stateHome, repoKey, "th-1", status({ run_id: "rv-b", mr: "th-1", state: "done", exit_code: 0, ...bound }), { verdict: "approve", decided: true });
 
   const env = { XDG_STATE_HOME: stateHome };
 
@@ -337,13 +360,13 @@ test("attention window ages out old undecided runs, stale runs, and outbox comme
   const oldDate = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
   utimesSync(join(pendingDir, "c1.json"), oldDate, oldDate);
 
-  const overview = buildOverview([REPO], false);
+  const overview = buildOverview([REPO], false, { candidates: CANDIDATES });
   expect(overview.actions.map((action) => action.run_id ?? action.kind)).toEqual(["r-new"]);
   expect(overview.aged_out).toBe(3);
   expect(renderOverview(overview)).toContain("3 aged out (--attention-days 0 to resurface)");
 
   // Window disabled: everything resurfaces.
-  const everything = buildOverview([REPO], false, { attentionDays: 0 });
+  const everything = buildOverview([REPO], false, { attentionDays: 0, candidates: CANDIDATES });
   expect(everything.aged_out).toBe(0);
   expect(everything.actions.map((action) => action.kind).sort()).toEqual(["decision", "decision", "mirror_sync", "reap"]);
 });
@@ -422,13 +445,12 @@ test.skipIf(!Boolean(Bun.which("jj")))("mergedBranchMrs (jj) lists bookmarks bel
 
 test("decision close acks without queueing a mirror comment; sweep batch-acks the backlog", async () => {
   const stateHome = makeStateHome();
-  const worktree = realpathSync(mkdtempSync(join(tmpdir(), "orch-overview-wt-")));
-  cleanups.push(() => rmSync(worktree, { recursive: true, force: true }));
+  const { worktree, snap } = await gitWorktree();
   const { repoKeyFromRemote } = await import("./paths.ts");
   const repoKey = repoKeyFromRemote(worktree, worktree);
   const env = { XDG_STATE_HOME: stateHome };
 
-  writeRun(stateHome, repoKey, "bk", status({ run_id: "bk-approve", mr: "bk", state: "done", exit_code: 0 }), { verdict: "approve" });
+  writeRun(stateHome, repoKey, "bk", status({ run_id: "bk-approve", mr: "bk", state: "done", exit_code: 0, start_snapshot: snap, end_snapshot: snap }), { verdict: "approve" });
   writeRun(stateHome, repoKey, "bk", status({ run_id: "bk-changes", mr: "bk", state: "done", exit_code: 0 }), { verdict: "request_changes", blocking: 2 });
   writeRun(stateHome, repoKey, "bk", status({ run_id: "bk-failed", mr: "bk", state: "failed", exit_code: 1 }));
   writeRun(stateHome, repoKey, "bk", status({ run_id: "bk-decided", mr: "bk", state: "done", exit_code: 0 }), { verdict: "approve", decided: true });
@@ -458,7 +480,7 @@ test("decision close acks without queueing a mirror comment; sweep batch-acks th
   expect(sweptPayload.decided).toHaveLength(2);
   expect(sweptPayload.skipped).toHaveLength(0);
   const accept = JSON.parse(readFileSync(join(stateHome, "orch", repoKey, "mrs", "bk", "runs", "bk-approve", "decision.json"), "utf8")) as { verdict: string; reason: string };
-  expect(accept).toMatchObject({ verdict: "accept", reason: "sweep: reviewer approve" });
+  expect(accept).toMatchObject({ verdict: "accept", reason: `sweep: reviewer approve @ ${snap.head.slice(0, 12)}` });
   expect(!existsSync(pendingDir) || readdirSync(pendingDir).filter((file) => file.endsWith(".json")).length === 0).toBe(true);
 
   // Idempotent: a second sweep finds nothing left.
@@ -474,11 +496,10 @@ test("orch --version prints the CLI version", async () => {
 
 test("decision is an atomic ack: a second decision fails and queues nothing", async () => {
   const stateHome = makeStateHome();
-  const worktree = realpathSync(mkdtempSync(join(tmpdir(), "orch-overview-wt-")));
-  cleanups.push(() => rmSync(worktree, { recursive: true, force: true }));
+  const { worktree, snap } = await gitWorktree();
   const { repoKeyFromRemote } = await import("./paths.ts");
   const repoKey = repoKeyFromRemote(worktree, worktree);
-  writeRun(stateHome, repoKey, "th-2", status({ run_id: "rv-x", mr: "th-2", state: "done", exit_code: 0 }), { verdict: "approve" });
+  writeRun(stateHome, repoKey, "th-2", status({ run_id: "rv-x", mr: "th-2", state: "done", exit_code: 0, start_snapshot: snap, end_snapshot: snap }), { verdict: "approve" });
   const env = { XDG_STATE_HOME: stateHome };
 
   const first = await runOrch(["decision", "accept", "--run", "rv-x", "--mr", "th-2", "--reason", "ok", "--worktree", worktree], env);

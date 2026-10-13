@@ -912,3 +912,95 @@ test("cross-review takes its default pair from config defaults.fanout and refuse
   const explicit = await runOrch(["cross-review", "--thread", "review-9", "--task", taskPath, "--worktree", worktree, "--to-agent", "claude-reviewer", "--dry-run"], env);
   expect(JSON.parse(explicit.stdout).agents.map((agent: { agent_id: string }) => agent.agent_id)).toEqual(["claude-reviewer"]);
 });
+
+async function cloneReviewFixture(prefix: string): Promise<{ root: string; stateHome: string; worktree: string; remote: string; taskPath: string; env: Record<string, string> }> {
+  const root = mkdtempSync(join(tmpdir(), prefix));
+  const stateHome = join(root, "state");
+  const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
+  const remote = "git@github.com:example/repo.git";
+  await initRepo(worktree, remote);
+  for (const name of ["staged.txt", "unstaged.txt"]) writeFileSync(join(worktree, name), "base\n", "utf8");
+  await runCmd(["git", "add", "."], worktree);
+  await runCmd(["git", "-c", "user.email=orch@example.com", "-c", "user.name=orch", "commit", "-q", "-m", "base"], worktree);
+  // Staged edit, staged addition, unstaged edit: the clone's reset --mixed
+  // turns the first two into unstaged/untracked state with the same bytes.
+  writeFileSync(join(worktree, "staged.txt"), "staged edit\n", "utf8");
+  writeFileSync(join(worktree, "added.txt"), "staged new\n", "utf8");
+  await runCmd(["git", "add", "staged.txt", "added.txt"], worktree);
+  writeFileSync(join(worktree, "unstaged.txt"), "unstaged edit\n", "utf8");
+  const taskPath = join(root, "review.md");
+  writeFileSync(taskPath, "Review the pending diff.\n", "utf8");
+  const env = { XDG_STATE_HOME: stateHome, XDG_CONFIG_HOME: join(root, "config"), ORCH_DRIVER_FAKE_RESULT: "1" };
+  await runOrch(["mail", "agent", "defaults"], env);
+  return { root, stateHome, worktree, remote, taskPath, env };
+}
+
+async function runningCloneStatuses(runsRoot: string, count: number): Promise<RunStatus[]> {
+  for (let i = 0; i < 600; i += 1) {
+    const statuses = existsSync(runsRoot)
+      ? readdirSync(runsRoot).flatMap((dir) => {
+          const path = join(runsRoot, dir, "status.json");
+          return existsSync(path) ? [JSON.parse(readFileSync(path, "utf8")) as RunStatus] : [];
+        })
+      : [];
+    if (statuses.length === count && statuses.every((status) => status.state === "running" && typeof status.pgid === "number")) return statuses;
+    await Bun.sleep(25);
+  }
+  throw new Error(`clone runs never reached running under ${runsRoot}`);
+}
+
+test.skipIf(process.platform !== "darwin")("cross-review --clone --auto accepts staged/unstaged/new work whose bytes did not move, and refuses a real change", async () => {
+  const fx = await cloneReviewFixture("orch-cross-review-index-");
+  const accepted = await runOrch(["cross-review", "--thread", "index-1", "--task", fx.taskPath, "--worktree", fx.worktree, "--clone", "--auto"], fx.env);
+  expect(accepted).toMatchObject({ exitCode: 0, stderr: "" });
+  const payload = JSON.parse(accepted.stdout) as { runs: Array<{ decision: string | null }>; clone: { removed: boolean } };
+  expect(payload.runs).toHaveLength(2);
+  for (const run of payload.runs) expect(run.decision).toBe("accept");
+  expect(payload.clone.removed).toBe(true);
+
+  // The source changes while the clone reviews run: nothing is accepted.
+  const thread = "index-2";
+  const pending = runOrch(["cross-review", "--thread", thread, "--task", fx.taskPath, "--worktree", fx.worktree, "--clone", "--auto"], { ...fx.env, ORCH_DRIVER_FAKE_SLEEP_MS: "1500" });
+  await runningCloneStatuses(join(fx.stateHome, "orch", repoKeyFromRemote(fx.remote, fx.worktree), "mrs", thread, "runs"), 2);
+  writeFileSync(join(fx.worktree, "added.txt"), "changed after review\n", "utf8");
+  const refused = JSON.parse((await pending).stdout) as { runs: Array<{ decision: string | null }> };
+  expect(refused.runs).toHaveLength(2);
+  for (const run of refused.runs) expect(run.decision).toBeNull();
+}, 60_000);
+
+test.skipIf(process.platform !== "darwin")("cross-review --clone --auto keeps the clone while a stale run's provider is still alive", async () => {
+  const fx = await cloneReviewFixture("orch-cross-review-orphan-");
+  const thread = "orphan-1";
+  const runsRoot = join(fx.stateHome, "orch", repoKeyFromRemote(fx.remote, fx.worktree), "mrs", thread, "runs");
+  const pending = runOrch(["cross-review", "--thread", thread, "--task", fx.taskPath, "--worktree", fx.worktree, "--clone", "--auto"], { ...fx.env, ORCH_DRIVER_FAKE_SLEEP_MS: "60000" });
+  const statuses = await runningCloneStatuses(runsRoot, 2);
+  const groupAlive = (pgid: number) => {
+    try {
+      process.kill(-pgid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  try {
+    for (const status of statuses) process.kill(status.supervisor_pid!, "SIGKILL");
+    const out = await pending;
+    const payload = JSON.parse(out.stdout) as { clone: { dest: string; removed: boolean; reason: string } };
+    expect(payload.clone).toMatchObject({ removed: false });
+    expect(payload.clone.reason).toContain("still alive");
+    expect(existsSync(payload.clone.dest)).toBe(true);
+    for (const status of statuses) expect(groupAlive(status.pgid!)).toBe(true);
+    for (const status of statuses) {
+      const cancel = await runOrch(["run", "cancel", "--run", status.run_id, "--mr", thread, "--worktree", fx.worktree], fx.env);
+      expect(JSON.parse(cancel.stdout)).toMatchObject({ canceled: true, stopped: true });
+      expect(groupAlive(status.pgid!)).toBe(false);
+    }
+    await runCmd(["git", "worktree", "remove", "--force", payload.clone.dest], fx.worktree);
+  } finally {
+    for (const status of statuses) {
+      try {
+        process.kill(-status.pgid!, "SIGKILL");
+      } catch {}
+    }
+  }
+}, 60_000);

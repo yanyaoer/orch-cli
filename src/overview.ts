@@ -5,11 +5,13 @@
 // line. Read-only: this module never writes state.
 
 import { existsSync, readdirSync, statSync } from "node:fs";
-import type { RunState, RunStatus } from "./types.ts";
+import { evidenceRoles, isRunRole, type RunState, type RunStatus, type VcsSnapshot } from "./types.ts";
 import { mailControlStateDir,  orchStateRoot, statePathSegment } from "./paths.ts";
+import { gitEnv } from "./git-env.ts";
 import { readJsonFile } from "./json.ts";
-import { looksStale, nonTerminalStates, scanMrRuns } from "./run-store.ts";
-import { vcsKind } from "./vcs.ts";
+import { looksStale, nonTerminalStates, scanMrRuns, type DecisionVerdict } from "./run-store.ts";
+import { validateRoleResult } from "./schema.ts";
+import { describeSnapshot, sameSnapshot, vcsKind, vcsResolveCommit, vcsSnapshot } from "./vcs.ts";
 
 export interface OverviewRun {
   repo_key: string;
@@ -22,9 +24,19 @@ export interface OverviewRun {
   verdict: string | null;
   blocking: number | null;
   decided: boolean;
+  decision: DecisionVerdict | null;
   started_at: string | null;
   updated_at: string;
   worktree: string;
+  // Validator errors for the stored result (contradictions included); a
+  // non-empty list means the result is not usable evidence.
+  result_errors: string[];
+  // Runs this one replaces (spec.supersedes), and the done run replacing it.
+  supersedes: string[];
+  superseded_by: string | null;
+  // Host-captured snapshot this run's result speaks for, or why there is none.
+  evidence_snapshot: VcsSnapshot | null;
+  evidence_problem: string | null;
 }
 
 export type ActionKind = "decision" | "inspect" | "reap" | "mirror_sync" | "mailctl" | "worktree_gc";
@@ -58,6 +70,9 @@ export interface OverviewOptions {
   // MRs considered closed because their branch merged: raw or sanitized mr
   // names, applied only to the repo they were computed for.
   archived?: { repoKey: string; mrs: Set<string> } | null;
+  // Current candidate per repo_key (only the repo we have a checkout for);
+  // repos without one never get an evidence-based accept suggestion.
+  candidates?: Map<string, CandidateResolution>;
 }
 
 export const DEFAULT_ATTENTION_DAYS = 14;
@@ -69,9 +84,9 @@ export function isGoodVerdict(verdict: string | null): boolean {
   return verdict !== null && goodVerdicts.has(verdict);
 }
 
-// The one accept/rework rubric: acceptable work is a good verdict with no
-// blocking findings. The bare overview, decision sweep, and cross-review
-// --auto all ask this instead of restating it.
+// Verdict-level half of the rubric: a good verdict with no blocking findings.
+// Callers deciding accept/rework go through assessRun, which adds result
+// validity, supersession, and candidate binding on top.
 export function isAcceptableOutcome(verdict: string | null, blocking: number | null): boolean {
   return isGoodVerdict(verdict) && (blocking ?? 0) === 0;
 }
@@ -82,10 +97,32 @@ export function isTerminal(state: RunState): boolean {
   return !nonTerminalStates.has(state);
 }
 
+// What a reviewer/verifier result is evidence FOR: the snapshot the
+// supervisor captured at start and end, when both exist and agree.
+function runEvidence(status: RunStatus): { snapshot: VcsSnapshot | null; problem: string | null } {
+  if (status.snapshot_error) return { snapshot: null, problem: status.snapshot_error };
+  if (!status.start_snapshot || !status.end_snapshot) {
+    return { snapshot: null, problem: "no orch-captured start/end snapshot (legacy or failed run); not proof for any head" };
+  }
+  if (!sameSnapshot(status.start_snapshot, status.end_snapshot)) {
+    return { snapshot: null, problem: `worktree drifted during run (${describeSnapshot(status.start_snapshot)} -> ${describeSnapshot(status.end_snapshot)})` };
+  }
+  return { snapshot: status.end_snapshot, problem: null };
+}
+
 export function collectMrRuns(repoKey: string, mr: string): OverviewRun[] {
+  const records = scanMrRuns(repoKey, mr);
+  // A run is superseded only once its replacement is done: a replacement that
+  // is still running, failed, or timed out leaves the old evidence standing.
+  const supersededBy = new Map<string, string>();
+  for (const { spec, status } of records) {
+    if (status?.state !== "done" || !spec || !Array.isArray(spec.supersedes)) continue;
+    for (const id of spec.supersedes) supersededBy.set(id, status.run_id);
+  }
   const runs: OverviewRun[] = [];
-  for (const { status, result, decision, stale } of scanMrRuns(repoKey, mr)) {
+  for (const { spec, status, result, decision, stale } of records) {
     if (!status) continue;
+    const evidence = runEvidence(status);
     runs.push({
       repo_key: repoKey,
       mr: status.mr,
@@ -97,12 +134,109 @@ export function collectMrRuns(repoKey: string, mr: string): OverviewRun[] {
       verdict: typeof result?.verdict === "string" ? result.verdict : null,
       blocking: result && "blocking_findings" in result && Array.isArray(result.blocking_findings) ? result.blocking_findings.length : null,
       decided: decision !== null,
+      decision: decision?.verdict ?? null,
       started_at: status.started_at,
       updated_at: status.updated_at,
       worktree: status.worktree,
+      result_errors: result === null ? [] : isRunRole(status.role) ? validateRoleResult(status.role, result).errors : [`unknown role ${status.role}`],
+      supersedes: spec && Array.isArray(spec.supersedes) ? spec.supersedes : [],
+      superseded_by: supersededBy.get(status.run_id) ?? null,
+      evidence_snapshot: evidence.snapshot,
+      evidence_problem: evidence.problem,
     });
   }
   return runs;
+}
+
+// The candidate a verdict or accept is judged against: either the current
+// snapshot of a checkout, or an explicitly pinned commit (--head). null with
+// an error when it cannot be determined — evidence then never auto-accepts.
+export type Candidate = { source: "worktree"; snapshot: VcsSnapshot } | { source: "head"; head: string };
+
+export interface CandidateResolution {
+  candidate: Candidate | null;
+  error: string | null;
+}
+
+export async function resolveCandidate(worktree: string, head: string | null): Promise<CandidateResolution> {
+  try {
+    if (head !== null) return { candidate: { source: "head", head: await vcsResolveCommit(worktree, head) }, error: null };
+    return { candidate: { source: "worktree", snapshot: await vcsSnapshot(worktree) }, error: null };
+  } catch (error) {
+    const detail = error instanceof Error ? error.message.split("\n")[0] : String(error);
+    return { candidate: null, error: head !== null ? `cannot resolve --head ${head}: ${detail}` : `cannot snapshot ${worktree}: ${detail}` };
+  }
+}
+
+export function describeCandidate(resolution: CandidateResolution | null): string {
+  const candidate = resolution?.candidate;
+  if (!candidate) return `unknown (${resolution?.error ?? "no candidate"})`;
+  return candidate.source === "head" ? `head ${candidate.head.slice(0, 12)}` : describeSnapshot(candidate.snapshot);
+}
+
+function evidenceMismatch(evidence: VcsSnapshot, candidate: Candidate): string | null {
+  if (candidate.source === "head") {
+    if (evidence.head !== candidate.head) return `evidence is for ${describeSnapshot(evidence)}, pinned --head is ${candidate.head.slice(0, 12)}`;
+    if (evidence.dirty) return `evidence covers uncommitted changes on top of ${candidate.head.slice(0, 12)}, not the pinned commit itself`;
+    return null;
+  }
+  if (!sameSnapshot(evidence, candidate.snapshot)) {
+    return `evidence is for ${describeSnapshot(evidence)}, current candidate is ${describeSnapshot(candidate.snapshot)}`;
+  }
+  return null;
+}
+
+export type RunOutcome = "accept" | "rework" | "inspect" | "close" | "pending" | "stale";
+
+export interface RunAssessment {
+  outcome: RunOutcome;
+  reason: string;
+}
+
+// The one accept/rework rubric shared by the overview, verdict, wait,
+// decision accept/sweep, and cross-review --auto. Fail closed: anything that
+// is not a valid, unsuperseded, good result — and, for reviewer/verifier, one
+// bound to the current candidate — is never "accept".
+export function assessRun(run: OverviewRun, candidate: CandidateResolution | null): RunAssessment {
+  if (run.stale) return { outcome: "stale", reason: "supervisor gone" };
+  if (!isTerminal(run.state)) return { outcome: "pending", reason: run.state };
+  if (run.superseded_by) return { outcome: "close", reason: `superseded by ${run.superseded_by}` };
+  if (run.state !== "done") return { outcome: "inspect", reason: `run ${run.state}` };
+  if (run.result_errors.length > 0) return { outcome: "inspect", reason: `invalid result: ${run.result_errors.join("; ")}` };
+  if (run.verdict === null) return { outcome: "inspect", reason: "done without a result verdict" };
+  const blockingText = run.blocking ? ` · blocking ${run.blocking}` : "";
+  if (!isAcceptableOutcome(run.verdict, run.blocking)) return { outcome: "rework", reason: `${run.role} ${run.verdict}${blockingText}` };
+  if (!isRunRole(run.role) || !evidenceRoles.has(run.role)) return { outcome: "accept", reason: `${run.role} ${run.verdict}` };
+  if (!run.evidence_snapshot) return { outcome: "inspect", reason: `${run.role} ${run.verdict} unbound: ${run.evidence_problem}` };
+  if (!candidate?.candidate) return { outcome: "inspect", reason: `${run.role} ${run.verdict}; candidate ${describeCandidate(candidate)}` };
+  const mismatch = evidenceMismatch(run.evidence_snapshot, candidate.candidate);
+  if (mismatch) return { outcome: "inspect", reason: `${run.role} ${run.verdict} stale: ${mismatch}` };
+  return { outcome: "accept", reason: `${run.role} ${run.verdict} @ ${describeSnapshot(run.evidence_snapshot)}` };
+}
+
+export type ThreadSuggestion = "accept" | "rework" | "inspect" | "pending" | "reap";
+
+// Thread-level aggregate over the runs still in force: a run superseded by a
+// done replacement is history, everything else must agree. Decisions do not
+// change this: `close` stays what it always was — a pure ack that stops the
+// notifications — and never resolves a blocker or retires evidence. A later
+// approve from one reviewer never cancels another reviewer's blocker; only an
+// explicit, successful supersede retires a run.
+export function assessThread(runs: OverviewRun[], candidate: CandidateResolution | null): {
+  suggestion: ThreadSuggestion;
+  reasons: string[];
+  assessments: Map<string, RunAssessment>;
+} {
+  const assessments = new Map(runs.map((run) => [run.run_id, assessRun(run, candidate)]));
+  const inForce = runs.filter((run) => assessments.get(run.run_id)!.outcome !== "close");
+  const pick = (outcome: RunOutcome) =>
+    inForce.filter((run) => assessments.get(run.run_id)!.outcome === outcome).map((run) => `${run.run_id}: ${assessments.get(run.run_id)!.reason}`);
+  for (const [outcome, suggestion] of [["stale", "reap"], ["pending", "pending"], ["inspect", "inspect"], ["rework", "rework"]] as const) {
+    const reasons = pick(outcome);
+    if (reasons.length > 0) return { suggestion, reasons, assessments };
+  }
+  if (inForce.length === 0) return { suggestion: "inspect", reasons: ["no run in force: every run is superseded"], assessments };
+  return { suggestion: "accept", reasons: pick("accept"), assessments };
 }
 
 // Directory names under <repo>/mrs are sanitized at write time; the raw mr id
@@ -143,22 +277,23 @@ export function collectRepoKeys(): string[] {
   return repos.sort();
 }
 
-export function suggestedRunAction(run: OverviewRun, withWorktree: boolean): OverviewAction | null {
+export function suggestedRunAction(run: OverviewRun, withWorktree: boolean, candidate: CandidateResolution | null = null): OverviewAction | null {
   if (!isTerminal(run.state) || run.decided) return null;
   // stale/cancelled runs are managed by reap, not by per-run decisions.
   if (run.state === "stale" || run.state === "cancelled") return null;
   const worktreeFlags = withWorktree ? ["--worktree", run.worktree] : [];
-  if (run.state === "done") {
-    const good = isAcceptableOutcome(run.verdict, run.blocking);
-    const verdictText = run.verdict ?? "no verdict";
-    const blockingText = run.blocking !== null ? ` · blocking ${run.blocking}` : "";
+  const assessment = assessRun(run, candidate);
+  if (assessment.outcome === "accept" || assessment.outcome === "rework" || assessment.outcome === "close") {
+    // An accept judged against a pinned --head must be replayed against it.
+    const headFlags = assessment.outcome === "accept" && candidate?.candidate?.source === "head" ? ["--head", candidate.candidate.head] : [];
     return {
       kind: "decision",
-      reason: `done · ${run.role} ${verdictText}${blockingText} · no decision`,
+      reason: `${run.state} · ${assessment.reason} · no decision`,
       argv: [
-        "orch", "decision", good ? "accept" : "rework",
+        "orch", "decision", assessment.outcome,
         "--run", run.run_id, "--mr", run.mr,
-        "--reason", `${run.role} ${verdictText}`,
+        "--reason", assessment.outcome === "close" ? assessment.reason : `${run.role} ${run.verdict ?? "no verdict"}`,
+        ...headFlags,
         ...worktreeFlags,
       ],
       repo_key: run.repo_key,
@@ -168,7 +303,7 @@ export function suggestedRunAction(run: OverviewRun, withWorktree: boolean): Ove
   }
   return {
     kind: "inspect",
-    reason: `${run.state} · no decision`,
+    reason: `${run.state} · ${assessment.reason} · no decision`,
     argv: ["orch", "result", "--run", run.run_id, "--mr", run.mr, ...worktreeFlags],
     repo_key: run.repo_key,
     mr: run.mr,
@@ -353,7 +488,7 @@ export function buildOverview(repoKeys: string[], withWorktree: boolean, options
           if (isAged(run.updated_at)) agedOut += 1;
           else staleCount += 1;
         }
-        const action = suggestedRunAction(run, withWorktree);
+        const action = suggestedRunAction(run, withWorktree, options.candidates?.get(repoKey) ?? null);
         if (action) {
           if (isAged(run.updated_at)) agedOut += 1;
           else decisions.push(action);
@@ -404,7 +539,7 @@ export function buildOverview(repoKeys: string[], withWorktree: boolean, options
 export async function mergedBranchMrs(worktree: string): Promise<Set<string> | null> {
   if (vcsKind(worktree) === "jj") return mergedBookmarkMrs(worktree);
   const git = (...args: string[]) =>
-    Bun.spawn(["git", "-C", worktree, ...args], { stdout: "pipe", stderr: "ignore" });
+    Bun.spawn(["git", "-C", worktree, ...args], { stdout: "pipe", stderr: "ignore", env: gitEnv() });
   try {
     const current = (await new Response(git("branch", "--show-current").stdout).text()).trim();
     const head = (await new Response(git("rev-parse", "HEAD").stdout).text()).trim();
@@ -432,7 +567,7 @@ async function mergedBookmarkMrs(worktree: string): Promise<Set<string> | null> 
   try {
     const proc = Bun.spawn(
       ["jj", "bookmark", "list", "-r", "::@- ~ @-", "--ignore-working-copy", "-T", 'if(remote, "", name ++ "\\n")'],
-      { cwd: worktree, stdout: "pipe", stderr: "ignore" },
+      { cwd: worktree, stdout: "pipe", stderr: "ignore", env: gitEnv() },
     );
     const out = await new Response(proc.stdout).text();
     if ((await proc.exited) !== 0) return null;

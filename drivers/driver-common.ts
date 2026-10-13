@@ -3,6 +3,7 @@ import { isRunRole, type AgentName, type ResultCoercion, type RunSpec, type Role
 import { fallbackResult, resultSchemaName, ROLE_REQUIRED_FIELDS, ROLE_RESULT_EXAMPLE, ROLE_VERDICTS, validateRoleResult } from "../src/schema.ts";
 import { appendJsonLine, countLines, writeJsonAtomic } from "../src/json.ts";
 import { normalizeNativeText, type NativeEvent } from "../src/native-events.ts";
+import { scrubGitLocationEnv } from "../src/git-env.ts";
 import { sha256 } from "../src/hash.ts";
 import {
   acceptableHostTmpDir,
@@ -70,8 +71,14 @@ export function buildPrompt(spec: RunSpec, provider: string): string {
     ...(role === "implementer"
       ? [
           // Repeated full builds inside implement loops dominated real run wall
-          // time on large repos; exhaustive verification is the verifier's job.
-          "Verification discipline: finish ALL edits first, then verify ONCE with checks scoped to the code you changed (one targeted build/test command). If that fails, fix and re-run the same scoped check. Never run repo-wide or full-module test suites — that exhaustive pass belongs to a separate verifier run.",
+          // time on large repos — but an unconditional ban left gaps whenever
+          // no verifier run followed, so required checks are always allowed.
+          "Verification discipline: finish ALL edits first, then run the checks this change needs: targeted tests for the code you changed, plus any broader suite or build the task explicitly requires. Do not loop full builds inside edit cycles. A necessary check you could not run is reported as skipped, never as passed.",
+        ]
+      : []),
+    ...(role === "implementer" || role === "verifier"
+      ? [
+          `Command evidence: every ${role === "verifier" ? "commands" : "tests"} entry carries "status": "passed" | "failed" | "skipped". A check that did not run is "skipped" with "exit_code": null — never exit_code 0. For a negative test whose expected outcome is a non-zero exit, set "expected_exit_code" to that code; "passed" then means exit_code equals it. A success verdict must not contain a failed check or an unmet acceptance item (acceptance status: met | unmet | skipped).${role === "verifier" ? ' A verifier "pass" also needs at least one command that actually ran and passed, and may skip a command or acceptance item only when it is marked "optional": true.' : ""} orch checks this JSON for consistency but does not re-run your commands: list only commands you actually ran.`,
         ]
       : []),
     ...(spec.language === "中文"
@@ -111,6 +118,26 @@ const recursiveToolEnvKeys = [
   "ORCH_TOOL_SERVER_URL",
 ] as const;
 
+// Set by the supervisor on the driver it spawns: the driver must read a "go"
+// line on stdin (sent once its process group is registered in status and the
+// worktree lock) before doing anything. EOF means the supervisor died first.
+export const DRIVER_HANDSHAKE_ENV = "ORCH_DRIVER_HANDSHAKE";
+
+export async function awaitSupervisorHandshake(): Promise<boolean> {
+  if (process.env[DRIVER_HANDSHAKE_ENV] !== "1") return true;
+  delete process.env[DRIVER_HANDSHAKE_ENV];
+  const reader = Bun.stdin.stream().getReader();
+  const decoder = new TextDecoder();
+  let received = "";
+  while (!received.includes("\n")) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    received += decoder.decode(value, { stream: true });
+  }
+  reader.releaseLock();
+  return received.split("\n")[0] === "go";
+}
+
 export function buildWorkerEnv(baseEnv: NodeJS.ProcessEnv = process.env): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [key, value] of Object.entries(baseEnv)) {
@@ -118,6 +145,10 @@ export function buildWorkerEnv(baseEnv: NodeJS.ProcessEnv = process.env): Record
   }
 
   for (const key of recursiveToolEnvKeys) delete env[key];
+  delete env[DRIVER_HANDSHAKE_ENV];
+  // Workers run in spec.worktree; inherited GIT_DIR & co. would point their
+  // git at another checkout than the one snapshotted and locked.
+  scrubGitLocationEnv(env);
   // Claude-specific hardening: do not auto-connect nested IDE/tool sessions, and
   // restrict any child-started Claude MCP servers to their own explicit allowlist.
   env.CLAUDE_CODE_AUTO_CONNECT_IDE = "false";
@@ -899,7 +930,7 @@ export async function maybeWriteFakeResult(runDir: string, spec: RunSpec, provid
             run_id: spec.run_id,
             verdict: "pass",
             verifies_run_id: spec.run_id,
-            commands: [],
+            commands: [{ cmd: `fake ${provider} check`, exit_code: 0, status: "passed", summary: "fake check passed" }],
             acceptance: [],
           }
       : spec.role === "researcher"

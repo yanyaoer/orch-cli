@@ -1,20 +1,20 @@
 // orch run create|list|reap|cancel: provider session config, resume chains, sandbox compatibility, spawning the detached supervisor.
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { isRunRole, writeRoles, type AgentName, type ProviderSessionMode, type RunRole, type RunSpec, type RunStatus } from "../types.ts";
-import { acquirePidfileLockWait } from "../locks.ts";
+import { evidenceRoles, isRunRole, writeRoles, type AgentName, type ProviderSessionMode, type RunRole, type RunSpec, type RunStatus, type VcsSnapshot } from "../types.ts";
+import { acquirePidfileLockWait, isProcessGroupAlive, processIdentity } from "../locks.ts";
 import { sha256 } from "../hash.ts";
 import { ensureStateLayout, getRepoIdentity, lockPathForWorktree, mrStateDir, type RepoIdentity } from "../paths.ts";
 import { appendJsonLine, countLines, jsonBytes, readJsonFile, writeJsonAtomic, writeTextAtomic } from "../json.ts";
 import { writeInitialRunFiles } from "../supervisor.ts";
-import { vcsDirty, vcsHead } from "../vcs.ts";
+import { describeSnapshot, vcsDirty, vcsHead, vcsResolveCommit, vcsSnapshot } from "../vcs.ts";
 import { isTerminal } from "../overview.ts";
 import { orchLanguage, readOrchConfig, type RoleDefaults } from "../config.ts";
 
 import { CliError, assertKnownFlags, flagBool, flagString, printJson, readStdinText, type ParsedArgs } from "../cli.ts";
 import { buildPrompt, buildProviderExecutionPlan, type ProviderExecutionPlan } from "../../drivers/driver-common.ts";
 import { SEATBELT_ENGINE, sandboxPosture, sandboxRunIdentity, seatbeltUnsupportedReason } from "../../drivers/sandbox.ts";
-import { archivedIdempotency, formatTable, locateRun, mrIdsForRepo, nonTerminalStates, orchCommand, readIdempotency, resolveMr, runId, runListRows, scanMrRuns, scanRunsRoot, stateDirectoryHint, statusState, type IdempotencyRecord } from "../run-store.ts";
+import { archivedIdempotency, formatTable, locateRun, looksStale, mrIdsForRepo, nonTerminalStates, orchCommand, readIdempotency, resolveMr, runId, runListRows, scanMrRuns, scanRunsRoot, stateDirectoryHint, statusState, type IdempotencyRecord } from "../run-store.ts";
 
 function isProviderSessionMode(value: string): value is ProviderSessionMode {
   return value === "ephemeral" || value === "fresh_persistent" || value === "resume_exact";
@@ -157,6 +157,88 @@ function assertSandboxCompatible(existing: IdempotencyRecord, engine: typeof SEA
   );
 }
 
+// Default and explicit idempotency keys alike must never hand back a run that
+// was bound to another worktree snapshot: the HEAD must match for every
+// snapshot-bound role, and reviewer/verifier also need identical content.
+// Legacy runs carry no snapshot and are therefore never reusable here.
+function assertSnapshotCompatible(existing: IdempotencyRecord, snapshot: VcsSnapshot, pinnedHead: string | null, role: RunRole): void {
+  if (role !== "implementer" && !evidenceRoles.has(role)) return;
+  const spec = readJsonFile<Partial<RunSpec> | null>(`${existing.run_dir}/spec.json`, null);
+  const stored = spec?.snapshot ?? null;
+  const storedPin = spec?.pinned_head ?? null;
+  const problem =
+    storedPin !== pinnedHead
+      ? `existing run pinned head ${storedPin ?? "none"}, requested ${pinnedHead ?? "none"}`
+      : stored === null
+        ? "existing run has no recorded worktree snapshot (created before snapshot binding)"
+        : stored.head !== snapshot.head || (evidenceRoles.has(role) && stored.content_sha !== snapshot.content_sha)
+          ? `existing run is bound to ${describeSnapshot(stored)}, worktree is now ${describeSnapshot(snapshot)}`
+          : null;
+  if (problem) {
+    throw new CliError(
+      ["idempotent run already exists for a different worktree snapshot", problem, "Pass --retry to create a new run for the current snapshot."].join("\n"),
+    );
+  }
+}
+
+async function captureCreateSnapshot(worktree: string): Promise<VcsSnapshot> {
+  try {
+    return await vcsSnapshot(worktree);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message.split("\n")[0] : String(error);
+    throw new CliError(`cannot capture worktree snapshot for ${worktree} (orch needs a git or jj checkout): ${detail}`);
+  }
+}
+
+// --head <rev>: pin the commit this run is about. The checkout must be at it
+// now (the supervisor re-checks after taking the lock); reviewer/verifier on a
+// pinned head also need a clean checkout, or they would review more than it.
+async function resolvePinnedHead(worktree: string, rev: string, snapshot: VcsSnapshot, role: RunRole): Promise<string> {
+  let head: string;
+  try {
+    head = await vcsResolveCommit(worktree, rev);
+  } catch {
+    head = "";
+  }
+  if (!head) throw new CliError(`--head ${rev} does not name a commit in ${worktree}`);
+  if (snapshot.head !== head) {
+    throw new CliError(
+      `--head ${rev} is ${head.slice(0, 12)} but the worktree is at ${describeSnapshot(snapshot)}; check out the pinned commit (a separate checkout keeps parallel work isolated)`,
+    );
+  }
+  if (evidenceRoles.has(role) && snapshot.dirty) {
+    throw new CliError(`--head pins ${head.slice(0, 12)} but the worktree has uncommitted changes; a ${role} on a pinned head needs a clean checkout`);
+  }
+  return head;
+}
+
+// Runs this one replaces. Explicit --supersedes ids must be existing runs of
+// the same role in this MR; --resume-from of a same-role run implies it.
+function resolveSupersedes(args: ParsedArgs, mrDir: string, mr: string, role: RunRole, resume: { run_id: string; mr: string; role: RunRole } | null): string[] {
+  const ids = new Set<string>();
+  if (args.flags.has("supersedes")) {
+    for (const id of flagString(args, "supersedes").split(",").map((item) => item.trim()).filter(Boolean)) ids.add(id);
+    if (ids.size === 0) throw new CliError("--supersedes needs at least one run id");
+  }
+  for (const id of ids) {
+    const spec = readJsonFile<Partial<RunSpec> | null>(`${mrDir}/runs/${id}/spec.json`, null);
+    const status = readJsonFile<Partial<RunStatus> | null>(`${mrDir}/runs/${id}/status.json`, null);
+    const storedRole = spec?.role ?? status?.role;
+    if (!storedRole) throw new CliError(`--supersedes ${id}: no such run under MR ${mr}`);
+    if (storedRole !== role) throw new CliError(`--supersedes ${id}: it is a ${storedRole} run; a ${role} run can only supersede ${role} runs`);
+  }
+  if (resume && resume.role === role && resume.mr === mr) ids.add(resume.run_id);
+  return [...ids];
+}
+
+// --retry replaces the run this key pointed at: record it as superseded when
+// it is the same role, so its evidence leaves the aggregate.
+function withRetrySupersede(supersedes: string[], existing: IdempotencyRecord | undefined, role: RunRole): string[] {
+  if (!existing || supersedes.includes(existing.run_id)) return supersedes;
+  const storedRole = readJsonFile<Partial<RunSpec> | null>(`${existing.run_dir}/spec.json`, null)?.role;
+  return storedRole === role ? [...supersedes, existing.run_id] : supersedes;
+}
+
 const VALID_AGENTS: readonly AgentName[] = ["codex", "claude", "pi", "omp"];
 
 function validateRunAgent(agent: AgentName, _role: RunRole): void {
@@ -186,6 +268,8 @@ const RUN_CREATE_FLAGS = [
   "session-name",
   "session-id",
   "allow-session-chain",
+  "head",
+  "supersedes",
   "dry-run",
   "json",
 ] as const;
@@ -368,9 +452,16 @@ export async function createRun(args: ParsedArgs): Promise<number> {
   const repo = await getRepoIdentity(worktree);
   const mrDir = mrStateDir(repo.repo_key, mr);
   const taskSha = sha256(taskText);
+  // Captured by orch, never taken from a model: what this run is about.
+  const snapshot = await captureCreateSnapshot(worktree);
+  const pinnedHead = args.flags.has("head") ? await resolvePinnedHead(worktree, flagString(args, "head"), snapshot, role) : null;
+  const supersedes = resolveSupersedes(args, mrDir, mr, role, resume);
   // The engine version is part of the default fingerprint so sandboxed and
-  // unsandboxed requests can never reuse each other's runs.
-  const defaultIdempotencyKey = `mr${mr}:${tag}:${taskSha}:session-${providerSessionFingerprint(providerSession)}${sandboxIdentity.keySuffix}`;
+  // unsandboxed requests can never reuse each other's runs; the actual HEAD
+  // (plus content for reviewer/verifier on a dirty checkout) is too, so the
+  // same request against a new candidate is a new run.
+  const contentKey = evidenceRoles.has(role) && snapshot.dirty ? `:content-${sha256(snapshot.content_sha).slice(0, 12)}` : "";
+  const defaultIdempotencyKey = `mr${mr}:${tag}:${taskSha}:session-${providerSessionFingerprint(providerSession)}:head-${snapshot.head}${contentKey}${sandboxIdentity.keySuffix}`;
   const idempotencyKey = flagString(args, "idempotency-key", defaultIdempotencyKey);
   const idempotencyPath = `${mrDir}/idempotency.json`;
   const dryRun = flagBool(args, "dry-run");
@@ -381,6 +472,7 @@ export async function createRun(args: ParsedArgs): Promise<number> {
     const existing = readIdempotency(idempotencyPath)[idempotencyKey];
     const existingSession = existing && !retry ? assertProviderSessionCompatible(existing, providerSession, agent) : null;
     if (existing && !retry) assertSandboxCompatible(existing, sandboxEngine, role);
+    if (existing && !retry) assertSnapshotCompatible(existing, snapshot, pinnedHead, role);
     const effectiveSession = existingSession ?? providerSession;
     const idempotent = Boolean(existing && !retry);
     // Same guard as the real create; an idempotent hit reuses an existing run
@@ -388,6 +480,7 @@ export async function createRun(args: ParsedArgs): Promise<number> {
     if (!idempotent) assertSessionChainAllowed(mrDir, effectiveSession, tag, flagBool(args, "allow-session-chain"));
     const id = idempotent ? existing!.run_id : runId(tag);
     const runDir = idempotent ? existing!.run_dir : `${mrDir}/runs/${id}`;
+    const plannedSupersedes = retry ? withRetrySupersede(supersedes, existing, role) : supersedes;
     const specPath = `${runDir}/spec.json`;
     const specPreview: RunSpec = {
       version: 1,
@@ -408,6 +501,9 @@ export async function createRun(args: ParsedArgs): Promise<number> {
       base_sha: baseSha,
       timeout_sec: timeoutSec,
       created_at: new Date().toISOString(),
+      snapshot,
+      ...(pinnedHead ? { pinned_head: pinnedHead } : {}),
+      ...(plannedSupersedes.length > 0 ? { supersedes: plannedSupersedes } : {}),
     };
     const payload = {
       dry_run: true,
@@ -438,6 +534,9 @@ export async function createRun(args: ParsedArgs): Promise<number> {
       worktree_lock: lockPathForWorktree(worktree),
       dirty: dirty.length > 0,
       base_sha: baseSha,
+      snapshot,
+      pinned_head: pinnedHead,
+      supersedes: plannedSupersedes,
       timeout_sec: timeoutSec,
       supervisor_plan: idempotent
         ? null
@@ -489,6 +588,9 @@ export async function createRun(args: ParsedArgs): Promise<number> {
         `worktree_lock: ${payload.worktree_lock}`,
         `dirty: ${payload.dirty}`,
         `base_sha: ${baseSha}`,
+        `snapshot: ${describeSnapshot(snapshot)}`,
+        `pinned_head: ${pinnedHead ?? "none"}`,
+        `supersedes: ${plannedSupersedes.length > 0 ? plannedSupersedes.join(",") : "none"}`,
         `timeout_sec: ${timeoutSec}`,
       ];
       if (payload.supervisor_plan) lines.push(`supervisor: ${payload.supervisor_plan.argv.join(" ")}`);
@@ -529,6 +631,9 @@ export async function createRun(args: ParsedArgs): Promise<number> {
       idempotencyPath,
       sandboxEngine,
       sandboxWriteDirs,
+      snapshot,
+      pinnedHead,
+      supersedes,
     })),
   });
   return 0;
@@ -555,13 +660,16 @@ interface StartRunInput {
   // built from an earlier config read (F6).
   sandboxEngine: typeof SEATBELT_ENGINE | null;
   sandboxWriteDirs: string[];
+  snapshot: VcsSnapshot;
+  pinnedHead: string | null;
+  supersedes: string[];
 }
 
 // Spawns a single supervised run and returns its create payload. Shared by
 // `run create` and the fan-out commands (cross-review / fanout / investigate).
 async function startRun(input: StartRunInput): Promise<Record<string, unknown>> {
   const { args, mr, role, agent, tag, worktree, taskPath, taskText, taskSha, timeoutSec } = input;
-  const { providerSession, repo, mrDir, idempotencyKey, idempotencyPath, sandboxEngine, sandboxWriteDirs } = input;
+  const { providerSession, repo, mrDir, idempotencyKey, idempotencyPath, sandboxEngine, sandboxWriteDirs, snapshot, pinnedHead } = input;
   const sandboxIdentity = sandboxRunIdentity(sandboxEngine, sandboxWriteDirs);
 
   try {
@@ -579,6 +687,7 @@ async function startRun(input: StartRunInput): Promise<Record<string, unknown>> 
     if (existing && !flagBool(args, "retry")) {
       const existingSession = assertProviderSessionCompatible(existing, providerSession, agent);
       assertSandboxCompatible(existing, sandboxEngine, role);
+      assertSnapshotCompatible(existing, snapshot, pinnedHead, role);
       const existingState = statusState(existing);
       if (existingState === "failed" || existingState === "timeout") {
         process.stderr.write(
@@ -607,6 +716,7 @@ async function startRun(input: StartRunInput): Promise<Record<string, unknown>> 
       );
     }
     const baseSha = await vcsHead(worktree);
+    const supersedes = withRetrySupersede(input.supersedes, existing, role);
     const id = runId(tag);
     const runDir = `${mrDir}/runs/${id}`;
     mkdirSync(runDir, { recursive: true });
@@ -630,6 +740,9 @@ async function startRun(input: StartRunInput): Promise<Record<string, unknown>> 
       base_sha: baseSha,
       timeout_sec: timeoutSec,
       created_at: createdAt,
+      snapshot,
+      ...(pinnedHead ? { pinned_head: pinnedHead } : {}),
+      ...(supersedes.length > 0 ? { supersedes } : {}),
     };
     const specBytes = jsonBytes(spec);
     writeTextAtomic(`${runDir}/spec.json`, specBytes);
@@ -701,7 +814,7 @@ export async function runReap(args: ParsedArgs): Promise<number> {
   const worktree = resolve(flagString(args, "worktree", process.cwd()));
   const repo = await getRepoIdentity(worktree);
   const mrIds = args.flags.has("mr") ? [flagString(args, "mr")] : mrIdsForRepo(repo.repo_key);
-  const reaped: Array<{ mr: string; run_id: string }> = [];
+  const reaped: Array<{ mr: string; run_id: string; provider_alive?: true; pgid?: number; cancel?: string }> = [];
   const running: Array<{ mr: string; run_id: string }> = [];
   for (const mr of mrIds) {
     for (const { status, stale, run_dir } of scanMrRuns(repo.repo_key, mr)) {
@@ -714,7 +827,14 @@ export async function runReap(args: ParsedArgs): Promise<number> {
       writeJsonAtomic(`${run_dir}/status.json`, { ...status, state: "stale", updated_at: new Date().toISOString() });
       const eventsPath = `${run_dir}/events.jsonl`;
       appendJsonLine(eventsPath, { type: "stale", seq: countLines(eventsPath), ts: new Date().toISOString() });
-      reaped.push({ mr: status.mr, run_id: id });
+      // The provider group can outlive its supervisor; it still holds the
+      // worktree lock and needs an explicit, verified stop.
+      const orphanPgid = typeof status.pgid === "number" && isProcessGroupAlive(status.pgid) ? status.pgid : null;
+      reaped.push(
+        orphanPgid === null
+          ? { mr: status.mr, run_id: id }
+          : { mr: status.mr, run_id: id, provider_alive: true, pgid: orphanPgid, cancel: `orch run cancel --run ${id} --mr ${status.mr}` },
+      );
     }
   }
   printJson({ reaped, still_running: running });
@@ -729,10 +849,14 @@ export async function runCancel(args: ParsedArgs): Promise<number> {
   const located = locateRun(repo.repo_key, runId, args.flags.has("mr") ? flagString(args, "mr") : undefined);
   const status = readJsonFile<RunStatus | null>(`${located.run_dir}/status.json`, null);
   if (!status) throw new CliError(`status.json not found for run: ${runId}`);
-  if (!nonTerminalStates.has(status.state)) {
+  // A stale run lost its supervisor, but its provider group may still run in
+  // the checkout (and hold the worktree lock); it stays cancellable.
+  const orphaned = status.state === "stale" || looksStale(status);
+  if (!nonTerminalStates.has(status.state) && status.state !== "stale") {
     printJson({ canceled: false, run_id: runId, state: status.state, reason: "already terminal" });
     return 0;
   }
+  if (orphaned) return cancelOrphan(args, located, status);
   if (status.pgid === null) {
     throw new CliError(
       `run ${runId} has no process group yet (state: ${status.state}); retry once it is running, or: orch run reap --mr ${located.mr}`,
@@ -763,6 +887,79 @@ export async function runCancel(args: ParsedArgs): Promise<number> {
   }
   printJson({ canceled: true, run_id: runId, mr: located.mr, signal, pgid: status.pgid });
   return 0;
+}
+
+// No supervisor will finalize an orphaned run, so cancel itself signals the
+// provider group and confirms it is gone before reporting success; a group
+// that survives the grace period is a failure, never assumed stopped. A
+// recorded pgid is only a number: once the group is confirmed gone it is
+// cleared (never signalled again), and while it looks alive it is signalled
+// only if the live leader matches the identity the supervisor recorded.
+async function cancelOrphan(args: ParsedArgs, located: { mr: string; run_dir: string }, status: RunStatus): Promise<number> {
+  const runId = status.run_id;
+  const pgid = typeof status.pgid === "number" && !status.orphan_stopped_at ? status.pgid : null;
+  if (pgid === null) {
+    if (status.state === "stale") {
+      printJson({ canceled: false, run_id: runId, state: status.state, reason: "stale run has no live process group (already stopped)" });
+      return 0;
+    }
+    printJson({ canceled: false, run_id: runId, state: status.state, reason: `process group none recorded; run: orch run reap --mr ${located.mr}` });
+    return 1;
+  }
+  if (!isProcessGroupAlive(pgid)) {
+    markOrphanStopped(located.run_dir, status, `orphaned process group ${pgid} found gone by orch run cancel`);
+    printJson({ canceled: false, run_id: runId, state: "stale", reason: `process group ${pgid} is gone; recorded as stopped (orch run reap --mr ${located.mr} reaps the rest)` });
+    return 1;
+  }
+  const mismatch = orphanIdentityProblem(status, pgid);
+  if (mismatch) {
+    printJson({
+      canceled: false,
+      run_id: runId,
+      mr: located.mr,
+      pgid,
+      orphaned: true,
+      reason: `not signalled: ${mismatch}. Inspect it with: ps -axo pid,pgid,lstart,command | awk '$2 == ${pgid}'; if it is this run's provider, stop it (kill -TERM -- -${pgid}) and rerun orch run cancel to record the stop`,
+    });
+    return 1;
+  }
+  const signal = flagBool(args, "force") ? "SIGKILL" : "SIGTERM";
+  try {
+    process.kill(-pgid, signal);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+  }
+  const deadline = Date.now() + (signal === "SIGKILL" ? 5_000 : 10_000);
+  while (isProcessGroupAlive(pgid) && Date.now() < deadline) await Bun.sleep(50);
+  if (isProcessGroupAlive(pgid)) {
+    printJson({ canceled: false, run_id: runId, mr: located.mr, signal, pgid, orphaned: true, reason: `process group ${pgid} still alive after ${signal}; retry with --force` });
+    return 1;
+  }
+  markOrphanStopped(located.run_dir, status, `orphaned process group ${pgid} stopped by orch run cancel (${signal})`);
+  printJson({ canceled: true, run_id: runId, mr: located.mr, signal, pgid, orphaned: true, stopped: true });
+  return 0;
+}
+
+// Why the live group `pgid` cannot be proven to be this run's provider, or
+// null when its leader still is the driver the supervisor spawned: same start
+// time as recorded at spawn, and a driver command line naming this run.
+function orphanIdentityProblem(status: RunStatus, pgid: number): string | null {
+  if (!status.pgid_started) return `no recorded identity for process group ${pgid} (run written by an older orch)`;
+  const live = processIdentity(pgid);
+  if (!live) return `process group ${pgid} has no live leader to verify (the driver exited; remaining members cannot be attributed)`;
+  if (live.started !== status.pgid_started || !live.command.includes("__driver-") || !live.command.includes(status.run_id)) {
+    return `process ${pgid} is not this run's driver (started ${live.started}, recorded ${status.pgid_started}); the number was likely reused`;
+  }
+  return null;
+}
+
+// Keep the supervisor-loss diagnosis (`stale`) and drop the process numbers,
+// so a later cancel can never signal whatever reuses them.
+function markOrphanStopped(runDir: string, status: RunStatus, message: string): void {
+  const ts = new Date().toISOString();
+  writeJsonAtomic(`${runDir}/status.json`, { ...status, state: "stale", pid: null, pgid: null, orphan_stopped_at: ts, updated_at: ts });
+  const eventsPath = `${runDir}/events.jsonl`;
+  appendJsonLine(eventsPath, { type: "stale", seq: countLines(eventsPath), ts, message });
 }
 
 export async function runList(args: ParsedArgs): Promise<number> {

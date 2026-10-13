@@ -122,9 +122,14 @@ test("buildWorkerEnv preserves normal env and removes recursive tool settings", 
     MCP_CONFIG: "/tmp/mcp.json",
     CODEX_MCP_CONFIG: "/tmp/codex-mcp.json",
     ORCH_MCP_URL: "http://127.0.0.1:9999/mcp",
+    GIT_DIR: "/elsewhere/.git",
+    GIT_WORK_TREE: "/elsewhere",
+    GIT_INDEX_FILE: "/elsewhere/.git/index",
+    ORCH_DRIVER_HANDSHAKE: "1",
     EMPTY_VALUE: undefined,
   };
   const env = buildWorkerEnv(baseEnv);
+  for (const key of ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "ORCH_DRIVER_HANDSHAKE"]) expect(key in env).toBe(false);
 
   expect(env.PATH).toBe("/usr/bin");
   expect(env.HOME).toBe("/home/orch");

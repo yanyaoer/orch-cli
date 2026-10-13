@@ -7,14 +7,14 @@ import { ensureStateLayout, mrStateDir } from "../paths.ts";
 import {  writeJsonExclusive } from "../json.ts";
 import { argvForDisplay, createForgeAdapter, detectForge } from "../forge.ts";
 import { findPrivateLeak, privateLeakAllowed } from "../leak.ts";
-import { collectMrRuns, isTerminal } from "../overview.ts";
+import { collectMrRuns, isTerminal, resolveCandidate } from "../overview.ts";
 import { mailFanout, type MailFanoutOutcome } from "../mail-cli.ts";
 import { readOrchConfig } from "../config.ts";
 import { fallbackRawReview, planAutoDecision, sanitizeCommentBody, withheldSection } from "../review-auto.ts";
 import { inspectWorktreeLosses, removeWorktreeClone } from "../worktree.ts";
 import { CliError, flagBool, flagNumber, printJson, type ParsedArgs } from "../cli.ts";
 import { MIRROR_BODY_MAX_CHARS, mirrorBody, zhComments } from "../render.ts";
-import { assertMirrorBodySafe, enqueueComment, forgeRefFor, pendingOutboxFiles, scanMrRuns, sentOutboxDir } from "../run-store.ts";
+import { assertMirrorBodySafe, enqueueComment, forgeRefFor, pendingOutboxFiles, runProcessesAlive, scanMrRuns, sentOutboxDir } from "../run-store.ts";
 
 import { mailFanoutContext } from "./mailctl.ts";
 
@@ -129,11 +129,29 @@ async function crossReviewAuto(args: ParsedArgs, outcome: MailFanoutOutcome): Pr
     tracked = collectMrRuns(repoKey, mr).filter((run) => runIds.has(run.run_id));
   }
 
+  // The candidate is the source checkout as it is now: reviews of a clone
+  // count only if the source still holds exactly the snapshot they saw.
+  const candidate = await resolveCandidate(outcome.worktree, null);
+
   // Every run is terminal: the fan-out's CoW clone has served its purpose.
   // The timeout path above throws before this line, so runs that continue
   // past --wait-sec keep their clone (remove_with stays in the payload).
   let cloneReport: Record<string, unknown> | null = null;
-  if (outcome.clone) {
+  // A stale run only lost its supervisor; its provider group may still be
+  // running inside the clone, so the clone stays until every group is gone.
+  const busy = outcome.clone
+    ? scanMrRuns(repoKey, mr)
+        .filter((record) => runIds.has(record.run_id) && record.status !== null && (record.stale || record.status.state === "stale") && runProcessesAlive(record.status))
+        .map((record) => record.run_id)
+    : [];
+  if (outcome.clone && busy.length > 0) {
+    cloneReport = {
+      dest: outcome.clone.dest,
+      removed: false,
+      reason: `run process still alive: ${busy.join(", ")}; stop it with orch run cancel --run <id>`,
+      remove_with: outcome.clone.remove_with,
+    };
+  } else if (outcome.clone) {
     const removed = removeWorktreeClone(outcome.clone.source, outcome.clone.dest);
     cloneReport = removed
       ? { dest: outcome.clone.dest, removed: true }
@@ -169,7 +187,7 @@ async function crossReviewAuto(args: ParsedArgs, outcome: MailFanoutOutcome): Pr
     const plan =
       result === null
         ? { decision: null, reason: null, attention: `no result.json; inspect: orch events tail --run ${run.run_id} --native` }
-        : planAutoDecision(run, raw !== null);
+        : planAutoDecision(run, raw !== null, candidate);
     if (plan.attention) attention.push(`${run.run_id} (${run.agent}): ${plan.attention}`);
 
     const verdict = result === null ? null : raw !== null ? "unparsed" : run.verdict;

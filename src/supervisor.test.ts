@@ -87,7 +87,7 @@ const result = spec.role === "reviewer"
       run_id: spec.run_id,
       verdict: "pass",
       verifies_run_id: spec.run_id,
-      commands: [],
+      commands: [{ cmd: "fake check", exit_code: 0, status: "passed", summary: "ok" }],
       acceptance: [{ id: "fake", status: "pass" }],
     }
   : {
@@ -279,4 +279,119 @@ test("supervisor evidence git failures do not change the terminal state", async 
   const events = readFileSync(join(runDir, "events.jsonl"), "utf8");
   expect(events).toContain("\"type\":\"done\"");
   expect(events).not.toContain("\"type\":\"failed\"");
+});
+
+async function snapshotOf(worktree: string) {
+  const { vcsSnapshot } = await import("./vcs.ts");
+  return vcsSnapshot(worktree);
+}
+
+function readStatus(runDir: string): RunStatus {
+  return JSON.parse(readFileSync(join(runDir, "status.json"), "utf8")) as RunStatus;
+}
+
+test("reviewer evidence is bound to the start/end snapshot it actually saw", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orch-supervisor-snapshot-"));
+  const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
+  const baseSha = await initGitWorktree(worktree);
+  const runDir = join(root, "run");
+  writeSpec(runDir, { ...testSpec({ runId: "review-bound", role: "reviewer", worktree, baseSha }), snapshot: await snapshotOf(worktree), pinned_head: baseSha });
+
+  expect(await runSupervisorWithState(runDir, [process.execPath, writeFakeDriver(root)], join(root, "state"))).toBe(0);
+  const status = readStatus(runDir);
+  expect(status.state).toBe("done");
+  expect(status.start_snapshot).toEqual({ vcs: "git", head: baseSha, dirty: false, content_sha: baseSha });
+  expect(status.end_snapshot).toEqual(status.start_snapshot);
+  expect(status.snapshot_error).toBeNull();
+});
+
+test("a reviewer refuses to start when the checkout moved after run create or off its pinned head", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orch-supervisor-predrift-"));
+  const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
+  const baseSha = await initGitWorktree(worktree);
+  const created = await snapshotOf(worktree);
+  // An outside (non-orch) edit lands between create and start.
+  writeFileSync(join(worktree, "README.md"), "edited outside orch\n", "utf8");
+  const runDir = join(root, "run");
+  writeSpec(runDir, { ...testSpec({ runId: "review-predrift", role: "reviewer", worktree, baseSha }), snapshot: created });
+  expect(await runSupervisorWithState(runDir, [process.execPath, writeFakeDriver(root)], join(root, "state"))).toBe(1);
+  const status = readStatus(runDir);
+  expect(status.state).toBe("failed");
+  expect(status.snapshot_error).toContain("worktree changed between run create");
+  // The worker never ran: the result is the fallback, not an approve.
+  expect(JSON.parse(readFileSync(join(runDir, "result.json"), "utf8")).verdict).toBe("request_changes");
+
+  const pinnedDir = join(root, "run-pinned");
+  writeSpec(pinnedDir, { ...testSpec({ runId: "review-pinned", role: "reviewer", worktree, baseSha }), pinned_head: "f".repeat(40) });
+  expect(await runSupervisorWithState(pinnedDir, [process.execPath, writeFakeDriver(root)], join(root, "state"))).toBe(1);
+  expect(readStatus(pinnedDir).snapshot_error).toContain("pinned head ffffffffffff");
+});
+
+test("a reviewer whose checkout changes while it runs fails closed with the drift recorded", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orch-supervisor-drift-"));
+  const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
+  const baseSha = await initGitWorktree(worktree);
+  const driver = join(root, "drifting-driver.js");
+  // Approves, but the checkout changes underneath it (an external editor).
+  writeFileSync(
+    driver,
+    String.raw`
+const { readFileSync, writeFileSync, appendFileSync } = require("node:fs");
+const { join } = require("node:path");
+const spec = JSON.parse(readFileSync(process.argv[process.argv.indexOf("--spec") + 1], "utf8"));
+const runDir = process.argv[process.argv.indexOf("--run-dir") + 1];
+appendFileSync(join(spec.worktree, "README.md"), "changed mid-review\n");
+writeFileSync(join(runDir, "result.json"), JSON.stringify({ schema: "orch.result/reviewer/v1", run_id: spec.run_id, verdict: "approve", reviews_run_id: "", blocking_findings: [], non_blocking_findings: [], suggested_tests: [] }));
+`,
+    "utf8",
+  );
+  const runDir = join(root, "run");
+  writeSpec(runDir, { ...testSpec({ runId: "review-drift", role: "reviewer", worktree, baseSha }), snapshot: await snapshotOf(worktree) });
+  expect(await runSupervisorWithState(runDir, [process.execPath, driver], join(root, "state"))).toBe(1);
+  const status = readStatus(runDir);
+  expect(status.state).toBe("failed");
+  expect(status.snapshot_error).toContain("worktree drifted during run");
+  expect(status.end_snapshot?.dirty).toBe(true);
+});
+
+test("reviewers share the worktree lock with each other but not with a writer", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orch-supervisor-shared-"));
+  const stateHome = join(root, "state");
+  const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
+  const baseSha = await initGitWorktree(worktree);
+  const prev = process.env.XDG_STATE_HOME;
+  process.env.XDG_STATE_HOME = stateHome;
+  const { acquireWorktreeLock } = await import("./locks.ts");
+  const lockPath = lockPathForWorktree(worktree);
+  try {
+    // Another reviewer is reading: this reviewer still runs.
+    const otherReader = acquireWorktreeLock(lockPath, "shared", "review-other", 1);
+    const okDir = join(root, "run-ok");
+    writeSpec(okDir, testSpec({ runId: "review-parallel", role: "reviewer", worktree, baseSha }));
+    expect(await runSupervisorWithState(okDir, [process.execPath, writeFakeDriver(root)], stateHome)).toBe(0);
+    // ...but an implementer must wait for readers.
+    const implDir = join(root, "run-impl");
+    writeSpec(implDir, testSpec({ runId: "impl-blocked", role: "implementer", worktree, baseSha }));
+    expect(await runSupervisorWithState(implDir, [process.execPath, writeFakeDriver(root)], stateHome)).toBe(75);
+    otherReader.release();
+
+    // A writer holds the checkout: a reviewer fails closed (exit 75).
+    const held = acquirePidfileLock(lockPath, process.pid, "impl-holding");
+    const blockedDir = join(root, "run-blocked");
+    writeSpec(blockedDir, testSpec({ runId: "review-blocked", role: "reviewer", worktree, baseSha }));
+    expect(await runSupervisorWithState(blockedDir, [process.execPath, writeFakeDriver(root)], stateHome)).toBe(75);
+    held.release();
+
+    // controller takes no worktree lock: it must not block its own workers.
+    const writer = acquirePidfileLock(lockPath, process.pid, "impl-running");
+    const ctrlDir = join(root, "run-ctrl");
+    writeSpec(ctrlDir, testSpec({ runId: "ctrl", role: "controller", worktree, baseSha }));
+    await runSupervisorWithState(ctrlDir, [process.execPath, writeFakeDriver(root)], stateHome);
+    expect(readStatus(ctrlDir).snapshot_error ?? null).toBeNull();
+    expect(readFileSync(join(ctrlDir, "events.jsonl"), "utf8")).not.toContain("lock held");
+    writer.release();
+  } finally {
+    if (prev === undefined) delete process.env.XDG_STATE_HOME;
+    else process.env.XDG_STATE_HOME = prev;
+  }
 });
