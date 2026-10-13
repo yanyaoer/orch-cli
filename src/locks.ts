@@ -193,7 +193,10 @@ function liveHolders(path: string, self: string | null): Holder[] {
       // No legacy pidfile.
     }
   }
-  if (legacyExists && legacy?.nonce !== nonceOf(self) && isLive(path, legacy)) holders.push({ mode: "exclusive", record: legacy });
+  // Skip it only when it is the caller's own marker; a probe (self null) has
+  // no marker, and a legacy record without a nonce is someone else's.
+  const own = self !== null && legacy !== null && legacy.nonce !== null && legacy.nonce === nonceOf(self);
+  if (legacyExists && !own && isLive(path, legacy)) holders.push({ mode: "exclusive", record: legacy });
   return holders;
 }
 

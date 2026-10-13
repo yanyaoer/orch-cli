@@ -614,11 +614,14 @@ test("blockers on older content stay in force, and verdict names the --supersede
   const runs = withState(fx, () => collectMrRuns(fx.repoKey, "mr-1"));
   // Strict: the fresh approve does not retire the old blocker by itself.
   expect(assessThread(runs, candidateFor(newHead)).suggestion).toBe("rework");
-  const hints = staleBlockerHints("mr-1", runs, candidateFor(newHead));
+  const hints = staleBlockerHints("mr-1", fx.worktree, runs, candidateFor(newHead));
   expect(hints.map((hint) => [hint.role, hint.run_ids])).toEqual([["reviewer", ["review-old"]], ["verifier", ["verify-old"]]]);
-  expect(hints[0]!.argv).toEqual(["orch", "run", "create", "--mr", "mr-1", "--role", "reviewer", "--task", "<task.md>", "--supersedes", "review-old"]);
+  expect(hints[0]!.argv).toEqual([
+    "orch", "run", "create", "--mr", "mr-1", "--role", "reviewer", "--agent", "claude",
+    "--worktree", fx.worktree, "--task", "<task.md>", "--retry", "--supersedes", "review-old",
+  ]);
   // A blocker on the candidate itself is a real rework, not a stale one.
-  expect(staleBlockerHints("mr-1", runs, candidateFor(oldHead))).toEqual([]);
+  expect(staleBlockerHints("mr-1", fx.worktree, runs, candidateFor(oldHead))).toEqual([]);
 
   const verdict = await runOrch(fx, ["verdict", "--thread", "mr-1", "--worktree", fx.worktree]);
   expect(verdict.exitCode).toBe(0);
@@ -627,3 +630,40 @@ test("blockers on older content stay in force, and verdict names the --supersede
   const json = JSON.parse((await runOrch(fx, ["verdict", "--thread", "mr-1", "--worktree", fx.worktree, "--json"])).stdout);
   expect(json.supersede_hints).toHaveLength(2);
 });
+
+// Codex review of PR #28: the printed command must work as printed — from
+// another cwd, without configured agent defaults, and even when an approve of
+// the current candidate already exists under the same idempotency key.
+test("the --supersedes hint replays as printed and retires the old blocker", async () => {
+  const fx = fixture();
+  const oldHead = commit(fx.worktree, "v1\n");
+  commit(fx.worktree, "v2\n");
+  writeRun(fx, { id: "review-old", agent: "codex", snapshot: oldHead, result: reviewResult("review-old", "request_changes") });
+  const taskPath = join(tempDir("orch-hint-task-"), "review.md");
+  writeFileSync(taskPath, "MR: mr-1\nreview the candidate\n", "utf8");
+  const env = { ORCH_DRIVER_FAKE_RESULT: "1" };
+  const create = ["run", "create", "--mr", "mr-1", "--role", "reviewer", "--agent", "codex", "--session-mode", "ephemeral", "--worktree", fx.worktree, "--task", taskPath];
+  const approve = await orchEnv(fx, env, create);
+  expect(approve.exitCode).toBe(0);
+  const approveRun = JSON.parse(approve.stdout) as { run_id: string; status_path: string };
+  expect((await waitStatus(approveRun.status_path, (status) => status.state === "done")).state).toBe("done");
+
+  // runOrch's cwd is the orch repo, not fx.worktree: the hint must carry it.
+  const before = JSON.parse((await orchEnv(fx, {}, ["verdict", "--thread", "mr-1", "--worktree", fx.worktree, "--json"])).stdout);
+  expect(before.suggestion).toBe("rework");
+  const argv = (before.supersede_hints[0].argv as string[]).map((arg) => (arg === "<task.md>" ? taskPath : arg));
+  expect(argv).toContain("--worktree");
+  expect(argv).toContain("--agent");
+  const replay = await orchEnv(fx, env, [...argv.slice(1), "--session-mode", "ephemeral"]);
+  expect(replay.exitCode).toBe(0);
+  const fresh = JSON.parse(replay.stdout) as { run_id: string; status_path: string; idempotent?: boolean };
+  expect(fresh.idempotent).not.toBe(true);
+  expect(fresh.run_id).not.toBe(approveRun.run_id);
+  expect((await waitStatus(fresh.status_path, (status) => status.state === "done")).state).toBe("done");
+
+  const after = JSON.parse((await orchEnv(fx, {}, ["verdict", "--thread", "mr-1", "--worktree", fx.worktree, "--json"])).stdout);
+  const old = after.runs.find((run: { run_id: string }) => run.run_id === "review-old");
+  expect(old.superseded_by).toBe(fresh.run_id);
+  expect(after.suggestion).toBe("accept");
+  expect(after.supersede_hints).toEqual([]);
+}, 60_000);

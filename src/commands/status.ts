@@ -135,7 +135,7 @@ export async function verdictCommand(args: ParsedArgs): Promise<number> {
   // any wait: evidence for an older snapshot never counts.
   const candidate = await resolveCandidate(worktree, headFlag(args));
   const { suggestion, reasons, assessments } = assessThread(runs, candidate);
-  const supersedeHints = suggestion === "rework" ? staleBlockerHints(mr, runs, candidate) : [];
+  const supersedeHints = suggestion === "rework" ? staleBlockerHints(mr, worktree, runs, candidate) : [];
   const staleRuns = runs.filter((run) => run.stale);
   const allTerminal = runs.every((run) => isTerminal(run.state));
 

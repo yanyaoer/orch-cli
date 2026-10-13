@@ -313,3 +313,25 @@ test("the probe reports writers and readers by mode and publishes nothing", () =
   writer.release();
   expect(worktreeLockBusy(path, "shared")).toBeNull();
 });
+
+// Codex review of PR #28 (F1): a live pre-hardening pidfile has no nonce; the
+// probe must still see it in both modes, and must leave it in place.
+test("the probe sees a live nonce-less legacy pidfile and does not touch it", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "orch-lock-legacy-probe-"));
+  const path = join(dir, "worktree.lock");
+  const holder = Bun.spawn(["sleep", "30"], { stdio: ["ignore", "ignore", "ignore"] });
+  try {
+    const legacy = `${JSON.stringify({ pid: holder.pid, run_id: "old-orch-impl", ts: new Date().toISOString() })}\n`;
+    writeFileSync(path, legacy, "utf8");
+    for (const mode of ["shared", "exclusive"] as const) {
+      expect(worktreeLockBusy(path, mode)?.holderRunId).toBe("old-orch-impl");
+    }
+    expect(readFileSync(path, "utf8")).toBe(legacy);
+    // The real acquirers agree with the probe.
+    expect(() => acquireWorktreeLock(path, "shared", "review")).toThrow(LockHeldError);
+  } finally {
+    holder.kill("SIGKILL");
+    await holder.exited;
+  }
+  expect(worktreeLockBusy(path, "exclusive")).toBeNull();
+});
