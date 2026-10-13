@@ -300,3 +300,15 @@ export function acquireWorktreeLock(path: string, mode: WorktreeLockMode, runId?
   mkdirSync(dirname(path), { recursive: true });
   return acquireLock(path, mode, runId, pid);
 }
+
+// Create-time check: who would block a `mode` acquire right now. Reads the
+// owner records only (dead ones are pruned as usual); the supervisor still
+// takes the real lock, this just reports contention to the caller up front
+// instead of as a run that fails later with exit 75.
+export function worktreeLockBusy(path: string, mode: WorktreeLockMode): LockHeldError | null {
+  const conflicts = liveHolders(path, null).filter((holder) => mode === "exclusive" || holder.mode === "exclusive");
+  if (conflicts.length === 0) return null;
+  const first = conflicts[0]!;
+  const detail = first.mode === "exclusive" ? "worktree write lock held" : `worktree read lock held (${conflicts.length} reader${conflicts.length > 1 ? "s" : ""})`;
+  return new LockHeldError(path, first.record?.pid ?? null, first.record?.run_id ?? null, detail);
+}

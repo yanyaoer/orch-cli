@@ -277,6 +277,34 @@ export function collectRepoKeys(): string[] {
   return repos.sort();
 }
 
+// Blockers that judged content other than the current candidate. Under the
+// strict rubric they keep the thread at rework until a fresh evaluation
+// declares --supersedes for them; nothing retires them implicitly. This only
+// spells out that command, grouped per role, so a re-review after a rework
+// does not leave the thread stuck on blockers the rework already answered.
+export interface SupersedeHint {
+  role: string;
+  run_ids: string[];
+  argv: string[];
+}
+
+export function staleBlockerHints(mr: string, runs: OverviewRun[], candidate: CandidateResolution | null): SupersedeHint[] {
+  const target = candidate?.candidate;
+  if (!target) return [];
+  const byRole = new Map<string, string[]>();
+  for (const run of runs) {
+    if (!isRunRole(run.role) || !evidenceRoles.has(run.role) || run.superseded_by || !run.evidence_snapshot) continue;
+    if (assessRun(run, candidate).outcome !== "rework") continue;
+    if (!evidenceMismatch(run.evidence_snapshot, target)) continue;
+    byRole.set(run.role, [...(byRole.get(run.role) ?? []), run.run_id]);
+  }
+  return [...byRole].map(([role, ids]) => ({
+    role,
+    run_ids: ids,
+    argv: ["orch", "run", "create", "--mr", mr, "--role", role, "--task", "<task.md>", "--supersedes", ids.join(","), ...(target.source === "head" ? ["--head", target.head] : [])],
+  }));
+}
+
 export function suggestedRunAction(run: OverviewRun, withWorktree: boolean, candidate: CandidateResolution | null = null): OverviewAction | null {
   if (!isTerminal(run.state) || run.decided) return null;
   // stale/cancelled runs are managed by reap, not by per-run decisions.

@@ -1,8 +1,8 @@
 // orch run create|list|reap|cancel: provider session config, resume chains, sandbox compatibility, spawning the detached supervisor.
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { evidenceRoles, isRunRole, writeRoles, type AgentName, type ProviderSessionMode, type RunRole, type RunSpec, type RunStatus, type VcsSnapshot } from "../types.ts";
-import { acquirePidfileLockWait, isProcessGroupAlive, processIdentity } from "../locks.ts";
+import { evidenceRoles, isRunRole, sharedLockRoles, writeRoles, type AgentName, type ProviderSessionMode, type RunRole, type RunSpec, type RunStatus, type VcsSnapshot } from "../types.ts";
+import { acquirePidfileLockWait, isProcessGroupAlive, processIdentity, worktreeLockBusy } from "../locks.ts";
 import { sha256 } from "../hash.ts";
 import { ensureStateLayout, getRepoIdentity, lockPathForWorktree, mrStateDir, type RepoIdentity } from "../paths.ts";
 import { appendJsonLine, countLines, jsonBytes, readJsonFile, writeJsonAtomic, writeTextAtomic } from "../json.ts";
@@ -713,6 +713,17 @@ async function startRun(input: StartRunInput): Promise<Record<string, unknown>> 
     if (dirty.length > 0 && writeRoles.has(role) && !flagBool(args, "allow-dirty")) {
       process.stderr.write(
         `warn: worktree has uncommitted changes; write-role run will proceed. Pass --allow-dirty to acknowledge.\n`,
+      );
+    }
+    // The supervisor takes the real worktree lock; checking here reports
+    // contention to the caller now, naming the holder, instead of as a run
+    // that fails later with exit 75.
+    const lockMode = writeRoles.has(role) ? "exclusive" : sharedLockRoles.has(role) ? "shared" : null;
+    const busy = lockMode ? worktreeLockBusy(lockPathForWorktree(worktree), lockMode) : null;
+    if (busy) {
+      throw new CliError(
+        `worktree ${worktree} is in use${busy.holderRunId ? ` by run ${busy.holderRunId}` : busy.holderPid ? ` by pid ${busy.holderPid}` : ""} ` +
+          `(${busy.message.split(":")[0]}); ${lockMode === "exclusive" ? "a write role needs it to itself" : "a reviewer waits for the writer"} — use another checkout or wait`,
       );
     }
     const baseSha = await vcsHead(worktree);

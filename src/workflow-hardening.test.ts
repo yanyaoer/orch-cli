@@ -7,7 +7,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RunState, RunStatus, VcsSnapshot } from "./types.ts";
-import { assessThread, collectMrRuns } from "./overview.ts";
+import { assessThread, collectMrRuns, staleBlockerHints } from "./overview.ts";
 import { repoKeyFromRemote } from "./paths.ts";
 
 const cleanups: Array<() => void> = [];
@@ -446,15 +446,14 @@ test("an inherited GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE cannot rebind run create
   expect(plan.worktree_lock).toBe(normal.worktree_lock);
 
   // A writer started from the polluted environment contends on the target's
-  // real lock: held here (normal environment), the run fails with 75.
+  // real lock: held here (normal environment), run create refuses it.
   const { acquireWorktreeLock } = await import("./locks.ts");
   const { lockPathForWorktree } = await import("./paths.ts");
   const held = withState(fx, () => acquireWorktreeLock(lockPathForWorktree(fx.worktree), "exclusive", "holder"));
   try {
     const created = await orchEnv(fx, { ...polluted, ORCH_DRIVER_FAKE_RESULT: "1" }, ["run", "create", "--mr", "mr-1", "--role", "implementer", "--agent", "claude", "--tag", "impl", "--session-mode", "ephemeral", "--worktree", fx.worktree]);
-    expect(created.exitCode).toBe(0);
-    const status = await waitStatus(JSON.parse(created.stdout).status_path, (s) => !["created", "starting", "running"].includes(s.state));
-    expect(status).toMatchObject({ state: "failed", exit_code: 75 });
+    expect(created.exitCode).not.toBe(0);
+    expect(created.stderr).toContain("is in use by run holder");
   } finally {
     held.release();
   }
@@ -484,9 +483,11 @@ test("a provider outliving its SIGKILLed supervisor keeps the checkout locked un
   expect(isPidAlive(a.supervisor_pid)).toBe(false);
   expect(isProcessGroupAlive(pgid)).toBe(true);
 
-  // Second writer on the same checkout: refused while the orphan provider lives.
-  const b = await create("owner-b", {});
-  expect(await waitStatus(b.status_path, (s) => !["created", "starting", "running"].includes(s.state))).toMatchObject({ state: "failed", exit_code: 75 });
+  // Second writer on the same checkout: refused at create while the orphan
+  // provider lives, naming the run whose provider holds it.
+  const b = await orchEnv(fx, { ORCH_DRIVER_FAKE_RESULT: "1" }, ["run", "create", "--mr", "mr-1", "--role", "implementer", "--agent", "claude", "--tag", "owner-b", "--session-mode", "ephemeral", "--worktree", fx.worktree]);
+  expect(b.exitCode).not.toBe(0);
+  expect(b.stderr).toContain(`is in use by run ${a.run_id}`);
 
   // reap keeps the supervisor-loss diagnosis and points at the live group.
   const reaped = JSON.parse((await orchEnv(fx, {}, ["run", "reap", "--mr", "mr-1", "--worktree", fx.worktree])).stdout);
@@ -602,3 +603,27 @@ test("cancelling an orphaned run never signals a process group it cannot attribu
   expect(isProcessGroupAlive(other.pid)).toBe(true);
   expect(JSON.parse(readFileSync(reusedPath, "utf8")).pgid).toBe(other.pid);
 }, 30_000);
+
+test("blockers on older content stay in force, and verdict names the --supersedes re-review", async () => {
+  const fx = fixture();
+  const oldHead = commit(fx.worktree, "v1\n");
+  const newHead = commit(fx.worktree, "v2\n");
+  writeRun(fx, { id: "review-old", snapshot: oldHead, result: reviewResult("review-old", "request_changes") });
+  writeRun(fx, { id: "verify-old", role: "verifier", snapshot: oldHead, result: { schema: "orch.result/verifier/v1", run_id: "verify-old", verdict: "fail", verifies_run_id: "", commands: [{ cmd: "bun test", exit_code: 1, summary: "1 fail" }], acceptance: [] } });
+  writeRun(fx, { id: "review-new", snapshot: newHead, started: "2026-10-13T01:00:00.000Z" });
+  const runs = withState(fx, () => collectMrRuns(fx.repoKey, "mr-1"));
+  // Strict: the fresh approve does not retire the old blocker by itself.
+  expect(assessThread(runs, candidateFor(newHead)).suggestion).toBe("rework");
+  const hints = staleBlockerHints("mr-1", runs, candidateFor(newHead));
+  expect(hints.map((hint) => [hint.role, hint.run_ids])).toEqual([["reviewer", ["review-old"]], ["verifier", ["verify-old"]]]);
+  expect(hints[0]!.argv).toEqual(["orch", "run", "create", "--mr", "mr-1", "--role", "reviewer", "--task", "<task.md>", "--supersedes", "review-old"]);
+  // A blocker on the candidate itself is a real rework, not a stale one.
+  expect(staleBlockerHints("mr-1", runs, candidateFor(oldHead))).toEqual([]);
+
+  const verdict = await runOrch(fx, ["verdict", "--thread", "mr-1", "--worktree", fx.worktree]);
+  expect(verdict.exitCode).toBe(0);
+  expect(verdict.stdout).toContain("hint: reviewer blocker review-old judged other content than the candidate.");
+  expect(verdict.stdout).toContain("--supersedes review-old");
+  const json = JSON.parse((await runOrch(fx, ["verdict", "--thread", "mr-1", "--worktree", fx.worktree, "--json"])).stdout);
+  expect(json.supersede_hints).toHaveLength(2);
+});

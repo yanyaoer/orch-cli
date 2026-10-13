@@ -4,7 +4,7 @@ import { resolve } from "node:path";
 import type { RunStatus } from "../types.ts";
 import { getRepoIdentity, mrStateDir } from "../paths.ts";
 
-import { DEFAULT_ATTENTION_DAYS, assessThread, buildOverview, collectMrRuns, collectRepoKeys, describeCandidate, isTerminal, mergedBranchMrs, renderArgv, renderOverview, resolveCandidate, suggestedRunAction, type OverviewRun } from "../overview.ts";
+import { DEFAULT_ATTENTION_DAYS, assessThread, buildOverview, collectMrRuns, collectRepoKeys, describeCandidate, isTerminal, mergedBranchMrs, renderArgv, renderOverview, staleBlockerHints, resolveCandidate, suggestedRunAction, type OverviewRun } from "../overview.ts";
 import { STALE_CLONE_DAYS, scanWorktreeClones } from "../worktree.ts";
 import { CliError, flagBool, flagNumber, flagString, printJson, type ParsedArgs } from "../cli.ts";
 import { mrIdsForRepo, scanMrRuns } from "../run-store.ts";
@@ -135,6 +135,7 @@ export async function verdictCommand(args: ParsedArgs): Promise<number> {
   // any wait: evidence for an older snapshot never counts.
   const candidate = await resolveCandidate(worktree, headFlag(args));
   const { suggestion, reasons, assessments } = assessThread(runs, candidate);
+  const supersedeHints = suggestion === "rework" ? staleBlockerHints(mr, runs, candidate) : [];
   const staleRuns = runs.filter((run) => run.stale);
   const allTerminal = runs.every((run) => isTerminal(run.state));
 
@@ -158,6 +159,7 @@ export async function verdictCommand(args: ParsedArgs): Promise<number> {
       reasons,
       runs: runs.map((run) => ({ ...run, assessment: assessments.get(run.run_id) })),
       actions,
+      supersede_hints: supersedeHints,
     });
     return 0;
   }
@@ -182,6 +184,11 @@ export async function verdictCommand(args: ParsedArgs): Promise<number> {
     lines.push(`  ${index + 1}. ${renderArgv(action.argv)}`);
   });
   if (actions.length === 0) lines.push("  nothing left to do — all runs decided");
+  for (const hint of supersedeHints) {
+    lines.push(`hint: ${hint.role} blocker${hint.run_ids.length > 1 ? "s" : ""} ${hint.run_ids.join(", ")} judged other content than the candidate.`);
+    lines.push(`  If the rework answered ${hint.run_ids.length > 1 ? "them" : "it"}, evaluate the candidate in ${hint.run_ids.length > 1 ? "their" : "its"} place:`);
+    lines.push(`  ${renderArgv(hint.argv)}`);
+  }
   process.stdout.write(`${lines.join("\n")}\n`);
   return 0;
 }

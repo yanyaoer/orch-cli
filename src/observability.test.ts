@@ -151,26 +151,21 @@ async function expectOneDoneOneLockHeld(args: { firstMr: string; secondMr: strin
   expect(first.worktree_lock).not.toContain(`${join("mrs", args.firstMr)}`);
   await waitForRunState(first.status_path, ["running"]);
 
-  const second = await createWriteRun({
-    mr: args.secondMr,
-    key: `${args.secondMr}-second`,
-    stateHome,
-    worktree,
-    taskPath,
-    extraEnv,
-  });
-  expect(second.worktree_lock).toBe(first.worktree_lock);
+  // The second writer is refused at create time, naming the holder; nothing
+  // is dispatched for it.
+  const second = await runOrch(
+    [
+      "run", "create", "--mr", args.secondMr, "--role", "implementer", "--agent", "codex",
+      "--tag", "impl-lock", "--idempotency-key", `${args.secondMr}-second`,
+      "--worktree", worktree, "--task", taskPath, "--timeout-sec", "10",
+    ],
+    { XDG_STATE_HOME: stateHome, ...extraEnv },
+  );
+  expect(second.exitCode).not.toBe(0);
+  expect(second.stderr).toContain(`is in use by run ${first.run_id}`);
 
-  const finals = await Promise.all([waitForRunFinal(first.status_path), waitForRunFinal(second.status_path)]);
-  expect(finals.map((status) => status.state).sort()).toEqual(["done", "failed"]);
-
-  const failedIndex = finals.findIndex((status) => status.state === "failed");
-  expect(failedIndex).toBeGreaterThanOrEqual(0);
-  const failedRun = failedIndex === 0 ? first : second;
-  const failedStatus = finals[failedIndex]!;
-  const failedResult = readResult(failedRun.result_path);
-  expect(failedStatus.exit_code).toBe(75);
-  expect(JSON.stringify(failedResult)).toContain("lock held:");
+  const final = await waitForRunFinal(first.status_path);
+  expect(final.state).toBe("done");
 }
 
 function providerResult(runId: string, provider: string): ImplementerResult {
