@@ -2,7 +2,7 @@
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { evidenceRoles, isRunRole, writeRoles, type AgentName, type ProviderSessionMode, type RunRole, type RunSpec, type RunStatus, type VcsSnapshot } from "../types.ts";
-import { acquirePidfileLockWait, isProcessGroupAlive } from "../locks.ts";
+import { acquirePidfileLockWait, isProcessGroupAlive, processIdentity } from "../locks.ts";
 import { sha256 } from "../hash.ts";
 import { ensureStateLayout, getRepoIdentity, lockPathForWorktree, mrStateDir, type RepoIdentity } from "../paths.ts";
 import { appendJsonLine, countLines, jsonBytes, readJsonFile, writeJsonAtomic, writeTextAtomic } from "../json.ts";
@@ -891,16 +891,36 @@ export async function runCancel(args: ParsedArgs): Promise<number> {
 
 // No supervisor will finalize an orphaned run, so cancel itself signals the
 // provider group and confirms it is gone before reporting success; a group
-// that survives the grace period is a failure, never assumed stopped.
+// that survives the grace period is a failure, never assumed stopped. A
+// recorded pgid is only a number: once the group is confirmed gone it is
+// cleared (never signalled again), and while it looks alive it is signalled
+// only if the live leader matches the identity the supervisor recorded.
 async function cancelOrphan(args: ParsedArgs, located: { mr: string; run_dir: string }, status: RunStatus): Promise<number> {
   const runId = status.run_id;
-  const pgid = typeof status.pgid === "number" && isProcessGroupAlive(status.pgid) ? status.pgid : null;
+  const pgid = typeof status.pgid === "number" && !status.orphan_stopped_at ? status.pgid : null;
   if (pgid === null) {
     if (status.state === "stale") {
       printJson({ canceled: false, run_id: runId, state: status.state, reason: "stale run has no live process group (already stopped)" });
       return 0;
     }
-    printJson({ canceled: false, run_id: runId, state: status.state, reason: `process group ${status.pgid ?? "none"} is gone; run: orch run reap --mr ${located.mr}` });
+    printJson({ canceled: false, run_id: runId, state: status.state, reason: `process group none recorded; run: orch run reap --mr ${located.mr}` });
+    return 1;
+  }
+  if (!isProcessGroupAlive(pgid)) {
+    markOrphanStopped(located.run_dir, status, `orphaned process group ${pgid} found gone by orch run cancel`);
+    printJson({ canceled: false, run_id: runId, state: "stale", reason: `process group ${pgid} is gone; recorded as stopped (orch run reap --mr ${located.mr} reaps the rest)` });
+    return 1;
+  }
+  const mismatch = orphanIdentityProblem(status, pgid);
+  if (mismatch) {
+    printJson({
+      canceled: false,
+      run_id: runId,
+      mr: located.mr,
+      pgid,
+      orphaned: true,
+      reason: `not signalled: ${mismatch}. Inspect it with: ps -axo pid,pgid,lstart,command | awk '$2 == ${pgid}'; if it is this run's provider, stop it (kill -TERM -- -${pgid}) and rerun orch run cancel to record the stop`,
+    });
     return 1;
   }
   const signal = flagBool(args, "force") ? "SIGKILL" : "SIGTERM";
@@ -915,14 +935,31 @@ async function cancelOrphan(args: ParsedArgs, located: { mr: string; run_dir: st
     printJson({ canceled: false, run_id: runId, mr: located.mr, signal, pgid, orphaned: true, reason: `process group ${pgid} still alive after ${signal}; retry with --force` });
     return 1;
   }
-  const ts = new Date().toISOString();
-  const eventsPath = `${located.run_dir}/events.jsonl`;
-  // Keep the supervisor-loss diagnosis: the run ends `stale`, with the stop
-  // recorded alongside it.
-  writeJsonAtomic(`${located.run_dir}/status.json`, { ...status, state: "stale", updated_at: ts });
-  appendJsonLine(eventsPath, { type: "stale", seq: countLines(eventsPath), ts, message: `orphaned process group ${pgid} stopped by orch run cancel (${signal})` });
+  markOrphanStopped(located.run_dir, status, `orphaned process group ${pgid} stopped by orch run cancel (${signal})`);
   printJson({ canceled: true, run_id: runId, mr: located.mr, signal, pgid, orphaned: true, stopped: true });
   return 0;
+}
+
+// Why the live group `pgid` cannot be proven to be this run's provider, or
+// null when its leader still is the driver the supervisor spawned: same start
+// time as recorded at spawn, and a driver command line naming this run.
+function orphanIdentityProblem(status: RunStatus, pgid: number): string | null {
+  if (!status.pgid_started) return `no recorded identity for process group ${pgid} (run written by an older orch)`;
+  const live = processIdentity(pgid);
+  if (!live) return `process group ${pgid} has no live leader to verify (the driver exited; remaining members cannot be attributed)`;
+  if (live.started !== status.pgid_started || !live.command.includes("__driver-") || !live.command.includes(status.run_id)) {
+    return `process ${pgid} is not this run's driver (started ${live.started}, recorded ${status.pgid_started}); the number was likely reused`;
+  }
+  return null;
+}
+
+// Keep the supervisor-loss diagnosis (`stale`) and drop the process numbers,
+// so a later cancel can never signal whatever reuses them.
+function markOrphanStopped(runDir: string, status: RunStatus, message: string): void {
+  const ts = new Date().toISOString();
+  writeJsonAtomic(`${runDir}/status.json`, { ...status, state: "stale", pid: null, pgid: null, orphan_stopped_at: ts, updated_at: ts });
+  const eventsPath = `${runDir}/events.jsonl`;
+  appendJsonLine(eventsPath, { type: "stale", seq: countLines(eventsPath), ts, message });
 }
 
 export async function runList(args: ParsedArgs): Promise<number> {

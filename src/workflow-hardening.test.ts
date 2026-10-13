@@ -3,7 +3,7 @@
 // wait, and HEAD-aware idempotency. Unit checks go through collectMrRuns +
 // assessThread; CLI checks spawn the real orch entry point.
 import { afterEach, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RunState, RunStatus, VcsSnapshot } from "./types.ts";
@@ -473,6 +473,7 @@ test("a provider outliving its SIGKILLed supervisor keeps the checkout locked un
   const a = await create("owner-a", { ORCH_DRIVER_FAKE_SLEEP_MS: "60000" });
   const running = await waitStatus(a.status_path, (s) => s.state === "running" && typeof s.pgid === "number");
   const pgid = running.pgid!;
+  expect(typeof running.pgid_started).toBe("string");
   cleanups.push(() => {
     try {
       process.kill(-pgid, "SIGKILL");
@@ -494,12 +495,19 @@ test("a provider outliving its SIGKILLed supervisor keeps the checkout locked un
   expect(runProcessesAlive(stale)).toBe(true);
   expect(isProcessGroupAlive(pgid)).toBe(true);
 
-  // A stale run stays cancellable; success means the group is confirmed gone.
-  const cancel = await orchEnv(fx, {}, ["run", "cancel", "--run", a.run_id, "--mr", "mr-1", "--worktree", fx.worktree]);
+  // A stale run stays cancellable (--force too); success means the group is
+  // confirmed gone, and the numbers are dropped so a repeat never signals.
+  const cancelArgs = ["run", "cancel", "--run", a.run_id, "--mr", "mr-1", "--worktree", fx.worktree, "--force"];
+  const cancel = await orchEnv(fx, {}, cancelArgs);
   expect(cancel.exitCode).toBe(0);
-  expect(JSON.parse(cancel.stdout)).toMatchObject({ canceled: true, orphaned: true, stopped: true, pgid });
+  expect(JSON.parse(cancel.stdout)).toMatchObject({ canceled: true, orphaned: true, stopped: true, pgid, signal: "SIGKILL" });
   expect(isProcessGroupAlive(pgid)).toBe(false);
-  expect(runProcessesAlive(await waitStatus(a.status_path, (s) => s.state === "stale"))).toBe(false);
+  const stopped = await waitStatus(a.status_path, (s) => s.state === "stale");
+  expect(stopped).toMatchObject({ pid: null, pgid: null, orphan_stopped_at: expect.any(String) });
+  expect(runProcessesAlive(stopped)).toBe(false);
+  const again = await orchEnv(fx, {}, cancelArgs);
+  expect(again.exitCode).toBe(0);
+  expect(JSON.parse(again.stdout)).toMatchObject({ canceled: false, reason: expect.stringContaining("already stopped") });
 
   // Clean recovery: the checkout is free again.
   const c = await create("owner-c", {});
@@ -528,3 +536,69 @@ test("a driver whose supervisor dies before the handshake exits without starting
   expect(await proc.exited).toBe(1);
   expect(existsSync(join(runDir, "result.json"))).toBe(false);
 }, 15_000);
+
+test("cancelling an orphaned run never signals a process group it cannot attribute to the run", async () => {
+  const fx = fixture();
+  commit(fx.worktree, "v1\n");
+  const { isProcessGroupAlive, processIdentity } = await import("./locks.ts");
+  // Unrelated process groups owned by this test only, standing in for a
+  // reused pgid number.
+  const bystander = () => {
+    const proc = Bun.spawn(["sleep", "60"], { detached: true, stdout: "ignore", stderr: "ignore" });
+    cleanups.push(() => {
+      try {
+        process.kill(-proc.pid, "SIGKILL");
+      } catch {}
+    });
+    return proc;
+  };
+  const orphan = (id: string, patch: Partial<RunStatus>) => {
+    const runDir = writeRun(fx, { id, role: "implementer", state: "stale", result: null });
+    const statusPath = join(runDir, "status.json");
+    writeFileSync(statusPath, JSON.stringify({ ...JSON.parse(readFileSync(statusPath, "utf8")), supervisor_pid: 999_999_999, ...patch }));
+    return statusPath;
+  };
+  const cancel = async (id: string) => {
+    const out = await orchEnv(fx, {}, ["run", "cancel", "--run", id, "--mr", "mr-1", "--worktree", fx.worktree, "--force"]);
+    return { exitCode: out.exitCode, payload: JSON.parse(out.stdout) as { canceled: boolean; reason: string } };
+  };
+
+  const other = bystander();
+  const identity = processIdentity(other.pid)!;
+  expect(identity).not.toBeNull();
+  // Older status without a recorded identity, a recorded start time that does
+  // not match, and a matching start time whose command is not this run's
+  // driver: all refused, the group untouched.
+  const cases: Array<[string, Partial<RunStatus>, string]> = [
+    ["impl-legacy", { pid: other.pid, pgid: other.pid }, "no recorded identity"],
+    ["impl-reused", { pid: other.pid, pgid: other.pid, pgid_started: "Thu Jan  1 00:00:00 1970" }, "not this run's driver"],
+    ["impl-foreign", { pid: other.pid, pgid: other.pid, pgid_started: identity.started }, "not this run's driver"],
+  ];
+  for (const [id, patch, reason] of cases) {
+    const statusPath = orphan(id, patch);
+    const out = await cancel(id);
+    expect(out.exitCode).toBe(1);
+    expect(out.payload).toMatchObject({ canceled: false });
+    expect(out.payload.reason).toContain(reason);
+    expect(out.payload.reason).toContain("not signalled");
+    expect(isProcessGroupAlive(other.pid)).toBe(true);
+    expect(JSON.parse(readFileSync(statusPath, "utf8")).pgid).toBe(other.pid);
+  }
+
+  // Exited without a cancel: the first check records the stop and drops the
+  // numbers; a later cancel is a no-op even if the number now names a group.
+  const done = Bun.spawn(["true"], { detached: true });
+  await done.exited;
+  const exitedPath = orphan("impl-exited", { pid: done.pid, pgid: done.pid, pgid_started: "x" });
+  const first = await cancel("impl-exited");
+  expect(first.exitCode).toBe(1);
+  expect(first.payload.reason).toContain("recorded as stopped");
+  expect(JSON.parse(readFileSync(exitedPath, "utf8"))).toMatchObject({ state: "stale", pid: null, pgid: null, orphan_stopped_at: expect.any(String) });
+  expect((await cancel("impl-exited")).payload.reason).toContain("already stopped");
+
+  // A stop marker wins over any number still present in the status.
+  const reusedPath = orphan("impl-marked", { pid: other.pid, pgid: other.pid, pgid_started: identity.started, orphan_stopped_at: "2026-10-13T00:00:00Z" });
+  expect((await cancel("impl-marked")).payload.reason).toContain("already stopped");
+  expect(isProcessGroupAlive(other.pid)).toBe(true);
+  expect(JSON.parse(readFileSync(reusedPath, "utf8")).pgid).toBe(other.pid);
+}, 30_000);

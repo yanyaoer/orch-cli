@@ -224,3 +224,73 @@ test("worktree lock path is canonical: symlinks and subdirectories map to one ch
   expect(() => acquireWorktreeLock(lockPathForWorktree(worktree), "shared", "r")).toThrow(LockHeldError);
   writer.release();
 });
+
+test("a contender holding a pre-adoption read never reclaims a record whose dead owner adopted a live provider group", async () => {
+  const dir = tempDir("orch-lock-adopt-");
+  const lockPath = join(dir, "wt.lock");
+  // A: a real supervisor stand-in in its own process, re-parented to init (it
+  // is started by a shell that exits at once), so its death is final and
+  // never lingers as our zombie. It takes the lock, then waits for a trigger
+  // file naming a pgid, adopts it, and dies without releasing.
+  const ownerScript = join(dir, "owner.ts");
+  writeFileSync(
+    ownerScript,
+    `import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { acquireWorktreeLock } from ${JSON.stringify(locksModule)};
+const [lockPath, dir] = process.argv.slice(2);
+const lock = acquireWorktreeLock(lockPath, "exclusive", "owner-a");
+writeFileSync(dir + "/owner.pid", String(process.pid));
+while (!existsSync(dir + "/adopt")) await Bun.sleep(5);
+lock.adoptProcessGroup(Number(readFileSync(dir + "/adopt", "utf8")));
+process.exit(0);
+`,
+    "utf8",
+  );
+  const provider = Bun.spawn(["sleep", "60"], { detached: true, stdout: "ignore", stderr: "ignore" });
+  cleanups.push(() => {
+    try {
+      process.kill(-provider.pid, "SIGKILL");
+    } catch {}
+  });
+  Bun.spawnSync(["sh", "-c", `"$0" "$1" "$2" "$3" >/dev/null 2>&1 &`, process.execPath, ownerScript, lockPath, dir]);
+  for (let i = 0; i < 500 && !existsSync(join(dir, "owner.pid")); i += 1) await Bun.sleep(10);
+  const ownerPid = Number(readFileSync(join(dir, "owner.pid"), "utf8"));
+  const alive = (pid: number) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  expect(alive(ownerPid)).toBe(true);
+  const ownerRecord = readdirSync(`${lockPath}.owners`).find((name) => name.startsWith("exclusive-"))!;
+  const recordPath = join(`${lockPath}.owners`, ownerRecord);
+  expect(JSON.parse(readFileSync(recordPath, "utf8")).pgid ?? null).toBeNull();
+
+  // B has read A's record (no pgid yet); before B judges it, A adopts the
+  // provider group and dies.
+  let interleaved = false;
+  lockTestHooks.afterRead = (entry) => {
+    if (interleaved || entry !== recordPath) return;
+    interleaved = true;
+    writeFileSync(join(dir, "adopt"), String(provider.pid));
+    const deadline = Date.now() + 10_000;
+    while (alive(ownerPid) && Date.now() < deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+  };
+  try {
+    expect(() => acquireWorktreeLock(lockPath, "exclusive", "contender-b")).toThrow(LockHeldError);
+  } finally {
+    lockTestHooks.afterRead = undefined;
+  }
+  expect(interleaved).toBe(true);
+  expect(alive(ownerPid)).toBe(false);
+  expect(JSON.parse(readFileSync(recordPath, "utf8")).pgid).toBe(provider.pid);
+
+  // Once the provider group is gone the dead record is reclaimed normally.
+  process.kill(-provider.pid, "SIGKILL");
+  await provider.exited;
+  const lock = acquireWorktreeLock(lockPath, "exclusive", "contender-b");
+  expect(existsSync(recordPath)).toBe(false);
+  lock.release();
+}, 30_000);

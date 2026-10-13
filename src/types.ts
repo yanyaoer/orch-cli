@@ -107,6 +107,13 @@ export interface RunStatus {
   // exits before the supervisor finishes collecting evidence and the result.
   // Absent on runs created by older versions (pid is used instead).
   supervisor_pid?: number | null;
+  // Start time (`ps lstart`) of the driver that leads pgid, captured by the
+  // supervisor at spawn. Cancelling an orphaned run signals the group only
+  // when the live leader still has this start time and its driver argv.
+  pgid_started?: string | null;
+  // Set once cancel confirmed an orphaned run's process group gone; pid/pgid
+  // are cleared at the same time so a reused number is never signalled.
+  orphan_stopped_at?: string;
   started_at: string | null;
   updated_at: string;
   exit_code: number | null;

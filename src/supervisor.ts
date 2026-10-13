@@ -2,7 +2,7 @@ import { closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync
 import { dirname } from "node:path";
 import type { OrchEvent, RunSpec, RunState, RunStatus, VcsSnapshot } from "./types.ts";
 import { evidenceRoles, sharedLockRoles, writeRoles } from "./types.ts";
-import { acquireWorktreeLock, LockHeldError, type PidfileLock } from "./locks.ts";
+import { acquireWorktreeLock, LockHeldError, processIdentity, type PidfileLock } from "./locks.ts";
 import { countLines, appendJsonLine, readJsonFile, writeJsonAtomic } from "./json.ts";
 import { fallbackResult, validateRoleResult } from "./schema.ts";
 import { lockPathForWorktree } from "./paths.ts";
@@ -316,6 +316,7 @@ export async function runSupervisor(runDir: string, orchCommand: string[]): Prom
       state: "running",
       pid: proc.pid,
       pgid: proc.pid,
+      pgid_started: processIdentity(proc.pid)?.started ?? null,
       started_at: startedAt,
       last_event_seq: nextSeq(runDir),
     });

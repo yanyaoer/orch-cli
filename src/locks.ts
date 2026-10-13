@@ -83,6 +83,25 @@ export function isPidAlive(pid: number): boolean {
   return processExists(pid);
 }
 
+// Host-observed identity of a live process: its start time and command line
+// as `ps` reports them, or null when the process is gone or ps fails. A pid
+// number alone can be reused; pid + start time + command cannot plausibly be.
+export function processIdentity(pid: number): { started: string; command: string } | null {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  const ps = (field: string): string | null => {
+    try {
+      const proc = Bun.spawnSync(["ps", "-ww", "-o", `${field}=`, "-p", String(pid)], { stdout: "pipe", stderr: "ignore", env: { ...process.env, LC_ALL: "C" } });
+      const out = proc.exitCode === 0 ? proc.stdout.toString().trim() : "";
+      return out || null;
+    } catch {
+      return null;
+    }
+  };
+  const started = ps("lstart");
+  const command = started ? ps("command") : null;
+  return started && command ? { started, command } : null;
+}
+
 export function isProcessGroupAlive(pgid: number): boolean {
   if (!Number.isInteger(pgid) || pgid <= 1) return false;
   try {
@@ -151,7 +170,16 @@ function liveHolders(path: string, self: string | null): Holder[] {
     if (!match || name === self) continue;
     const entry = `${dir}/${name}`;
     const record = readRecord(entry);
-    if (isLive(entry, record)) holders.push({ mode: match[1] as LockMode, record });
+    lockTestHooks.afterRead?.(entry);
+    if (isLive(entry, record)) {
+      holders.push({ mode: match[1] as LockMode, record });
+      continue;
+    }
+    // The record read above may predate its owner adopting a provider group.
+    // Only the owner itself adopts, and it is now confirmed dead, so a re-read
+    // after that confirmation is final: nothing can update the record later.
+    const current = readRecord(entry);
+    if (current && isLive(entry, current)) holders.push({ mode: match[1] as LockMode, record: current });
     else rmSync(entry, { force: true });
   }
   // A live pre-hardening pidfile is an exclusive holder; never deleted here.
@@ -175,7 +203,9 @@ function nonceOf(name: string | null): string | null {
 
 // Test seam for deterministic interleavings: called after this contender's
 // record is published and before it looks at the others.
-export const lockTestHooks: { afterAnnounce?: (path: string, mode: LockMode) => void } = {};
+// afterRead: called after a contender read another holder's record and before
+// it judges that record's liveness.
+export const lockTestHooks: { afterAnnounce?: (path: string, mode: LockMode) => void; afterRead?: (entry: string) => void } = {};
 
 export function acquireLock(path: string, mode: LockMode, runId?: string, pid = process.pid): PidfileLock {
   const dir = ownersDir(path);
@@ -226,6 +256,9 @@ export function acquireLock(path: string, mode: LockMode, runId?: string, pid = 
     pid,
     adoptProcessGroup(pgid: number) {
       if (released) return;
+      // Contenders rely on "a dead owner never updates its record" (see
+      // liveHolders), so only the recorded pid may adopt.
+      if (pid !== process.pid) throw new Error(`lock owner pid ${pid} is not this process; cannot adopt a process group`);
       publish(own, { ...record, pgid });
     },
     release() {
