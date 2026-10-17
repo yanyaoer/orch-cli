@@ -19,6 +19,7 @@ import {
   pipeToFile,
   resultValidationErrors,
   rawResultText,
+  repairPreservesVerdict,
   runProviderDriver,
   SEATBELT_ENV_MARKER,
 } from "./driver-common.ts";
@@ -1781,4 +1782,85 @@ test("pipeToFile drops message_update and tool_execution_update lines, including
   const path = join(tempDir(), "native.jsonl");
   await pipeToFile(stream, path);
   expect(readFileSync(path, "utf8")).toBe(kept1 + keptStart + keptEnd + kept2 + keptTail);
+});
+
+const deliveryResult = {
+  schema: "orch.result/reviewer/v1", run_id: "delivery", verdict: "approve",
+  reviews_run_id: "impl", blocking_findings: [], non_blocking_findings: [], suggested_tests: [],
+};
+const piAnswer = (text: string, stopReason = "stop") => ({ type: "message_end", message: {
+  role: "assistant", stopReason, content: [{ type: "text", text }],
+} });
+
+test("latest Pi answer wins; invalid final cannot resurrect earlier valid JSON or tool output", () => {
+  const dir = tempDir();
+  const final = 'Done with "quotes" and \\paths\n{"verdict":"approve","bad":}';
+  const lines = [piAnswer("I will inspect first"), piAnswer(JSON.stringify(deliveryResult)),
+    { type: "tool_execution_end", result: { content: [{ type: "text", text: JSON.stringify(deliveryResult) }] } },
+    piAnswer(final)];
+  writeFileSync(join(dir, "native.jsonl"), lines.map(JSON.stringify).join("\n"));
+  writeFileSync(join(dir, "last_message.txt"), JSON.stringify(deliveryResult));
+  expect(rawResultText(dir)).toBe(final);
+  expect(extractResultFromRunDir(dir, spec("reviewer", "delivery"))).toBeNull();
+});
+
+test("Pi agent_end uses its last assistant; escaped JSON round trips", () => {
+  const dir = tempDir();
+  const result = { ...deliveryResult, suggested_tests: ['assert "quoted" at C:\\tmp\\x\nnext line'] };
+  writeFileSync(join(dir, "native.jsonl"), JSON.stringify({ type: "agent_end", messages: [
+    piAnswer("opening").message, piAnswer(JSON.stringify(result)).message,
+  ] }));
+  expect(extractResultFromRunDir(dir, spec("reviewer", "delivery"))).toEqual(result);
+});
+
+test("provider failed terminal invalidates valid-looking answer; repair attempts cannot reuse old output", () => {
+  for (const ending of [piAnswer("", "error"), piAnswer("", "aborted"), { type: "turn.failed" },
+    { type: "result", is_error: true, result: JSON.stringify(deliveryResult) }]) {
+    const dir = tempDir();
+    writeFileSync(join(dir, "native.jsonl"), [piAnswer(JSON.stringify(deliveryResult)), ending].map(JSON.stringify).join("\n"));
+    expect(extractResultFromRunDir(dir, spec("reviewer", "delivery"))).toBeNull();
+  }
+  const dir = tempDir();
+  writeFileSync(join(dir, "native.jsonl"), [piAnswer(JSON.stringify(deliveryResult)), { type: "orch_result_repair", attempt: 1 }].map(JSON.stringify).join("\n"));
+  writeFileSync(join(dir, "last_message.txt"), JSON.stringify(deliveryResult));
+  expect(rawResultText(dir)).toBeNull();
+  expect(extractResultFromRunDir(dir, spec("reviewer", "delivery"))).toBeNull();
+});
+
+test("format repair cannot upgrade explicit failure or infer success from malformed JSON", () => {
+  const runSpec = spec("reviewer", "delivery");
+  const approve = extractResultFromText(JSON.stringify(deliveryResult), runSpec)!;
+  expect(repairPreservesVerdict('{"verdict":"request_changes","blocking_findings":[{"finding":"broken"}]}', approve, runSpec)).toBe(false);
+  expect(repairPreservesVerdict('{"verdict":"approve","summary":"bad "quote""}', approve, runSpec)).toBe(false);
+  expect(repairPreservesVerdict('{"verdict":"approve","suggested_tests":{}}', approve, runSpec)).toBe(true);
+});
+
+test("driver refuses success after process failure or failed repair; original final is preserved", async () => {
+  for (const mode of ["exit", "repair-exit", "upgrade", "native-error"] as const) {
+    const root = tempDir();
+    const runDir = join(root, "run"), binDir = join(root, "bin"), worktree = join(root, "worktree");
+    for (const dir of [runDir, binDir, worktree]) mkdirSync(dir);
+    const first = join(root, "first");
+    const invalid = JSON.stringify({ ...deliveryResult, verdict: "request_changes", blocking_findings: [{ finding: "broken" }] });
+    const original = mode === "exit" || mode === "native-error" ? JSON.stringify(deliveryResult) : invalid;
+    const output = JSON.stringify(piAnswer(original, mode === "native-error" ? "error" : "stop"));
+    writeFileSync(join(binDir, "codex"), `#!/bin/sh\nprompt=$(cat)\nif [ -e ${shellQuote(first)} ]; then\n printf '%s\\n' ${shellQuote(JSON.stringify(piAnswer(JSON.stringify(deliveryResult))))}\n exit ${mode === "repair-exit" ? 7 : 0}\nfi\n: > ${shellQuote(first)}\nprintf '%s\\n' ${shellQuote(JSON.stringify(piAnswer("opening")))}\nprintf '%s\\n' ${shellQuote(output)}\nexit ${mode === "exit" ? 3 : 0}\n`);
+    chmodSync(join(binDir, "codex"), 0o755);
+    const specPath = join(runDir, "spec.json");
+    writeFileSync(specPath, JSON.stringify(spec("reviewer", "delivery")));
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${binDir}:${previousPath ?? ""}`;
+    try {
+      expect(await runProviderDriver("codex", ["--spec", specPath, "--run-dir", runDir, "--worktree", worktree])).not.toBe(0);
+    } finally { process.env.PATH = previousPath; }
+    expect(JSON.parse(readFileSync(join(runDir, "result.json"), "utf8")).verdict).toBe("request_changes");
+    expect(readFileSync(join(runDir, "result.raw.md"), "utf8")).toBe(original);
+  }
+});
+
+test("format repair cannot delete failed checks while retaining a success verdict", () => {
+  const s = spec("verifier", "negative");
+  const result = extractResultFromText(JSON.stringify({ schema: "orch.result/verifier/v1", run_id: "negative", verdict: "pass", verifies_run_id: "impl", commands: [{ cmd: "check", exit_code: 0, summary: "passed" }], acceptance: [] }), s)!;
+  expect(repairPreservesVerdict('{"verdict":"pass","commands":[{"cmd":"check","exit_code":1,"summary":"failed"}]}', result, s)).toBe(false);
+  expect(repairPreservesVerdict('{"verdict":"pass","acceptance":[{"id":"AC1","status":"unmet"}]}', result, s)).toBe(false);
 });
