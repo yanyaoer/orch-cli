@@ -24,6 +24,10 @@ the business verdict.
 - `coverage`: `complete`, `partial` or `missing`, with machine-readable reasons,
   counted-record count and provider basis. Partial values describe only observed
   records. Missing fields are not inferred as zero.
+- `response_observations`: Pi completed assistant messages classified by explicit
+  stop reason into successful, error/aborted and unknown, plus repair attempt
+  count. These are not HTTP request/attempt counts. Other providers' response
+  counts remain null. Error usage is marked partial even when it reports zero.
 - `lifecycle`: safe phase timestamps and observed run duration. Creation-to-start
   time is not pure queue wait. Provider duration includes model, tools and
   transport. Queue, human and model-only waits remain null when not observed.

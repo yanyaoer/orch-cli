@@ -7,6 +7,7 @@ export interface NormalizedTokens {
 export type UsageEvidence = {
   normalized_tokens: NormalizedTokens | null;
   coverage: { status: "complete" | "partial" | "missing"; reasons: string[]; counted_records: number; basis: string };
+  response_observations: { basis: "pi_completed_assistant_messages_only" | "unavailable"; successful_messages: number | null; error_messages: number | null; unknown_messages: number | null; repair_attempts: number };
 };
 const zero = (): NormalizedTokens => ({ input_tokens: 0, cache_read_input_tokens: 0, cache_write_input_tokens: 0, output_tokens: 0, total_tokens: 0, non_cache_read_tokens: 0 });
 function count(n: unknown): n is number { return typeof n === "number" && Number.isSafeInteger(n) && n >= 0; }
@@ -35,26 +36,34 @@ export function usageEvidence(native: string | null, spec: Partial<RunSpec> | nu
   const reasons = new Set<string>();
   const attempts: any[][] = [[]];
   for (const line of (native ?? "").split(/\r?\n/)) {
-    let e: any; try { e = JSON.parse(line); } catch { continue; }
+    if (!line.trim()) continue;
+    let e: any; try { e = JSON.parse(line); } catch { reasons.add("malformed_native_record"); continue; }
     if (e?.type === "orch_result_repair") attempts.push([]);
     else if (e && typeof e === "object") attempts.at(-1)!.push(e);
   }
   let sum = zero(), records = 0;
+  let piSeen = false, successMessages = 0, errorMessages = 0, unknownMessages = 0;
   const formats = new Set<string>();
   for (const [index, events] of attempts.entries()) {
     const pi = events.filter(e => e.type === "message_end" && e.message?.role === "assistant");
-    const claude = events.filter(e => e.type === "result" && e.usage);
-    const codex = events.filter(e => e.type === "turn.completed" && e.usage);
+    // Detect the envelope before looking for usage. A terminal error or a
+    // newer missing counter must not disappear behind an earlier valid one.
+    const claude = events.filter(e => e.type === "result");
+    const codex = events.filter(e => ["thread.started", "turn.started", "turn.completed", "turn.failed"].includes(e.type));
     if ([pi.length, claude.length, codex.length].filter(Boolean).length > 1) reasons.add("mixed_provider_formats");
     if (pi.length) {
+      piSeen = true;
       formats.add("pi_message_end");
       const ids = new Set<string>();
       for (const e of pi) {
         const m = e.message;
-        if (["error", "aborted"].includes(m.stopReason)) reasons.add("provider_error_usage_may_be_incomplete");
         const id = typeof m.responseId === "string" ? m.responseId : typeof m.id === "string" ? m.id : null;
         if (id && ids.has(id)) continue;
         if (id) ids.add(id);
+        if (["error", "aborted"].includes(m.stopReason)) {
+          errorMessages++; reasons.add("provider_error_usage_may_be_incomplete");
+        } else if (["stop", "length", "toolUse"].includes(m.stopReason)) successMessages++;
+        else unknownMessages++;
         const n = normalized(m.usage, "pi");
         if (n) { sum = addNormalized(sum, n); records++; }
         else reasons.add("pi_message_usage_missing_or_invalid");
@@ -76,8 +85,14 @@ export function usageEvidence(native: string | null, spec: Partial<RunSpec> | nu
       if (!fresh) { reasons.add("codex_session_baseline_unknown"); continue; }
       const counters = new Map<string, NormalizedTokens>();
       let session = "unidentified";
+      let unfinished = false;
       for (const e of events) {
         if (e.type === "thread.started" && typeof e.thread_id === "string") session = e.thread_id;
+        if (e.type === "turn.started") {
+          if (unfinished) reasons.add("codex_overlapping_turns");
+          unfinished = true;
+        }
+        if (e.type === "turn.completed" || e.type === "turn.failed") unfinished = false;
         if (e.type !== "turn.completed") continue;
         const n = normalized(e.usage, "codex");
         if (!n) { reasons.add("codex_terminal_usage_invalid"); continue; }
@@ -87,12 +102,18 @@ export function usageEvidence(native: string | null, spec: Partial<RunSpec> | nu
         }
         counters.set(session, n);
       }
+      if (unfinished) reasons.add("codex_unfinished_turn");
+      if (!counters.size) reasons.add("codex_terminal_usage_missing");
       for (const n of counters.values()) { sum = addNormalized(sum, n); records++; }
     } else reasons.add("attempt_usage_missing");
   }
   if (!status || !["done", "failed"].includes(status.state ?? "")) reasons.add("run_not_terminal_or_interrupted");
   if (formats.size > 1) reasons.add("mixed_provider_formats");
-  return { normalized_tokens: records ? sum : null, coverage: {
+  return { normalized_tokens: records ? sum : null, response_observations: {
+    basis: piSeen ? "pi_completed_assistant_messages_only" : "unavailable",
+    successful_messages: piSeen ? successMessages : null, error_messages: piSeen ? errorMessages : null,
+    unknown_messages: piSeen ? unknownMessages : null, repair_attempts: attempts.length - 1,
+  }, coverage: {
     status: records ? reasons.size ? "partial" : "complete" : "missing",
     reasons: [...reasons].sort(), counted_records: records,
     basis: [...formats].sort().join("+") || "none",

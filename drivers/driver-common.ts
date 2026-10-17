@@ -828,9 +828,16 @@ export function repairPreservesVerdict(previous: string, result: RoleResult, spe
       if (success && obj && typeof obj.verdict === "string") {
         if (Array.isArray(obj.blocking_findings) && obj.blocking_findings.length) return false;
         for (const field of ["tests", "commands"]) {
-          if (Array.isArray(obj[field]) && obj[field].some((entry: any) => entry && commandOutcome(entry) === "failed")) return false;
+          if (Array.isArray(obj[field]) && obj[field].some((entry: any) => entry && (
+            commandOutcome(entry) === "failed" ||
+            (typeof entry.exit_code === "number" && entry.exit_code !== (entry.expected_exit_code ?? 0)) ||
+            (entry.status === "skipped" && entry.optional !== true)
+          ))) return false;
         }
-        if (Array.isArray(obj.acceptance) && obj.acceptance.some((entry: any) => entry && acceptanceOutcome(entry.status) === "unmet")) return false;
+        if (Array.isArray(obj.acceptance) && obj.acceptance.some((entry: any) => entry && (
+          acceptanceOutcome(entry.status) === "unmet" ||
+          (acceptanceOutcome(entry.status) !== "met" && entry.optional !== true)
+        ))) return false;
       }
     }
   }

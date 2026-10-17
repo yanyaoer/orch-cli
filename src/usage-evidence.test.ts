@@ -58,4 +58,28 @@ test("zero-usage error messages are not complete successful response evidence", 
   const e = usageEvidence(stream({ type: "message_end", message: { role: "assistant", stopReason: "error", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } } }, { type: "agent_end" }), fresh, done);
   expect(e.coverage.status).toBe("partial");
   expect(e.coverage.reasons).toContain("provider_error_usage_may_be_incomplete");
+  expect(e.response_observations).toMatchObject({ successful_messages: 0, error_messages: 1 });
+});
+
+test("latest Claude terminal without usage cannot hide behind an earlier total", () => {
+  const usage = { input_tokens: 10, cache_read_input_tokens: 100, cache_creation_input_tokens: 0, output_tokens: 5 };
+  const e = usageEvidence(stream({ type: "result", usage }, { type: "result", is_error: true, subtype: "error_during_execution" }), fresh, { state: "failed" });
+  expect(e.coverage.status).toBe("missing");
+  expect(e.coverage.reasons).toContain("claude_terminal_usage_invalid");
+  expect(e.coverage.reasons).toContain("provider_error_usage_may_be_incomplete");
+});
+test("mixed provider envelopes are detected even if one lacks usage", () => {
+  const e = usageEvidence(stream({ type: "message_end", message: { role: "assistant", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 } } }, { type: "agent_end" }, { type: "result", is_error: true }), fresh, done);
+  expect(e.coverage.status).toBe("partial");
+  expect(e.coverage.reasons).toContain("mixed_provider_formats");
+});
+test("unfinished Codex turns and truncated records make observed counters partial", () => {
+  const prefix = stream({ type: "thread.started", thread_id: "one" }, { type: "turn.started" }, counter(100, 80, 5));
+  const open = usageEvidence(prefix + '\n' + stream({ type: "turn.started" }), fresh, { state: "failed" });
+  expect(open.coverage.status).toBe("partial");
+  expect(open.coverage.reasons).toContain("codex_unfinished_turn");
+  expect(open.normalized_tokens?.total_tokens).toBe(105);
+  const truncated = usageEvidence(prefix + '\n{"type":"turn.completed","usage":', fresh, done);
+  expect(truncated.coverage.status).toBe("partial");
+  expect(truncated.coverage.reasons).toContain("malformed_native_record");
 });

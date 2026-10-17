@@ -1528,7 +1528,7 @@ test("extractResultFromRunDir reads pi message_end assistant text events", () =>
         type: "turn_end",
         message: {
           role: "assistant",
-          content: [{ type: "thinking", text: "valid JSON event, but no text candidate" }],
+          content: [{ type: "text", text: "```json\n" + JSON.stringify(reviewer) + "\n```" }],
         },
       }),
       "",
@@ -1863,4 +1863,49 @@ test("format repair cannot delete failed checks while retaining a success verdic
   const result = extractResultFromText(JSON.stringify({ schema: "orch.result/verifier/v1", run_id: "negative", verdict: "pass", verifies_run_id: "impl", commands: [{ cmd: "check", exit_code: 0, summary: "passed" }], acceptance: [] }), s)!;
   expect(repairPreservesVerdict('{"verdict":"pass","commands":[{"cmd":"check","exit_code":1,"summary":"failed"}]}', result, s)).toBe(false);
   expect(repairPreservesVerdict('{"verdict":"pass","acceptance":[{"id":"AC1","status":"unmet"}]}', result, s)).toBe(false);
+});
+
+test("empty Pi message or terminal snapshot cannot retain an earlier result", () => {
+  for (const final of [piAnswer(""), { type: "turn_end", message: piAnswer("").message }, { type: "agent_end", messages: [piAnswer("").message] }, { type: "agent_end", messages: [] }]) {
+    const dir = tempDir();
+    writeFileSync(join(dir, "native.jsonl"), [piAnswer(JSON.stringify(deliveryResult)), final].map(JSON.stringify).join("\n"));
+    expect(extractResultFromRunDir(dir, spec("reviewer", "delivery"))).toBeNull();
+  }
+});
+
+test("tool-only native streams never provide business results", () => {
+  const dir = tempDir();
+  writeFileSync(join(dir, "native.jsonl"), JSON.stringify({ type: "tool_execution_end", result: deliveryResult }));
+  expect(extractResultFromRunDir(dir, spec("reviewer", "delivery"))).toBeNull();
+});
+
+test("repair cannot erase contradictory passed status or required skipped evidence", () => {
+  const s = spec("verifier", "negative");
+  const result = extractResultFromText(JSON.stringify({ schema: "orch.result/verifier/v1", run_id: "negative", verdict: "pass", verifies_run_id: "impl", commands: [{ cmd: "check", exit_code: 0, summary: "passed" }], acceptance: [] }), s)!;
+  for (const entry of [{ cmd: "check", exit_code: 1, status: "passed" }, { cmd: "check", status: "skipped" }]) {
+    expect(repairPreservesVerdict(JSON.stringify({ verdict: "pass", commands: [entry] }), result, s)).toBe(false);
+  }
+  expect(repairPreservesVerdict('{"verdict":"pass","acceptance":[{"id":"required","status":"not_run"}]}', result, s)).toBe(false);
+});
+
+test("an incomplete latest assistant cannot revive a completed earlier answer", () => {
+  for (const tail of [{ type: "message_start", message: { role: "assistant" } },
+    { type: "item.started", item: { type: "agent_message", text: JSON.stringify(deliveryResult) } }]) {
+    const dir = tempDir();
+    writeFileSync(join(dir, "native.jsonl"), [piAnswer(JSON.stringify(deliveryResult)), tail].map(JSON.stringify).join("\n"));
+    expect(extractResultFromRunDir(dir, spec("reviewer", "delivery"))).toBeNull();
+  }
+});
+
+test("native envelopes without an answer ignore stale files and repair tool-shaped JSON", () => {
+  for (const lines of [
+    [{ type: "thread.started", thread_id: "session" }, { type: "turn.completed", usage: {} }],
+    [{ type: "orch_result_repair", attempt: 1 }, { type: "tool_execution_end", result: deliveryResult }],
+  ]) {
+    const dir = tempDir();
+    mkdirSync(join(dir, "scratch"));
+    writeFileSync(join(dir, "scratch/last_message.txt"), JSON.stringify(deliveryResult));
+    writeFileSync(join(dir, "native.jsonl"), lines.map(JSON.stringify).join("\n"));
+    expect(extractResultFromRunDir(dir, spec("reviewer", "delivery"))).toBeNull();
+  }
 });

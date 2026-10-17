@@ -19,17 +19,23 @@ export function nativeResult(text: string): {
     }
     attemptLines.push(line);
     if (!obj || typeof obj !== "object") continue;
+    if ((obj.type === "message_start" && obj.message?.role === "assistant") ||
+        (["item.started", "item.updated"].includes(obj.type) && obj.item?.type === "agent_message")) {
+      structured = true; answer = null;
+      continue;
+    }
     const piMessage = (obj.type === "message_end" || obj.type === "turn_end") && obj.message?.role === "assistant";
     const piEnd = obj.type === "agent_end" && Array.isArray(obj.messages);
     if (piMessage || piEnd) {
       structured = true;
       const messages = piMessage ? [obj.message] : obj.messages.filter((m: any) => m?.role === "assistant");
+      if (piEnd && messages.length === 0) answer = null;
       for (const message of messages) {
         if (typeof message.stopReason === "string") failed = ["error", "aborted"].includes(message.stopReason);
         const value = textFromAssistantContent(message.content);
-        // Empty duplicate turn_end payloads are common. An explicit failed
-        // response still blocks extraction even when it has no text.
-        if (value !== null) answer = value;
+        // A repeated turn_end carries the same completed message. If its
+        // content differs or is empty, never assume an older answer survives.
+        answer = value;
       }
       continue;
     }
@@ -39,6 +45,7 @@ export function nativeResult(text: string): {
       structured = true; failed = true;
     }
     for (const event of normalizeNativeLine(line)) {
+      if (event.kind !== "raw") structured = true;
       if (event.kind === "final" || event.kind === "assistant") {
         structured = true;
         if (event.text !== undefined) answer = event.text;
