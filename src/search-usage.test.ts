@@ -269,3 +269,17 @@ test("usage aggregate excludes missing final Claude, unfinished Codex and trunca
     expect(p.normalized_coverage.excluded_runs).toHaveLength(3);
   }
 });
+
+test("usage aggregates exclude conflicting duplicate Pi response evidence", async () => {
+  const f = makeFixture(), now = new Date().toISOString();
+  const message = { role: "assistant", responseId: "same", stopReason: "stop", usage: { input: 10, output: 2, cacheRead: 0, cacheWrite: 0 } };
+  writeRun({ stateHome: f.stateHome, repoKey: f.repoKey, mr: "conflict", runId: "pi-conflict", startedAt: now,
+    nativeLines: [{ type: "message_end", message }, { type: "message_end", message: { ...message, stopReason: "error" } }, { type: "agent_end" }] });
+  for (const args of [["usage", "thread", "--thread", "conflict"], ["usage", "daily", "--days", "1"]]) {
+    const r = await runOrch([...args, "--worktree", f.worktree, "--json"], { XDG_STATE_HOME: f.stateHome });
+    expect(r.exitCode).toBe(0);
+    const data = JSON.parse(r.stdout), p = data.buckets?.[0] ?? data;
+    expect(p.normalized_tokens).toBeNull();
+    expect(p.normalized_coverage).toEqual({ complete_runs: 0, total_runs: 1, excluded_runs: ["pi-conflict"] });
+  }
+});

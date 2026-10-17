@@ -11,6 +11,8 @@ One formatting repair remains available. Its prompt receives the actual final
 answer, and `result.original.md` preserves that answer before repair. A repair
 must exit successfully, pass the schema, and preserve an explicit original
 verdict. Unparseable originals cannot authorize successful repaired verdicts.
+Failed evidence cannot be removed to obtain success. Required skipped checks
+block a verifier pass; implementers may preserve checks left to a verifier.
 Rejected repairs leave the original in `result.raw.md`. This is a conservative
 gate, not proof of every factual statement; independent review and host evidence
 are still required. Run `done` describes process completion, not acceptance of
@@ -34,7 +36,9 @@ the business verdict.
 
 Pi counts `message_end.message.usage`, deduplicating explicit response/message
 IDs and ignoring repeated turn/end snapshots. Claude uses the final terminal
-result total per attempt, not assistant totals as well. Codex uses the last
+result total per attempt, not assistant totals as well. Conflicting Pi records
+with the same ID make coverage partial and the response error or unknown;
+their tokens are never counted twice. Codex uses the last
 cumulative counter per session, plus separately marked fresh repair attempts.
 Resumed/legacy Codex runs without an evidenced pre-run baseline remain excluded
 from complete totals. This version deliberately does not inspect arbitrary

@@ -44,6 +44,13 @@ export function nativeResult(text: string): {
         (obj.type === "result" && (obj.is_error === true || String(obj.subtype ?? "").startsWith("error")))) {
       structured = true; failed = true;
     }
+    if (obj.type === "result") {
+      // Claude's terminal envelope supersedes every earlier assistant even
+      // when its result is missing, empty or malformed.
+      structured = true;
+      answer = typeof obj.result === "string" ? obj.result.trim() || null : null;
+      continue;
+    }
     for (const event of normalizeNativeLine(line)) {
       if (event.kind !== "raw") structured = true;
       if (event.kind === "final" || event.kind === "assistant") {

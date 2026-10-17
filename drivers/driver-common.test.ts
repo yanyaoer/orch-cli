@@ -1909,3 +1909,29 @@ test("native envelopes without an answer ignore stale files and repair tool-shap
     expect(extractResultFromRunDir(dir, spec("reviewer", "delivery"))).toBeNull();
   }
 });
+
+test("Claude missing or malformed terminal text invalidates earlier success", () => {
+  for (const ending of [{}, { result: null }, { result: {} }, { result: "" }]) {
+    const dir = tempDir();
+    writeFileSync(join(dir, "native.jsonl"), [
+      { type: "assistant", message: { content: [{ type: "text", text: JSON.stringify(deliveryResult) }] } },
+      { type: "result", subtype: "success", is_error: false, ...ending },
+    ].map(JSON.stringify).join("\n"));
+    writeFileSync(join(dir, "last_message.txt"), JSON.stringify(deliveryResult));
+    expect(extractResultFromRunDir(dir, spec("reviewer", "delivery"))).toBeNull();
+    expect(rawResultText(dir)).toBeNull();
+  }
+});
+
+test("implementer format repair preserves legitimate skipped evidence", () => {
+  const s = spec("implementer", "skip-checks");
+  const repaired = { schema: "orch.result/implementer/v1", run_id: "skip-checks", verdict: "completed",
+    summary: "Implementation ready for verification", base_sha: "base", head_sha: "head", changed_files: [],
+    tests: [{ cmd: "integration check", exit_code: null, status: "skipped", summary: "Left to verifier" }],
+    acceptance: [{ id: "integration", status: "skipped", evidence: "Left to verifier" }], risks: [], rollback: "Revert change" };
+  const result = extractResultFromText(JSON.stringify(repaired), s)!;
+  expect(result).not.toBeNull();
+  expect(repairPreservesVerdict(JSON.stringify({ ...repaired, risks: {} }), result, s)).toBe(true);
+  expect(repairPreservesVerdict(JSON.stringify({ ...repaired, tests: [{ cmd: "check", status: "passed", exit_code: 1 }] }), result, s)).toBe(false);
+  expect(repairPreservesVerdict(JSON.stringify({ ...repaired, acceptance: [{ id: "check", status: "unmet" }] }), result, s)).toBe(false);
+});

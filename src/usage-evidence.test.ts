@@ -83,3 +83,22 @@ test("unfinished Codex turns and truncated records make observed counters partia
   expect(truncated.coverage.status).toBe("partial");
   expect(truncated.coverage.reasons).toContain("malformed_native_record");
 });
+
+test("conflicting duplicate Pi messages retain error and invalid evidence without double counting", () => {
+  const first = { role: "assistant", responseId: "same", stopReason: "stop", usage: { input: 10, output: 2, cacheRead: 0, cacheWrite: 0 } };
+  for (const tail of [
+    { ...first, stopReason: "error", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } },
+    { ...first, stopReason: "aborted" },
+    { ...first, usage: {} },
+    { ...first, usage: { ...first.usage, output: 3 } },
+  ]) {
+    const e = usageEvidence(stream({ type: "message_end", message: first }, { type: "message_end", message: tail },
+      { type: "message_end", message: tail }, { type: "agent_end" }), fresh, done);
+    expect(e.coverage.status).toBe("partial");
+    expect(e.coverage.reasons).toContain("pi_duplicate_message_conflict");
+    expect(e.coverage.counted_records).toBe(1);
+    expect(e.normalized_tokens?.total_tokens).toBe(12);
+    expect(e.response_observations.successful_messages).toBe(0);
+    expect(e.response_observations.error_messages).toBe(["error", "aborted"].includes(tail.stopReason) ? 1 : 0);
+  }
+});

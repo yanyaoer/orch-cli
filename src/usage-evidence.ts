@@ -54,20 +54,36 @@ export function usageEvidence(native: string | null, spec: Partial<RunSpec> | nu
     if (pi.length) {
       piSeen = true;
       formats.add("pi_message_end");
-      const ids = new Set<string>();
+      type Outcome = "success" | "error" | "unknown";
+      const counts: Record<Outcome, number> = { success: 0, error: 0, unknown: 0 };
+      const ids = new Map<string, { signature: string; outcome: Outcome }>();
       for (const e of pi) {
         const m = e.message;
         const id = typeof m.responseId === "string" ? m.responseId : typeof m.id === "string" ? m.id : null;
-        if (id && ids.has(id)) continue;
-        if (id) ids.add(id);
-        if (["error", "aborted"].includes(m.stopReason)) {
-          errorMessages++; reasons.add("provider_error_usage_may_be_incomplete");
-        } else if (["stop", "length", "toolUse"].includes(m.stopReason)) successMessages++;
-        else unknownMessages++;
+        const outcome: Outcome = ["error", "aborted"].includes(m.stopReason) ? "error" :
+          ["stop", "length", "toolUse"].includes(m.stopReason) ? "success" : "unknown";
+        if (outcome === "error") reasons.add("provider_error_usage_may_be_incomplete");
         const n = normalized(m.usage, "pi");
+        if (!n) reasons.add("pi_message_usage_missing_or_invalid");
+        const signature = JSON.stringify([m.stopReason ?? null, n]);
+        const prior = id ? ids.get(id) : undefined;
+        if (prior) {
+          if (prior.signature !== signature) {
+            reasons.add("pi_duplicate_message_conflict");
+            // A conflicting identity cannot remain a successful response.
+            // Error evidence is sticky; other conflicts are unknown. Tokens
+            // remain counted once and partial runs are excluded from totals.
+            counts[prior.outcome]--;
+            prior.outcome = prior.outcome === "error" || outcome === "error" ? "error" : "unknown";
+            counts[prior.outcome]++;
+          }
+          continue;
+        }
+        if (id) ids.set(id, { signature, outcome });
+        counts[outcome]++;
         if (n) { sum = addNormalized(sum, n); records++; }
-        else reasons.add("pi_message_usage_missing_or_invalid");
       }
+      successMessages += counts.success; errorMessages += counts.error; unknownMessages += counts.unknown;
       if (!events.some(e => e.type === "agent_end")) reasons.add("pi_terminal_missing");
     } else if (claude.length) {
       formats.add("claude_result_total");
