@@ -1,8 +1,9 @@
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync, writeSync } from "node:fs";
 import { isRunRole, type AgentName, type ResultCoercion, type RunSpec, type RoleResult, type SandboxEngine, type SandboxPosture } from "../src/types.ts";
-import { fallbackResult, resultSchemaName, ROLE_REQUIRED_FIELDS, ROLE_RESULT_EXAMPLE, ROLE_VERDICTS, validateRoleResult } from "../src/schema.ts";
+import { acceptanceOutcome, commandOutcome, fallbackResult, resultSchemaName, ROLE_REQUIRED_FIELDS, ROLE_RESULT_EXAMPLE, ROLE_VERDICTS, validateRoleResult } from "../src/schema.ts";
 import { appendJsonLine, countLines, writeJsonAtomic } from "../src/json.ts";
-import { normalizeNativeText, type NativeEvent } from "../src/native-events.ts";
+import { normalizeNativeText } from "../src/native-events.ts";
+import { nativeResult } from "../src/native-result.ts";
 import { scrubGitLocationEnv } from "../src/git-env.ts";
 import { sha256 } from "../src/hash.ts";
 import {
@@ -674,40 +675,31 @@ export function extractResultFromText(text: string, spec: RunSpec): RoleResult |
   return extractResultWithCoercionsFromText(text, spec)?.result ?? null;
 }
 
-function candidateTexts(events: NativeEvent[], kind: NativeEvent["kind"], format: NativeEvent["format"]): string[] {
-  return events.filter((event) => event.kind === kind && event.format === format && typeof event.text === "string").map((event) => event.text!);
-}
-
 function collectResultCandidates(runDir: string): string[] {
-  const candidates: string[] = [];
+  const nativePath = `${runDir}/native.jsonl`;
+  const native = existsSync(nativePath) ? nativeResult(readFileSync(nativePath, "utf8")) : null;
+  // Once a structured stream or repair attempt exists it is authoritative.
+  // Never search old messages, tool output, or stale last_message files for
+  // a valid-looking result if the actual final message is invalid/empty.
+  if (native && (native.structured || native.repair)) return native.text === null ? [] : [native.text];
   // scratch/last_message.txt is the sandboxed codex location (provider-writable
   // scratch); last_message.txt is the unsandboxed one.
   for (const path of [`${runDir}/scratch/last_message.txt`, `${runDir}/last_message.txt`, `${runDir}/stdout.log`]) {
-    if (existsSync(path)) candidates.push(readFileSync(path, "utf8"));
+    if (existsSync(path)) {
+      const text = readFileSync(path, "utf8");
+      if (text.trim()) return [text];
+    }
   }
+  return native?.text ? [native.text] : [];
+}
 
-  const nativePath = `${runDir}/native.jsonl`;
-  if (existsSync(nativePath)) {
-    const nativeText = readFileSync(nativePath, "utf8");
-    const events = normalizeNativeText(nativeText);
-    // Final-message-first candidate order per provider format; raw lines are
-    // plain text and stream noise, tried after every structured candidate.
-    candidates.push(
-      ...candidateTexts(events, "final", "claude"),
-      ...candidateTexts(events, "assistant", "claude"),
-      ...candidateTexts(events, "assistant", "codex"),
-      ...candidateTexts(events, "assistant", "pi"),
-      ...candidateTexts(events, "raw", "unknown"),
-      // A plain-text provider response may be a JSON object spanning multiple
-      // lines, so try the whole stream as one candidate too.
-      nativeText,
-    );
-  }
-
-  return candidates;
+function providerFailed(runDir: string): boolean {
+  const path = `${runDir}/native.jsonl`;
+  return existsSync(path) && nativeResult(readFileSync(path, "utf8")).failed;
 }
 
 export function extractResultWithCoercionsFromRunDir(runDir: string, spec: RunSpec): ExtractedResult | null {
+  if (providerFailed(runDir)) return null;
   for (const candidate of collectResultCandidates(runDir)) {
     const extracted = extractResultWithCoercionsFromText(candidate, spec);
     if (extracted) return extracted;
@@ -764,7 +756,7 @@ function repairTaskText(spec: RunSpec, errors: string[], previous: string): stri
     "Your previous final answer for this run did not validate as an orch result. Validator errors:",
     ...errors.map((error) => `- ${error}`),
     "",
-    "Return the corrected JSON object as your final answer and nothing else. Keep every fact from the previous answer; do not invent values you do not have — leave optional arrays empty instead. Do not run tools or edit files.",
+    "Return the corrected JSON object as your final answer and nothing else. Keep every fact and the verdict from the previous answer. Do not upgrade failures, remove findings, or invent evidence. Do not run tools or edit files.",
     `Required shape: ${ROLE_RESULT_EXAMPLE[role]}`,
     "",
     "--- previous answer ---",
@@ -802,11 +794,14 @@ async function runResultRepair(input: {
   }
   const nativePath = `${input.runDir}/native.jsonl`;
   appendFileSync(nativePath, `${JSON.stringify({ type: "orch_result_repair", attempt: 1, errors: input.errors })}\n`, "utf8");
+  appendDriverEvent(input.runDir, { type: "phase", phase: "result_repair_start", wait_reason: "provider_process" });
   const proc = Bun.spawn(plan.argv, { cwd: input.worktree, stdin: "pipe", stdout: "pipe", stderr: "inherit", env: plan.env });
   if (input.provider !== "omp") proc.stdin.write(prompt);
   proc.stdin.end();
   await pipeToFile(proc.stdout, nativePath, "a");
-  return await proc.exited;
+  const code = await proc.exited;
+  appendDriverEvent(input.runDir, { type: "phase", phase: "result_repair_end", exit_code: code });
+  return code;
 }
 
 // Best human-readable stand-in for the worker's final answer, used to preserve
@@ -818,6 +813,37 @@ export function rawResultText(runDir: string): string | null {
     if (candidate.trim().length > 0) return candidate;
   }
   return null;
+}
+
+// A formatting call is not a second assessment. Only an explicit, parseable
+// original verdict can authorize a successful repaired result. Unparseable
+// answers stay failed even if the formatting model guesses a success.
+export function repairPreservesVerdict(previous: string, result: RoleResult, spec: RunSpec): boolean {
+  const verdicts = new Set<string>();
+  const success = ["completed", "approve", "pass"].includes(result.verdict);
+  for (const candidate of parsedJsonCandidates(previous)) {
+    for (const value of unwrappedCandidates(candidate, spec)) {
+      const obj = coerceCandidate(value, spec)?.obj;
+      if (typeof obj?.verdict === "string" && ROLE_VERDICTS[spec.role].includes(obj.verdict)) verdicts.add(obj.verdict);
+      if (success && obj && typeof obj.verdict === "string") {
+        if (Array.isArray(obj.blocking_findings) && obj.blocking_findings.length) return false;
+        for (const field of ["tests", "commands"]) {
+          if (Array.isArray(obj[field]) && obj[field].some((entry: any) => entry && (
+            commandOutcome(entry) === "failed" ||
+            (typeof entry.exit_code === "number" && entry.exit_code !== (entry.expected_exit_code ?? 0)) ||
+            (spec.role === "verifier" && entry.status === "skipped" && entry.optional !== true)
+          ))) return false;
+        }
+        if (Array.isArray(obj.acceptance) && obj.acceptance.some((entry: any) => entry && (
+          acceptanceOutcome(entry.status) === "unmet" ||
+          acceptanceOutcome(entry.status) === null ||
+          (spec.role === "verifier" && acceptanceOutcome(entry.status) === "skipped" && entry.optional !== true)
+        ))) return false;
+      }
+    }
+  }
+  if (verdicts.size === 1) return verdicts.has(result.verdict);
+  return verdicts.size === 0 && ["failed", "fail", "request_changes"].includes(result.verdict);
 }
 
 export function synthesizeResult(spec: RunSpec, summary: string): RoleResult {
@@ -1278,6 +1304,7 @@ export async function runProviderDriver(provider: AgentName, argv: string[]): Pr
     sandbox_profile_sha256: plan.profileSha256,
     provider_native_sandbox: plan.providerNativeSandbox,
   });
+  appendDriverEvent(args.runDir, { type: "phase", phase: "provider_start", wait_reason: "provider_process" });
   const proc = Bun.spawn(plan.argv, {
     cwd: args.worktree,
     stdin: "pipe",
@@ -1290,30 +1317,37 @@ export async function runProviderDriver(provider: AgentName, argv: string[]): Pr
 
   await pipeToFile(proc.stdout, `${args.runDir}/native.jsonl`);
   const code = await proc.exited;
+  appendDriverEvent(args.runDir, { type: "phase", phase: "provider_end", exit_code: code });
   writeExitCode(args.runDir, code);
 
-  let extracted = extractResultWithCoercionsFromRunDir(args.runDir, spec);
+  appendDriverEvent(args.runDir, { type: "phase", phase: "result_validation" });
+  const original = rawResultText(args.runDir);
+  const failed = code !== 0 || providerFailed(args.runDir);
+  let extracted = failed ? null : extractResultWithCoercionsFromRunDir(args.runDir, spec);
   // A provider that finished normally but whose answer does not validate gets
   // one repair round (ORCH_RESULT_REPAIR=0 disables it); a crashed or killed
   // provider does not, its raw output is preserved below instead.
-  if (!extracted && code === 0 && process.env.ORCH_RESULT_REPAIR !== "0") {
+  if (!extracted && !failed && process.env.ORCH_RESULT_REPAIR !== "0") {
     const errors = resultValidationErrors(args.runDir, spec);
     const previous = rawResultText(args.runDir);
     if (previous) {
+      writeFileSync(`${args.runDir}/result.original.md`, previous, "utf8");
       const repairCode = await runResultRepair({ provider, spec, runDir: args.runDir, worktree: args.worktree, errors, previous });
-      extracted = extractResultWithCoercionsFromRunDir(args.runDir, spec);
+      const repaired = repairCode === 0 ? extractResultWithCoercionsFromRunDir(args.runDir, spec) : null;
+      extracted = repaired && repairPreservesVerdict(previous, repaired.result, spec) ? repaired : null;
       appendDriverEvent(args.runDir, { type: "result_repair", attempt: 1, errors, repair_exit_code: repairCode, outcome: extracted ? "valid" : "invalid" });
     }
   }
   if (extracted) {
     writeResult(args.runDir, spec, extracted.result);
     appendResultCoercionEvent(args.runDir, extracted.coercions);
+    appendDriverEvent(args.runDir, { type: "phase", phase: "delivery_complete", valid_result: true });
     return code;
   }
 
   // Preserve the worker's real answer even when it doesn't fit the schema —
   // in practice most runs produce a usable review that must stay reachable.
-  const raw = rawResultText(args.runDir);
+  const raw = original;
   if (raw) writeFileSync(`${args.runDir}/result.raw.md`, raw, "utf8");
 
   // Exit 71 under the Seatbelt wrapper is the canonical sandbox_apply failure:
@@ -1327,9 +1361,11 @@ export async function runProviderDriver(provider: AgentName, argv: string[]): Pr
         ? `${provider} did not return a valid orch result JSON; raw output saved to result.raw.md. Excerpt: ${raw!.slice(0, 400)}`
         : `${provider} exited ${code}${sandboxApplyHint}${raw ? "; raw output saved to result.raw.md" : ""}`;
   writeResult(args.runDir, spec, synthesizeResult(spec, summary));
+  appendDriverEvent(args.runDir, { type: "phase", phase: "delivery_complete", valid_result: false });
   // No valid result is a failed run whatever the provider exit code claims:
   // exit 0 here would let the supervisor mark a protocol failure `done`, and
   // run-state consumers (overview, wait, retries) would read it as success.
   // The raw answer stays reachable via result.raw.md either way.
+  writeExitCode(args.runDir, code || 1);
   return code || 1;
 }
