@@ -45,9 +45,10 @@ async function fixture(files: Record<string, string | Uint8Array>) {
 }
 
 describe("documentation inventory and mapping", () => {
-  test("covers the current 10 Markdown, 1 JSON, and 2 text sources", async () => {
+  test("covers the current 11 Markdown, 1 JSON, and 2 text sources", async () => {
     const sources = await getTrackedDocsSources();
-    expect(sources.filter((source) => source.endsWith(".md"))).toHaveLength(10);
+    expect(sources.filter((source) => source.endsWith(".md"))).toHaveLength(11);
+    expect(sources).toContain("result-delivery-and-usage.md");
     // The workflow hardening record is a published page, not an unlisted file.
     expect(sources).toContain("development-workflow-hardening.md");
     expect(renderedOutputForSource("development-workflow-hardening.md")).toBe("development-workflow-hardening.html");

@@ -7,6 +7,7 @@ import { normalizeNativeLine } from "../native-events.ts";
 import { CliError, assertKnownFlags, flagBool, flagNumber, flagString, printJson, type ParsedArgs } from "../cli.ts";
 import { readTextFile, runLocation, runLocationsForMr, runLocationsForRepo, type RunLocation } from "../run-store.ts";
 import { threadMr } from "./status.ts";
+import { usageEvidence, lifecycleEvidence, addNormalized, type UsageEvidence, type NormalizedTokens } from "../usage-evidence.ts";
 
 type TokenUsageMap = Record<string, number>;
 
@@ -17,11 +18,13 @@ type UsageSummary = {
   unpriced_models: string[];
 };
 
-type RunUsageSummary = UsageSummary & {
+type RunUsageSummary = UsageSummary & UsageEvidence & {
   mr: string;
   run_id: string;
   usage_events: number;
   source_file: string;
+  legacy_usage_semantics: string;
+  lifecycle: ReturnType<typeof lifecycleEvidence>;
 };
 
 function addUsage(target: TokenUsageMap, usage: TokenUsageMap): void {
@@ -91,6 +94,9 @@ function runUsageSummary(run: RunLocation): RunUsageSummary {
     unpriced_models: [...models].sort(),
     usage_events: usageEvents,
     source_file: nativePath,
+    legacy_usage_semantics: "raw_event_sum; provider-dependent; may contain cumulative duplicates; prefer normalized_tokens with coverage",
+    ...usageEvidence(native, spec, run.status),
+    lifecycle: lifecycleEvidence(readTextFile(`${run.run_dir}/events.jsonl`), spec),
   };
 }
 
@@ -98,12 +104,19 @@ function aggregateRunUsage(runs: RunUsageSummary[]): UsageSummary & {
   run_count: number;
   runs_with_token_data: number;
   missing_runs: string[];
+  normalized_tokens: NormalizedTokens | null;
+  normalized_coverage: { complete_runs: number; total_runs: number; excluded_runs: string[] };
 } {
   const usage: TokenUsageMap = {};
   const models = new Set<string>();
   const missingRuns: string[] = [];
   let runsWithTokenData = 0;
+  let normalizedTokens: NormalizedTokens | null = null;
+  const excluded: string[] = [];
   for (const run of runs) {
+    if (run.coverage.status === "complete" && run.normalized_tokens) {
+      normalizedTokens = normalizedTokens ? addNormalized(normalizedTokens, run.normalized_tokens) : run.normalized_tokens;
+    } else excluded.push(run.run_id);
     for (const model of run.unpriced_models) models.add(model);
     if (!run.has_token_data || !run.usage) {
       missingRuns.push(run.run_id);
@@ -121,6 +134,8 @@ function aggregateRunUsage(runs: RunUsageSummary[]): UsageSummary & {
     usage: hasTokenData ? sortedUsage(usage) : null,
     estimated_cost_usd: null,
     unpriced_models: [...models].sort(),
+    normalized_tokens: normalizedTokens,
+    normalized_coverage: { complete_runs: runs.length - excluded.length, total_runs: runs.length, excluded_runs: excluded },
   };
 }
 

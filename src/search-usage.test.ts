@@ -225,3 +225,61 @@ test("orch usage reports missing token data as missing and aggregates token maps
     usage: { cache_read_input_tokens: 5, input_tokens: 100, output_tokens: 20 },
   });
 });
+
+test("usage CLI normalizes Pi and Claude and excludes unknown resumed Codex from totals", async () => {
+  const f = makeFixture(), now = new Date().toISOString();
+  const pi = writeRun({ stateHome: f.stateHome, repoKey: f.repoKey, mr: "normalized", runId: "pi", startedAt: now,
+    nativeLines: [{ type: "message_end", message: { role: "assistant", usage: { input: 5, cacheRead: 100, cacheWrite: 0, output: 5 } } }, { type: "agent_end", messages: [] }],
+    events: '{"type":"starting","ts":"2026-01-01T00:00:00Z"}\n{"type":"done","ts":"2026-01-01T00:00:05Z"}\n' });
+  writeFileSync(join(pi, "spec.json"), JSON.stringify({ agent: "pi", provider_session_mode: "fresh_persistent" }));
+  const claude = writeRun({ stateHome: f.stateHome, repoKey: f.repoKey, mr: "normalized", runId: "claude", startedAt: now,
+    nativeLines: [{ type: "result", usage: { input_tokens: 2, cache_read_input_tokens: 20, cache_creation_input_tokens: 3, output_tokens: 5 } }] });
+  writeFileSync(join(claude, "spec.json"), JSON.stringify({ agent: "claude", provider_session_mode: "fresh_persistent" }));
+  const resumed = writeRun({ stateHome: f.stateHome, repoKey: f.repoKey, mr: "normalized", runId: "resumed", startedAt: now,
+    nativeLines: [{ type: "turn.completed", usage: { input_tokens: 999, cached_input_tokens: 900, output_tokens: 99 } }] });
+  writeFileSync(join(resumed, "spec.json"), JSON.stringify({ agent: "codex", provider_session_mode: "resume_exact" }));
+  const r = await runOrch(["usage", "thread", "--thread", "normalized", "--worktree", f.worktree, "--json"], { XDG_STATE_HOME: f.stateHome });
+  expect(r.exitCode).toBe(0);
+  const p = JSON.parse(r.stdout);
+  expect(p.normalized_tokens.total_tokens).toBe(140);
+  expect(p.normalized_coverage).toEqual({ complete_runs: 2, total_runs: 3, excluded_runs: ["resumed"] });
+  expect(p.runs.find((r: any) => r.run_id === "pi").lifecycle.observed_run_ms).toBe(5000);
+  expect(p.estimated_cost_usd).toBeNull();
+});
+
+test("usage aggregate excludes missing final Claude, unfinished Codex and truncated records", async () => {
+  const f = makeFixture(), now = new Date().toISOString();
+  const usage = { input_tokens: 10, output_tokens: 2, cache_read_input_tokens: 5, cache_creation_input_tokens: 0 };
+  for (const [runId, lines] of [
+    ["claude-error", [{ type: "result", usage }, { type: "result", is_error: true }]],
+    ["codex-open", [{ type: "turn.completed", usage: { input_tokens: 10, output_tokens: 2, cached_input_tokens: 5 } }, { type: "turn.started" }]],
+    ["truncated", [{ type: "turn.completed", usage: { input_tokens: 10, output_tokens: 2, cached_input_tokens: 5 } }]],
+  ] as const) {
+    const dir = writeRun({ stateHome: f.stateHome, repoKey: f.repoKey, mr: "partial", runId, startedAt: now, nativeLines: [...lines] });
+    writeFileSync(join(dir, "spec.json"), JSON.stringify({ provider_session_mode: "fresh_persistent" }));
+    if (runId === "truncated") writeFileSync(join(dir, "native.jsonl"), lines.map(e => JSON.stringify(e)).join("\n") + '\n{"type":');
+  }
+  for (const args of [["usage", "thread", "--thread", "partial"], ["usage", "daily", "--days", "1"]]) {
+    const r = await runOrch([...args, "--worktree", f.worktree, "--json"], { XDG_STATE_HOME: f.stateHome });
+    expect(r.exitCode).toBe(0);
+    const data = JSON.parse(r.stdout);
+    const p = data.buckets?.[0] ?? data;
+    expect(p.normalized_tokens).toBeNull();
+    expect(p.normalized_coverage.complete_runs).toBe(0);
+    expect(p.normalized_coverage.excluded_runs).toHaveLength(3);
+  }
+});
+
+test("usage aggregates exclude conflicting duplicate Pi response evidence", async () => {
+  const f = makeFixture(), now = new Date().toISOString();
+  const message = { role: "assistant", responseId: "same", stopReason: "stop", usage: { input: 10, output: 2, cacheRead: 0, cacheWrite: 0 } };
+  writeRun({ stateHome: f.stateHome, repoKey: f.repoKey, mr: "conflict", runId: "pi-conflict", startedAt: now,
+    nativeLines: [{ type: "message_end", message }, { type: "message_end", message: { ...message, stopReason: "error" } }, { type: "agent_end" }] });
+  for (const args of [["usage", "thread", "--thread", "conflict"], ["usage", "daily", "--days", "1"]]) {
+    const r = await runOrch([...args, "--worktree", f.worktree, "--json"], { XDG_STATE_HOME: f.stateHome });
+    expect(r.exitCode).toBe(0);
+    const data = JSON.parse(r.stdout), p = data.buckets?.[0] ?? data;
+    expect(p.normalized_tokens).toBeNull();
+    expect(p.normalized_coverage).toEqual({ complete_runs: 0, total_runs: 1, excluded_runs: ["pi-conflict"] });
+  }
+});
