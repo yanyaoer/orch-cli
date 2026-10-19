@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   acceptableHostTmpDir,
+  accountStateDirReason,
   canonicalizePath,
   exactStateDirReason,
   findWorktreeHardlinks,
@@ -15,6 +16,7 @@ import {
   sandboxRunIdentity,
   sbplString,
   scratchEnv,
+  seatbeltEngineFor,
   seatbeltProfile,
   seatbeltUnsupportedReason,
 } from "./sandbox.ts";
@@ -277,4 +279,56 @@ test("seatbeltProfile: default-deny writes, minimal allows, Git denied last", ()
   expect(readOnly).toContain('(subpath "/Users/u/.local/state/orch/dispatch/pending")');
   expect(readOnly).not.toContain('(subpath "/Users/u/.local/state/orch/dispatch/done")');
   expect(readOnly).not.toContain('"/Users/u/.local/state")');
+});
+
+test("providerStatePaths with an account grants exactly the account dir (seatbelt-v2)", () => {
+  expect(providerStatePaths("claude", "/home/u", { id: "work", provider: "claude", env: { CLAUDE_CONFIG_DIR: "/home/u/.claude-work" } })).toEqual({
+    dirs: ["/home/u/.claude-work"],
+    files: [],
+  });
+  expect(providerStatePaths("codex", "/home/u", { id: "cx", provider: "codex", env: { CODEX_HOME: "/data/codex-home" } })).toEqual({
+    dirs: ["/data/codex-home"],
+    files: [],
+  });
+  expect(() => providerStatePaths("codex", "/home/u", { id: "work", provider: "claude", env: { CLAUDE_CONFIG_DIR: "/x" } })).toThrow(
+    "does not configure a codex config dir",
+  );
+});
+
+test("seatbeltEngineFor: v1 without an account, v2 with one", () => {
+  expect(seatbeltEngineFor(undefined)).toBe("seatbelt-v1");
+  expect(seatbeltEngineFor({ id: "a", provider: "claude", env: { CLAUDE_CONFIG_DIR: "/x" } })).toBe("seatbelt-v2");
+  expect(sandboxRunIdentity("seatbelt-v2").keySuffix).toBe(":sandbox-seatbelt-v2");
+});
+
+test("accountStateDirReason: any narrow dir outside HOME's slot passes; HOME, symlinks, orch config/state are refused", () => {
+  const root = realpathSync(tempDir());
+  const home = join(root, "home");
+  const worktree = join(root, "worktree");
+  const configDir = join(home, ".config", "orch");
+  const stateRoot = join(home, ".local", "state", "orch");
+  const guarded = [
+    [configDir, "orch config dir"],
+    [stateRoot, "orch state root"],
+  ] as const;
+  for (const dir of [worktree, configDir, stateRoot]) mkdirSync(dir, { recursive: true });
+  const work = join(home, ".claude-work");
+  const elsewhere = join(root, "accounts", "codex-b");
+  mkdirSync(work);
+  mkdirSync(elsewhere, { recursive: true });
+  expect(accountStateDirReason(work, work, home, worktree, guarded)).toBeNull();
+  expect(accountStateDirReason(elsewhere, elsewhere, home, worktree, guarded)).toBeNull();
+
+  expect(accountStateDirReason(home, home, home, worktree, guarded)).toContain("overlaps the orch config dir");
+  expect(accountStateDirReason(home, home, home, worktree, [])).toContain("home directory");
+  expect(accountStateDirReason(join(home, ".local"), join(home, ".local"), home, worktree, guarded)).toContain("overlaps the orch state root");
+  expect(accountStateDirReason(join(stateRoot, "x"), join(stateRoot, "x"), home, worktree, guarded)).toContain("does not exist");
+  mkdirSync(join(stateRoot, "x"));
+  expect(accountStateDirReason(join(stateRoot, "x"), join(stateRoot, "x"), home, worktree, guarded)).toContain("overlaps the orch state root");
+  expect(accountStateDirReason(configDir, configDir, home, worktree, guarded)).toContain("overlaps the orch config dir");
+  expect(accountStateDirReason(worktree, worktree, home, worktree, guarded)).toContain("overlaps the worktree");
+  const alias = join(home, ".claude-alias");
+  symlinkSync(work, alias);
+  expect(accountStateDirReason(alias, realpathSync(alias), home, worktree, guarded)).toContain("symlink");
+  expect(accountStateDirReason(join(home, "missing"), join(home, "missing"), home, worktree, guarded)).toContain("does not exist");
 });

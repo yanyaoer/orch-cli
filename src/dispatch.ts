@@ -355,7 +355,7 @@ function validateDispatchRequest(raw: unknown, controllerRunId: string, stateRoo
   if (!pathIsInside(canonicalStateRoot, canonicalRunDir)) throw new Error("controller run dir is outside orch state");
   const spec = readJsonFile<RunSpec | null>(`${canonicalRunDir}/spec.json`, null);
   const status = readJsonFile<RunStatus | null>(`${canonicalRunDir}/status.json`, null);
-  if (!spec || spec.run_id !== controllerRunId || spec.role !== "controller" || spec.agent !== "claude" || spec.sandbox_engine !== "seatbelt-v1") {
+  if (!spec || spec.run_id !== controllerRunId || spec.role !== "controller" || spec.agent !== "claude" || (spec.sandbox_engine !== "seatbelt-v1" && spec.sandbox_engine !== "seatbelt-v2")) {
     throw new Error("request is not bound to this sandboxed controller spec");
   }
   if (!status || status.run_id !== spec.run_id || status.role !== "controller" || status.state !== "running" || !status.pid || !isPidAlive(status.pid)) {

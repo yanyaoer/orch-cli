@@ -1,7 +1,7 @@
 // orch run create|list|reap|cancel: provider session config, resume chains, sandbox compatibility, spawning the detached supervisor.
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { evidenceRoles, isRunRole, sharedLockRoles, writeRoles, type AgentName, type ProviderSessionMode, type RunRole, type RunSpec, type RunStatus, type VcsSnapshot } from "../types.ts";
+import { evidenceRoles, isRunRole, sharedLockRoles, writeRoles, type AgentName, type RunAccount, type ProviderSessionMode, type RunRole, type RunSpec, type RunStatus, type VcsSnapshot } from "../types.ts";
 import { acquirePidfileLockWait, isProcessGroupAlive, processIdentity, worktreeLockBusy } from "../locks.ts";
 import { sha256 } from "../hash.ts";
 import { ensureStateLayout, getRepoIdentity, lockPathForWorktree, mrStateDir, type RepoIdentity } from "../paths.ts";
@@ -9,11 +9,11 @@ import { appendJsonLine, countLines, jsonBytes, readJsonFile, writeJsonAtomic, w
 import { writeInitialRunFiles } from "../supervisor.ts";
 import { describeSnapshot, vcsDirty, vcsHead, vcsResolveCommit, vcsSnapshot } from "../vcs.ts";
 import { isTerminal } from "../overview.ts";
-import { orchLanguage, readOrchConfig, type RoleDefaults } from "../config.ts";
+import { orchAccounts, orchLanguage, readOrchConfig, type RoleDefaults } from "../config.ts";
 
 import { CliError, assertKnownFlags, flagBool, flagString, printJson, readStdinText, type ParsedArgs } from "../cli.ts";
 import { buildPrompt, buildProviderExecutionPlan, type ProviderExecutionPlan } from "../../drivers/driver-common.ts";
-import { SEATBELT_ENGINE, sandboxPosture, sandboxRunIdentity, seatbeltUnsupportedReason } from "../../drivers/sandbox.ts";
+import { SEATBELT_ENGINE, SEATBELT_ENGINE_V2, sandboxPosture, sandboxRunIdentity, seatbeltEngineFor, seatbeltUnsupportedReason, type SeatbeltEngine } from "../../drivers/sandbox.ts";
 import { archivedIdempotency, formatTable, locateRun, looksStale, mrIdsForRepo, nonTerminalStates, orchCommand, readIdempotency, resolveMr, runId, runListRows, scanMrRuns, scanRunsRoot, stateDirectoryHint, statusState, type IdempotencyRecord } from "../run-store.ts";
 
 function isProviderSessionMode(value: string): value is ProviderSessionMode {
@@ -124,7 +124,7 @@ function assertProviderSessionCompatible(
 // come from the SAME config read (F6: engine and dirs must not split across
 // two reads); shape-checked here for early feedback, authoritatively re-vetted
 // by the driver against canonical paths.
-function requestedSandboxEngine(): { engine: typeof SEATBELT_ENGINE | null; writeDirs: string[] } {
+function requestedSandboxEngine(account: RunAccount | null): { engine: SeatbeltEngine | null; writeDirs: string[] } {
   const cfg = readOrchConfig();
   if (cfg.sandbox !== true) return { engine: null, writeDirs: [] };
   const reason = seatbeltUnsupportedReason();
@@ -135,16 +135,16 @@ function requestedSandboxEngine(): { engine: typeof SEATBELT_ENGINE | null; writ
       throw new CliError(`config sandbox_write_dirs entries must be absolute paths (no ~ or relative): ${JSON.stringify(dir)}`);
     }
   }
-  return { engine: SEATBELT_ENGINE, writeDirs };
+  return { engine: seatbeltEngineFor(account ?? undefined), writeDirs };
 }
 
 // An idempotency hit (notably an explicit --idempotency-key) must never hand
 // back a run that executed under different sandbox semantics: engine and the
 // role-derived posture both have to match. A missing spec.json (legacy run)
 // means engine none.
-function assertSandboxCompatible(existing: IdempotencyRecord, engine: typeof SEATBELT_ENGINE | null, role: RunRole): void {
+function assertSandboxCompatible(existing: IdempotencyRecord, engine: SeatbeltEngine | null, role: RunRole): void {
   const spec = readJsonFile<Partial<RunSpec> | null>(`${existing.run_dir}/spec.json`, null);
-  const storedEngine = spec?.sandbox_engine === SEATBELT_ENGINE ? SEATBELT_ENGINE : null;
+  const storedEngine = spec?.sandbox_engine === SEATBELT_ENGINE || spec?.sandbox_engine === SEATBELT_ENGINE_V2 ? spec.sandbox_engine : null;
   const storedRole = typeof spec?.role === "string" && isRunRole(spec.role) ? spec.role : role;
   if (storedEngine === engine && sandboxPosture(storedRole) === sandboxPosture(role)) return;
   throw new CliError(
@@ -155,6 +155,39 @@ function assertSandboxCompatible(existing: IdempotencyRecord, engine: typeof SEA
       "Pass --retry to create a new run under the requested sandbox settings.",
     ].join("\n"),
   );
+}
+
+// An idempotency hit (notably an explicit --idempotency-key) must never hand
+// back a run that used another account's config dir. A missing spec.account
+// (legacy run, or no --account) means no account.
+function assertAccountCompatible(existing: IdempotencyRecord, account: RunAccount | null): void {
+  const stored = readJsonFile<Partial<RunSpec> | null>(`${existing.run_dir}/spec.json`, null)?.account?.id ?? null;
+  if (stored === (account?.id ?? null)) return;
+  throw new CliError(
+    [
+      "idempotent run already exists with a different account",
+      `existing: account=${stored ?? "none"}`,
+      `requested: account=${account?.id ?? "none"}`,
+      "Pass --retry to create a new run under the requested account.",
+    ].join("\n"),
+  );
+}
+
+// --account <id>: pin the run to one configured provider account (config.json
+// accounts[]). The account's provider must be the run's agent; with --agent
+// omitted it decides the agent. Without --account nothing changes: the config
+// dir is inherited from the environment (automatic selection comes later).
+function resolveRunAccount(args: ParsedArgs): RunAccount | null {
+  if (!args.flags.has("account")) return null;
+  const id = flagString(args, "account").trim();
+  const accounts = orchAccounts();
+  const found = accounts.find((account) => account.id === id);
+  if (!found) {
+    throw new CliError(
+      `unknown account ${JSON.stringify(id)}; configured: ${accounts.length > 0 ? accounts.map((account) => account.id).join(", ") : "none (add accounts[] to config.json)"}`,
+    );
+  }
+  return { id: found.id, provider: found.provider, env: { ...found.env } };
 }
 
 // Default and explicit idempotency keys alike must never hand back a run that
@@ -260,6 +293,7 @@ const RUN_CREATE_FLAGS = [
   "worktree",
   "task",
   "resume-from",
+  "account",
   "idempotency-key",
   "retry",
   "allow-dirty",
@@ -390,6 +424,11 @@ function configuredRoleDefaults(role: RunRole): RoleDefaults {
   return typeof raw === "string" ? { agent: raw } : raw;
 }
 
+// Dry-run/create view of an account: identity only, never env values.
+function accountPayload(account: RunAccount | null): { account?: { id: string; provider: RunAccount["provider"] } } {
+  return account ? { account: { id: account.id, provider: account.provider } } : {};
+}
+
 // Dry-run view of an execution plan: argv + the effective sandbox contract.
 // plan.env is deliberately omitted — it is the worker's full environment.
 function providerPlanPayload(plan: ProviderExecutionPlan, cwd: string) {
@@ -412,11 +451,19 @@ export async function createRun(args: ParsedArgs): Promise<number> {
   // config.json (defaults.agents) when omitted; explicit flags always win and
   // without either source the original "missing --agent" error stands.
   const roleDefaults = configuredRoleDefaults(role);
+  const account = resolveRunAccount(args);
   const agent = resume
     ? resume.agent
-    : args.flags.has("agent") || !roleDefaults.agent
+    : args.flags.has("agent")
       ? (flagString(args, "agent") as AgentName)
-      : roleDefaults.agent;
+      : account
+        ? account.provider
+        : roleDefaults.agent ?? (flagString(args, "agent") as AgentName);
+  if (account && account.provider !== agent) {
+    throw new CliError(
+      `--account ${account.id} is a ${account.provider} account but the run's agent is ${agent}${resume ? ` (inherited from --resume-from ${resume.run_id})` : ""}`,
+    );
+  }
   const tag = flagString(args, "tag", role);
   const worktree = resume ? resume.worktree : resolve(flagString(args, "worktree", process.cwd()));
   const taskFlag = args.flags.has("task") ? flagString(args, "task") : null;
@@ -446,7 +493,7 @@ export async function createRun(args: ParsedArgs): Promise<number> {
   // Resolved exactly once here and threaded through to the spec, key,
   // compatibility check, dry-run, and startRun (F6): a config change between
   // two reads must not split the idempotency key from the recorded spec.
-  const { engine: sandboxEngine, writeDirs: sandboxWriteDirs } = requestedSandboxEngine();
+  const { engine: sandboxEngine, writeDirs: sandboxWriteDirs } = requestedSandboxEngine(account);
   const sandboxIdentity = sandboxRunIdentity(sandboxEngine, sandboxWriteDirs);
 
   const repo = await getRepoIdentity(worktree);
@@ -461,7 +508,7 @@ export async function createRun(args: ParsedArgs): Promise<number> {
   // (plus content for reviewer/verifier on a dirty checkout) is too, so the
   // same request against a new candidate is a new run.
   const contentKey = evidenceRoles.has(role) && snapshot.dirty ? `:content-${sha256(snapshot.content_sha).slice(0, 12)}` : "";
-  const defaultIdempotencyKey = `mr${mr}:${tag}:${taskSha}:session-${providerSessionFingerprint(providerSession)}:head-${snapshot.head}${contentKey}${sandboxIdentity.keySuffix}`;
+  const defaultIdempotencyKey = `mr${mr}:${tag}:${taskSha}:session-${providerSessionFingerprint(providerSession)}:head-${snapshot.head}${contentKey}${sandboxIdentity.keySuffix}${account ? `:account-${account.id}` : ""}`;
   const idempotencyKey = flagString(args, "idempotency-key", defaultIdempotencyKey);
   const idempotencyPath = `${mrDir}/idempotency.json`;
   const dryRun = flagBool(args, "dry-run");
@@ -473,6 +520,7 @@ export async function createRun(args: ParsedArgs): Promise<number> {
     const existingSession = existing && !retry ? assertProviderSessionCompatible(existing, providerSession, agent) : null;
     if (existing && !retry) assertSandboxCompatible(existing, sandboxEngine, role);
     if (existing && !retry) assertSnapshotCompatible(existing, snapshot, pinnedHead, role);
+    if (existing && !retry) assertAccountCompatible(existing, account);
     const effectiveSession = existingSession ?? providerSession;
     const idempotent = Boolean(existing && !retry);
     // Same guard as the real create; an idempotent hit reuses an existing run
@@ -504,6 +552,7 @@ export async function createRun(args: ParsedArgs): Promise<number> {
       snapshot,
       ...(pinnedHead ? { pinned_head: pinnedHead } : {}),
       ...(plannedSupersedes.length > 0 ? { supersedes: plannedSupersedes } : {}),
+      ...(account ? { account } : {}),
     };
     const payload = {
       dry_run: true,
@@ -511,6 +560,7 @@ export async function createRun(args: ParsedArgs): Promise<number> {
       mr_source: mrSource,
       role,
       agent,
+      ...accountPayload(account),
       model: effectiveSession.model,
       tag,
       provider_session_name: effectiveSession.provider_session_name,
@@ -581,6 +631,7 @@ export async function createRun(args: ParsedArgs): Promise<number> {
         `idempotency_key: ${idempotencyKey}`,
         `idempotent: ${payload.idempotent}`,
         `state: ${payload.state}`,
+        ...(account ? [`account: ${account.id} (${account.provider})`] : []),
         `model: ${payload.model ?? "default"}`,
         `provider_session_mode: ${payload.provider_session_mode}`,
         `provider_session_name: ${payload.provider_session_name ?? "none"}`,
@@ -634,6 +685,7 @@ export async function createRun(args: ParsedArgs): Promise<number> {
       snapshot,
       pinnedHead,
       supersedes,
+      account,
     })),
   });
   return 0;
@@ -658,18 +710,19 @@ interface StartRunInput {
   // Resolved once by the caller (createRun) and passed in immutable, so the
   // spec startRun writes cannot diverge from the idempotency key createRun
   // built from an earlier config read (F6).
-  sandboxEngine: typeof SEATBELT_ENGINE | null;
+  sandboxEngine: SeatbeltEngine | null;
   sandboxWriteDirs: string[];
   snapshot: VcsSnapshot;
   pinnedHead: string | null;
   supersedes: string[];
+  account: RunAccount | null;
 }
 
 // Spawns a single supervised run and returns its create payload. Shared by
 // `run create` and the fan-out commands (cross-review / fanout / investigate).
 async function startRun(input: StartRunInput): Promise<Record<string, unknown>> {
   const { args, mr, role, agent, tag, worktree, taskPath, taskText, taskSha, timeoutSec } = input;
-  const { providerSession, repo, mrDir, idempotencyKey, idempotencyPath, sandboxEngine, sandboxWriteDirs, snapshot, pinnedHead } = input;
+  const { providerSession, repo, mrDir, idempotencyKey, idempotencyPath, sandboxEngine, sandboxWriteDirs, snapshot, pinnedHead, account } = input;
   const sandboxIdentity = sandboxRunIdentity(sandboxEngine, sandboxWriteDirs);
 
   try {
@@ -688,6 +741,7 @@ async function startRun(input: StartRunInput): Promise<Record<string, unknown>> 
       const existingSession = assertProviderSessionCompatible(existing, providerSession, agent);
       assertSandboxCompatible(existing, sandboxEngine, role);
       assertSnapshotCompatible(existing, snapshot, pinnedHead, role);
+      assertAccountCompatible(existing, account);
       const existingState = statusState(existing);
       if (existingState === "failed" || existingState === "timeout") {
         process.stderr.write(
@@ -754,6 +808,7 @@ async function startRun(input: StartRunInput): Promise<Record<string, unknown>> 
       snapshot,
       ...(pinnedHead ? { pinned_head: pinnedHead } : {}),
       ...(supersedes.length > 0 ? { supersedes } : {}),
+      ...(account ? { account } : {}),
     };
     const specBytes = jsonBytes(spec);
     writeTextAtomic(`${runDir}/spec.json`, specBytes);
@@ -801,6 +856,7 @@ async function startRun(input: StartRunInput): Promise<Record<string, unknown>> 
     return {
       run_id: id,
       state: "starting",
+      ...accountPayload(account),
       model: providerSession.model,
       provider_session_name: providerSession.provider_session_name,
       provider_session_id: providerSession.provider_session_id,

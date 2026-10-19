@@ -1,15 +1,24 @@
 import { accessSync, constants, existsSync, lstatSync, readdirSync, realpathSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
-import type { AgentName, RunRole, SandboxPosture } from "../src/types.ts";
+import { ACCOUNT_DIR_ENV, type AgentName, type RunAccount, type RunRole, type SandboxPosture } from "../src/types.ts";
 
 // macOS Seatbelt (`sandbox-exec`) write-jail primitives for orch workers —
-// engine `seatbelt-v1`, docs/sandbox-design.md. This is accidental-write
+// engines `seatbelt-v1` and (account runs) `seatbelt-v2`, docs/sandbox-design.md. This is accidental-write
 // blast-radius control for trusted local agents, not a hostile-code boundary:
 // reads, exec, and network stay open; only local file writes are confined.
 // All path inputs are computed by orch for the current run; no task- or
 // model-supplied path may ever reach these functions.
 
 export const SEATBELT_ENGINE = "seatbelt-v1" as const;
+// v2 differs from v1 only in the provider-state grant: the run's account dir
+// (spec.account) replaces the HOME-level slot. Runs without an account keep
+// v1 byte-for-byte, so their idempotency keys and profile hashes are unchanged.
+export const SEATBELT_ENGINE_V2 = "seatbelt-v2" as const;
+export type SeatbeltEngine = typeof SEATBELT_ENGINE | typeof SEATBELT_ENGINE_V2;
+
+export function seatbeltEngineFor(account: RunAccount | undefined): SeatbeltEngine {
+  return account ? SEATBELT_ENGINE_V2 : SEATBELT_ENGINE;
+}
 
 // Role decides the worktree posture; the provider cannot widen it. verifier
 // is project-write because real test/build commands create artifacts, caches,
@@ -25,9 +34,9 @@ export function sandboxPosture(role: RunRole): SandboxPosture {
 // the same config read: they land in the spec (the driver must not depend on
 // live global config) but not in the key — a dir-list edit changes future
 // grants, not run identity.
-export function sandboxRunIdentity(engine: typeof SEATBELT_ENGINE | null, writeDirs: readonly string[] = []): {
+export function sandboxRunIdentity(engine: SeatbeltEngine | null, writeDirs: readonly string[] = []): {
   keySuffix: string;
-  specField: { sandbox_engine?: typeof SEATBELT_ENGINE; sandbox_write_dirs?: string[] };
+  specField: { sandbox_engine?: SeatbeltEngine; sandbox_write_dirs?: string[] };
 } {
   if (!engine) return { keySuffix: "", specField: {} };
   return {
@@ -91,7 +100,16 @@ export interface ProviderStatePaths {
 // Only the selected provider's state is writable per run; other providers'
 // state and generic dirs (~/.config, ~/Library/*) stay read-only. New provider
 // paths require real-run evidence and a policy version bump, not a quiet edit.
-export function providerStatePaths(provider: AgentName, home: string): ProviderStatePaths {
+// With an account (seatbelt-v2) the grant is exactly the account's config dir:
+// claude keeps .claude.json inside CLAUDE_CONFIG_DIR, so no root-level files.
+export function providerStatePaths(provider: AgentName, home: string, account?: RunAccount): ProviderStatePaths {
+  if (account) {
+    const dir = account.env[ACCOUNT_DIR_ENV[account.provider]];
+    if (account.provider !== provider || !dir) {
+      throw new Error(`sandbox: account ${account.id} (${account.provider}) does not configure a ${provider} config dir`);
+    }
+    return { dirs: [dir], files: [] };
+  }
   if (provider === "claude") {
     return { dirs: [join(home, ".claude")], files: [join(home, ".claude.json"), join(home, ".claude.json.backup")] };
   }
@@ -194,6 +212,29 @@ export function providerStateDirReason(expected: string, canonical: string, home
     if (lstatSync(expected).isSymbolicLink()) return "is a symlink (provider-state symlinks are not supported by seatbelt-v1)";
   } catch {
     return "does not exist";
+  }
+  return narrowWritableDirReason(canonical, home, worktree);
+}
+
+// seatbelt-v2 account dirs live wherever the user keeps them (~/.claude-work,
+// /Volumes/x/codex-home), so the exact-slot-under-HOME rule is replaced by:
+// no top-level symlink, the narrow-dir gate, and never overlapping orch's own
+// config dir or state root (`guarded`, canonical) — a worker must not be able
+// to edit config.json or forge run state through its account grant.
+export function accountStateDirReason(
+  expected: string,
+  canonical: string,
+  home: string,
+  worktree: string,
+  guarded: ReadonlyArray<readonly [string, string]>,
+): string | null {
+  try {
+    if (lstatSync(expected).isSymbolicLink()) return "is a symlink (account config dir symlinks are not supported by seatbelt-v2)";
+  } catch {
+    return "does not exist";
+  }
+  for (const [dir, label] of guarded) {
+    if (isAncestorOrEqual(canonical, dir) || isAncestorOrEqual(dir, canonical)) return `overlaps the ${label} (${dir})`;
   }
   return narrowWritableDirReason(canonical, home, worktree);
 }

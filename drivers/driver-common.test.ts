@@ -1935,3 +1935,104 @@ test("implementer format repair preserves legitimate skipped evidence", () => {
   expect(repairPreservesVerdict(JSON.stringify({ ...repaired, tests: [{ cmd: "check", status: "passed", exit_code: 1 }] }), result, s)).toBe(false);
   expect(repairPreservesVerdict(JSON.stringify({ ...repaired, acceptance: [{ id: "check", status: "unmet" }] }), result, s)).toBe(false);
 });
+
+// ---------------- accounts (seatbelt-v2) ----------------
+
+test("buildWorkerEnv: an account replaces inherited config-dir vars; no account inherits them untouched", () => {
+  const base = { PATH: "/usr/bin", HOME: "/home/orch", CLAUDE_CONFIG_DIR: "/home/orch/.claude-old", CODEX_HOME: "/home/orch/.codex-old" };
+  // No account: today's behavior, byte for byte.
+  const plain = buildWorkerEnv(base);
+  expect(plain.CLAUDE_CONFIG_DIR).toBe("/home/orch/.claude-old");
+  expect(plain.CODEX_HOME).toBe("/home/orch/.codex-old");
+  expect(buildWorkerEnv(base, undefined)).toEqual(plain);
+
+  const claude = buildWorkerEnv(base, { id: "work", provider: "claude", env: { CLAUDE_CONFIG_DIR: "/home/orch/.claude-work" } });
+  expect(claude.CLAUDE_CONFIG_DIR).toBe("/home/orch/.claude-work");
+  expect("CODEX_HOME" in claude).toBe(false);
+  const codex = buildWorkerEnv(base, { id: "cx", provider: "codex", env: { CODEX_HOME: "/data/codex" } });
+  expect(codex.CODEX_HOME).toBe("/data/codex");
+  expect("CLAUDE_CONFIG_DIR" in codex).toBe(false);
+  // Everything else is untouched.
+  const { CLAUDE_CONFIG_DIR: _a, CODEX_HOME: _b, ...rest } = plain;
+  const { CLAUDE_CONFIG_DIR: _c, ...claudeRest } = claude;
+  expect(claudeRest).toEqual(rest);
+  // Process env is not mutated.
+  expect(base.CLAUDE_CONFIG_DIR).toBe("/home/orch/.claude-old");
+});
+
+test("engine none: the provider plan env carries the account dir", () => {
+  const account = { id: "work", provider: "claude" as const, env: { CLAUDE_CONFIG_DIR: "/home/orch/.claude-work" } };
+  const plan = buildProviderExecutionPlan({
+    provider: "claude",
+    spec: { ...spec("implementer", "acct-plain"), agent: "claude", account },
+    runDir: "/run",
+    worktree: "/worktree",
+    env: { PATH: "/usr/bin", HOME: "/home/orch", CLAUDE_CONFIG_DIR: "/elsewhere", CODEX_HOME: "/elsewhere-codex" },
+  });
+  expect(plan.sandboxEngine).toBe("none");
+  expect(plan.env.CLAUDE_CONFIG_DIR).toBe("/home/orch/.claude-work");
+  expect("CODEX_HOME" in plan.env).toBe(false);
+});
+
+test("sandbox engine must match the account: v1 with an account or v2 without one fails closed", () => {
+  const account = { id: "work", provider: "claude" as const, env: { CLAUDE_CONFIG_DIR: "/x" } };
+  const v1 = { ...spec("implementer", "acct-v1"), agent: "claude" as const, sandbox_engine: "seatbelt-v1" as const, account };
+  expect(() => buildProviderExecutionPlan({ provider: "claude", spec: v1, runDir: "/run", worktree: "/wt", env: { HOME: "/h" } })).toThrow(
+    /unsupported sandbox_engine "seatbelt-v1" for a run with an account \(this build implements seatbelt-v2/,
+  );
+  const v2 = { ...spec("implementer", "acct-v2"), agent: "claude" as const, sandbox_engine: "seatbelt-v2" as const };
+  expect(() => buildProviderExecutionPlan({ provider: "claude", spec: v2, runDir: "/run", worktree: "/wt", env: { HOME: "/h" } })).toThrow(
+    /unsupported sandbox_engine "seatbelt-v2" for a run without an account/,
+  );
+});
+
+function accountContext(provider: "claude" | "codex", dirName: string) {
+  const ctx = seatbeltContext("implementer", provider);
+  const dir = join(ctx.home, dirName);
+  mkdirSync(dir, { recursive: true });
+  const key = provider === "claude" ? "CLAUDE_CONFIG_DIR" : "CODEX_HOME";
+  const account = { id: `${provider}-acct`, provider, env: { [key]: dir } };
+  return { ...ctx, dir, account, spec: { ...ctx.spec, sandbox_engine: "seatbelt-v2" as const, account } };
+}
+
+test.skipIf(process.platform !== "darwin")("seatbelt-v2 grants the account dir instead of HOME-level provider state", () => {
+  for (const provider of ["claude", "codex"] as const) {
+    const ctx = accountContext(provider, provider === "claude" ? ".claude-work" : "codex-b");
+    const plan = buildProviderExecutionPlan({ provider, spec: ctx.spec, runDir: ctx.runDir, worktree: ctx.worktree, env: { ...ctx.env, CLAUDE_CONFIG_DIR: "/inherited" } });
+    const home = realpathSync(ctx.home);
+    expect(plan.sandboxEngine).toBe("seatbelt-v2");
+    expect(plan.env[SEATBELT_ENV_MARKER]).toBe("seatbelt-v2");
+    expect(plan.argv[2]).toContain(`(subpath "${realpathSync(ctx.dir)}")`);
+    // No HOME-level slot and no root-level .claude.json literals.
+    expect(plan.argv[2]).not.toContain(`(subpath "${join(home, provider === "claude" ? ".claude" : ".codex")}")`);
+    expect(plan.argv[2]).not.toContain(".claude.json");
+    expect(plan.env[provider === "claude" ? "CLAUDE_CONFIG_DIR" : "CODEX_HOME"]).toBe(ctx.dir);
+    if (provider === "codex") expect("CLAUDE_CONFIG_DIR" in plan.env).toBe(false);
+  }
+});
+
+test.skipIf(process.platform !== "darwin")("seatbelt-v2 refuses account dirs that are HOME, symlinks, missing, or orch's own state", () => {
+  const attempt = (mutate: (ctx: ReturnType<typeof accountContext>) => string) => {
+    const ctx = accountContext("claude", ".claude-work");
+    const dir = mutate(ctx);
+    const runSpec = { ...ctx.spec, account: { ...ctx.account, env: { CLAUDE_CONFIG_DIR: dir } } };
+    return () => buildProviderExecutionPlan({ provider: "claude", spec: runSpec, runDir: ctx.runDir, worktree: ctx.worktree, env: ctx.env });
+  };
+  expect(attempt((ctx) => ctx.home)).toThrow(/state-target[\s\S]*(home directory|overlaps the orch)/);
+  expect(
+    attempt((ctx) => {
+      const state = join(ctx.env.XDG_STATE_HOME, "orch", "accounts");
+      mkdirSync(state, { recursive: true });
+      return state;
+    }),
+  ).toThrow(/state-target[\s\S]*overlaps the orch state root/);
+  expect(
+    attempt((ctx) => {
+      const alias = join(ctx.home, ".claude-alias");
+      symlinkSync(ctx.dir, alias);
+      return alias;
+    }),
+  ).toThrow(/state-target[\s\S]*symlink/);
+  expect(attempt((ctx) => join(ctx.home, ".claude-missing"))).toThrow(/provider-state[\s\S]*not found/);
+  expect(attempt((ctx) => ctx.worktree)).toThrow(/state-target[\s\S]*overlaps the worktree/);
+});

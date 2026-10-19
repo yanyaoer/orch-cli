@@ -321,6 +321,7 @@ test("observability commands read local run state", async () => {
       state: "done",
       started_at: "2026-06-19T12:00:00.000Z",
       exit_code: 0,
+      account: null,
       stale: false,
     },
   ]);

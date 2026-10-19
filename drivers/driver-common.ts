@@ -1,5 +1,5 @@
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync, writeSync } from "node:fs";
-import { isRunRole, type AgentName, type ResultCoercion, type RunSpec, type RoleResult, type SandboxEngine, type SandboxPosture } from "../src/types.ts";
+import { ACCOUNT_DIR_ENV, isRunRole, type AgentName, type ResultCoercion, type RunAccount, type RunSpec, type RoleResult, type SandboxEngine, type SandboxPosture } from "../src/types.ts";
 import { acceptanceOutcome, commandOutcome, fallbackResult, resultSchemaName, ROLE_REQUIRED_FIELDS, ROLE_RESULT_EXAMPLE, ROLE_VERDICTS, validateRoleResult } from "../src/schema.ts";
 import { appendJsonLine, countLines, writeJsonAtomic } from "../src/json.ts";
 import { normalizeNativeText } from "../src/native-events.ts";
@@ -8,6 +8,7 @@ import { scrubGitLocationEnv } from "../src/git-env.ts";
 import { sha256 } from "../src/hash.ts";
 import {
   acceptableHostTmpDir,
+  accountStateDirReason,
   canonicalizePath,
   exactStateDirReason,
   findWorktreeHardlinks,
@@ -17,7 +18,7 @@ import {
   rootLevelStateFileReason,
   sandboxPosture,
   scratchEnv,
-  SEATBELT_ENGINE,
+  seatbeltEngineFor,
   seatbeltProfile,
   seatbeltUnsupportedReason,
   workerCacheDir,
@@ -139,10 +140,17 @@ export async function awaitSupervisorHandshake(): Promise<boolean> {
   return received.split("\n")[0] === "go";
 }
 
-export function buildWorkerEnv(baseEnv: NodeJS.ProcessEnv = process.env): Record<string, string> {
+export function buildWorkerEnv(baseEnv: NodeJS.ProcessEnv = process.env, account?: RunAccount): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [key, value] of Object.entries(baseEnv)) {
     if (value !== undefined) env[key] = value;
+  }
+  // A run pinned to an account uses exactly that account's config dir: no
+  // inherited CLAUDE_CONFIG_DIR/CODEX_HOME may leak in alongside it. Without
+  // an account the environment's values are inherited untouched.
+  if (account) {
+    for (const key of Object.values(ACCOUNT_DIR_ENV)) delete env[key];
+    Object.assign(env, account.env);
   }
 
   for (const key of recursiveToolEnvKeys) delete env[key];
@@ -1072,7 +1080,7 @@ export const ORCH_SANDBOX_RUN_DIR_ENV = "ORCH_SANDBOX_RUN_DIR";
 export function buildProviderExecutionPlan(ctx: ExecutionContext): ProviderExecutionPlan {
   const { provider, spec, runDir, worktree } = ctx;
   const posture = sandboxPosture(spec.role);
-  const env = buildWorkerEnv(ctx.env ?? process.env);
+  const env = buildWorkerEnv(ctx.env ?? process.env, spec.account);
   env[ORCH_SANDBOX_RUN_ID_ENV] = spec.run_id;
   env[ORCH_SANDBOX_RUN_DIR_ENV] = runDir;
   if (spec.sandbox_engine === undefined) {
@@ -1086,12 +1094,16 @@ export function buildProviderExecutionPlan(ctx: ExecutionContext): ProviderExecu
     };
   }
   // A spec from a newer orch may carry an engine this build does not
-  // implement; running it unsandboxed would silently drop the boundary.
-  if (spec.sandbox_engine !== SEATBELT_ENGINE) {
-    throw new Error(`sandbox: spec requests unsupported sandbox_engine ${JSON.stringify(spec.sandbox_engine)} (this build implements ${SEATBELT_ENGINE})`);
+  // implement; running it unsandboxed would silently drop the boundary. The
+  // engine is tied to the account: v1 without one, v2 with one.
+  const engine = seatbeltEngineFor(spec.account);
+  if (spec.sandbox_engine !== engine) {
+    throw new Error(
+      `sandbox: spec requests unsupported sandbox_engine ${JSON.stringify(spec.sandbox_engine)} for a run ${spec.account ? "with" : "without"} an account (this build implements ${engine} for it)`,
+    );
   }
   const fail = (stage: string, detail: string): never => {
-    throw new Error(`sandbox ${SEATBELT_ENGINE} (provider=${provider} role=${spec.role} stage=${stage}): ${detail}`);
+    throw new Error(`sandbox ${engine} (provider=${provider} role=${spec.role} stage=${stage}): ${detail}`);
   };
 
   const unsupported = seatbeltUnsupportedReason(ctx.platform ?? process.platform);
@@ -1112,7 +1124,12 @@ export function buildProviderExecutionPlan(ctx: ExecutionContext): ProviderExecu
   // The selected provider reuses the host's real login/session state; a
   // missing state dir means "log in from a normal terminal first", not "open
   // $HOME so the provider can pick a landing spot".
-  const state = providerStatePaths(provider, canonicalHome);
+  let state: ReturnType<typeof providerStatePaths>;
+  try {
+    state = providerStatePaths(provider, canonicalHome, spec.account);
+  } catch (error) {
+    return fail("provider-state", error instanceof Error ? error.message : String(error));
+  }
   for (const dir of state.dirs) {
     if (!existsSync(dir)) fail("provider-state", `${dir} not found; run \`${provider}\` interactively once to initialize it`);
   }
@@ -1142,12 +1159,12 @@ export function buildProviderExecutionPlan(ctx: ExecutionContext): ProviderExecu
   // orch's own config dir and state root are never grantable — a worker could
   // otherwise edit sandbox_write_dirs for future runs or forge run state —
   // and everything else passes the same narrow-dir gate as built-in grants.
+  const guarded: Array<[string, string]> = [
+    [canonicalizePath(env.XDG_CONFIG_HOME ? `${env.XDG_CONFIG_HOME}/orch` : `${home}/.config/orch`), "orch config dir"],
+    [canonicalizePath(env.XDG_STATE_HOME ? `${env.XDG_STATE_HOME}/orch` : `${home}/.local/state/orch`), "orch state root"],
+  ];
   const extraWriteDirs: string[] = [];
   if ((spec.sandbox_write_dirs ?? []).length > 0) {
-    const guarded: Array<[string, string]> = [
-      [canonicalizePath(env.XDG_CONFIG_HOME ? `${env.XDG_CONFIG_HOME}/orch` : `${home}/.config/orch`), "orch config dir"],
-      [canonicalizePath(env.XDG_STATE_HOME ? `${env.XDG_STATE_HOME}/orch` : `${home}/.local/state/orch`), "orch state root"],
-    ];
     for (const raw of spec.sandbox_write_dirs!) {
       if (typeof raw !== "string" || !raw.startsWith("/")) {
         fail("config-write-dir", `sandbox_write_dirs entry is not an absolute path: ${JSON.stringify(raw)}`);
@@ -1190,7 +1207,9 @@ export function buildProviderExecutionPlan(ctx: ExecutionContext): ProviderExecu
   const providerStateDirs = state.dirs.map(canonicalizePath);
   for (let index = 0; index < providerStateDirs.length; index += 1) {
     const dir = providerStateDirs[index]!;
-    const reason = providerStateDirReason(state.dirs[index]!, dir, canonicalHome, canonicalWorktree);
+    const reason = spec.account
+      ? accountStateDirReason(state.dirs[index]!, dir, canonicalHome, canonicalWorktree, guarded)
+      : providerStateDirReason(state.dirs[index]!, dir, canonicalHome, canonicalWorktree);
     if (reason) fail("state-target", `provider state ${dir} ${reason}; refusing to grant it as a write subpath`);
   }
   const providerStateFiles = state.files.map(canonicalizePath);
@@ -1248,7 +1267,7 @@ export function buildProviderExecutionPlan(ctx: ExecutionContext): ProviderExecu
 
   return {
     argv: ["/usr/bin/sandbox-exec", "-p", profile, ...providerArgv(provider, spec, runDir, worktree, ctx.prompt ?? "", true)],
-    sandboxEngine: SEATBELT_ENGINE,
+    sandboxEngine: engine,
     sandboxPosture: posture,
     profileSha256: sha256(profile),
     providerNativeSandbox: false,
@@ -1263,7 +1282,7 @@ export function buildProviderExecutionPlan(ctx: ExecutionContext): ProviderExecu
       // Git metadata is read-only in the jail; without this, `git status`
       // tries to take the optional index lock to refresh stat data and fails.
       GIT_OPTIONAL_LOCKS: "0",
-      [SEATBELT_ENV_MARKER]: SEATBELT_ENGINE,
+      [SEATBELT_ENV_MARKER]: engine,
     },
   };
 }

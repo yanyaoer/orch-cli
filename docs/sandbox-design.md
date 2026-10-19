@@ -1,6 +1,8 @@
 # orch macOS Sandbox 设计
 
-Status: Implemented (`seatbelt-v1`, 2026-07-14；实现入口 `drivers/sandbox.ts` + `buildProviderExecutionPlan` + host dispatch `src/dispatch.ts`。两轮 review 后已收窄 TMPDIR、provider state、controller dispatch、verifier posture 和 engine 计算边界；证据见 `docs/reviews/`)
+Status: Implemented (`seatbelt-v1`, 2026-07-14；`seatbelt-v2` 2026-10-19，仅用于带账号的 run，见下方版本说明；实现入口 `drivers/sandbox.ts` + `buildProviderExecutionPlan` + host dispatch `src/dispatch.ts`。两轮 review 后已收窄 TMPDIR、provider state、controller dispatch、verifier posture 和 engine 计算边界；证据见 `docs/reviews/`)
+
+**版本说明。** `seatbelt-v2`（2026-10-19，ADR 0002（仓库内 `docs/adr/0002-per-account-slots-and-pauses.md`））只改 provider 状态授权：`run create --account <id>` 的 run 授予该账号的目录（claude：`CLAUDE_CONFIG_DIR`，`.claude.json` 就在目录内，不再有根级文件 literal；codex：`CODEX_HOME`），不再授予 `~/.claude` + `~/.claude.json*` / `~/.codex`。账号目录不要求是 HOME 下的固定槽位，改为：顶层不得是 symlink、过窄目录门（非 HOME/HOME 祖先/共享根/worktree 重叠、当前 uid 拥有）、且与 orch config dir、orch state root 任意方向不重叠。engine 与账号绑定：无账号的 run 仍是 `seatbelt-v1`，profile、幂等 key、dry-run 输出逐字节不变；spec 中 engine 与账号不匹配（v1 带账号、v2 无账号）时 driver fail-closed。
 
 本文定义 `orch` 的本地 sandbox 目标设计。它解决的是个人在真实仓库中编排多个高权限 agent 时的误操作半径，不把本机 agent 包装成不可信租户，也不试图替代虚拟机。
 
@@ -236,7 +238,7 @@ provider 状态目录和临时目录是明确的可写例外，不递归做 hard
 当前“先生成 provider argv，再选择性 wrap”的接口容易产生危险的半状态。目标接口应一次返回最终可执行命令：
 
 ```ts
-type SandboxEngine = "none" | "seatbelt-v1";
+type SandboxEngine = "none" | "seatbelt-v1" | "seatbelt-v2"; // v2 = 带账号的 run
 type SandboxPosture = "read-only" | "project-write";
 
 interface ProviderExecutionPlan {
@@ -284,7 +286,7 @@ function buildProviderExecutionPlan(context: ExecutionContext): ProviderExecutio
 
 ```ts
 interface RunSpec {
-  sandbox_engine?: "seatbelt-v1"; // 缺失表示 none
+  sandbox_engine?: "seatbelt-v1" | "seatbelt-v2"; // 缺失表示 none；v2 仅在 spec.account 存在时
 }
 ```
 

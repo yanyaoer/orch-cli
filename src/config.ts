@@ -1,7 +1,7 @@
-import { chmodSync, mkdirSync, realpathSync } from "node:fs";
-import { resolve } from "node:path";
+import { chmodSync, mkdirSync, realpathSync, statSync } from "node:fs";
+import { isAbsolute, resolve } from "node:path";
 import { readJsonFile, writeJsonAtomic } from "./json.ts";
-import type { AgentName, RunRole } from "./types.ts";
+import { ACCOUNT_DIR_ENV, type AccountProvider, type AgentName, type RunRole } from "./types.ts";
 
 export interface BridgeWorker {
   name: string;
@@ -52,6 +52,21 @@ export interface OrchDefaults {
   // omitted, replacing the built-in claude+omp pairs. Every id must exist in
   // mail-agents.json.
   fanout?: { "cross-review"?: string[]; investigate?: string[] };
+  // Per-role model-family pairing for automatic account selection. Validated
+  // only; no behavior yet (docs/adr/0002-per-account-slots-and-pauses.md).
+  pairing?: Partial<Record<RunRole, "cross-family">>;
+}
+
+// A provider account: one config dir (CLAUDE_CONFIG_DIR / CODEX_HOME) that
+// `run create --account <id>` pins a run to. The env is snapshotted into
+// spec.account; max_concurrent and models are recorded for later slot and
+// selection logic (ADR 0002) and not enforced yet.
+export interface OrchAccount {
+  id: string;
+  provider: AccountProvider;
+  env: Record<string, string>;
+  max_concurrent?: number;
+  models?: string[];
 }
 
 export interface OrchConfig {
@@ -62,7 +77,8 @@ export interface OrchConfig {
   // "中文" or "english". Missing or any other value behaves as english.
   language?: string;
   // When true, every provider spawn (claude/codex/pi/omp) runs under one
-  // orch-generated macOS Seatbelt write jail (engine seatbelt-v1, see
+  // orch-generated macOS Seatbelt write jail (engine seatbelt-v1, or v2 for
+  // runs with an account; see
   // docs/sandbox-design.md): writes confined to the role's worktree posture,
   // per-run scratch, and the selected provider's own state; reads, exec, and
   // network stay open. Snapshotted into spec.sandbox_engine at run create;
@@ -78,6 +94,7 @@ export interface OrchConfig {
   // never be able to edit this list or forge run state). This shifts the
   // blast-radius responsibility for the listed dirs to the user.
   sandbox_write_dirs?: string[];
+  accounts?: OrchAccount[];
 }
 
 export interface MailAgentDefinition {
@@ -317,8 +334,9 @@ export async function resolveMailPassword(cfg: MailControlConfig): Promise<strin
   throw new Error("mail control account.password or account.password_cmd is required");
 }
 
-const ORCH_CONFIG_KEYS = ["version", "workspaces", "defaults", "language", "sandbox", "sandbox_write_dirs"] as const;
-const ORCH_DEFAULTS_KEYS = ["agents", "models", "fanout"] as const;
+const ORCH_CONFIG_KEYS = ["version", "workspaces", "defaults", "language", "sandbox", "sandbox_write_dirs", "accounts"] as const;
+const ORCH_DEFAULTS_KEYS = ["agents", "models", "fanout", "pairing"] as const;
+const ACCOUNT_KEYS = ["id", "provider", "env", "max_concurrent", "models"] as const;
 const ROLE_DEFAULT_KEYS = ["agent", "model", "timeout_sec"] as const;
 const FANOUT_KEYS = ["cross-review", "investigate"] as const;
 const RUN_ROLES: readonly string[] = ["implementer", "reviewer", "verifier", "controller", "researcher"];
@@ -354,6 +372,7 @@ export function validateOrchConfig(raw: unknown): { warnings: string[] } {
   if (raw.sandbox_write_dirs !== undefined && (!Array.isArray(raw.sandbox_write_dirs) || raw.sandbox_write_dirs.some((d) => typeof d !== "string"))) {
     fail("sandbox_write_dirs must be an array of strings");
   }
+  if (raw.accounts !== undefined) validateAccounts(raw.accounts, fail, isObject, unknownKeys);
   const defaults = raw.defaults;
   if (defaults === undefined) return { warnings };
   if (!isObject(defaults)) return fail("defaults must be an object");
@@ -397,7 +416,67 @@ export function validateOrchConfig(raw: unknown): { warnings: string[] } {
       }
     }
   }
+
+  if (defaults.pairing !== undefined) {
+    if (!isObject(defaults.pairing)) fail("defaults.pairing must be an object keyed by role");
+    for (const [role, rule] of Object.entries(defaults.pairing)) {
+      if (!RUN_ROLES.includes(role)) warnings.push(`unknown role defaults.pairing.${role} is ignored (roles: ${RUN_ROLES.join(", ")})`);
+      if (rule !== "cross-family") warnings.push(`defaults.pairing.${role} ${JSON.stringify(rule)} is not "cross-family"; it is ignored`);
+    }
+  }
   return { warnings };
+}
+
+// accounts[] errors fail the config: a run pinned to a wrong or shared config
+// dir would act on the wrong login rather than merely be ineffective. The dir
+// must already exist — a missing one means the provider was never logged in.
+function validateAccounts(
+  accounts: unknown,
+  fail: (message: string) => never,
+  isObject: (value: unknown) => value is Record<string, unknown>,
+  unknownKeys: (obj: Record<string, unknown>, known: readonly string[], where: string) => void,
+): void {
+  if (!Array.isArray(accounts)) fail("accounts must be an array");
+  const ids = new Set<string>();
+  const dirs = new Map<string, string>();
+  (accounts as unknown[]).forEach((entry, index) => {
+    const where = `accounts[${index}]`;
+    if (!isObject(entry)) fail(`${where} must be an object`);
+    const account = entry as Record<string, unknown>;
+    unknownKeys(account, ACCOUNT_KEYS, `${where}.`);
+    if (typeof account.id !== "string" || !/^[A-Za-z0-9._-]+$/.test(account.id)) fail(`${where}.id must match [A-Za-z0-9._-]+`);
+    const id = account.id as string;
+    if (ids.has(id)) fail(`${where}.id ${JSON.stringify(id)} is not unique`);
+    ids.add(id);
+    if (account.provider !== "claude" && account.provider !== "codex") {
+      fail(`accounts.${id}.provider must be claude or codex (got ${JSON.stringify(account.provider)})`);
+    }
+    const provider = account.provider as AccountProvider;
+    const dirKey = ACCOUNT_DIR_ENV[provider];
+    if (!isObject(account.env)) fail(`accounts.${id}.env must be an object`);
+    const env = account.env as Record<string, unknown>;
+    const keys = Object.keys(env);
+    if (keys.length !== 1 || keys[0] !== dirKey) fail(`accounts.${id}.env must set exactly ${dirKey} for provider ${provider} (got: ${keys.join(", ") || "none"})`);
+    const dir = env[dirKey];
+    if (typeof dir !== "string" || !isAbsolute(dir)) fail(`accounts.${id}.env.${dirKey} must be an absolute path (no ~ or relative)`);
+    let isDir = false;
+    try {
+      isDir = statSync(dir as string).isDirectory();
+    } catch {
+      isDir = false;
+    }
+    if (!isDir) fail(`accounts.${id}.env.${dirKey} ${dir} is not an existing directory; log in with that config dir once first`);
+    const canonical = `${provider}:${canonicalPath(dir as string)}`;
+    const other = dirs.get(canonical);
+    if (other) fail(`accounts.${id} and accounts.${other} share the ${provider} config dir ${dir}`);
+    dirs.set(canonical, id);
+    if (account.max_concurrent !== undefined && (typeof account.max_concurrent !== "number" || !Number.isInteger(account.max_concurrent) || account.max_concurrent < 1)) {
+      fail(`accounts.${id}.max_concurrent must be a positive integer`);
+    }
+    if (account.models !== undefined && (!Array.isArray(account.models) || account.models.length === 0 || account.models.some((m) => typeof m !== "string" || m === ""))) {
+      fail(`accounts.${id}.models must be a non-empty array of model names`);
+    }
+  });
 }
 
 // Each distinct warning is printed once per process: readOrchConfig is called
@@ -430,6 +509,11 @@ export function orchLanguage(): OrchLanguage {
 // not depend on live global config, and the spec stays auditable.
 export function orchSandbox(): boolean {
   return readOrchConfig().sandbox === true;
+}
+
+// Configured accounts with max_concurrent defaulted to 1; [] when none.
+export function orchAccounts(cfg: OrchConfig = readOrchConfig()): Array<OrchAccount & { max_concurrent: number }> {
+  return (cfg.accounts ?? []).map((account) => ({ ...account, max_concurrent: account.max_concurrent ?? 1 }));
 }
 
 export function writeOrchConfig(cfg: OrchConfig): void {

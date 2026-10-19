@@ -1,7 +1,7 @@
 // orch trajectory: normalize a run/thread's provider session into role-based records.
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import type { RunStatus } from "../types.ts";
+import { ACCOUNT_DIR_ENV, type RunSpec, type RunStatus } from "../types.ts";
 import { getRepoIdentity } from "../paths.ts";
 import { readJsonFile, writeTextAtomic } from "../json.ts";
 import { CliError, assertKnownFlags, flagBool, flagString, type ParsedArgs } from "../cli.ts";
@@ -18,8 +18,9 @@ interface TrajectorySession {
 }
 
 // One run's provider session, normalized. Chained (resumed) runs share a
-// session, so records cover the whole chain, not just this run.
-function trajectoryForStatus(status: RunStatus): TrajectorySession {
+// session, so records cover the whole chain, not just this run. A run with an
+// account kept its session under that account's config dir.
+function trajectoryForStatus(status: RunStatus, spec: Partial<RunSpec> | null): TrajectorySession {
   // Adapter support first: pi/omp runs usually also lack a resume id, and
   // the actionable error is the missing adapter, not the missing id.
   if (!(status.agent in TRAJECTORY_SOURCES)) {
@@ -27,7 +28,9 @@ function trajectoryForStatus(status: RunStatus): TrajectorySession {
   }
   const resumeId = status.provider_resume_id ?? status.provider_session_id;
   if (!resumeId) throw new CliError(`run ${status.run_id} recorded no provider session id`);
-  const found = locateSessionFile(status.agent, resumeId);
+  const account = spec?.account;
+  const configDir = account ? account.env[ACCOUNT_DIR_ENV[account.provider]] : undefined;
+  const found = locateSessionFile(status.agent, resumeId, undefined, configDir);
   if (!found) throw new CliError(`no ${status.agent} session file found for id ${resumeId}`);
   const records = normalizeSession(found.source, readFileSync(found.path, "utf8"));
   return { run_ids: [status.run_id], source: found.source, session_path: found.path, records };
@@ -58,7 +61,7 @@ export async function trajectoryCommand(args: ParsedArgs): Promise<number> {
     const located = locateRun(repo.repo_key, runId, args.flags.has("mr") ? flagString(args, "mr") : undefined);
     const status = readJsonFile<RunStatus | null>(`${located.run_dir}/status.json`, null);
     if (!status) throw new CliError(`status.json not found for run: ${runId}`);
-    const session = trajectoryForStatus(status);
+    const session = trajectoryForStatus(status, readJsonFile<Partial<RunSpec> | null>(`${located.run_dir}/spec.json`, null));
     if (flagBool(args, "archive")) {
       writeTextAtomic(
         `${located.run_dir}/trajectory.jsonl`,
@@ -97,10 +100,10 @@ export async function trajectoryCommand(args: ParsedArgs): Promise<number> {
     // thread view lists each transcript once with every run that rode it.
     const sessions = new Map<string, TrajectorySession>();
     const skipped: { run_id: string; reason: string }[] = [];
-    for (const { status } of records) {
+    for (const { status, spec } of records) {
       if (!status) continue;
       try {
-        const session = trajectoryForStatus(status);
+        const session = trajectoryForStatus(status, spec);
         const existing = sessions.get(session.session_path);
         if (existing) existing.run_ids.push(status.run_id);
         else sessions.set(session.session_path, session);

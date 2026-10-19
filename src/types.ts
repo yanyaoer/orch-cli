@@ -9,7 +9,24 @@ export type ProviderSessionMode = "ephemeral" | "fresh_persistent" | "resume_exa
 // OS sandbox policy version (docs/sandbox-design.md). A semantic change to
 // the policy must ship as a new engine value (seatbelt-v2, …); the same value
 // must never silently widen.
-export type SandboxEngine = "none" | "seatbelt-v1";
+// seatbelt-v2 = v1 + the run's account dir granted instead of the HOME-level
+// provider state; only runs with an account use it.
+export type SandboxEngine = "none" | "seatbelt-v1" | "seatbelt-v2";
+
+// Providers whose config dir orch can select per run (config.json accounts[]).
+export type AccountProvider = "claude" | "codex";
+
+// The one env var that selects each provider's config dir; an account may set
+// nothing else (it is a config-dir selector, not a general env overlay).
+export const ACCOUNT_DIR_ENV: Readonly<Record<AccountProvider, string>> = { claude: "CLAUDE_CONFIG_DIR", codex: "CODEX_HOME" };
+
+// Account snapshot taken at run create: the driver injects `env` (the
+// provider's config-dir variable) and never reads live config.
+export interface RunAccount {
+  id: string;
+  provider: AccountProvider;
+  env: Record<string, string>;
+}
 
 // Worktree write posture, derived from the immutable role: implementer and
 // verifier write the project; reviewer/researcher/controller do not.
@@ -62,7 +79,7 @@ export interface RunSpec {
   // in this exact policy version or fail closed. Absent means no orch OS
   // sandbox. Posture is derived from the immutable role, never stored, so the
   // two can't contradict. Mirrors `language` snapshotting.
-  sandbox_engine?: "seatbelt-v1";
+  sandbox_engine?: "seatbelt-v1" | "seatbelt-v2";
   // Snapshot of config.json `sandbox_write_dirs` at spec creation: extra
   // user-declared write subpaths for this run. The driver re-vets each entry
   // fail-closed before granting; orch's own config dir and state root are
@@ -78,6 +95,10 @@ export interface RunSpec {
   // (--supersedes, --resume-from, --retry). Aggregation drops a superseded
   // run's evidence once this run is done.
   supersedes?: string[];
+  // Snapshot of the config.json account this run was created with
+  // (`run create --account`). Absent means no account: the provider config
+  // dir is inherited from the environment, as before accounts existed.
+  account?: RunAccount;
 }
 
 // Host-captured worktree identity. content_sha equals head when the checkout
@@ -137,6 +158,8 @@ export interface RunStatus {
   start_snapshot?: VcsSnapshot | null;
   end_snapshot?: VcsSnapshot | null;
   snapshot_error?: string | null;
+  // spec.account.id; absent for runs without an account.
+  account?: string;
 }
 
 export interface ResultCoercion {

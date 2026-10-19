@@ -46,6 +46,7 @@ function initialStatus(spec: RunSpec): RunStatus {
     // the driver's recorded plan (sandbox.json) later confirms both and adds
     // the profile hash via sandboxStatus().
     ...(spec.sandbox_engine ? { sandbox_engine: spec.sandbox_engine, sandbox_posture: sandboxPosture(spec.role) } : {}),
+    ...(spec.account ? { account: spec.account.id } : {}),
   };
 }
 
@@ -56,7 +57,7 @@ function sandboxStatus(runDir: string): Partial<RunStatus> {
   const value = readJsonFile<Record<string, unknown> | null>(runDirFile(runDir, "sandbox.json"), null);
   if (!value) return {};
   const patch: Partial<RunStatus> = {};
-  if (value.sandbox_engine === "none" || value.sandbox_engine === "seatbelt-v1") patch.sandbox_engine = value.sandbox_engine;
+  if (value.sandbox_engine === "none" || value.sandbox_engine === "seatbelt-v1" || value.sandbox_engine === "seatbelt-v2") patch.sandbox_engine = value.sandbox_engine;
   if (value.sandbox_posture === "read-only" || value.sandbox_posture === "project-write") patch.sandbox_posture = value.sandbox_posture;
   if (typeof value.sandbox_profile_sha256 === "string" || value.sandbox_profile_sha256 === null) {
     patch.sandbox_profile_sha256 = value.sandbox_profile_sha256 as string | null;

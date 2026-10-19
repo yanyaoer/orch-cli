@@ -202,6 +202,27 @@ test("locateSessionFile finds claude and codex session files, rejects unknown ag
   expect(locateSessionFile("omp", "abc-123", home)).toBeNull();
 });
 
+test("locateSessionFile looks in the account config dir, falling back to HOME without one", () => {
+  const home = tempHome();
+  const work = join(home, ".claude-work");
+  const codexB = join(home, "codex-b");
+  // One session per home: the default dirs and the account dirs.
+  mkdirSync(join(home, ".claude/projects/-tmp-w"), { recursive: true });
+  writeFileSync(join(home, ".claude/projects/-tmp-w/in-default.jsonl"), "{}\n");
+  mkdirSync(join(work, "projects/-tmp-w"), { recursive: true });
+  writeFileSync(join(work, "projects/-tmp-w/in-work.jsonl"), "{}\n");
+  mkdirSync(join(codexB, "sessions/2026/10/19"), { recursive: true });
+  writeFileSync(join(codexB, "sessions/2026/10/19/rollout-2026-10-19T01-02-03-cx-1.jsonl"), "{}\n");
+
+  expect(locateSessionFile("claude", "in-work", home, work)?.path).toBe(join(work, "projects/-tmp-w/in-work.jsonl"));
+  expect(locateSessionFile("claude", "in-default", home)?.path).toBe(join(home, ".claude/projects/-tmp-w/in-default.jsonl"));
+  // Each lookup stays inside its own dir.
+  expect(locateSessionFile("claude", "in-default", home, work)).toBeNull();
+  expect(locateSessionFile("claude", "in-work", home)).toBeNull();
+  expect(locateSessionFile("codex", "cx-1", home, codexB)?.path).toBe(join(codexB, "sessions/2026/10/19/rollout-2026-10-19T01-02-03-cx-1.jsonl"));
+  expect(locateSessionFile("codex", "cx-1", home)).toBeNull();
+});
+
 // ---------------------------------------------------------------------------
 // Process-level command tests
 

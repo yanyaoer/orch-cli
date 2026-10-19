@@ -7,6 +7,7 @@ import {
   buildBridgeUrls,
   mailAgentsConfigPath,
   mailControlConfigPath,
+  orchAccounts,
   orchConfigPath,
   orchLanguage,
   orchSandbox,
@@ -376,7 +377,7 @@ test("mail control notify.to must be a single lower-cased bare address", () => {
 });
 
 test("validateOrchConfig warns on ignored keys/values and rejects wrong types", () => {
-  const known = "version, workspaces, defaults, language, sandbox, sandbox_write_dirs";
+  const known = "version, workspaces, defaults, language, sandbox, sandbox_write_dirs, accounts";
   expect(validateOrchConfig({ version: 1, workspaces: {}, sandbox_wirte_dirs: ["/x"] }).warnings).toEqual([
     `unknown key sandbox_wirte_dirs is ignored (known: ${known})`,
   ]);
@@ -443,4 +444,65 @@ test("readOrchConfig prints each config warning once per process and rejects inv
     if (prev === undefined) delete process.env.XDG_CONFIG_HOME;
     else process.env.XDG_CONFIG_HOME = prev;
   }
+});
+
+test("validateOrchConfig accepts accounts[] and defaults.pairing", () => {
+  const claudeA = tempDir();
+  const claudeB = tempDir();
+  const codex = tempDir();
+  const cfg = {
+    version: 1,
+    workspaces: {},
+    accounts: [
+      { id: "claude-main", provider: "claude", env: { CLAUDE_CONFIG_DIR: claudeA }, max_concurrent: 2 },
+      { id: "claude.work_2", provider: "claude", env: { CLAUDE_CONFIG_DIR: claudeB }, models: ["opus", "fable"] },
+      // Same dir as a claude account is fine: the rule is per provider.
+      { id: "codex-main", provider: "codex", env: { CODEX_HOME: codex } },
+    ],
+    defaults: { pairing: { verifier: "cross-family", reviewer: "cross-family" } },
+  };
+  expect(validateOrchConfig(cfg).warnings).toEqual([]);
+  expect(orchAccounts(cfg as unknown as Parameters<typeof orchAccounts>[0]).map((a) => [a.id, a.max_concurrent])).toEqual([
+    ["claude-main", 2],
+    ["claude.work_2", 1],
+    ["codex-main", 1],
+  ]);
+  expect(validateOrchConfig({ defaults: { pairing: { verifier: "same-family", implementor: "cross-family" } } }).warnings).toEqual([
+    'defaults.pairing.verifier "same-family" is not "cross-family"; it is ignored',
+    "unknown role defaults.pairing.implementor is ignored (roles: implementer, reviewer, verifier, controller, researcher)",
+  ]);
+  expect(() => validateOrchConfig({ defaults: { pairing: ["cross-family"] } })).toThrow("defaults.pairing must be an object");
+  expect(validateOrchConfig({ accounts: [{ id: "a", provider: "claude", env: { CLAUDE_CONFIG_DIR: claudeA }, slots: 2 }] }).warnings[0]).toContain(
+    "unknown key accounts[0].slots is ignored",
+  );
+});
+
+test("validateOrchConfig rejects invalid accounts", () => {
+  const dir = tempDir();
+  const other = tempDir();
+  const file = join(dir, "file");
+  writeFileSync(file, "");
+  const claude = (extra: Record<string, unknown> = {}) => ({ id: "c", provider: "claude", env: { CLAUDE_CONFIG_DIR: dir }, ...extra });
+  const bad = (accounts: unknown) => () => validateOrchConfig({ accounts });
+  expect(bad({})).toThrow("accounts must be an array");
+  expect(bad(["c"])).toThrow("accounts[0] must be an object");
+  expect(bad([claude({ id: "has space" })])).toThrow("accounts[0].id must match [A-Za-z0-9._-]+");
+  expect(bad([claude({ id: "" })])).toThrow("accounts[0].id must match");
+  expect(bad([claude(), claude({ env: { CLAUDE_CONFIG_DIR: other } })])).toThrow('accounts[1].id "c" is not unique');
+  expect(bad([claude({ provider: "pi" })])).toThrow('accounts.c.provider must be claude or codex (got "pi")');
+  expect(bad([claude({ env: { CODEX_HOME: dir } })])).toThrow("accounts.c.env must set exactly CLAUDE_CONFIG_DIR for provider claude (got: CODEX_HOME)");
+  expect(bad([claude({ env: { CLAUDE_CONFIG_DIR: dir, ANTHROPIC_API_KEY: "x" } })])).toThrow("must set exactly CLAUDE_CONFIG_DIR");
+  expect(bad([{ id: "x", provider: "codex", env: { CLAUDE_CONFIG_DIR: dir } }])).toThrow("accounts.x.env must set exactly CODEX_HOME for provider codex");
+  expect(bad([claude({ env: {} })])).toThrow("(got: none)");
+  expect(bad([claude({ env: "x" })])).toThrow("accounts.c.env must be an object");
+  expect(bad([claude({ env: { CLAUDE_CONFIG_DIR: "~/.claude" } })])).toThrow("must be an absolute path");
+  expect(bad([claude({ env: { CLAUDE_CONFIG_DIR: join(dir, "missing") } })])).toThrow("is not an existing directory");
+  expect(bad([claude({ env: { CLAUDE_CONFIG_DIR: file } })])).toThrow("is not an existing directory");
+  // Two accounts of one provider on one dir, also through a trailing slash.
+  expect(bad([claude(), claude({ id: "d", env: { CLAUDE_CONFIG_DIR: `${dir}/` } })])).toThrow("accounts.d and accounts.c share the claude config dir");
+  expect(bad([claude({ max_concurrent: 0 })])).toThrow("accounts.c.max_concurrent must be a positive integer");
+  expect(bad([claude({ max_concurrent: 1.5 })])).toThrow("max_concurrent must be a positive integer");
+  expect(bad([claude({ max_concurrent: "2" })])).toThrow("max_concurrent must be a positive integer");
+  expect(bad([claude({ models: [] })])).toThrow("accounts.c.models must be a non-empty array of model names");
+  expect(bad([claude({ models: ["opus", 1] })])).toThrow("accounts.c.models must be a non-empty array");
 });

@@ -1,0 +1,92 @@
+{
+  "dry_run": true,
+  "mr": "42",
+  "mr_source": "flag",
+  "role": "implementer",
+  "agent": "claude",
+  "model": null,
+  "tag": "implementer",
+  "provider_session_name": null,
+  "provider_session_id": null,
+  "provider_session_mode": "fresh_persistent",
+  "repo": {
+    "repo_root": "<root>/worktree",
+    "remote_url": "git@github.com:example/accounts.git",
+    "repo_key": "github.com/example/accounts-cc378cf4"
+  },
+  "repo_key": "github.com/example/accounts-cc378cf4",
+  "mr_dir": "<root>/state/orch/github.com/example/accounts-cc378cf4/mrs/42",
+  "task_path": null,
+  "task_sha": "80e7f7e737c124229cef7e7405f0771eb5f6f6529353fbdd40eeed9b1308d95f",
+  "idempotency_key": "mr42:implementer:80e7f7e737c124229cef7e7405f0771eb5f6f6529353fbdd40eeed9b1308d95f:session-2abcd9715a1a:head-<head>",
+  "idempotent": false,
+  "existing_run_id": null,
+  "state": "would_start",
+  "run_id": "<run_id>",
+  "run_id_preview": "<run_id>",
+  "run_dir": "<root>/state/orch/github.com/example/accounts-cc378cf4/mrs/42/runs/<run_id>",
+  "status_path": "<root>/state/orch/github.com/example/accounts-cc378cf4/mrs/42/runs/<run_id>/status.json",
+  "result_path": "<root>/state/orch/github.com/example/accounts-cc378cf4/mrs/42/runs/<run_id>/result.json",
+  "events_path": "<root>/state/orch/github.com/example/accounts-cc378cf4/mrs/42/runs/<run_id>/events.jsonl",
+  "worktree_lock": "<root>/state/orch/worktree-locks/<lock>.lock",
+  "dirty": false,
+  "base_sha": "<head>",
+  "snapshot": {
+    "vcs": "git",
+    "head": "<head>",
+    "dirty": false,
+    "content_sha": "<head>"
+  },
+  "pinned_head": null,
+  "supersedes": [],
+  "timeout_sec": 14400,
+  "supervisor_plan": {
+    "argv": [
+      "<bun>",
+      "<cwd>/src/orch.ts",
+      "__supervisor",
+      "--run-dir",
+      "<root>/state/orch/github.com/example/accounts-cc378cf4/mrs/42/runs/<run_id>"
+    ],
+    "cwd": "<root>/worktree",
+    "spawn": false
+  },
+  "driver_plan": {
+    "argv": [
+      "<bun>",
+      "<cwd>/src/orch.ts",
+      "__driver-claude",
+      "--spec",
+      "<root>/state/orch/github.com/example/accounts-cc378cf4/mrs/42/runs/<run_id>/spec.json",
+      "--run-dir",
+      "<root>/state/orch/github.com/example/accounts-cc378cf4/mrs/42/runs/<run_id>",
+      "--worktree",
+      "<root>/worktree"
+    ],
+    "cwd": "<root>/worktree",
+    "spawn": false
+  },
+  "provider_plan": {
+    "argv": [
+      "claude",
+      "-p",
+      "--verbose",
+      "--output-format",
+      "stream-json",
+      "--input-format",
+      "text",
+      "--effort",
+      "medium",
+      "--allowedTools",
+      "Task,Bash,BashOutput,KillShell,Glob,Grep,LS,Read,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch,TodoWrite",
+      "--permission-mode",
+      "dontAsk"
+    ],
+    "cwd": "<root>/worktree",
+    "spawn": false,
+    "sandbox_engine": "none",
+    "sandbox_posture": "project-write",
+    "sandbox_profile_sha256": null,
+    "provider_native_sandbox": true
+  }
+}

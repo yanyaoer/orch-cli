@@ -37,13 +37,16 @@ export const TRAJECTORY_SOURCES: Record<string, TrajectorySource> = {
 // ---------------------------------------------------------------------------
 // Session file location
 
+// `configDir` is the run's account config dir (spec.account: CLAUDE_CONFIG_DIR
+// or CODEX_HOME); without one the provider's default dir under HOME is used.
 export function locateSessionFile(
   agent: string,
   resumeId: string,
   home: string = homedir(),
+  configDir?: string,
 ): { source: TrajectorySource; path: string } | null {
   if (agent === "claude") {
-    const projects = `${home}/.claude/projects`;
+    const projects = `${configDir ?? `${home}/.claude`}/projects`;
     let slugs: string[];
     try {
       slugs = readdirSync(projects);
@@ -57,7 +60,7 @@ export function locateSessionFile(
     return null;
   }
   if (agent === "codex") {
-    const root = `${home}/.codex/sessions`;
+    const root = `${configDir ?? `${home}/.codex`}/sessions`;
     const suffix = `-${resumeId}.jsonl`;
     let entries: string[];
     try {

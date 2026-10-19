@@ -19,6 +19,8 @@ export type IdempotencyRecord = {
 };
 
 type RunListRow = Pick<RunStatus, "run_id" | "mr" | "role" | "agent" | "tag" | "state" | "started_at" | "exit_code"> & {
+  // status.account; null for runs without an account (and legacy runs).
+  account: string | null;
   stale: boolean;
 };
 
@@ -253,6 +255,7 @@ export function runListRows(runsRoot: string): RunListRow[] {
       state: status.state,
       started_at: status.started_at,
       exit_code: status.exit_code,
+      account: status.account ?? null,
       stale,
     }));
 }
@@ -267,7 +270,9 @@ export function mrIdsForRepo(repoKey: string): string[] {
 }
 
 export function formatTable(rows: RunListRow[]): string {
-  const headers = ["run_id", "mr", "role", "agent", "tag", "state", "started_at", "exit_code"];
+  // account is appended last so positional parsers of the older table keep
+  // their column indexes.
+  const headers = ["run_id", "mr", "role", "agent", "tag", "state", "started_at", "exit_code", "account"];
   const body = rows.map((row) => [
     row.run_id,
     row.mr,
@@ -277,6 +282,7 @@ export function formatTable(rows: RunListRow[]): string {
     row.stale ? `${row.state} (stale?)` : row.state,
     row.started_at ?? "-",
     row.exit_code === null ? "-" : String(row.exit_code),
+    row.account ?? "-",
   ]);
   const widths = headers.map((header, index) =>
     Math.max(header.length, ...body.map((row) => row[index]!.length)),
