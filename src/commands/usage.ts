@@ -8,6 +8,7 @@ import { CliError, assertKnownFlags, flagBool, flagNumber, flagString, printJson
 import { readTextFile, runLocation, runLocationsForMr, runLocationsForRepo, type RunLocation } from "../run-store.ts";
 import { threadMr } from "./status.ts";
 import { usageEvidence, lifecycleEvidence, addNormalized, type UsageEvidence, type NormalizedTokens } from "../usage-evidence.ts";
+import { codexBaselinePath, type CodexBaseline } from "../codex-baseline.ts";
 
 type TokenUsageMap = Record<string, number>;
 
@@ -95,9 +96,20 @@ function runUsageSummary(run: RunLocation): RunUsageSummary {
     usage_events: usageEvents,
     source_file: nativePath,
     legacy_usage_semantics: "raw_event_sum; provider-dependent; may contain cumulative duplicates; prefer normalized_tokens with coverage",
-    ...usageEvidence(native, spec, run.status),
+    ...usageEvidence(native, spec, run.status, readCodexBaselineFile(run.run_dir)),
     lifecycle: lifecycleEvidence(readTextFile(`${run.run_dir}/events.jsonl`), spec),
   };
+}
+
+function readCodexBaselineFile(runDir: string): CodexBaseline | null {
+  const text = readTextFile(codexBaselinePath(runDir));
+  if (!text) return null;
+  try {
+    const value = JSON.parse(text);
+    return value && typeof value.thread_id === "string" ? (value as CodexBaseline) : null;
+  } catch {
+    return null;
+  }
 }
 
 function aggregateRunUsage(runs: RunUsageSummary[]): UsageSummary & {

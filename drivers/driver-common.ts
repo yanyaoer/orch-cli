@@ -1,9 +1,10 @@
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync, writeSync } from "node:fs";
 import { isRunRole, type AgentName, type ResultCoercion, type RunSpec, type RoleResult, type SandboxEngine, type SandboxPosture } from "../src/types.ts";
-import { acceptanceOutcome, commandOutcome, fallbackResult, resultSchemaName, ROLE_REQUIRED_FIELDS, ROLE_RESULT_EXAMPLE, ROLE_VERDICTS, validateRoleResult } from "../src/schema.ts";
+import { acceptanceOutcome, commandOutcome, fallbackResult, isProvenRedCheck, resultSchemaName, ROLE_REQUIRED_FIELDS, ROLE_RESULT_EXAMPLE, ROLE_VERDICTS, roleJsonSchema, stripNulls, validateRoleResult } from "../src/schema.ts";
 import { appendJsonLine, countLines, writeJsonAtomic } from "../src/json.ts";
 import { normalizeNativeText } from "../src/native-events.ts";
 import { nativeResult } from "../src/native-result.ts";
+import { codexBaselinePath, readCodexBaseline } from "../src/codex-baseline.ts";
 import { scrubGitLocationEnv } from "../src/git-env.ts";
 import { sha256 } from "../src/hash.ts";
 import {
@@ -79,7 +80,7 @@ export function buildPrompt(spec: RunSpec, provider: string): string {
       : []),
     ...(role === "implementer" || role === "verifier"
       ? [
-          `Command evidence: every ${role === "verifier" ? "commands" : "tests"} entry carries "status": "passed" | "failed" | "skipped". A check that did not run is "skipped" with "exit_code": null — never exit_code 0. For a negative test whose expected outcome is a non-zero exit, set "expected_exit_code" to that code; "passed" then means exit_code equals it. A success verdict must not contain a failed check or an unmet acceptance item (acceptance status: met | unmet | skipped).${role === "verifier" ? ' A verifier "pass" also needs at least one command that actually ran and passed, and may skip a command or acceptance item only when it is marked "optional": true.' : ""} orch checks this JSON for consistency but does not re-run your commands: list only commands you actually ran.`,
+          `Command evidence: every ${role === "verifier" ? "commands" : "tests"} entry carries "status": "passed" | "failed" | "skipped". A check that did not run is "skipped" with "exit_code": null — never exit_code 0. ${role === "verifier" ? 'For a negative test whose expected outcome is a non-zero exit, set "expected_exit_code" to that code; "passed" then means exit_code equals it. ' : 'Write a negative check so that success exits 0 (e.g. `! cmd`); implementer tests never set a non-zero "expected_exit_code". Every test carries "phase": a red check run on the unfixed tree is "before_change" (its failure is expected evidence, and the same cmd must also appear passing as "after_change"); everything else is "after_change". '}A success verdict must not contain a failed check or an unmet acceptance item (acceptance status: met | unmet | skipped): a required check that failed means the verdict is "${failure ?? "failed"}".${role === "verifier" ? ' A verifier "pass" also needs at least one command that actually ran and passed, and may skip a command or acceptance item only when it is marked "optional": true. Nit and pre-existing observations go to the optional "non_blocking_findings" (severity "nit" | "pre-existing"); they never change the verdict.' : ""} orch checks this JSON for consistency but does not re-run your commands: list only commands you actually ran.`,
         ]
       : []),
     ...(spec.language === "中文"
@@ -200,6 +201,24 @@ export function ompModelChain(model: string | null | undefined): { primary: stri
 
 export function ompPromptPath(runDir: string): string {
   return `${runDir}/prompt.md`;
+}
+
+// Provider-native structured output (claude --json-schema, codex
+// --output-schema) constrains the final answer's shape at the provider; the
+// text path + repair round stays the fallback (and the only path for pi/omp).
+// ORCH_NATIVE_SCHEMA=0 turns it off. The codex schema file lives in the
+// host-owned run dir, which a sandboxed provider can read but not rewrite.
+export function nativeSchemaEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.ORCH_NATIVE_SCHEMA !== "0";
+}
+
+export function resultSchemaPath(runDir: string): string {
+  return `${runDir}/result.schema.json`;
+}
+
+export function writeResultSchemaFile(runDir: string, spec: RunSpec): void {
+  if (!isRunRole(spec.role)) return;
+  writeFileSync(resultSchemaPath(runDir), `${JSON.stringify(roleJsonSchema(spec.role))}\n`, "utf8");
 }
 
 export function ompFallbackConfigPath(runDir: string): string {
@@ -343,6 +362,7 @@ function providerArgv(
     // `sandbox`: the outer Seatbelt then jails every provider uniformly.
     else argv.push("--allowedTools", CLAUDE_WRITE_ALLOWED_TOOLS, "--permission-mode", "dontAsk");
     if (spec.provider_session_name) argv.push("--name", spec.provider_session_name);
+    if (nativeSchemaEnabled() && isRunRole(spec.role)) argv.push("--json-schema", JSON.stringify(roleJsonSchema(spec.role)));
     if (spec.provider_session_mode === "ephemeral") {
       argv.push("--no-session-persistence");
     } else if (spec.provider_session_mode === "resume_exact" && spec.provider_session_id) {
@@ -377,12 +397,14 @@ function providerArgv(
       // sandbox rides the parent `exec` level, accepted before the subcommand.
       const resume = ["codex", "exec", ...sandboxFlags];
       resume.push("resume", "--json", "--output-last-message", lastMessagePath);
+      if (nativeSchemaEnabled()) resume.push("--output-schema", resultSchemaPath(runDir));
       if (model) resume.push("--model", model);
       resume.push(...researcherFlags);
       resume.push(spec.provider_session_id, "-");
       return resume;
     }
     const argv = ["codex", "exec", "--json", "--cd", worktree, "--output-last-message", lastMessagePath];
+    if (nativeSchemaEnabled()) argv.push("--output-schema", resultSchemaPath(runDir));
     if (model) argv.push("--model", model);
     argv.push(...researcherFlags);
     argv.push(...sandboxFlags);
@@ -631,7 +653,9 @@ function coerceCandidate(value: unknown, spec: RunSpec): { obj: Record<string, u
   if (!isRunRole(spec.role)) return null;
 
   const schemaName = resultSchemaName(spec.role);
-  const obj = { ...(value as Record<string, unknown>) };
+  // Strict provider schemas (codex --output-schema) encode absent optional
+  // fields as null; the validator expects them missing.
+  const obj = stripNulls(value) as Record<string, unknown>;
   const coercions: ResultCoercion[] = [];
   // Candidates only come from this run's own stream, so the spec is the
   // authority on run_id — models frequently invent one, which used to reject
@@ -757,6 +781,7 @@ function repairTaskText(spec: RunSpec, errors: string[], previous: string): stri
     ...errors.map((error) => `- ${error}`),
     "",
     "Return the corrected JSON object as your final answer and nothing else. Keep every fact and the verdict from the previous answer. Do not upgrade failures, remove findings, or invent evidence. Do not run tools or edit files.",
+    `Exception: if the previous answer claimed success but its own evidence shows a failed required check or an unmet acceptance item, a required check that failed means the verdict is ${JSON.stringify(ROLE_VERDICTS[role][1])}: return that verdict with the facts unchanged.`,
     `Required shape: ${ROLE_RESULT_EXAMPLE[role]}`,
     "",
     "--- previous answer ---",
@@ -817,8 +842,12 @@ export function rawResultText(runDir: string): string | null {
 
 // A formatting call is not a second assessment. Only an explicit, parseable
 // original verdict can authorize a successful repaired result. Unparseable
-// answers stay failed even if the formatting model guesses a success.
+// answers stay failed even if the formatting model guesses a success. A move
+// to the role's failure verdict is always allowed (never an upgrade): live
+// repairs correctly turned "completed + failed test" into "failed", and
+// rejecting that discarded the real answer for a synthetic fallback.
 export function repairPreservesVerdict(previous: string, result: RoleResult, spec: RunSpec): boolean {
+  if (isRunRole(spec.role) && result.verdict === ROLE_VERDICTS[spec.role][1]) return true;
   const verdicts = new Set<string>();
   const success = ["completed", "approve", "pass"].includes(result.verdict);
   for (const candidate of parsedJsonCandidates(previous)) {
@@ -828,7 +857,7 @@ export function repairPreservesVerdict(previous: string, result: RoleResult, spe
       if (success && obj && typeof obj.verdict === "string") {
         if (Array.isArray(obj.blocking_findings) && obj.blocking_findings.length) return false;
         for (const field of ["tests", "commands"]) {
-          if (Array.isArray(obj[field]) && obj[field].some((entry: any) => entry && (
+          if (Array.isArray(obj[field]) && obj[field].some((entry: any, _index: number, all: unknown[]) => entry && !isProvenRedCheck(entry, all) && (
             commandOutcome(entry) === "failed" ||
             (typeof entry.exit_code === "number" && entry.exit_code !== (entry.expected_exit_code ?? 0)) ||
             (spec.role === "verifier" && entry.status === "skipped" && entry.optional !== true)
@@ -844,6 +873,19 @@ export function repairPreservesVerdict(previous: string, result: RoleResult, spe
   }
   if (verdicts.size === 1) return verdicts.has(result.verdict);
   return verdicts.size === 0 && ["failed", "fail", "request_changes"].includes(result.verdict);
+}
+
+// The verdict the provider's own (invalid) answer claimed, when exactly one
+// is parseable; feeds the result_repair event's downgrade note.
+export function previousVerdictOf(previous: string, spec: RunSpec): string | null {
+  const verdicts = new Set<string>();
+  for (const candidate of parsedJsonCandidates(previous)) {
+    for (const value of unwrappedCandidates(candidate, spec)) {
+      const verdict = (value as Record<string, unknown>).verdict;
+      if (typeof verdict === "string" && isRunRole(spec.role) && ROLE_VERDICTS[spec.role].includes(verdict)) verdicts.add(verdict);
+    }
+  }
+  return verdicts.size === 1 ? [...verdicts][0]! : null;
 }
 
 export function synthesizeResult(spec: RunSpec, summary: string): RoleResult {
@@ -1274,6 +1316,11 @@ export async function runProviderDriver(provider: AgentName, argv: string[]): Pr
   if (await maybeWriteFakeResult(args.runDir, spec, provider)) return 0;
 
   const prompt = buildPrompt(spec, provider);
+  if (provider === "codex" && nativeSchemaEnabled()) writeResultSchemaFile(args.runDir, spec);
+  if (provider === "codex" && spec.provider_session_mode === "resume_exact" && spec.provider_session_id) {
+    const baseline = readCodexBaseline(spec.provider_session_id);
+    if (baseline) writeFileSync(codexBaselinePath(args.runDir), `${JSON.stringify(baseline)}\n`, "utf8");
+  }
   if (provider === "omp") {
     // omp -p ignores stdin: the prompt rides an @file argument, and the quota
     // fallback chain rides a per-run config overlay (omp retry.fallbackChains).
@@ -1335,7 +1382,16 @@ export async function runProviderDriver(provider: AgentName, argv: string[]): Pr
       const repairCode = await runResultRepair({ provider, spec, runDir: args.runDir, worktree: args.worktree, errors, previous });
       const repaired = repairCode === 0 ? extractResultWithCoercionsFromRunDir(args.runDir, spec) : null;
       extracted = repaired && repairPreservesVerdict(previous, repaired.result, spec) ? repaired : null;
-      appendDriverEvent(args.runDir, { type: "result_repair", attempt: 1, errors, repair_exit_code: repairCode, outcome: extracted ? "valid" : "invalid" });
+      const previousVerdict = previousVerdictOf(previous, spec);
+      const downgraded = Boolean(extracted && previousVerdict && previousVerdict !== extracted.result.verdict);
+      appendDriverEvent(args.runDir, {
+        type: "result_repair",
+        attempt: 1,
+        errors,
+        repair_exit_code: repairCode,
+        outcome: extracted ? "valid" : "invalid",
+        ...(downgraded ? { verdict_downgraded: { from: previousVerdict, to: extracted!.result.verdict } } : {}),
+      });
     }
   }
   if (extracted) {

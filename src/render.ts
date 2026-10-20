@@ -73,6 +73,7 @@ export function printResultSummary(result: RoleResult): void {
         process.stdout.write(`  - ${item.id}: ${item.status}${item.evidence ? ` — ${item.evidence}` : ""}\n`);
       }
     }
+    if (verifier.non_blocking_findings?.length) printFindings("non_blocking_findings", verifier.non_blocking_findings);
     return;
   }
 
@@ -204,6 +205,7 @@ function resultDetailLines(result: RoleResult): string[] {
       return [
         ...mirrorListLines(t("Commands", "命令"), result.commands.map(commandLine)),
         ...mirrorListLines(t("Acceptance", "验收"), result.acceptance.map((item) => `${item.id}: ${item.status}${item.evidence ? ` — ${item.evidence}` : ""}`)),
+        ...(result.non_blocking_findings?.length ? mirrorFindingLines(t("Non-blocking findings", "非阻断性发现"), result.non_blocking_findings) : []),
       ];
     case "orch.result/implementer/v1":
       return [

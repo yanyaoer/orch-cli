@@ -29,7 +29,14 @@ const tempDirs: string[] = [];
 
 afterEach(() => {
   for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  delete process.env.ORCH_NATIVE_SCHEMA;
 });
+
+// The exact-argv tests below pin session/model/posture flags; the native
+// schema flags they would also carry are asserted in result-contract.test.ts.
+function withoutNativeSchema(): void {
+  process.env.ORCH_NATIVE_SCHEMA = "0";
+}
 
 function tempDir(): string {
   const dir = mkdtempSync(join(tmpdir(), "orch-driver-common-"));
@@ -232,6 +239,7 @@ test("buildPrompt adds the Chinese prose rule only when the spec language is 中
 });
 
 test("buildProviderArgv keeps defaults fresh and only resumes exact sessions", () => {
+  withoutNativeSchema();
   const base = spec("implementer", "impl-session");
 
   expect(buildProviderArgv("claude", base, "/run", "/worktree")).toEqual([
@@ -323,6 +331,7 @@ test("buildProviderArgv keeps defaults fresh and only resumes exact sessions", (
 });
 
 test("buildProviderArgv passes explicit model overrides to supporting providers", () => {
+  withoutNativeSchema();
   const base = spec("reviewer", "model-override");
   const model = "myprov/reviewer-xl";
 
@@ -482,6 +491,7 @@ test("ompFallbackConfigYaml renders omp's native retry.fallbackChains overlay", 
 });
 
 test("buildProviderArgv matches read-only posture to the reviewer role per provider", () => {
+  withoutNativeSchema();
   const base = spec("reviewer", "review-posture");
 
   // claude reviewer runs in plan mode (read-only, no edits), escalated to opus/high effort.
@@ -532,6 +542,7 @@ test("buildProviderArgv matches read-only posture to the reviewer role per provi
 });
 
 test("buildProviderArgv gives researcher a read-only web-research posture on claude and codex", () => {
+  withoutNativeSchema();
   const base = spec("researcher", "research-posture");
 
   // claude researcher runs fable at xhigh effort; web tools ride an explicit
@@ -753,6 +764,7 @@ test("extractResultFromText fails closed on any missing or blank researcher verd
 });
 
 test("buildProviderArgv picks claude model/effort by role", () => {
+  withoutNativeSchema();
   const argv = (role: RunSpec["role"], runId: string) =>
     buildProviderArgv("claude", spec(role, runId), "/run", "/worktree");
 

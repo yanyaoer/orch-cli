@@ -1,3 +1,4 @@
+import { writeSync } from "node:fs";
 export interface ParsedArgs {
   positionals: string[];
   flags: Map<string, string | boolean>;
@@ -98,8 +99,20 @@ export function flagNumber(args: ParsedArgs, name: string): number | undefined {
   return value;
 }
 
+// Synchronous on purpose: orch exits through process.exit, which drops what
+// an async stdout write has not handed to a pipe yet (`orch usage daily --json
+// | jq` was cut at exactly 128 KiB). writeSync blocks until the reader takes it.
 export function printJson(value: unknown): void {
-  process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
+  const bytes = Buffer.from(`${JSON.stringify(value, null, 2)}\n`);
+  let offset = 0;
+  while (offset < bytes.length) {
+    try {
+      offset += writeSync(1, bytes, offset);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EAGAIN") throw error;
+      Bun.sleepSync(1);
+    }
+  }
 }
 
 // `--task -` support: read the whole task text from stdin. Lets a controller
