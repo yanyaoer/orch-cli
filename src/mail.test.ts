@@ -9,7 +9,8 @@ import type { ImplementerResult, RunStatus } from "./types.ts";
 async function runOrch(args: string[], env: Record<string, string>): Promise<{ stdout: string; stderr: string; exitCode: number }> {
   const proc = Bun.spawn([process.execPath, "src/orch.ts", ...args], {
     cwd: process.cwd(),
-    env: { ...process.env, ...env },
+    // mail is deprecated; these assertions cover its behavior, not the notice (deprecation.test.ts does).
+    env: { ...process.env, ORCH_DEPRECATION_WARNED: "1", ...env },
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -24,7 +25,7 @@ async function runOrch(args: string[], env: Record<string, string>): Promise<{ s
 async function runOrchWithInput(args: string[], env: Record<string, string>, stdin: string): Promise<{ stdout: string; stderr: string; exitCode: number }> {
   const proc = Bun.spawn([process.execPath, "src/orch.ts", ...args], {
     cwd: process.cwd(),
-    env: { ...process.env, ...env },
+    env: { ...process.env, ORCH_DEPRECATION_WARNED: "1", ...env },
     stdin: "pipe",
     stdout: "pipe",
     stderr: "pipe",

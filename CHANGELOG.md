@@ -4,6 +4,10 @@ All notable user-facing changes are recorded here.
 
 ## [Unreleased]
 
+### Deprecated
+
+- Slated for removal after a usage audit of local run state (2026-09-20..10-20) found no runs or calls: `orch new`, `prewalk`, `fanout`, `investigate`, `mail`, `mailctl`, `dispatch`, `workspace`, `chatgpt-bridge`, `handoff-pro`, and config `sandbox: true` (seatbelt-v1). They keep working; invoking one prints a single `[orch] deprecated: …` line on stderr (stdout and `--json` are unchanged, child processes inherit `ORCH_DEPRECATION_WARNED=1` so one invocation warns once), and top-level help tags them `[deprecated]`. `cross-review` (internal mail routing included), `worktree`, `trajectory`, and `search` stay.
+
 ### Changes
 
 - Evidence-bound adjudication. `orch verdict`, the bare overview, `orch wait`, `orch decision accept|sweep`, and `cross-review --auto` now share one rubric (`assessRun`): only runs in force count — a run superseded by a done replacement (`run create --supersedes <id[,id]>`, same-role `--resume-from`, `--retry`) is history; `close` stays a pure ack and never clears a blocker; one reviewer's later approve never clears another reviewer's blocker. Failed/timed-out/cancelled/stale runs, missing results, and results that fail re-validation (contradictions included) suggest inspect; `decision accept` refuses them and `sweep` lists unbound or failed reviewer/verifier runs under `manual` instead of deciding them.

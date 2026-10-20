@@ -28,6 +28,7 @@ import { trajectoryCommand } from "./commands/trajectory.ts";
 import { updateCommand } from "./commands/update.ts";
 import { usageCommand } from "./commands/usage.ts";
 import { locateRun, orchCommand, readMirrorResult } from "./run-store.ts";
+import { warnDeprecatedCommand } from "./deprecation.ts";
 
 // Host-side git probes (vcsDirty at run create, supervisor evidence capture,
 // repo-root resolution) run in worktrees the user may be rebasing in at the
@@ -96,7 +97,10 @@ async function main(): Promise<number> {
     if (result.stderr) process.stderr.write(result.stderr);
     return result.exit_code;
   }
-  if (first === "dispatch") return dispatchCommand(args);
+  if (first === "dispatch") {
+    warnDeprecatedCommand(first);
+    return dispatchCommand(args);
+  }
 
   // Bare `orch` is the overview: current state + runnable pending actions.
   // `orch --help` keeps printing the command reference.
@@ -228,6 +232,7 @@ async function main(): Promise<number> {
     return 2;
   }
 
+  warnDeprecatedCommand(first);
   if (first === "verdict") return verdictCommand(args);
   if (first === "wait") return waitCommand(args);
   if (first === "new") return newCommand(args);

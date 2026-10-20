@@ -97,6 +97,8 @@ Because a sandboxed `controller` cannot spawn a working worker (any process it s
 - Role result schemas exist for `implementer`, `reviewer`, `verifier`, `researcher` (read-only plan-not-code research, `orch.result/researcher/v1`), and `controller` (the `orch mailctl` mail controller; claude-only, orchestrate-not-edit).
 - Provider session/model controls are explicit: defaults avoid latest-session resume, exact resume requires `--session-mode resume_exact --session-id <id>`, `--model <ref>` selects a provider model when supported, and idempotency keys include session/model settings.
 
+Deprecated (still working, slated for removal; see CHANGELOG "Deprecated"): `orch new`, `prewalk`, `fanout`, `investigate`, `mail`, `mailctl`, `dispatch`, `workspace`, `chatgpt-bridge`, `handoff-pro`, and config `sandbox: true`. Invoking one prints one stderr notice.
+
 Not shipped yet:
 
 - No long-running daemon.
