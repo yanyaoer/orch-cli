@@ -47,6 +47,16 @@ function validateStringArray(obj: Record<string, unknown>, field: string, errors
 }
 
 const COMMAND_STATUSES = new Set(["passed", "failed", "skipped"]);
+const COMMAND_PHASES = new Set(["before_change", "after_change"]);
+
+// A failed red check (phase before_change) is evidence that the test caught
+// the defect, not a failure of the change — but only when the same cmd also
+// passed after the change. Without that pairing it stays a contradiction, so
+// a real failure cannot be relabeled away.
+export function isProvenRedCheck(item: Record<string, unknown>, all: readonly unknown[]): boolean {
+  if (item.phase !== "before_change") return false;
+  return all.some((other) => record(other) && other !== item && other.cmd === item.cmd && other.phase !== "before_change" && commandOutcome(other) === "passed");
+}
 
 // What a reported check actually amounted to. Legacy entries without status
 // derive it from exit_code vs expected_exit_code (default 0), so a negative
@@ -57,7 +67,12 @@ export function commandOutcome(item: { exit_code?: unknown; status?: unknown; ex
   return item.exit_code === expected ? "passed" : "failed";
 }
 
-function validateCommands(obj: Record<string, unknown>, field: string, errors: string[]): void {
+// negativeChecks: only verifier commands may declare a non-zero expected exit.
+// An implementer's tests prove its own change works; a live run reported a
+// failing test as exit_code 1 / expected_exit_code 1 / passed to keep
+// "completed". A genuine negative check there is written to exit 0 (`! cmd`),
+// and a red check is reported as failed with phase "before_change".
+function validateCommands(obj: Record<string, unknown>, field: string, errors: string[], negativeChecks = true): void {
   if (!array(obj[field])) {
     errors.push(`${field} must be an array`);
     return;
@@ -73,8 +88,13 @@ function validateCommands(obj: Record<string, unknown>, field: string, errors: s
       errors.push(`${field}[${index}].status must be passed|failed|skipped`);
     }
     if (item.optional !== undefined && typeof item.optional !== "boolean") errors.push(`${field}[${index}].optional must be a boolean`);
+    if (item.phase !== undefined && (negativeChecks || !COMMAND_PHASES.has(item.phase as string))) {
+      errors.push(negativeChecks ? `${field}[${index}].phase is only for implementer tests` : `${field}[${index}].phase must be before_change|after_change`);
+    }
     if (item.expected_exit_code !== undefined && !Number.isInteger(item.expected_exit_code)) {
       errors.push(`${field}[${index}].expected_exit_code must be an integer`);
+    } else if (!negativeChecks && item.expected_exit_code !== undefined && item.expected_exit_code !== 0) {
+      errors.push(`${field}[${index}].expected_exit_code must be 0 for implementer tests (write a negative check so success exits 0, e.g. \`! cmd\`)`);
     }
     if (item.status === "skipped") {
       // A check that never ran cannot encode success (exit_code 0).
@@ -135,7 +155,7 @@ function validateSuccessConsistency(obj: Record<string, unknown>, verdict: strin
   const commands = obj[commandField];
   if (Array.isArray(commands)) {
     commands.forEach((item: unknown, index) => {
-      if (record(item) && commandOutcome(item) === "failed") {
+      if (record(item) && commandOutcome(item) === "failed" && !isProvenRedCheck(item, commands)) {
         errors.push(`verdict ${verdict} contradicts ${commandField}[${index}] (failed: ${String(item.cmd)})`);
       }
     });
@@ -230,15 +250,90 @@ export const ROLE_REQUIRED_FIELDS: Record<RunRole, readonly string[]> = {
 // it from a field list (live runs invented finding keys and object items).
 export const ROLE_RESULT_EXAMPLE: Record<RunRole, string> = {
   implementer:
-    '{"schema":"orch.result/implementer/v1","run_id":"<run_id>","verdict":"completed|failed","summary":"what changed and why","base_sha":"<base sha from the task>","head_sha":"<HEAD after your commits>","changed_files":["path/one.ts"],"tests":[{"cmd":"bun test src/one.test.ts","exit_code":0,"status":"passed","summary":"12 pass"},{"cmd":"bun run build","exit_code":null,"status":"skipped","summary":"not run: why"}],"acceptance":[{"id":"AC1","status":"met|unmet|skipped","evidence":"how you checked"}],"risks":["..."],"rollback":"git revert <head_sha>"}',
+    '{"schema":"orch.result/implementer/v1","run_id":"<run_id>","verdict":"completed|failed","summary":"what changed and why","base_sha":"<base sha from the task>","head_sha":"<HEAD after your commits>","changed_files":["path/one.ts"],"tests":[{"cmd":"bun test src/one.test.ts","exit_code":1,"status":"failed","phase":"before_change","summary":"red check: fails on the unfixed tree"},{"cmd":"bun test src/one.test.ts","exit_code":0,"status":"passed","phase":"after_change","summary":"12 pass"},{"cmd":"bun run build","exit_code":null,"status":"skipped","phase":"after_change","summary":"not run: why"}],"acceptance":[{"id":"AC1","status":"met|unmet|skipped","evidence":"how you checked"}],"risks":["..."],"rollback":"git revert <head_sha>"}',
   reviewer:
     '{"schema":"orch.result/reviewer/v1","run_id":"<run_id>","verdict":"approve|request_changes","reviews_run_id":"<run id under review; empty string if none>","blocking_findings":[{"id":"F1","severity":"high|medium|low","file":"path/one.ts:42","body":"what breaks, how to reproduce, what to change"}],"non_blocking_findings":[{"body":"..."}],"suggested_tests":["..."]}',
   controller: '{"schema":"orch.result/controller/v1","run_id":"<run_id>","verdict":"completed|failed","summary":"...","actions":["..."]}',
   researcher:
     '{"schema":"orch.result/researcher/v1","run_id":"<run_id>","verdict":"completed|failed","summary":"...","recommendation":"...","alternatives":["..."],"sources":["https://..."],"open_questions":["..."],"risks":["..."]}',
   verifier:
-    '{"schema":"orch.result/verifier/v1","run_id":"<run_id>","verdict":"pass|fail","verifies_run_id":"<run id verified>","commands":[{"cmd":"...","exit_code":0,"status":"passed","summary":"..."},{"cmd":"<negative test>","exit_code":2,"expected_exit_code":2,"status":"passed","summary":"rejects bad input as expected"},{"cmd":"<optional check>","exit_code":null,"status":"skipped","optional":true,"summary":"not run: why"}],"acceptance":[{"id":"AC1","status":"met|unmet|skipped","evidence":"..."}]}',
+    '{"schema":"orch.result/verifier/v1","run_id":"<run_id>","verdict":"pass|fail","verifies_run_id":"<run id verified>","commands":[{"cmd":"...","exit_code":0,"status":"passed","summary":"..."},{"cmd":"<negative test>","exit_code":2,"expected_exit_code":2,"status":"passed","summary":"rejects bad input as expected"},{"cmd":"<optional check>","exit_code":null,"status":"skipped","optional":true,"summary":"not run: why"}],"acceptance":[{"id":"AC1","status":"met|unmet|skipped","evidence":"..."}],"non_blocking_findings":[{"severity":"nit|pre-existing","file":"path/one.ts:42","body":"optional; never changes the verdict"}]}',
 };
+
+// Provider-native strict JSON Schema per role (claude --json-schema, codex
+// --output-schema). Shaped for OpenAI strict mode: every property required,
+// additionalProperties false, optional fields nullable, no oneOf/allOf/if.
+// It only constrains shape; cross-field rules (success vs failed checks,
+// skipped => exit_code null) stay in validateRoleResult, which still runs on
+// every result. Nulls are stripped (stripNulls) before validation.
+type JsonSchema = Record<string, unknown>;
+const S_STRING: JsonSchema = { type: "string" };
+const S_STRINGS: JsonSchema = { type: "array", items: S_STRING };
+function sNullable(type: string): JsonSchema {
+  return { type: [type, "null"] };
+}
+function sEnum(values: readonly string[]): JsonSchema {
+  return { type: "string", enum: [...values] };
+}
+function sObject(properties: Record<string, JsonSchema>): JsonSchema {
+  return { type: "object", properties, required: Object.keys(properties), additionalProperties: false };
+}
+function sArray(items: JsonSchema): JsonSchema {
+  return { type: "array", items };
+}
+function sCommand(negativeChecks: boolean): JsonSchema {
+  return sObject({
+    cmd: S_STRING,
+    exit_code: sNullable("integer"),
+    status: sEnum(["passed", "failed", "skipped"]),
+    summary: S_STRING,
+    ...(negativeChecks ? { expected_exit_code: sNullable("integer") } : { phase: sEnum(["before_change", "after_change"]) }),
+    optional: sNullable("boolean"),
+  });
+}
+const S_ACCEPTANCE = sObject({ id: S_STRING, status: sEnum(["met", "unmet", "skipped"]), evidence: sNullable("string"), optional: sNullable("boolean") });
+
+const S_NON_BLOCKING_FINDING = sObject({ id: sNullable("string"), severity: sNullable("string"), file: sNullable("string"), body: S_STRING });
+
+export function roleJsonSchema(role: RunRole): JsonSchema {
+  const head = { schema: sEnum([resultSchemaName(role)]), run_id: S_STRING, verdict: sEnum(ROLE_VERDICTS[role]) };
+  if (role === "implementer") {
+    return sObject({ ...head, summary: S_STRING, base_sha: S_STRING, head_sha: S_STRING, changed_files: S_STRINGS, tests: sArray(sCommand(false)), acceptance: sArray(S_ACCEPTANCE), risks: S_STRINGS, rollback: S_STRING });
+  }
+  if (role === "reviewer") {
+    return sObject({
+      ...head,
+      reviews_run_id: S_STRING,
+      blocking_findings: sArray(sObject({ id: S_STRING, severity: S_STRING, file: S_STRING, body: S_STRING })),
+      non_blocking_findings: sArray(S_NON_BLOCKING_FINDING),
+      suggested_tests: S_STRINGS,
+    });
+  }
+  if (role === "controller") return sObject({ ...head, summary: S_STRING, actions: S_STRINGS });
+  if (role === "researcher") {
+    return sObject({ ...head, summary: S_STRING, recommendation: S_STRING, alternatives: S_STRINGS, sources: S_STRINGS, open_questions: S_STRINGS, risks: S_STRINGS });
+  }
+  return sObject({
+    ...head,
+    verifies_run_id: S_STRING,
+    commands: sArray(sCommand(true)),
+    acceptance: sArray(S_ACCEPTANCE),
+    non_blocking_findings: { type: ["array", "null"], items: S_NON_BLOCKING_FINDING },
+  });
+}
+
+// Strict schemas encode "absent" as null; the validator and readers expect the
+// field to be missing instead. exit_code keeps its null: that is the
+// documented encoding of a skipped check.
+export function stripNulls(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stripNulls);
+  if (!record(value)) return value;
+  const out: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (item !== null || key === "exit_code") out[key] = stripNulls(item);
+  }
+  return out;
+}
 
 export function validateRoleResult(role: RunRole, value: unknown): ValidationResult {
   if (!isRunRole(role)) {
@@ -258,7 +353,7 @@ export function validateRoleResult(role: RunRole, value: unknown): ValidationRes
     const missing = requireFields(obj, [...ROLE_REQUIRED_FIELDS.implementer]);
     errors.push(...missing.map((field) => `${field} is required`));
     validateStringArray(obj, "changed_files", errors);
-    validateCommands(obj, "tests", errors);
+    validateCommands(obj, "tests", errors, false);
     validateAcceptance(obj, "acceptance", errors, true);
     validateStringArray(obj, "risks", errors);
     if (obj.verdict === "completed") validateSuccessConsistency(obj, "completed", "tests", errors);
@@ -288,6 +383,8 @@ export function validateRoleResult(role: RunRole, value: unknown): ValidationRes
     // A verifier's whole deliverable is evidence-backed checks; rejecting the
     // evidence field discarded an otherwise complete live result.
     validateAcceptance(obj, "acceptance", errors, true);
+    // Optional, and deliberately outside the pass/fail consistency checks.
+    if (obj.non_blocking_findings !== undefined) validateFindings(obj, "non_blocking_findings", errors, false);
     if (obj.verdict === "pass") {
       validateSuccessConsistency(obj, "pass", "commands", errors);
       validateVerifierPass(obj, errors);

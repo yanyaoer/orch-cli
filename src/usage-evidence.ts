@@ -1,4 +1,5 @@
 import type { RunSpec, RunStatus } from "./types.ts";
+import type { CodexBaseline } from "./codex-baseline.ts";
 
 export interface NormalizedTokens {
   input_tokens: number; cache_read_input_tokens: number; cache_write_input_tokens: number;
@@ -32,7 +33,7 @@ function normalized(u: any, format: "pi" | "claude" | "codex"): NormalizedTokens
 
 // Reads only numeric provider usage and lifecycle metadata. It never returns
 // prompts, assistant content, tool arguments, credentials or SDK price guesses.
-export function usageEvidence(native: string | null, spec: Partial<RunSpec> | null, status?: Partial<RunStatus> | null): UsageEvidence {
+export function usageEvidence(native: string | null, spec: Partial<RunSpec> | null, status?: Partial<RunStatus> | null, codexBaseline?: CodexBaseline | null): UsageEvidence {
   const reasons = new Set<string>();
   const attempts: any[][] = [[]];
   for (const line of (native ?? "").split(/\r?\n/)) {
@@ -98,7 +99,8 @@ export function usageEvidence(native: string | null, spec: Partial<RunSpec> | nu
       // never every turn. Resumed sessions need a host-captured pre-run
       // baseline; absent evidence is deliberately not inferred from siblings.
       const fresh = index > 0 || spec?.provider_session_mode === "fresh_persistent" || spec?.provider_session_mode === "ephemeral";
-      if (!fresh) { reasons.add("codex_session_baseline_unknown"); continue; }
+      const baseline = !fresh && codexBaseline ? codexBaseline : null;
+      if (!fresh && !baseline) { reasons.add("codex_session_baseline_unknown"); continue; }
       const counters = new Map<string, NormalizedTokens>();
       let session = "unidentified";
       let unfinished = false;
@@ -120,7 +122,19 @@ export function usageEvidence(native: string | null, spec: Partial<RunSpec> | nu
       }
       if (unfinished) reasons.add("codex_unfinished_turn");
       if (!counters.size) reasons.add("codex_terminal_usage_missing");
-      for (const n of counters.values()) { sum = addNormalized(sum, n); records++; }
+      for (const [id, n] of counters) {
+        let counted: NormalizedTokens | null = n;
+        if (baseline) {
+          // A resumed thread's counter minus the host-captured pre-run counter
+          // is this run's own increment. Any other session id is not covered
+          // by the baseline and stays unknown.
+          if (id !== baseline.thread_id && id !== "unidentified") { reasons.add("codex_session_baseline_unknown"); continue; }
+          const delta = { input_tokens: n.input_tokens - baseline.input_tokens, cached_input_tokens: n.cache_read_input_tokens - baseline.cached_input_tokens, output_tokens: n.output_tokens - baseline.output_tokens };
+          counted = Object.values(delta).every(v => v >= 0) ? normalized(delta, "codex") : null;
+          if (!counted) { reasons.add("codex_counter_regressed"); continue; }
+        }
+        sum = addNormalized(sum, counted); records++;
+      }
     } else reasons.add("attempt_usage_missing");
   }
   if (!status || !["done", "failed"].includes(status.state ?? "")) reasons.add("run_not_terminal_or_interrupted");

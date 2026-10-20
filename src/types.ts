@@ -168,6 +168,10 @@ export interface CommandResult {
   // Marks a check the verdict does not depend on; only optional checks may be
   // skipped under a verifier pass.
   optional?: boolean;
+  // Implementer tests only. "before_change" marks a red check (the test run
+  // on the unfixed tree); its failure is evidence, not a contradiction, once
+  // the same cmd passed after the change.
+  phase?: "before_change" | "after_change";
 }
 
 export interface AcceptanceResult {
@@ -209,6 +213,9 @@ export interface VerifierResult {
   verifies_run_id: string;
   commands: CommandResult[];
   acceptance: AcceptanceResult[];
+  // Nit / pre-existing observations. Recorded for the controller, never part
+  // of the verdict (a defect that should block is a failed check instead).
+  non_blocking_findings?: ReviewerResult["non_blocking_findings"];
 }
 
 export interface ControllerResult {

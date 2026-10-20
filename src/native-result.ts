@@ -1,4 +1,5 @@
 import { normalizeNativeLine, textFromAssistantContent } from "./native-events.ts";
+import { stripNulls } from "./schema.ts";
 
 // Result delivery has stricter semantics than progress display: a malformed
 // final answer must never expose an earlier, schema-shaped answer as final.
@@ -48,7 +49,13 @@ export function nativeResult(text: string): {
       // Claude's terminal envelope supersedes every earlier assistant even
       // when its result is missing, empty or malformed.
       structured = true;
-      answer = typeof obj.result === "string" ? obj.result.trim() || null : null;
+      // Under --json-schema the validated object rides structured_output; it
+      // wins over the prose result. null (schema retries exhausted) falls back
+      // to the text path and its repair round.
+      const native = obj.structured_output;
+      answer = native && typeof native === "object" && !Array.isArray(native)
+        ? JSON.stringify(stripNulls(native))
+        : typeof obj.result === "string" ? obj.result.trim() || null : null;
       continue;
     }
     for (const event of normalizeNativeLine(line)) {
