@@ -4,6 +4,10 @@ All notable user-facing changes are recorded here.
 
 ## [Unreleased]
 
+### Deprecated
+
+- Slated for removal after a usage audit of local run state (2026-09-20..10-20) found no runs or calls: `orch new`, `prewalk`, `fanout`, `investigate`, `mail`, `mailctl`, `dispatch`, `workspace`, `chatgpt-bridge`, `handoff-pro`, and config `sandbox: true` (seatbelt-v1). They keep working; invoking one prints a single `[orch] deprecated: …` line on stderr (stdout and `--json` are unchanged, child processes inherit `ORCH_DEPRECATION_WARNED=1` so one invocation warns once), and top-level help tags them `[deprecated]`. `cross-review` (internal mail routing included), `worktree`, `trajectory`, and `search` stay.
+
 ### Changes
 
 - Provider-native structured output. claude runs get `--json-schema` and codex runs `--output-schema <run-dir>/result.schema.json` (fresh and `exec resume`), generated per role by `roleJsonSchema` in strict-mode shape (every property required, `additionalProperties: false`, absent fields as `null`, no `oneOf`/`allOf`/`if`). claude's terminal `structured_output` wins over the prose result; `null` falls back to the text path and repair round. Nulls are stripped before validation except a skipped check's `exit_code: null`. pi/omp are unchanged. `ORCH_NATIVE_SCHEMA=0` disables it.

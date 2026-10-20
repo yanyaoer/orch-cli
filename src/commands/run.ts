@@ -14,6 +14,7 @@ import { orchLanguage, readOrchConfig, type RoleDefaults } from "../config.ts";
 import { CliError, assertKnownFlags, flagBool, flagString, printJson, readStdinText, type ParsedArgs } from "../cli.ts";
 import { buildPrompt, buildProviderExecutionPlan, type ProviderExecutionPlan } from "../../drivers/driver-common.ts";
 import { SEATBELT_ENGINE, sandboxPosture, sandboxRunIdentity, seatbeltUnsupportedReason } from "../../drivers/sandbox.ts";
+import { DEPRECATED_SANDBOX_REASON, warnDeprecated } from "../deprecation.ts";
 import { archivedIdempotency, formatTable, locateRun, looksStale, mrIdsForRepo, nonTerminalStates, orchCommand, readIdempotency, resolveMr, runId, runListRows, scanMrRuns, scanRunsRoot, stateDirectoryHint, statusState, type IdempotencyRecord } from "../run-store.ts";
 
 function isProviderSessionMode(value: string): value is ProviderSessionMode {
@@ -447,6 +448,7 @@ export async function createRun(args: ParsedArgs): Promise<number> {
   // compatibility check, dry-run, and startRun (F6): a config change between
   // two reads must not split the idempotency key from the recorded spec.
   const { engine: sandboxEngine, writeDirs: sandboxWriteDirs } = requestedSandboxEngine();
+  if (sandboxEngine) warnDeprecated("config sandbox:true", DEPRECATED_SANDBOX_REASON);
   const sandboxIdentity = sandboxRunIdentity(sandboxEngine, sandboxWriteDirs);
 
   const repo = await getRepoIdentity(worktree);
