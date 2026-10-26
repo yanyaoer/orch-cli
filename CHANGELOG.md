@@ -4,6 +4,8 @@ All notable user-facing changes are recorded here.
 
 ## [Unreleased]
 
+## [0.0.14] - 2026-10-26
+
 ### Fixes
 
 - Claude implementer results that were rejected although the work was done (orch run ledger 2026-10-23..26: 42 of 45 failed claude implementer runs, their repair rounds also `invalid`):
