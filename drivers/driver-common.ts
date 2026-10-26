@@ -1,6 +1,6 @@
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync, writeSync } from "node:fs";
 import { isRunRole, type AgentName, type ResultCoercion, type RunSpec, type RoleResult, type SandboxEngine, type SandboxPosture } from "../src/types.ts";
-import { acceptanceOutcome, commandOutcome, fallbackResult, isProvenRedCheck, resultSchemaName, ROLE_REQUIRED_FIELDS, ROLE_RESULT_EXAMPLE, ROLE_VERDICTS, roleJsonSchema, stripNulls, validateRoleResult } from "../src/schema.ts";
+import { acceptanceOutcome, commandOutcome, fallbackResult, isProvenRedCheck, pairingCmd, resultSchemaName, ROLE_REQUIRED_FIELDS, ROLE_RESULT_EXAMPLE, ROLE_VERDICTS, roleJsonSchema, stripNulls, validateRoleResult } from "../src/schema.ts";
 import { appendJsonLine, countLines, writeJsonAtomic } from "../src/json.ts";
 import { normalizeNativeText } from "../src/native-events.ts";
 import { nativeResult } from "../src/native-result.ts";
@@ -80,7 +80,7 @@ export function buildPrompt(spec: RunSpec, provider: string): string {
       : []),
     ...(role === "implementer" || role === "verifier"
       ? [
-          `Command evidence: every ${role === "verifier" ? "commands" : "tests"} entry carries "status": "passed" | "failed" | "skipped". A check that did not run is "skipped" with "exit_code": null — never exit_code 0. ${role === "verifier" ? 'For a negative test whose expected outcome is a non-zero exit, set "expected_exit_code" to that code; "passed" then means exit_code equals it. ' : 'Write a negative check so that success exits 0 (e.g. `! cmd`); implementer tests never set a non-zero "expected_exit_code". Every test carries "phase": a red check run on the unfixed tree is "before_change" (its failure is expected evidence, and the same cmd must also appear passing as "after_change"); everything else is "after_change". '}A success verdict must not contain a failed check or an unmet acceptance item (acceptance status: met | unmet | skipped): a required check that failed means the verdict is "${failure ?? "failed"}".${role === "verifier" ? ' A verifier "pass" also needs at least one command that actually ran and passed, and may skip a command or acceptance item only when it is marked "optional": true. Nit and pre-existing observations go to the optional "non_blocking_findings" (severity "nit" | "pre-existing"); they never change the verdict.' : ""} orch checks this JSON for consistency but does not re-run your commands: list only commands you actually ran.`,
+          `Command evidence: every ${role === "verifier" ? "commands" : "tests"} entry carries "status": "passed" | "failed" | "skipped". A check that did not run is "skipped" with "exit_code": null — never exit_code 0. ${role === "verifier" ? 'For a negative test whose expected outcome is a non-zero exit, set "expected_exit_code" to that code; "passed" then means exit_code equals it. ' : 'Write a negative check so that success exits 0 (e.g. `! cmd`); implementer tests never set a non-zero "expected_exit_code". Every test carries "phase": a red check run on the unfixed tree is "before_change" (its failure is expected evidence, and the same cmd must also appear passing as "after_change" — the identical command string; put notes such as the tree, commit or mutation it ran against in "summary", not in "cmd"); everything else is "after_change". '}A success verdict must not contain a failed check or an unmet acceptance item (acceptance status: met | unmet | skipped): a required check that failed means the verdict is "${failure ?? "failed"}".${role === "verifier" ? ' A verifier "pass" also needs at least one command that actually ran and passed, and may skip a command or acceptance item only when it is marked "optional": true. Nit and pre-existing observations go to the optional "non_blocking_findings" (severity "nit" | "pre-existing"); they never change the verdict.' : ""} orch checks this JSON for consistency but does not re-run your commands: list only commands you actually ran.`,
         ]
       : []),
     ...(spec.language === "中文"
@@ -699,22 +699,69 @@ export function extractResultFromText(text: string, spec: RunSpec): RoleResult |
   return extractResultWithCoercionsFromText(text, spec)?.result ?? null;
 }
 
-function collectResultCandidates(runDir: string): string[] {
+// Whether a final answer is an attempt at the result at all: it parses to a
+// role-shaped object, or merely mentions a verdict key or result schema (a
+// truncated or malformed JSON attempt). Deliberately broad: anything that may
+// be a result attempt is judged as the final answer, never replaced.
+function looksLikeResultAttempt(text: string, spec: RunSpec): boolean {
+  if (/"verdict"|orch\.result\//.test(text)) return true;
+  return parsedJsonCandidates(text).some((candidate) =>
+    unwrappedCandidates(candidate, spec).some((value) => "schema" in (value as object) || "verdict" in (value as object)));
+}
+
+export interface FinalAnswer {
+  text: string;
+  // "earlier_turn": the stream ended on a prose turn with no result attempt,
+  // after an earlier terminal envelope of the same attempt carried one.
+  source: "final" | "earlier_turn";
+  // The prose final turn that was passed over (source "earlier_turn" only).
+  finalTurn?: string;
+}
+
+// The answer that is judged as the run's result. Normally the final message.
+// One exception (spec required): a Claude session that delivered its result
+// and was then woken again by its own reminder or a background task
+// notification ends on a prose turn ("Nothing left to do… final result
+// already delivered"); 9 of 42 rejected claude results were that. When the
+// final turn is not a result attempt at all, the latest earlier terminal
+// envelope of the same attempt that is one stands in for it. A final answer
+// that may be a result attempt (even malformed) is never replaced, and
+// nothing outside terminal envelopes (assistant messages, tool output, stale
+// files) or before a repair marker is ever considered.
+export function effectiveFinalAnswer(runDir: string, spec?: RunSpec): FinalAnswer | null {
   const nativePath = `${runDir}/native.jsonl`;
   const native = existsSync(nativePath) ? nativeResult(readFileSync(nativePath, "utf8")) : null;
   // Once a structured stream or repair attempt exists it is authoritative.
   // Never search old messages, tool output, or stale last_message files for
   // a valid-looking result if the actual final message is invalid/empty.
-  if (native && (native.structured || native.repair)) return native.text === null ? [] : [native.text];
+  if (native && (native.structured || native.repair)) {
+    if (native.text === null) return null;
+    if (spec && native.earlier.length > 0 && !looksLikeResultAttempt(native.text, spec)) {
+      const earlier = [...native.earlier].reverse().find((text) => looksLikeResultAttempt(text, spec));
+      if (earlier) return { text: earlier, source: "earlier_turn", finalTurn: native.text };
+    }
+    return { text: native.text, source: "final" };
+  }
+  const fallback = collectFileCandidates(runDir);
+  if (fallback) return { text: fallback, source: "final" };
+  return native?.text ? { text: native.text, source: "final" } : null;
+}
+
+function collectResultCandidates(runDir: string, spec?: RunSpec): string[] {
+  const answer = effectiveFinalAnswer(runDir, spec);
+  return answer ? [answer.text] : [];
+}
+
+function collectFileCandidates(runDir: string): string | null {
   // scratch/last_message.txt is the sandboxed codex location (provider-writable
   // scratch); last_message.txt is the unsandboxed one.
   for (const path of [`${runDir}/scratch/last_message.txt`, `${runDir}/last_message.txt`, `${runDir}/stdout.log`]) {
     if (existsSync(path)) {
       const text = readFileSync(path, "utf8");
-      if (text.trim()) return [text];
+      if (text.trim()) return text;
     }
   }
-  return native?.text ? [native.text] : [];
+  return null;
 }
 
 function providerFailed(runDir: string): boolean {
@@ -724,7 +771,7 @@ function providerFailed(runDir: string): boolean {
 
 export function extractResultWithCoercionsFromRunDir(runDir: string, spec: RunSpec): ExtractedResult | null {
   if (providerFailed(runDir)) return null;
-  for (const candidate of collectResultCandidates(runDir)) {
+  for (const candidate of collectResultCandidates(runDir, spec)) {
     const extracted = extractResultWithCoercionsFromText(candidate, spec);
     if (extracted) return extracted;
   }
@@ -741,7 +788,7 @@ export function extractResultFromRunDir(runDir: string, spec: RunSpec): RoleResu
 // back to the model by the repair round.
 export function resultValidationErrors(runDir: string, spec: RunSpec): string[] {
   let fallback: string[] | null = null;
-  for (const text of collectResultCandidates(runDir)) {
+  for (const text of collectResultCandidates(runDir, spec)) {
     for (const candidate of parsedJsonCandidates(text)) {
       for (const value of unwrappedCandidates(candidate, spec)) {
         const coerced = coerceCandidate(value, spec);
@@ -773,15 +820,73 @@ export function appendResultCoercionEvent(runDir: string, coercions: ResultCoerc
 
 const REPAIR_PREVIOUS_MAX_CHARS = 16_000;
 
+// The previous answer's role-shaped object (coerced), for explaining its
+// validator errors and judging a repair's downgrade.
+function previousResultObject(previous: string, spec: RunSpec): Record<string, unknown> | null {
+  for (const candidate of parsedJsonCandidates(previous)) {
+    for (const value of unwrappedCandidates(candidate, spec)) {
+      const obj = coerceCandidate(value, spec)?.obj;
+      if (obj && ("schema" in obj || "verdict" in obj)) return obj;
+    }
+  }
+  return null;
+}
+
+const RED_CHECK_PAIRING_RULE =
+  'A failed "before_change" red check counts only when an "after_change" entry with the same cmd passed. orch compares the two cmd strings character for character after dropping surrounding whitespace, a trailing shell comment (" # ...") and trailing " (note)" annotations; the before cmd may also end with "; <after cmd>" or " && <after cmd>" (a mutation step, then the same command). Keep notes such as the tree, commit or mutation a check ran against in "summary", not in "cmd".';
+
+// The rule behind each validator error, stated so that the formatting call
+// can fix the shape instead of reaching for the verdict: in live repairs a
+// red check whose cmd carried a note ("... (module from 439227a3)") was
+// "fixed" by turning completed into failed.
+export function repairHints(errors: string[], previous: string, spec: RunSpec): string[] {
+  const obj = previousResultObject(previous, spec);
+  const hints: string[] = [];
+  const add = (hint: string) => { if (!hints.includes(hint)) hints.push(hint); };
+  for (const error of errors) {
+    const contradiction = /^verdict \S+ contradicts (tests|commands)\[(\d+)\]/.exec(error);
+    if (contradiction) {
+      const [, field, index] = contradiction;
+      const entries = Array.isArray(obj?.[field!]) ? (obj![field!] as unknown[]) : [];
+      const entry = entries[Number(index)] as Record<string, unknown> | undefined;
+      if (entry?.phase === "before_change") {
+        const passing = entries
+          .filter((other): other is Record<string, unknown> => Boolean(other) && typeof other === "object" && (other as Record<string, unknown>).phase !== "before_change" && commandOutcome(other as Record<string, unknown>) === "passed" && (other as Record<string, unknown>).exit_code === 0)
+          .map((other) => JSON.stringify(String(other.cmd)));
+        add(RED_CHECK_PAIRING_RULE);
+        add(`${field}[${index}] is a before_change red check with no passing after_change entry of the same cmd. Passing after_change cmds in the previous answer: ${passing.length ? passing.slice(0, 12).join(", ") : "none"}. If one of them re-ran exactly this command, make the two cmd strings match (move the note to summary); that is a formatting fix and the verdict stays. A red check that failed before the change is not a failed required check. Only if none of them ran the same command can orch not accept the red check under a success verdict.`);
+      } else if (field === "tests" && spec.role === "implementer") {
+        add(`${field}[${index}] failed and is not phase "before_change". If it was a red check run on the unfixed tree, its phase is "before_change" (pairing rule above applies). If its failure was the expected outcome of a break/mutation check, it is a negative check: cmd "! <cmd>", exit_code 0, status "passed". Otherwise it is a failed required check.`);
+        add(RED_CHECK_PAIRING_RULE);
+      }
+      continue;
+    }
+    const mismatch = /^(tests|commands)\[(\d+)\] is passed but exit_code (-?\d+) != expected_exit_code (-?\d+)/.exec(error);
+    if (mismatch) {
+      const [, field, index, code] = mismatch;
+      add(spec.role === "verifier"
+        ? `status must agree with exit_code: "passed" means exit_code equals expected_exit_code (default 0). For ${field}[${index}], if exit ${code} was the expected outcome of a negative test, set "expected_exit_code": ${code}; otherwise its status is "failed".`
+        : `status must agree with exit_code: an implementer test is "passed" only with exit_code 0 (expected_exit_code is always 0). For ${field}[${index}], if exit ${code} was the expected outcome (a break/mutation check that must fail), report it as a negative check: cmd "! <cmd>", exit_code 0, status "passed". Otherwise its status is "failed".`);
+      continue;
+    }
+    if (/^(tests|commands)\[\d+\] is skipped, so exit_code must be null/.test(error)) {
+      add('A "skipped" check did not run and has "exit_code": null. A check that ran is "passed" or "failed" according to its exit code.');
+    }
+  }
+  return hints;
+}
+
 function repairTaskText(spec: RunSpec, errors: string[], previous: string): string {
   const role = isRunRole(spec.role) ? spec.role : "implementer";
   const excerpt = previous.length > REPAIR_PREVIOUS_MAX_CHARS ? `${previous.slice(0, REPAIR_PREVIOUS_MAX_CHARS)}\n[truncated]` : previous;
+  const hints = repairHints(errors, previous, spec);
   return [
     "Your previous final answer for this run did not validate as an orch result. Validator errors:",
     ...errors.map((error) => `- ${error}`),
+    ...(hints.length ? ["", "Rules behind these errors:", ...hints.map((hint) => `- ${hint}`)] : []),
     "",
-    "Return the corrected JSON object as your final answer and nothing else. Keep every fact and the verdict from the previous answer. Do not upgrade failures, remove findings, or invent evidence. Do not run tools or edit files.",
-    `Exception: if the previous answer claimed success but its own evidence shows a failed required check or an unmet acceptance item, a required check that failed means the verdict is ${JSON.stringify(ROLE_VERDICTS[role][1])}: return that verdict with the facts unchanged.`,
+    "Return the corrected JSON object as your final answer and nothing else. Keep every fact and the verdict from the previous answer. Do not upgrade failures, remove findings, or invent evidence. Do not run tools or edit files. Fix the shape the rules above describe (cmd strings, status, exit_code, phase) before considering the verdict.",
+    `Exception: if the previous answer claimed success but its own evidence shows a failed required check or an unmet acceptance item, a required check that failed means the verdict is ${JSON.stringify(ROLE_VERDICTS[role][1])}: return that verdict with the facts unchanged. A failed before_change red check is not a failed required check.`,
     `Required shape: ${ROLE_RESULT_EXAMPLE[role]}`,
     "",
     "--- previous answer ---",
@@ -833,11 +938,31 @@ async function runResultRepair(input: {
 // the raw output when schema extraction fails: candidates are ordered
 // final-message-first, so the first non-empty one is the closest thing to the
 // provider's answer.
-export function rawResultText(runDir: string): string | null {
-  for (const candidate of collectResultCandidates(runDir)) {
+export function rawResultText(runDir: string, spec?: RunSpec): string | null {
+  for (const candidate of collectResultCandidates(runDir, spec)) {
     if (candidate.trim().length > 0) return candidate;
   }
   return null;
+}
+
+// A red check the repair round may pair by fixing cmd strings: already proven,
+// or a passing after_change entry of the same answer ran a command that the
+// red check's cmd contains ("REDCHECK R3 (note): node x.cjs" / "node x.cjs").
+// The repaired result must still pair it strictly (validateRoleResult); this
+// only keeps the gate below from treating such a red check as a failed check
+// the success verdict would be hiding. With no passing after_change command
+// in the red cmd there is nothing a formatting call can pair it with.
+function isRepairableRedCheck(entry: Record<string, unknown>, all: readonly unknown[]): boolean {
+  if (isProvenRedCheck(entry, all)) return true;
+  if (entry.phase !== "before_change" || typeof entry.cmd !== "string") return false;
+  const before = pairingCmd(entry.cmd);
+  return all.some((other) => {
+    if (!other || typeof other !== "object" || other === entry) return false;
+    const item = other as Record<string, unknown>;
+    if (item.phase === "before_change" || typeof item.cmd !== "string" || commandOutcome(item) !== "passed") return false;
+    const after = pairingCmd(item.cmd);
+    return after.length > 0 && before.includes(after);
+  });
 }
 
 // A formatting call is not a second assessment. Only an explicit, parseable
@@ -857,7 +982,7 @@ export function repairPreservesVerdict(previous: string, result: RoleResult, spe
       if (success && obj && typeof obj.verdict === "string") {
         if (Array.isArray(obj.blocking_findings) && obj.blocking_findings.length) return false;
         for (const field of ["tests", "commands"]) {
-          if (Array.isArray(obj[field]) && obj[field].some((entry: any, _index: number, all: unknown[]) => entry && !isProvenRedCheck(entry, all) && (
+          if (Array.isArray(obj[field]) && obj[field].some((entry: any, _index: number, all: unknown[]) => entry && !isRepairableRedCheck(entry, all) && (
             commandOutcome(entry) === "failed" ||
             (typeof entry.exit_code === "number" && entry.exit_code !== (entry.expected_exit_code ?? 0)) ||
             (spec.role === "verifier" && entry.status === "skipped" && entry.optional !== true)
@@ -886,6 +1011,41 @@ export function previousVerdictOf(previous: string, spec: RunSpec): string | nul
     }
   }
   return verdicts.size === 1 ? [...verdicts][0]! : null;
+}
+
+// Why a repair moved the verdict to the failure side. "evidence": the
+// previous answer itself had a failed after-change check, a passed check with
+// a non-zero exit, a failed verifier command, or an unmet acceptance item.
+// "red_checks_only": its only failed checks were before_change red checks
+// orch could not pair — the downgrade came from the format, not from a failed
+// check of the change (4 live repairs did this), so it is flagged for the
+// controller instead of passing as an ordinary failure. It is not rejected:
+// that would throw the whole answer away for a synthetic failure.
+export function downgradeBasis(previous: string, spec: RunSpec): "evidence" | "red_checks_only" {
+  const obj = previousResultObject(previous, spec);
+  if (!obj) return "evidence";
+  for (const field of ["tests", "commands"]) {
+    const entries = Array.isArray(obj[field]) ? (obj[field] as unknown[]) : [];
+    for (const entry of entries) {
+      if (!entry || typeof entry !== "object") continue;
+      const item = entry as Record<string, unknown>;
+      if (item.phase === "before_change") continue;
+      if (commandOutcome(item) === "failed") return "evidence";
+      const expected = typeof item.expected_exit_code === "number" ? item.expected_exit_code : 0;
+      if (typeof item.exit_code === "number" && item.exit_code !== expected) return "evidence";
+    }
+  }
+  if (Array.isArray(obj.acceptance) && obj.acceptance.some((item: any) => item && acceptanceOutcome(item.status) === "unmet")) return "evidence";
+  if (Array.isArray(obj.blocking_findings) && obj.blocking_findings.length > 0) return "evidence";
+  return "red_checks_only";
+}
+
+// An orch note on the delivered result, for roles that carry a risks list
+// (implementer, researcher); other roles keep the note in events.jsonl only.
+function noteOnResult(result: RoleResult, note: string): RoleResult {
+  const risks = (result as { risks?: unknown }).risks;
+  if (!Array.isArray(risks)) return result;
+  return { ...result, risks: [...risks, note] } as RoleResult;
 }
 
 export function synthesizeResult(spec: RunSpec, summary: string): RoleResult {
@@ -1368,15 +1528,24 @@ export async function runProviderDriver(provider: AgentName, argv: string[]): Pr
   writeExitCode(args.runDir, code);
 
   appendDriverEvent(args.runDir, { type: "phase", phase: "result_validation" });
-  const original = rawResultText(args.runDir);
+  const original = rawResultText(args.runDir, spec);
   const failed = code !== 0 || providerFailed(args.runDir);
+  const answer = failed ? null : effectiveFinalAnswer(args.runDir, spec);
   let extracted = failed ? null : extractResultWithCoercionsFromRunDir(args.runDir, spec);
+  let note: string | null = null;
+  if (answer?.source === "earlier_turn") {
+    // Recorded whether or not that answer validates: the controller should
+    // see that the final turn was passed over, and what it said.
+    const finalTurn = compactCoercionValue(answer.finalTurn ?? "");
+    appendDriverEvent(args.runDir, { type: "result_source", source: "earlier_turn", final_turn_excerpt: finalTurn });
+    note = `orch: the session ended on a prose turn without a result; the result is the one it delivered in an earlier turn. Final turn: ${finalTurn}`;
+  }
   // A provider that finished normally but whose answer does not validate gets
   // one repair round (ORCH_RESULT_REPAIR=0 disables it); a crashed or killed
   // provider does not, its raw output is preserved below instead.
   if (!extracted && !failed && process.env.ORCH_RESULT_REPAIR !== "0") {
     const errors = resultValidationErrors(args.runDir, spec);
-    const previous = rawResultText(args.runDir);
+    const previous = rawResultText(args.runDir, spec);
     if (previous) {
       writeFileSync(`${args.runDir}/result.original.md`, previous, "utf8");
       const repairCode = await runResultRepair({ provider, spec, runDir: args.runDir, worktree: args.worktree, errors, previous });
@@ -1384,17 +1553,26 @@ export async function runProviderDriver(provider: AgentName, argv: string[]): Pr
       extracted = repaired && repairPreservesVerdict(previous, repaired.result, spec) ? repaired : null;
       const previousVerdict = previousVerdictOf(previous, spec);
       const downgraded = Boolean(extracted && previousVerdict && previousVerdict !== extracted.result.verdict);
+      const basis = downgraded ? downgradeBasis(previous, spec) : null;
       appendDriverEvent(args.runDir, {
         type: "result_repair",
         attempt: 1,
         errors,
         repair_exit_code: repairCode,
         outcome: extracted ? "valid" : "invalid",
-        ...(downgraded ? { verdict_downgraded: { from: previousVerdict, to: extracted!.result.verdict } } : {}),
+        ...(downgraded ? { verdict_downgraded: { from: previousVerdict, to: extracted!.result.verdict, basis } } : {}),
       });
+      if (downgraded) {
+        const change = `the result repair round changed the verdict from ${previousVerdict} to ${extracted!.result.verdict}`;
+        const why = basis === "red_checks_only"
+          ? "although the original answer's only failed checks were before_change red checks orch could not pair with a passing after_change of the same cmd, so the change itself may be complete"
+          : "because the original answer's own evidence had a failed check or unmet acceptance item";
+        note = [note, `orch: ${change} ${why}; the original answer is in result.original.md.`].filter(Boolean).join(" ");
+      }
     }
   }
   if (extracted) {
+    if (note) extracted = { ...extracted, result: noteOnResult(extracted.result, note) };
     writeResult(args.runDir, spec, extracted.result);
     appendResultCoercionEvent(args.runDir, extracted.coercions);
     appendDriverEvent(args.runDir, { type: "phase", phase: "delivery_complete", valid_result: true });

@@ -4,6 +4,14 @@ All notable user-facing changes are recorded here.
 
 ## [Unreleased]
 
+### Fixes
+
+- Claude implementer results that were rejected although the work was done (orch run ledger 2026-10-23..26: 42 of 45 failed claude implementer runs, their repair rounds also `invalid`):
+  - Red check pairing compares commands, not annotations: a failed `before_change` test pairs with a passing `after_change` one when their `cmd`s match after dropping surrounding whitespace, a trailing shell comment (` # ...`) and trailing ` (note)` annotations (`node --test x.mjs (module from 439227a3)` ↔ `node --test x.mjs`), or when the before `cmd` ends with `; <after cmd>` / ` && <after cmd>` (a mutation step, then the same command). Only text a shell would not run is dropped: a `(` after an operator (`&& (cd web && npm test)`), `$(...)`, quoted text and inner whitespace still have to match, and a pass of a different command (a broader suite, `make smoke`) never pairs. The worker prompt asks for the identical command string with notes in `summary`.
+  - The repair prompt states the rule behind each validator error (pairing rule plus the answer's passing `after_change` cmds, status vs `exit_code` with the `! <cmd>` negative-check form, skipped means `exit_code: null`) and that a failed red check is not a failed required check. The repair gate lets a success verdict through when a red check's cmd contains a passing after-change command of the same answer, so a repair can fix the cmd strings instead of the verdict; the repaired result must still pair strictly.
+  - A Claude session that delivered its result and was then woken again (its own reminder, a background task notification) and ended on a prose turn now delivers the result of the latest earlier terminal envelope, and the repair round sees that answer (and its verdict) instead of the prose. Only when the final turn is a successful envelope with no result attempt in it; recorded as a `result_source` event and an `orch:` line in `risks`.
+  - A repair that moves the verdict to the failure side records `verdict_downgraded.basis` (`evidence` | `red_checks_only`), and implementer/researcher results carry an `orch:` line in `risks` saying so; `red_checks_only` means the original's only failed checks were unpaired red checks.
+
 ### Deprecated
 
 - Slated for removal after a usage audit of local run state (2026-09-20..10-20) found no runs or calls: `orch new`, `prewalk`, `fanout`, `investigate`, `mail`, `mailctl`, `dispatch`, `workspace`, `chatgpt-bridge`, `handoff-pro`, and config `sandbox: true` (seatbelt-v1). They keep working; invoking one prints a single `[orch] deprecated: …` line on stderr (stdout and `--json` are unchanged, child processes inherit `ORCH_DEPRECATION_WARNED=1` so one invocation warns once), and top-level help tags them `[deprecated]`. `cross-review` (internal mail routing included), `worktree`, `trajectory`, and `search` stay.

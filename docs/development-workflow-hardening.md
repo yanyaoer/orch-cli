@@ -41,7 +41,7 @@ GitLab 新 Issue 发现、main 增量审查属于任务入口。已有 Claude �
 
 ### 验证结果语义
 
-- `tests[]`/`commands[]` 每项有 `status: passed|failed|skipped`；`skipped` 必须 `exit_code: null`，未运行不能写成 0；verifier 的负向测试用 `expected_exit_code` 表达预期非零退出，`passed` 即 `exit_code == expected_exit_code`；implementer 的 tests 不允许非零 `expected_exit_code`（负向检查写成成功时退出 0，如 `! cmd`），红检查用 `phase: "before_change"` 记为 failed，只有同一 `cmd` 在改动后也 passed 时才不与 `completed` 矛盾。无 `status` 的旧条目按 `exit_code == expected_exit_code(默认 0)` 推导。
+- `tests[]`/`commands[]` 每项有 `status: passed|failed|skipped`；`skipped` 必须 `exit_code: null`，未运行不能写成 0；verifier 的负向测试用 `expected_exit_code` 表达预期非零退出，`passed` 即 `exit_code == expected_exit_code`；implementer 的 tests 不允许非零 `expected_exit_code`（负向检查写成成功时退出 0，如 `! cmd`），红检查用 `phase: "before_change"` 记为 failed，只有同一 `cmd` 在改动后也 passed 时才不与 `completed` 矛盾（比较前去掉首尾空白、末尾 ` # 注释` 和末尾 ` (说明)`；改动前的 `cmd` 也可以是 `<变异步骤>; <改动后 cmd>` 或 `<变异步骤> && <改动后 cmd>`）。无 `status` 的旧条目按 `exit_code == expected_exit_code(默认 0)` 推导。
 - `pass`/`completed` 不能同时含失败检查或 `unmet` 验收；verifier `pass` 还必须至少有一条实际运行并通过的命令，且只有显式标记 `"optional": true` 的命令/验收项可以 `skipped`（全部 skipped 的 pass 被拒绝）；implementer 的 `completed` 表示“编辑完成，可留待主控/verifier 验证”，允许 skipped，不与 verifier 的 pass 混同；验收状态为 `met|unmet|skipped`（常见同义词会映射，无法识别的值在成功结论下被拒绝）。
 - implementer 提示词不再无条件禁止必要的较大范围测试：先完成编辑，再跑本次改动需要的检查以及任务明确要求的套件；不能运行的必要检查报告为 `skipped`。
 - 这些校验只保证 JSON 自洽，不证明命令真的执行过；原始日志（`native.jsonl`、`stdout.log`）保留，主控仍须独立运行关键验证。orch 不伪造 host-attested 证据。
