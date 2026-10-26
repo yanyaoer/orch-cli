@@ -21,6 +21,7 @@ import {
   rawResultText,
   repairPreservesVerdict,
   runProviderDriver,
+  ORCH_RUN_EVIDENCE_DIR_ENV,
   SEATBELT_ENV_MARKER,
 } from "./driver-common.ts";
 import type { AgentName, RunSpec } from "../src/types.ts";
@@ -256,6 +257,8 @@ test("buildProviderArgv keeps defaults fresh and only resumes exact sessions", (
     CLAUDE_WRITE_ALLOWED_TOOLS,
     "--permission-mode",
     "dontAsk",
+    "--add-dir",
+    "/run/evidence",
   ]);
   expect(buildProviderArgv("codex", base, "/run", "/worktree")).toEqual([
     "codex",
@@ -267,6 +270,8 @@ test("buildProviderArgv keeps defaults fresh and only resumes exact sessions", (
     "/run/last_message.txt",
     "--sandbox",
     "workspace-write",
+    "--add-dir",
+    "/run/evidence",
     "-",
   ]);
   expect(buildProviderArgv("pi", { ...base, provider_session_mode: "ephemeral" }, "/run", "/worktree")).toEqual([
@@ -307,6 +312,8 @@ test("buildProviderArgv keeps defaults fresh and only resumes exact sessions", (
     CLAUDE_WRITE_ALLOWED_TOOLS,
     "--permission-mode",
     "dontAsk",
+    "--add-dir",
+    "/run/evidence",
     "--name",
     "mr123-review",
     "--resume",
@@ -319,7 +326,7 @@ test("buildProviderArgv keeps defaults fresh and only resumes exact sessions", (
       "/run",
       "/worktree",
     ),
-  ).toEqual(["codex", "exec", "--sandbox", "workspace-write", "resume", "--json", "--output-last-message", "/run/last_message.txt", "thread-123", "-"]);
+  ).toEqual(["codex", "exec", "--sandbox", "workspace-write", "--add-dir", "/run/evidence", "resume", "--json", "--output-last-message", "/run/last_message.txt", "thread-123", "-"]);
   expect(
     buildProviderArgv(
       "pi",
@@ -800,6 +807,8 @@ test("buildProviderArgv picks claude model/effort by role", () => {
     CLAUDE_WRITE_ALLOWED_TOOLS,
     "--permission-mode",
     "dontAsk",
+    "--add-dir",
+    "/run/evidence",
   ]);
 
   // verifier stays on the CLI default model (sonnet), low effort (mechanical checks).
@@ -817,6 +826,8 @@ test("buildProviderArgv picks claude model/effort by role", () => {
     CLAUDE_WRITE_ALLOWED_TOOLS,
     "--permission-mode",
     "dontAsk",
+    "--add-dir",
+    "/run/evidence",
   ]);
 
   expect(argv("controller", "role-controller")).toEqual([
@@ -1946,4 +1957,38 @@ test("implementer format repair preserves legitimate skipped evidence", () => {
   expect(repairPreservesVerdict(JSON.stringify({ ...repaired, risks: {} }), result, s)).toBe(true);
   expect(repairPreservesVerdict(JSON.stringify({ ...repaired, tests: [{ cmd: "check", status: "passed", exit_code: 1 }] }), result, s)).toBe(false);
   expect(repairPreservesVerdict(JSON.stringify({ ...repaired, acceptance: [{ id: "check", status: "unmet" }] }), result, s)).toBe(false);
+});
+
+test("evidence dir: write roles get the prompt line, env and --add-dir on every codex/claude path; read-only roles none", () => {
+  withoutNativeSchema();
+  for (const role of ["implementer", "verifier"] as const) {
+    const runSpec = spec(role, `ev-${role}`);
+    const prompt = buildPrompt(runSpec, "codex", "/run");
+    expect(prompt).toContain("Evidence dir: /run/evidence (also $ORCH_RUN_EVIDENCE_DIR)");
+    expect(prompt).toContain("Keep fixture repositories and whole-tree copies in $TMPDIR");
+    expect(buildPrompt(runSpec, "codex")).not.toContain("Evidence dir:"); // repair rounds pass no run dir
+    const plan = buildProviderExecutionPlan({ provider: "codex", spec: runSpec, runDir: "/run", worktree: "/worktree", env: { HOME: "/h" } });
+    expect(plan.evidenceDir).toBe("/run/evidence");
+    expect(plan.env[ORCH_RUN_EVIDENCE_DIR_ENV]).toBe("/run/evidence");
+    const resumed = { ...runSpec, provider_session_mode: "resume_exact" as const, provider_session_id: "thread-1" };
+    for (const provider of ["codex", "claude"] as const) {
+      for (const s of [runSpec, resumed]) {
+        const argv = buildProviderArgv(provider, s, "/run", "/worktree");
+        expect(argv.filter((arg, i) => arg === "--add-dir" && argv[i + 1] === "/run/evidence")).toHaveLength(1);
+      }
+    }
+    // codex resume: the grant rides the parent exec level, before the subcommand.
+    const resume = buildProviderArgv("codex", resumed, "/run", "/worktree");
+    expect(resume.indexOf("--add-dir")).toBeLessThan(resume.indexOf("resume"));
+    // pi / omp have no native sandbox: env and prompt only.
+    expect(buildProviderArgv("pi", runSpec, "/run", "/worktree")).not.toContain("--add-dir");
+  }
+  for (const role of ["reviewer", "researcher", "controller"] as const) {
+    const runSpec = spec(role, `ev-${role}`);
+    expect(buildPrompt(runSpec, "claude", "/run")).not.toContain("Evidence dir:");
+    const plan = buildProviderExecutionPlan({ provider: "claude", spec: runSpec, runDir: "/run", worktree: "/worktree", env: { HOME: "/h" } });
+    expect(plan.evidenceDir).toBeNull();
+    expect(plan.env[ORCH_RUN_EVIDENCE_DIR_ENV]).toBeUndefined();
+    expect(plan.argv).not.toContain("--add-dir");
+  }
 });

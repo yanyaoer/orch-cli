@@ -244,6 +244,8 @@ test("seatbeltProfile: default-deny writes, minimal allows, Git denied last", ()
   expect(lines[1]).toBe("(allow default)");
   expect(lines[2]).toBe("(deny file-write*)");
   expect(profile).toContain('(subpath "/wt")');
+  expect(profile).not.toContain("/runs/r1/evidence"); // no evidence dir given: none granted
+  expect(seatbeltProfile({ posture: "project-write", worktree: "/wt", scratchDir: "/runs/r1/scratch", providerStateDirs: [], providerStateFiles: [], hostTmpDir: null, orchStateDir: null, workerCacheDir: "/c", extraWriteDirs: [], evidenceDir: "/runs/r1/evidence" })).toContain('(subpath "/runs/r1/evidence")');
   expect(profile).toContain('(subpath "/Users/u/.pi")');
   expect(profile).toContain('(subpath "/runs/r1/scratch")');
   expect(profile).toContain('(subpath "/private/tmp")');

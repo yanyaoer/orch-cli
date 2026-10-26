@@ -10,6 +10,7 @@ import { providerResumeIdFromNativeText } from "./native-events.ts";
 import { buildWorkerEnv, DRIVER_HANDSHAKE_ENV } from "../drivers/driver-common.ts";
 import { sandboxPosture } from "../drivers/sandbox.ts";
 import { describeSnapshot, jjWorkspaceRoot, sameSnapshot, vcsHead, vcsKind, vcsSnapshot } from "./vcs.ts";
+import { writeEvidenceManifest } from "./evidence.ts";
 
 function now(): string {
   return new Date().toISOString();
@@ -146,6 +147,13 @@ function startDrift(spec: RunSpec, start: VcsSnapshot): string | null {
 class SnapshotError extends Error {}
 
 async function writeEvidence(runDir: string, spec: RunSpec): Promise<void> {
+  try {
+    // The worker's own evidence dir (write roles): list what it left there.
+    // Independent of base_sha; a failure here never changes the outcome.
+    writeEvidenceManifest(runDir, spec.run_id);
+  } catch {
+    // diagnostic only
+  }
   try {
     const baseSha = typeof spec.base_sha === "string" ? spec.base_sha.trim() : "";
     if (!writeRoles.has(spec.role) || !baseSha) return;

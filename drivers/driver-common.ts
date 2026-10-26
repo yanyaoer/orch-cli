@@ -1,5 +1,5 @@
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync, writeSync } from "node:fs";
-import { isRunRole, type AgentName, type ResultCoercion, type RunSpec, type RoleResult, type SandboxEngine, type SandboxPosture } from "../src/types.ts";
+import { isRunRole, writeRoles, type AgentName, type ResultCoercion, type RunSpec, type RoleResult, type SandboxEngine, type SandboxPosture } from "../src/types.ts";
 import { acceptanceOutcome, commandOutcome, fallbackResult, isProvenRedCheck, resultSchemaName, ROLE_REQUIRED_FIELDS, ROLE_RESULT_EXAMPLE, ROLE_VERDICTS, roleJsonSchema, stripNulls, validateRoleResult } from "../src/schema.ts";
 import { appendJsonLine, countLines, writeJsonAtomic } from "../src/json.ts";
 import { normalizeNativeText } from "../src/native-events.ts";
@@ -47,8 +47,24 @@ export function readSpec(path: string): RunSpec {
   return JSON.parse(readFileSync(path, "utf8")) as RunSpec;
 }
 
-export function buildPrompt(spec: RunSpec, provider: string): string {
+// Per-run evidence dir: the one place inside the run dir a write-role worker
+// may write (besides the Seatbelt scratch). Logs, reproduction scripts and
+// check output written here outlive the worktree, so the worktree can end
+// clean; the supervisor lists it in artifacts/evidence-manifest.json.
+// Read-only roles (reviewer, researcher) and the controller get none.
+export const ORCH_RUN_EVIDENCE_DIR_ENV = "ORCH_RUN_EVIDENCE_DIR";
+
+export function runEvidenceDir(runDir: string): string {
+  return `${runDir}/evidence`;
+}
+
+export function roleHasEvidenceDir(role: RunSpec["role"]): boolean {
+  return writeRoles.has(role);
+}
+
+export function buildPrompt(spec: RunSpec, provider: string, runDir?: string): string {
   const role = isRunRole(spec.role) ? spec.role : "implementer";
+  const evidenceDir = runDir && roleHasEvidenceDir(role) ? runEvidenceDir(runDir) : null;
   const schemaName = resultSchemaName(role);
   const verdicts = ROLE_VERDICTS[role];
   const failure = verdicts.find((verdict) => verdict === "failed" || verdict === "fail");
@@ -60,6 +76,12 @@ export function buildPrompt(spec: RunSpec, provider: string): string {
     `Worktree: ${spec.worktree}`,
     `Provider session mode: ${spec.provider_session_mode}`,
     `Provider session name: ${spec.provider_session_name ?? "none"}`,
+    ...(evidenceDir
+      ? [
+          `Evidence dir: ${evidenceDir} (also $${ORCH_RUN_EVIDENCE_DIR_ENV})`,
+          "Write every log, reproduction script, red/break check output, mutation diff and fetched test report you want kept into the evidence dir (a subdirectory per check is fine); it outlives the worktree and the controller cites it. Keep fixture repositories and whole-tree copies in $TMPDIR, not there. The worktree must end clean (`git status --porcelain` empty); one-off scratch goes to $TMPDIR.",
+        ]
+      : []),
     "",
     "Execute the task below. Your final answer must be a single JSON object matching this orch schema.",
     `The top-level JSON object must include: "schema": "${schemaName}".`,
@@ -361,6 +383,10 @@ function providerArgv(
     // sandbox entirely). OS-enforced write confinement is opt-in via config
     // `sandbox`: the outer Seatbelt then jails every provider uniformly.
     else argv.push("--allowedTools", CLAUDE_WRITE_ALLOWED_TOOLS, "--permission-mode", "dontAsk");
+    // Required, not hardening: Edit/Write and Bash output redirects (>, >>,
+    // tee) are checked against the working directories, so without it a
+    // dontAsk worker cannot write its evidence. Re-passed on every resume.
+    if (roleHasEvidenceDir(spec.role)) argv.push("--add-dir", runEvidenceDir(runDir));
     if (spec.provider_session_name) argv.push("--name", spec.provider_session_name);
     if (nativeSchemaEnabled() && isRunRole(spec.role)) argv.push("--json-schema", JSON.stringify(roleJsonSchema(spec.role)));
     if (spec.provider_session_mode === "ephemeral") {
@@ -392,10 +418,14 @@ function providerArgv(
     const researcherFlags =
       spec.role === "researcher" ? ["-c", `model_reasoning_effort=${CODEX_RESEARCHER_EFFORT}`, "-c", "tools.web_search=true"] : [];
     const model = spec.model ?? (spec.role === "researcher" ? CODEX_RESEARCHER_MODEL : null);
+    // The run's evidence dir is the only writable root added to workspace-write
+    // (worktree, $TMPDIR and /tmp are codex defaults); the rest of the run dir
+    // stays unwritable. Like --sandbox it rides the parent `exec` level on resume.
+    const evidenceFlags = roleHasEvidenceDir(spec.role) ? ["--add-dir", runEvidenceDir(runDir)] : [];
     if (spec.provider_session_mode === "resume_exact" && spec.provider_session_id) {
       // `codex exec resume` has no --sandbox flag (exit 2 if passed); the
       // sandbox rides the parent `exec` level, accepted before the subcommand.
-      const resume = ["codex", "exec", ...sandboxFlags];
+      const resume = ["codex", "exec", ...sandboxFlags, ...evidenceFlags];
       resume.push("resume", "--json", "--output-last-message", lastMessagePath);
       if (nativeSchemaEnabled()) resume.push("--output-schema", resultSchemaPath(runDir));
       if (model) resume.push("--model", model);
@@ -408,6 +438,7 @@ function providerArgv(
     if (model) argv.push("--model", model);
     argv.push(...researcherFlags);
     argv.push(...sandboxFlags);
+    argv.push(...evidenceFlags);
     if (spec.provider_session_mode === "ephemeral") argv.push("--ephemeral");
     argv.push("-");
     return argv;
@@ -962,6 +993,16 @@ const FAKE_RESEARCH_PLAN = [
 
 export async function maybeWriteFakeResult(runDir: string, spec: RunSpec, provider: string): Promise<boolean> {
   if (process.env.ORCH_DRIVER_FAKE_RESULT !== "1") return false;
+  // Test seam: a fake write-role run leaves one file in its evidence dir, the
+  // way a real worker would, so the supervisor's manifest can be checked.
+  const fakeEvidence = process.env.ORCH_DRIVER_FAKE_EVIDENCE;
+  if (fakeEvidence && roleHasEvidenceDir(spec.role)) {
+    if (!/^[A-Za-z0-9._-]+$/.test(fakeEvidence) || fakeEvidence === "." || fakeEvidence === "..") {
+      throw new Error(`ORCH_DRIVER_FAKE_EVIDENCE must be a plain file name: ${JSON.stringify(fakeEvidence)}`);
+    }
+    mkdirSync(runEvidenceDir(runDir), { recursive: true, mode: 0o700 });
+    writeFileSync(`${runEvidenceDir(runDir)}/${fakeEvidence}`, `fake ${provider} evidence for ${spec.run_id}\n`, "utf8");
+  }
   const sleepMs = Number(process.env.ORCH_DRIVER_FAKE_SLEEP_MS ?? "0");
   if (Number.isFinite(sleepMs) && sleepMs > 0) await sleep(sleepMs);
   writeFileSync(
@@ -1091,6 +1132,7 @@ export interface ProviderExecutionPlan {
   sandboxPosture: SandboxPosture;
   profileSha256: string | null;
   providerNativeSandbox: boolean;
+  evidenceDir: string | null; // ${runDir}/evidence for write roles, exported as ORCH_RUN_EVIDENCE_DIR
   env: Record<string, string>;
 }
 
@@ -1117,6 +1159,10 @@ export function buildProviderExecutionPlan(ctx: ExecutionContext): ProviderExecu
   const env = buildWorkerEnv(ctx.env ?? process.env);
   env[ORCH_SANDBOX_RUN_ID_ENV] = spec.run_id;
   env[ORCH_SANDBOX_RUN_DIR_ENV] = runDir;
+  const evidenceDir = roleHasEvidenceDir(spec.role) ? runEvidenceDir(runDir) : null;
+  // The plan never touches the host (its fail-closed checks come first): run
+  // create makes the dir, and runProviderDriver re-ensures it before spawning.
+  if (evidenceDir) env[ORCH_RUN_EVIDENCE_DIR_ENV] = evidenceDir;
   if (spec.sandbox_engine === undefined) {
     return {
       argv: providerArgv(provider, spec, runDir, worktree, ctx.prompt ?? "", false),
@@ -1124,6 +1170,7 @@ export function buildProviderExecutionPlan(ctx: ExecutionContext): ProviderExecu
       sandboxPosture: posture,
       profileSha256: null,
       providerNativeSandbox: provider === "codex" || provider === "claude",
+      evidenceDir,
       env,
     };
   }
@@ -1286,6 +1333,7 @@ export function buildProviderExecutionPlan(ctx: ExecutionContext): ProviderExecu
     orchStateDir,
     workerCacheDir: canonicalCache,
     extraWriteDirs,
+    evidenceDir: evidenceDir ? canonicalizePath(evidenceDir) : null,
   });
 
   return {
@@ -1294,6 +1342,7 @@ export function buildProviderExecutionPlan(ctx: ExecutionContext): ProviderExecu
     sandboxPosture: posture,
     profileSha256: sha256(profile),
     providerNativeSandbox: false,
+    evidenceDir,
     env: {
       ...env,
       ...scratchEnv(canonicalScratch),
@@ -1315,7 +1364,7 @@ export async function runProviderDriver(provider: AgentName, argv: string[]): Pr
   const spec = readSpec(args.specPath);
   if (await maybeWriteFakeResult(args.runDir, spec, provider)) return 0;
 
-  const prompt = buildPrompt(spec, provider);
+  const prompt = buildPrompt(spec, provider, args.runDir);
   if (provider === "codex" && nativeSchemaEnabled()) writeResultSchemaFile(args.runDir, spec);
   if (provider === "codex" && spec.provider_session_mode === "resume_exact" && spec.provider_session_id) {
     const baseline = readCodexBaseline(spec.provider_session_id);
@@ -1343,6 +1392,7 @@ export async function runProviderDriver(provider: AgentName, argv: string[]): Pr
     writeResult(args.runDir, spec, synthesizeResult(spec, message));
     return 1;
   }
+  if (plan.evidenceDir) mkdirSync(plan.evidenceDir, { recursive: true, mode: 0o700 });
   // Audit record of the plan actually used; the supervisor folds it into
   // status.json (the driver never writes status.json itself).
   writeJsonAtomic(`${args.runDir}/sandbox.json`, {
@@ -1350,6 +1400,7 @@ export async function runProviderDriver(provider: AgentName, argv: string[]): Pr
     sandbox_posture: plan.sandboxPosture,
     sandbox_profile_sha256: plan.profileSha256,
     provider_native_sandbox: plan.providerNativeSandbox,
+    evidence_dir: plan.evidenceDir,
   });
   appendDriverEvent(args.runDir, { type: "phase", phase: "provider_start", wait_reason: "provider_process" });
   const proc = Bun.spawn(plan.argv, {

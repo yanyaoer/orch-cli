@@ -41,6 +41,8 @@ export function topLevelHelp(): string {
     "  orch worktree clone  CoW-clone a worktree into an isolated per-agent checkout (APFS/reflink, keeps build output)",
     "  orch worktree gc   Inventory this repo's orch clones and trash; remove the proven-safe ones with --execute",
     "  orch worktree remove  Remove one clone: loss detection gates it (--force overrides), merged branch tidied",
+    "  orch evidence dir  Create/print an MR's control-plane evidence dir (<mr_dir>/evidence/<label>/)",
+    "  orch evidence list List an MR's run and control-plane evidence (file counts, bytes, warnings)",
     "  orch update        Self-update to the latest GitHub release (--check to only compare)",
     "",
     "[deprecated] commands still run but are slated for removal; see CHANGELOG.md \"Deprecated\".",
@@ -687,6 +689,30 @@ export function worktreeCloneHelp(): string {
   ]);
 }
 
+export function evidenceHelp(): string {
+  return lines([
+    "orch evidence: per-MR evidence directories",
+    "",
+    "Usage:",
+    "  orch evidence dir --mr <id> --label <label> [--worktree <path>] [--json]",
+    "  orch evidence list --mr <id> [--worktree <path>] [--json]",
+    "",
+    "dir creates (mode 0700) and prints <mr_dir>/evidence/<label>/ for evidence the controller produces",
+    "itself: merge checks, break-check logs, device evidence, files moved out of an old worktree. The label",
+    "matches [A-Za-z0-9][A-Za-z0-9._-]* without \"..\"; an existing dir is reused, never cleared.",
+    "",
+    "list shows every run of the MR that has an evidence/ dir (from its artifacts/evidence-manifest.json, or a",
+    "live count while the run is going) and every control-plane label, with file counts, bytes and warnings.",
+    "",
+    "Run evidence itself needs no command: implementer and verifier runs get <run_dir>/evidence/ and",
+    "$ORCH_RUN_EVIDENCE_DIR automatically (orch help concepts).",
+    "",
+    "Examples:",
+    "  orch evidence dir --mr 123 --label merge-check-r2",
+    "  orch evidence list --mr 123 --json",
+  ]);
+}
+
 export function worktreeRemoveHelp(): string {
   return lines([
     "orch worktree remove: remove one orch clone, gated by loss detection",
@@ -912,6 +938,10 @@ export function topicHelp(topic: HelpTopic): string {
         "  verdict is completed or failed",
         "",
         "Main controllers should read result.json for decisions; provider-native output is retained separately for debugging.",
+        "",
+        "Evidence: implementer/verifier runs also leave <run_dir>/evidence/ and artifacts/evidence-manifest.json",
+        "(orch.evidence-manifest/v1: files[{path,bytes,sha256}], total_bytes, nested_repos, node_modules, warnings).",
+        "orch result prints the file count and size; cite evidence as <run_id> + evidence/<path>.",
       ]);
     case "events":
       return lines([
@@ -948,7 +978,17 @@ export function topicHelp(topic: HelpTopic): string {
         "State directory layout:",
         "  ${XDG_STATE_HOME:-$HOME/.local/state}/orch/<repo_key>/mrs/<mr>/runs/<run_id>/",
         "  Shorthand: ${XDG_STATE_HOME:-~/.local/state}/orch/<repo_key>/mrs/<mr>/runs/<run_id>/",
-        "  Important files: spec.json, spec.sha256, status.json, events.jsonl, native.jsonl, stdout.log, stderr.log, result.json, artifacts/",
+        "  Important files: spec.json, spec.sha256, status.json, events.jsonl, native.jsonl, stdout.log, stderr.log, result.json, artifacts/, evidence/",
+        "",
+        "Evidence:",
+        "  implementer and verifier runs get <run_dir>/evidence/ (mode 0700), created by run create and",
+        "  exported as $ORCH_RUN_EVIDENCE_DIR; the prompt names it. It is the only provider-writable part of the",
+        "  run dir (plus Seatbelt scratch/): codex and claude get --add-dir for it (resume too), Seatbelt an allow",
+        "  rule. Workers write logs, check output and mutation diffs there so the worktree can end clean;",
+        "  fixture repos and whole-tree copies belong in $TMPDIR. When the run ends the supervisor writes",
+        "  artifacts/evidence-manifest.json (path, bytes, sha256 per file; nested repos, node_modules and a total",
+        "  over $ORCH_EVIDENCE_MAX_MB (200) are warnings, never a verdict change). Reviewers, researchers and the",
+        "  controller get no evidence dir. Controller-side evidence: orch evidence dir --mr <mr> --label <x>.",
         "  MR outbox: ${XDG_STATE_HOME:-~/.local/state}/orch/<repo_key>/mrs/<mr>/outbox/{pending,sent}/",
         "",
         "Outbox:",

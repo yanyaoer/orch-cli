@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import type { CommandResult, ControllerResult, ImplementerResult, ResearcherResult, ReviewerResult, RoleResult, RunStatus, VerifierResult } from "./types.ts";
 import { orchLanguage } from "./config.ts";
 import { commandOutcome } from "./schema.ts";
+import { evidenceSummaryLines } from "./evidence.ts";
 import type { DecisionRecord } from "./run-store.ts";
 
 function printFindings(label: string, findings: ReviewerResult["non_blocking_findings"]): void {
@@ -136,9 +137,11 @@ function evidencePaths(runDir: string): string[] {
 
 export function printEvidenceSummary(runDir: string): void {
   const paths = evidencePaths(runDir);
-  if (paths.length === 0) return;
+  const run = evidenceSummaryLines(runDir);
+  if (paths.length === 0 && run.length === 0) return;
   process.stdout.write("\nevidence:\n");
   for (const path of paths) process.stdout.write(`  - ${path}\n`);
+  for (const line of run) process.stdout.write(`  ${line}\n`);
 }
 
 // GitHub caps issue comments at 65536 chars; stay under it with room for the

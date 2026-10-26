@@ -12,7 +12,7 @@ import { isTerminal } from "../overview.ts";
 import { orchLanguage, readOrchConfig, type RoleDefaults } from "../config.ts";
 
 import { CliError, assertKnownFlags, flagBool, flagString, printJson, readStdinText, type ParsedArgs } from "../cli.ts";
-import { buildPrompt, buildProviderExecutionPlan, type ProviderExecutionPlan } from "../../drivers/driver-common.ts";
+import { buildPrompt, buildProviderExecutionPlan, roleHasEvidenceDir, runEvidenceDir, type ProviderExecutionPlan } from "../../drivers/driver-common.ts";
 import { SEATBELT_ENGINE, sandboxPosture, sandboxRunIdentity, seatbeltUnsupportedReason } from "../../drivers/sandbox.ts";
 import { DEPRECATED_SANDBOX_REASON, warnDeprecated } from "../deprecation.ts";
 import { archivedIdempotency, formatTable, locateRun, looksStale, mrIdsForRepo, nonTerminalStates, orchCommand, readIdempotency, resolveMr, runId, runListRows, scanMrRuns, scanRunsRoot, stateDirectoryHint, statusState, type IdempotencyRecord } from "../run-store.ts";
@@ -402,6 +402,7 @@ function providerPlanPayload(plan: ProviderExecutionPlan, cwd: string) {
     sandbox_posture: plan.sandboxPosture,
     sandbox_profile_sha256: plan.profileSha256,
     provider_native_sandbox: plan.providerNativeSandbox,
+    evidence_dir: plan.evidenceDir,
   };
 }
 
@@ -565,7 +566,7 @@ export async function createRun(args: ParsedArgs): Promise<number> {
               spec: specPreview,
               runDir,
               worktree,
-              prompt: buildPrompt(specPreview, agent),
+              prompt: buildPrompt(specPreview, agent, runDir),
               dryRun: true,
             }),
             worktree,
@@ -607,6 +608,7 @@ export async function createRun(args: ParsedArgs): Promise<number> {
             : plan.argv;
         lines.push(`provider: ${argv.join(" ")}`);
         lines.push(`sandbox: ${plan.sandbox_engine}/${plan.sandbox_posture}`);
+        lines.push(`evidence_dir: ${plan.evidence_dir ?? "none"}`);
       }
       process.stdout.write(lines.join("\n") + "\n");
     }
@@ -733,6 +735,10 @@ async function startRun(input: StartRunInput): Promise<Record<string, unknown>> 
     const id = runId(tag);
     const runDir = `${mrDir}/runs/${id}`;
     mkdirSync(runDir, { recursive: true });
+    // Created before the worker starts so it exists for every provider (and
+    // the fake driver); ORCH_RUN_EVIDENCE_DIR and the prompt point here.
+    const evidenceDir = roleHasEvidenceDir(role) ? runEvidenceDir(runDir) : null;
+    if (evidenceDir) mkdirSync(evidenceDir, { recursive: true, mode: 0o700 });
     const createdAt = new Date().toISOString();
     const spec: RunSpec = {
       version: 1,
@@ -811,6 +817,7 @@ async function startRun(input: StartRunInput): Promise<Record<string, unknown>> 
       repo_key: repo.repo_key,
       mr_dir: mrDir,
       run_dir: runDir,
+      evidence_dir: evidenceDir,
       status_path: `${runDir}/status.json`,
       events_path: `${runDir}/events.jsonl`,
       worktree_lock: lockPathForWorktree(worktree),

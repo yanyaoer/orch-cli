@@ -433,3 +433,129 @@ printf '%s\\n' '${JSON.stringify(result)}'
   },
   30_000,
 );
+
+// ---------------- per-run evidence dir (ORCH_RUN_EVIDENCE_DIR) ----------------
+
+const roleArgs = (worktree: string, role: string, agent: string, extra: string[] = []) => [
+  "run", "create", "--mr", "42", "--role", role, "--agent", agent, "--tag", `${role}-${agent}`,
+  "--worktree", worktree, "--task", "-", "--json", ...extra,
+];
+
+interface EvidencePlan {
+  run_dir: string;
+  provider_plan: { argv: string[]; evidence_dir: string | null };
+}
+
+test("dry-run argv snapshots: write roles get --add-dir <run>/evidence, read-only roles none, no dir is created", async () => {
+  const fx = await fixture(false);
+  const plan = async (role: string, agent: string): Promise<EvidencePlan> => {
+    const dry = await runOrch(roleArgs(fx.worktree, role, agent, ["--dry-run"]), fx.env, "evidence probe\n");
+    expect(dry.exitCode).toBe(0);
+    return JSON.parse(dry.stdout) as EvidencePlan;
+  };
+
+  const codex = await plan("verifier", "codex");
+  const run = codex.run_dir;
+  expect(codex.provider_plan.evidence_dir).toBe(`${run}/evidence`);
+  expect(codex.provider_plan.argv).toEqual([
+    "codex", "exec", "--json", "--cd", fx.worktree,
+    "--output-last-message", `${run}/last_message.txt`,
+    "--output-schema", `${run}/result.schema.json`,
+    "--sandbox", "workspace-write",
+    "--add-dir", `${run}/evidence`,
+    "-",
+  ]);
+
+  const claude = await plan("implementer", "claude");
+  expect(claude.provider_plan.evidence_dir).toBe(`${claude.run_dir}/evidence`);
+  const add = claude.provider_plan.argv.indexOf("--add-dir");
+  expect(add).toBeGreaterThan(claude.provider_plan.argv.indexOf("dontAsk"));
+  expect(claude.provider_plan.argv[add + 1]).toBe(`${claude.run_dir}/evidence`);
+  expect(claude.provider_plan.argv.filter((arg) => arg === "--add-dir")).toHaveLength(1);
+
+  for (const [role, agent] of [["reviewer", "codex"], ["reviewer", "claude"], ["researcher", "codex"]] as const) {
+    const readOnly = await plan(role, agent);
+    expect(readOnly.provider_plan.evidence_dir).toBeNull();
+    expect(readOnly.provider_plan.argv).not.toContain("--add-dir");
+  }
+  // Dry-run is a preview: nothing under the state root.
+  expect(existsSync(fx.runsDir)).toBe(false);
+});
+
+test.skipIf(process.platform !== "darwin")("seatbelt verifier profile allows <run>/evidence and no other part of the run dir", async () => {
+  const fx = await fixture(true);
+  const dry = await runOrch(roleArgs(fx.worktree, "verifier", "pi", ["--dry-run"]), fx.env, "sandboxed evidence\n");
+  expect(dry.exitCode).toBe(0);
+  const payload = JSON.parse(dry.stdout) as EvidencePlan;
+  const profile = payload.provider_plan.argv[2]!;
+  const root = join(fx.stateRoot, "..", ".."); // exists; state/ is not created by a dry-run
+  const runReal = realpathSync(root) + payload.run_dir.slice(root.length);
+  expect(profile).toContain(`(subpath "${runReal}/evidence")`);
+  expect(profile).toContain(`(subpath "${runReal}/scratch")`);
+  expect(profile).not.toContain(`(subpath "${runReal}")`);
+  const reviewer = await runOrch(roleArgs(fx.worktree, "reviewer", "pi", ["--dry-run"]), fx.env, "sandboxed evidence\n");
+  expect((JSON.parse(reviewer.stdout) as EvidencePlan).provider_plan.argv[2]).not.toContain("/evidence\")");
+});
+
+test("fake verifier run: evidence dir exists before the worker, manifest lists what it wrote, result/list/dir report it", async () => {
+  const fx = await fixture(false, { ORCH_DRIVER_FAKE_RESULT: "1", ORCH_DRIVER_FAKE_EVIDENCE: "check.log" });
+  const created = await runOrch(roleArgs(fx.worktree, "verifier", "pi"), fx.env, "verify with evidence\n");
+  expect(created.exitCode).toBe(0);
+  const out = JSON.parse(created.stdout) as { run_id: string; run_dir: string; evidence_dir: string };
+  expect(out.evidence_dir).toBe(`${out.run_dir}/evidence`);
+  const status = await waitForTerminal(join(out.run_dir, "status.json"));
+  expect(status.state).toBe("done");
+  const { statSync } = await import("node:fs");
+  expect(statSync(out.evidence_dir).mode & 0o777).toBe(0o700);
+
+  const manifest = JSON.parse(readFileSync(join(out.run_dir, "artifacts", "evidence-manifest.json"), "utf8")) as {
+    schema: string; run_id: string; files: Array<{ path: string; bytes: number; sha256: string }>; total_bytes: number; warnings: string[];
+  };
+  const content = readFileSync(join(out.evidence_dir, "check.log"));
+  const { createHash } = await import("node:crypto");
+  expect(manifest.schema).toBe("orch.evidence-manifest/v1");
+  expect(manifest.run_id).toBe(out.run_id);
+  expect(manifest.files).toEqual([{ path: "check.log", bytes: content.length, sha256: createHash("sha256").update(content).digest("hex") }]);
+  expect(manifest.total_bytes).toBe(content.length);
+  expect(manifest.warnings).toEqual([]);
+  // The worktree stays clean: evidence lives outside it.
+  const git = Bun.spawnSync(["git", "-C", fx.worktree, "status", "--porcelain"]);
+  expect(git.stdout.toString()).toBe("");
+
+  const result = await runOrch(["result", "--run", out.run_id, "--mr", "42", "--worktree", fx.worktree], fx.env);
+  expect(result.exitCode).toBe(0);
+  expect(result.stdout).toContain(`run evidence: 1 file(s), ${content.length} bytes`);
+
+  const dir = await runOrch(["evidence", "dir", "--mr", "42", "--label", "merge-check-r1", "--worktree", fx.worktree], fx.env);
+  expect(dir.exitCode).toBe(0);
+  const control = dir.stdout.trim();
+  expect(control).toBe(join(fx.stateRoot, fx.repoKey, "mrs", "42", "evidence", "merge-check-r1"));
+  expect(statSync(control).mode & 0o777).toBe(0o700);
+  writeFileSync(join(control, "stale.json"), "{}");
+  for (const bad of ["../x", "a/b", "..", ".hidden", ""]) {
+    const refused = await runOrch(["evidence", "dir", "--mr", "42", "--label", bad, "--worktree", fx.worktree], fx.env);
+    expect(refused.exitCode).not.toBe(0);
+  }
+  // Reuse never clears.
+  expect((await runOrch(["evidence", "dir", "--mr", "42", "--label", "merge-check-r1", "--worktree", fx.worktree], fx.env)).exitCode).toBe(0);
+  expect(existsSync(join(control, "stale.json"))).toBe(true);
+
+  const list = await runOrch(["evidence", "list", "--mr", "42", "--worktree", fx.worktree, "--json"], fx.env);
+  expect(list.exitCode).toBe(0);
+  const rows = (JSON.parse(list.stdout) as { rows: Array<{ kind: string; id: string; file_count: number; manifest: boolean }> }).rows;
+  expect(rows).toEqual([
+    expect.objectContaining({ kind: "run", id: out.run_id, file_count: 1, manifest: true }),
+    expect.objectContaining({ kind: "control", id: "merge-check-r1", file_count: 1, manifest: false }),
+  ]);
+});
+
+test("fake reviewer run gets no evidence dir and no manifest", async () => {
+  const fx = await fixture(false, { ORCH_DRIVER_FAKE_RESULT: "1", ORCH_DRIVER_FAKE_EVIDENCE: "check.log" });
+  const created = await runOrch(roleArgs(fx.worktree, "reviewer", "pi"), fx.env, "review only\n");
+  expect(created.exitCode).toBe(0);
+  const out = JSON.parse(created.stdout) as { run_dir: string; evidence_dir: string | null };
+  expect(out.evidence_dir).toBeNull();
+  expect((await waitForTerminal(join(out.run_dir, "status.json"))).state).toBe("done");
+  expect(existsSync(join(out.run_dir, "evidence"))).toBe(false);
+  expect(existsSync(join(out.run_dir, "artifacts", "evidence-manifest.json"))).toBe(false);
+});

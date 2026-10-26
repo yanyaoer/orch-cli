@@ -2,7 +2,7 @@ import pkg from "../package.json";
 import { runSupervisor } from "./supervisor.ts";
 import { scrubGitLocationEnv } from "./git-env.ts";
 
-import { HELP_TOPICS, chatgptBridgeHelp, decisionHelp, eventsTailHelp, fanoutHelp, handoffProHelp, mailHelp, mailctlHelp, mirrorHelp, mirrorSyncHelp, newHelp, prewalkHelp, resultCommandHelp, runCancelHelp, runCreateHelp, runHelp, runListHelp, searchHelp, statusHelp, topLevelHelp, topicHelp, trajectoryHelp, unknownTopicHelp, updateHelp, usageHelp, verdictHelp, waitHelp, workspaceHelp, worktreeCloneHelp, worktreeGcHelp, worktreeRemoveHelp, type HelpTopic } from "./help.ts";
+import { HELP_TOPICS, chatgptBridgeHelp, decisionHelp, eventsTailHelp, evidenceHelp, fanoutHelp, handoffProHelp, mailHelp, mailctlHelp, mirrorHelp, mirrorSyncHelp, newHelp, prewalkHelp, resultCommandHelp, runCancelHelp, runCreateHelp, runHelp, runListHelp, searchHelp, statusHelp, topLevelHelp, topicHelp, trajectoryHelp, unknownTopicHelp, updateHelp, usageHelp, verdictHelp, waitHelp, workspaceHelp, worktreeCloneHelp, worktreeGcHelp, worktreeRemoveHelp, type HelpTopic } from "./help.ts";
 import { runCodexDriver } from "../drivers/codex-headless.ts";
 import { runClaudeDriver } from "../drivers/claude-headless.ts";
 import { awaitSupervisorHandshake } from "../drivers/driver-common.ts";
@@ -11,6 +11,7 @@ import { runOmpDriver } from "../drivers/omp-headless.ts";
 import { mail } from "./mail-cli.ts";
 import { workspace } from "./workspace-cli.ts";
 import { worktreeClone, worktreeGc, worktreeRemove } from "./worktree.ts";
+import { evidenceDirCommand, evidenceListCommand } from "./commands/evidence.ts";
 import { CliError, assertKnownFlags, flagBool, flagString, hasHelp, parseArgs, printJson, readStdinText, type ParsedArgs } from "./cli.ts";
 import { insideSandbox, proxyToHost, reconcileDispatchOnce, reconcileDispatchWatch, shouldProxyToHost } from "./dispatch.ts";
 import { prewalkCommand } from "./prewalk.ts";
@@ -191,6 +192,10 @@ async function main(): Promise<number> {
       process.stdout.write(second === "gc" ? worktreeGcHelp() : second === "remove" ? worktreeRemoveHelp() : worktreeCloneHelp());
       return 0;
     }
+    if (first === "evidence") {
+      process.stdout.write(evidenceHelp());
+      return 0;
+    }
     if (first === "mirror" && second === "sync") {
       process.stdout.write(mirrorSyncHelp());
       return 0;
@@ -258,6 +263,8 @@ async function main(): Promise<number> {
   if (first === "worktree" && second === "clone") return worktreeClone(args);
   if (first === "worktree" && second === "gc") return worktreeGc(args);
   if (first === "worktree" && second === "remove") return worktreeRemove(args);
+  if (first === "evidence" && second === "dir") return evidenceDirCommand(args);
+  if (first === "evidence" && second === "list") return evidenceListCommand(args);
   if (first === "chatgpt-bridge") return chatgptBridge(args);
   if (first === "handoff-pro") return handoffPro(args);
   if (first === "update") return updateCommand(args);

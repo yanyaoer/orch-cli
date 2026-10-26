@@ -255,6 +255,7 @@ export interface SeatbeltProfileInput {
   orchStateDir: string | null; // canonical dispatch/pending request dir, controller only
   workerCacheDir: string; // canonical persistent per-user cache, pre-vetted via narrowWritableDirReason
   extraWriteDirs: string[]; // canonical config-declared dirs, pre-vetted (narrow gate + orch config/state denial)
+  evidenceDir?: string | null; // canonical ${runDir}/evidence, write roles only — the rest of the run dir stays denied
 }
 
 // Profile shape: reads/exec/network stay open, writes are default-denied, the
@@ -269,6 +270,7 @@ export function seatbeltProfile(input: SeatbeltProfileInput): string {
   for (const dir of input.providerStateDirs) allows.push(`(subpath ${sbplString(dir)})`);
   for (const file of input.providerStateFiles) allows.push(`(literal ${sbplString(file)})`);
   allows.push(`(subpath ${sbplString(input.scratchDir)})`);
+  if (input.evidenceDir) allows.push(`(subpath ${sbplString(input.evidenceDir)})`);
   allows.push(`(subpath ${sbplString(input.workerCacheDir)})`);
   for (const dir of input.extraWriteDirs) allows.push(`(subpath ${sbplString(dir)})`);
   // Disposable-state exceptions, not part of the project boundary: /private/tmp
