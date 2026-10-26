@@ -53,9 +53,75 @@ const COMMAND_PHASES = new Set(["before_change", "after_change"]);
 // the defect, not a failure of the change — but only when the same cmd also
 // passed after the change. Without that pairing it stays a contradiction, so
 // a real failure cannot be relabeled away.
+//
+// "Same cmd" is compared on the command a shell would run, after dropping
+// only text that cannot change what runs (pairingCmd). Live implementers
+// annotated the red run's cmd ("node --test x.mjs (module from 439227a3)",
+// "node x.cjs  # R1: stream URL reverted") and 33 of 42 rejected claude
+// results failed on that alone. A before cmd may also end in the after cmd
+// as its last step ("<mutate>; <cmd>", "<mutate> && <cmd>"): the red run then
+// executed exactly the command that later passed. Nothing looser counts — a
+// passing check on a different command (a broader suite, "make smoke") proves
+// nothing about this one, so it never pairs.
 export function isProvenRedCheck(item: Record<string, unknown>, all: readonly unknown[]): boolean {
-  if (item.phase !== "before_change") return false;
-  return all.some((other) => record(other) && other !== item && other.cmd === item.cmd && other.phase !== "before_change" && commandOutcome(other) === "passed");
+  if (item.phase !== "before_change" || typeof item.cmd !== "string") return false;
+  const before = pairingCmd(item.cmd);
+  if (!before) return false;
+  return all.some((other) => {
+    if (!record(other) || other === item || other.phase === "before_change" || typeof other.cmd !== "string") return false;
+    if (commandOutcome(other) !== "passed") return false;
+    const after = pairingCmd(other.cmd);
+    return Boolean(after) && (before === after || before.endsWith(`; ${after}`) || before.endsWith(` && ${after}`));
+  });
+}
+
+// Characters after which a "(" is shell syntax (subshell, command
+// substitution, array, process substitution, redirection), not a note.
+const SHELL_PAREN_LEADS = ["&&", "||", ";", "|", "&", "(", "$", "<", ">", "=", "`", "!"];
+
+// A trailing ` # ...` outside quotes is a shell comment: it never runs.
+function stripShellComment(cmd: string): string {
+  let quote: string | null = null;
+  let escaped = false;
+  for (let index = 0; index < cmd.length; index++) {
+    const char = cmd[index]!;
+    if (escaped) { escaped = false; continue; }
+    if (char === "\\" && quote !== "'") { escaped = true; continue; }
+    if (quote) { if (char === quote) quote = null; continue; }
+    if (char === "'" || char === '"') { quote = char; continue; }
+    if (char === "#" && index > 0 && /\s/.test(cmd[index - 1]!)) return cmd.slice(0, index);
+  }
+  return cmd;
+}
+
+// A trailing ` (note)` after a plain word is not valid shell (`word (x)` is a
+// syntax error; a subshell needs an operator before it), so it is an
+// annotation. Returns the command without it, or null when there is none.
+function stripTrailingNote(cmd: string): string | null {
+  if (!cmd.endsWith(")")) return null;
+  let depth = 0;
+  for (let index = cmd.length - 1; index >= 0; index--) {
+    const char = cmd[index];
+    if (char === ")") depth++;
+    else if (char === "(" && --depth === 0) {
+      if (index === 0 || !/\s/.test(cmd[index - 1]!)) return null;
+      if (!cmd.slice(index + 1, -1).trim()) return null;
+      const head = cmd.slice(0, index).trimEnd();
+      if (!head || SHELL_PAREN_LEADS.some((lead) => head.endsWith(lead))) return null;
+      return head;
+    }
+  }
+  return null;
+}
+
+// The cmd as red-check pairing compares it: surrounding whitespace, a trailing
+// shell comment and trailing ` (note)` annotations removed. Everything else —
+// quoting, inner whitespace, flags, paths — must match character for
+// character.
+export function pairingCmd(cmd: string): string {
+  let text = stripShellComment(cmd).trim();
+  for (let note = stripTrailingNote(text); note !== null; note = stripTrailingNote(text)) text = note.trim();
+  return text;
 }
 
 // What a reported check actually amounted to. Legacy entries without status

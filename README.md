@@ -8,7 +8,7 @@ Daemonless multi-agent orchestration for coding work.
 
 中文：`orch` 是一个无常驻 daemon 的多 Agent 编排 CLI。它把 Codex/Claude 这类 headless worker 进程化运行，把状态落到本地目录，并用统一的 `result.json` 给主控或人类做裁决。
 
-Latest release: `v0.0.13` ([CHANGELOG.md](CHANGELOG.md)).
+Latest release: `v0.0.14` ([CHANGELOG.md](CHANGELOG.md)).
 
 ## Documentation map
 
@@ -482,7 +482,7 @@ Implemented schemas:
 - `orch.result/reviewer/v1`: `verdict`, `reviews_run_id`, `blocking_findings`, `non_blocking_findings`, `suggested_tests`
 - `orch.result/verifier/v1`: `verdict`, `verifies_run_id`, `commands`, `acceptance`
 
-Command entries (`tests[]`, `commands[]`) carry `status` (`passed` | `failed` | `skipped`), `exit_code` (`null` only when skipped), and optional `expected_exit_code` for verifier negative tests (implementer tests write negative checks so success exits 0, e.g. `! cmd`; a non-zero `expected_exit_code` there is rejected). Implementer tests also carry `phase` (`before_change` | `after_change`): a failed `before_change` entry is a red check and does not contradict `completed`, but only when the same `cmd` also passed after the change. Verifier results may carry optional `non_blocking_findings` (nit / pre-existing; never part of the verdict). Legacy entries without `status` are judged by `exit_code == expected_exit_code (default 0)`. Acceptance `status` is `met` | `unmet` | `skipped` (common synonyms are mapped).
+Command entries (`tests[]`, `commands[]`) carry `status` (`passed` | `failed` | `skipped`), `exit_code` (`null` only when skipped), and optional `expected_exit_code` for verifier negative tests (implementer tests write negative checks so success exits 0, e.g. `! cmd`; a non-zero `expected_exit_code` there is rejected). Implementer tests also carry `phase` (`before_change` | `after_change`): a failed `before_change` entry is a red check and does not contradict `completed`, but only when the same `cmd` also passed after the change (compared after dropping surrounding whitespace, a trailing ` # comment` and trailing ` (note)` annotations; the before `cmd` may also end with `; <after cmd>` or ` && <after cmd>`). Verifier results may carry optional `non_blocking_findings` (nit / pre-existing; never part of the verdict). Legacy entries without `status` are judged by `exit_code == expected_exit_code (default 0)`. Acceptance `status` is `met` | `unmet` | `skipped` (common synonyms are mapped).
 - `orch.result/researcher/v1`: `verdict` (completed|failed), `summary`, `recommendation`, `alternatives[]`, `sources[]`, `open_questions[]`, `risks[]`
 - `orch.result/controller/v1`: `verdict`, `summary`, `actions` (the `orch mailctl` controller; claude-only, not in `writeRoles`, launched with a `Bash(orch *)` + read-only allowed-tools whitelist)
 
