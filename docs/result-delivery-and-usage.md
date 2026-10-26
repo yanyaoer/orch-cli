@@ -7,13 +7,31 @@ assistant message; a failed/aborted response or nonzero process exit prevents
 successful delivery. A repair marker begins a new attempt, even if it emits no
 answer.
 
+One narrow exception: a Claude session that already delivered its result can be
+woken again (its own reminder, a background task notification) and end on a
+prose turn. When that final turn is a successful terminal envelope and is not a
+result attempt at all (no role-shaped JSON, no `"verdict"` key, no
+`orch.result/` schema anywhere in it), the latest earlier terminal envelope of
+the same attempt that is a result attempt stands in for it. Earlier assistant
+messages, tool output and anything before a repair marker are still never used;
+a malformed or failed final answer is never replaced. The run records a
+`result_source` event with the passed-over turn, and implementer/researcher
+results get an `orch:` line in `risks`.
+
 One formatting repair remains available. Its prompt receives the actual final
-answer, and `result.original.md` preserves that answer before repair. A repair
+answer (or the earlier-turn answer above), the validator's errors, and the rule
+behind each error (red check pairing, status vs `exit_code`, skipped checks), and
+`result.original.md` preserves that answer before repair. A repair
 must exit successfully, pass the schema, and preserve an explicit original
 verdict. Unparseable originals cannot authorize successful repaired verdicts.
 Failed evidence cannot be removed to obtain success. Required skipped checks
 block a verifier pass; implementers may preserve checks left to a verifier.
-Rejected repairs leave the original in `result.raw.md`. This is a conservative
+A repair that moves the verdict to the failure side is accepted and flagged:
+`verdict_downgraded.basis` is `evidence` when the original answer had a failed
+after-change check, a passed check with a non-zero exit, or an unmet acceptance
+item, and `red_checks_only` when its only failed checks were unpaired red checks
+(the downgrade came from the format); implementer/researcher results get an
+`orch:` line in `risks` either way. Rejected repairs leave the original in `result.raw.md`. This is a conservative
 gate, not proof of every factual statement; independent review and host evidence
 are still required. Run `done` describes process completion, not acceptance of
 the business verdict.
