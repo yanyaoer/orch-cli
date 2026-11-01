@@ -36,10 +36,13 @@ function normalized(u: any, format: "pi" | "claude" | "codex"): NormalizedTokens
 export function usageEvidence(native: string | null, spec: Partial<RunSpec> | null, status?: Partial<RunStatus> | null, codexBaseline?: CodexBaseline | null): UsageEvidence {
   const reasons = new Set<string>();
   const attempts: any[][] = [[]];
+  let repairs = 0;
   for (const line of (native ?? "").split(/\r?\n/)) {
     if (!line.trim()) continue;
     let e: any; try { e = JSON.parse(line); } catch { reasons.add("malformed_native_record"); continue; }
-    if (e?.type === "orch_result_repair") attempts.push([]);
+    if (e?.type === "orch_result_repair") { attempts.push([]); repairs++; }
+    // An in-run API resume is a new claude process: its result carries only its own usage.
+    else if (e?.type === "orch_api_resume") attempts.push([]);
     else if (e && typeof e === "object") attempts.at(-1)!.push(e);
   }
   let sum = zero(), records = 0;
@@ -142,7 +145,7 @@ export function usageEvidence(native: string | null, spec: Partial<RunSpec> | nu
   return { normalized_tokens: records ? sum : null, response_observations: {
     basis: piSeen ? "pi_completed_assistant_messages_only" : "unavailable",
     successful_messages: piSeen ? successMessages : null, error_messages: piSeen ? errorMessages : null,
-    unknown_messages: piSeen ? unknownMessages : null, repair_attempts: attempts.length - 1,
+    unknown_messages: piSeen ? unknownMessages : null, repair_attempts: repairs,
   }, coverage: {
     status: records ? reasons.size ? "partial" : "complete" : "missing",
     reasons: [...reasons].sort(), counted_records: records,
