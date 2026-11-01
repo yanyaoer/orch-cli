@@ -200,6 +200,17 @@ export function runProcessesAlive(status: RunStatus): boolean {
   return typeof status.pid === "number" && isPidAlive(status.pid);
 }
 
+// Work still in flight for retention/compaction purposes: a non-terminal run
+// the stale rule has not given up on (mid-creation, before any pid is
+// recorded), or a non-terminal / stale run whose processes are alive — a stale
+// run's provider can outlive its supervisor. A finished run's recorded pids
+// are never probed: pids are reused, and a live stranger would pin it forever.
+export function runInFlight(status: RunStatus): boolean {
+  const unfinished = nonTerminalStates.has(status.state);
+  if (unfinished && !looksStale(status)) return true;
+  return (unfinished || status.state === "stale") && runProcessesAlive(status);
+}
+
 // Everything a run directory says about itself, read once. Every command that
 // walks runs/ (overview, status, list, reap, sweep, fanout --auto, --rework,
 // events tail, trajectory, orch new) projects from this record instead of

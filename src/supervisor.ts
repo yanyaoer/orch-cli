@@ -11,6 +11,7 @@ import { buildWorkerEnv, DRIVER_HANDSHAKE_ENV } from "../drivers/driver-common.t
 import { sandboxPosture } from "../drivers/sandbox.ts";
 import { describeSnapshot, jjWorkspaceRoot, sameSnapshot, vcsHead, vcsKind, vcsSnapshot } from "./vcs.ts";
 import { writeEvidenceManifest } from "./evidence.ts";
+import { compactEvidenceDir, evidenceCompactEnabled } from "./evidence-compact.ts";
 
 function now(): string {
   return new Date().toISOString();
@@ -153,6 +154,13 @@ async function writeEvidence(runDir: string, spec: RunSpec): Promise<void> {
     writeEvidenceManifest(runDir, spec.run_id);
   } catch {
     // diagnostic only
+  }
+  try {
+    // After the manifest (the record of what the run left): gzip large text,
+    // drop rebuildable binaries; ledger in evidence/.orch-compaction.json.
+    if (evidenceCompactEnabled() && existsSync(`${runDir}/evidence`)) compactEvidenceDir(`${runDir}/evidence`, { execute: true });
+  } catch {
+    // best effort: compaction never changes the outcome
   }
   try {
     const baseSha = typeof spec.base_sha === "string" ? spec.base_sha.trim() : "";

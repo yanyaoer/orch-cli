@@ -2,7 +2,7 @@ import pkg from "../package.json";
 import { runSupervisor } from "./supervisor.ts";
 import { scrubGitLocationEnv } from "./git-env.ts";
 
-import { HELP_TOPICS, chatgptBridgeHelp, decisionHelp, eventsTailHelp, evidenceHelp, fanoutHelp, handoffProHelp, mailHelp, mailctlHelp, mirrorHelp, mirrorSyncHelp, newHelp, prewalkHelp, resultCommandHelp, runCancelHelp, runCreateHelp, runHelp, runListHelp, searchHelp, statusHelp, topLevelHelp, topicHelp, trajectoryHelp, unknownTopicHelp, updateHelp, usageHelp, verdictHelp, waitHelp, workspaceHelp, worktreeCloneHelp, worktreeGcHelp, worktreeRemoveHelp, type HelpTopic } from "./help.ts";
+import { HELP_TOPICS, chatgptBridgeHelp, decisionHelp, eventsTailHelp, evidenceHelp, fanoutHelp, handoffProHelp, mailHelp, mailctlHelp, mirrorHelp, mirrorSyncHelp, newHelp, prewalkHelp, resultCommandHelp, runCancelHelp, runCreateHelp, runGcHelp, runHelp, runListHelp, searchHelp, statusHelp, topLevelHelp, topicHelp, trajectoryHelp, unknownTopicHelp, updateHelp, usageHelp, verdictHelp, waitHelp, workspaceHelp, worktreeCloneHelp, worktreeGcHelp, worktreeRemoveHelp, type HelpTopic } from "./help.ts";
 import { runCodexDriver } from "../drivers/codex-headless.ts";
 import { runClaudeDriver } from "../drivers/claude-headless.ts";
 import { awaitSupervisorHandshake } from "../drivers/driver-common.ts";
@@ -11,7 +11,7 @@ import { runOmpDriver } from "../drivers/omp-headless.ts";
 import { mail } from "./mail-cli.ts";
 import { workspace } from "./workspace-cli.ts";
 import { worktreeClone, worktreeGc, worktreeRemove } from "./worktree.ts";
-import { evidenceDirCommand, evidenceListCommand } from "./commands/evidence.ts";
+import { evidenceCompactCommand, evidenceDirCommand, evidenceListCommand } from "./commands/evidence.ts";
 import { CliError, assertKnownFlags, flagBool, flagString, hasHelp, parseArgs, printJson, readStdinText, type ParsedArgs } from "./cli.ts";
 import { insideSandbox, proxyToHost, reconcileDispatchOnce, reconcileDispatchWatch, shouldProxyToHost } from "./dispatch.ts";
 import { prewalkCommand } from "./prewalk.ts";
@@ -23,6 +23,7 @@ import { mailctlCommand } from "./commands/mailctl.ts";
 import { mirrorCommand } from "./commands/mirror.ts";
 import { newCommand } from "./commands/new.ts";
 import { createRun, runCancel, runList, runReap } from "./commands/run.ts";
+import { runGc } from "./commands/run-gc.ts";
 import { searchCommand } from "./commands/search.ts";
 import { overviewCommand, statusCommand, verdictCommand, waitCommand } from "./commands/status.ts";
 import { trajectoryCommand } from "./commands/trajectory.ts";
@@ -130,6 +131,10 @@ async function main(): Promise<number> {
     }
     if (first === "run" && second === "list") {
       process.stdout.write(runListHelp());
+      return 0;
+    }
+    if (first === "run" && second === "gc") {
+      process.stdout.write(runGcHelp());
       return 0;
     }
     if (first === "run" && second === "cancel") {
@@ -244,6 +249,7 @@ async function main(): Promise<number> {
   if (first === "run" && second === "create") return createRun(args);
   if (first === "run" && second === "list") return runList(args);
   if (first === "run" && second === "reap") return runReap(args);
+  if (first === "run" && second === "gc") return runGc(args);
   if (first === "run" && second === "cancel") return runCancel(args);
   if (first === "search") return searchCommand(args);
   if (first === "usage") return usageCommand(args);
@@ -265,6 +271,7 @@ async function main(): Promise<number> {
   if (first === "worktree" && second === "remove") return worktreeRemove(args);
   if (first === "evidence" && second === "dir") return evidenceDirCommand(args);
   if (first === "evidence" && second === "list") return evidenceListCommand(args);
+  if (first === "evidence" && second === "compact") return evidenceCompactCommand(args);
   if (first === "chatgpt-bridge") return chatgptBridge(args);
   if (first === "handoff-pro") return handoffPro(args);
   if (first === "update") return updateCommand(args);

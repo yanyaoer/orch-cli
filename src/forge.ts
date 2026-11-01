@@ -196,3 +196,56 @@ function shellQuote(arg: string): string {
 export function argvForDisplay(argv: string[]): string {
   return argv.map(shellQuote).join(" ");
 }
+
+// Lifecycle of one MR/PR for retention decisions (orch run gc). Fail closed:
+// only an explicit open/merged/closed answer is a state; a 404 is
+// "not_found" (the ref names nothing on this forge), anything else — auth,
+// network, an unparseable answer — is "error" and callers must keep data.
+export interface ForgeMrLifecycle {
+  state: "open" | "merged" | "closed" | "not_found" | "error";
+  // ISO time the MR reached its terminal state; null when open or unknown.
+  terminal_at: string | null;
+  detail: string | null;
+}
+
+function lifecycleFromFields(state: string, mergedAt: unknown, closedAt: unknown, updatedAt: unknown): ForgeMrLifecycle {
+  const pick = (...values: unknown[]): string | null => {
+    for (const value of values) if (typeof value === "string" && value && Number.isFinite(Date.parse(value))) return value;
+    return null;
+  };
+  const normalized = state.toLowerCase();
+  if (normalized === "opened" || normalized === "open" || normalized === "locked") return { state: "open", terminal_at: null, detail: null };
+  if (normalized === "merged") return { state: "merged", terminal_at: pick(mergedAt, closedAt, updatedAt), detail: null };
+  if (normalized === "closed") return { state: "closed", terminal_at: pick(closedAt, updatedAt), detail: null };
+  return { state: "error", terminal_at: null, detail: `unknown state ${JSON.stringify(state)}` };
+}
+
+export async function forgeMrLifecycle(forge: Exclude<ForgeKind, "none">, ref: string, cwd?: string): Promise<ForgeMrLifecycle> {
+  const argv =
+    forge === "gitlab"
+      ? ["glab", "mr", "view", ref, "-F", "json"]
+      : ["gh", "pr", "view", ref, "--json", "state,mergedAt,closedAt,updatedAt"];
+  let result: ForgeCommandResult;
+  try {
+    result = await runArgv(forge, argv, true, cwd);
+  } catch (error) {
+    return { state: "error", terminal_at: null, detail: `${argv[0]}: ${error instanceof Error ? error.message : String(error)}` };
+  }
+  const text = `${result.stdout}\n${result.stderr}`;
+  if (result.exit_code !== 0) {
+    if (/404 Not Found|Could not resolve to a PullRequest|no pull requests? found/i.test(text)) {
+      return { state: "not_found", terminal_at: null, detail: `${argv[0]}: not found` };
+    }
+    return { state: "error", terminal_at: null, detail: `${argv[0]} exit ${result.exit_code}: ${text.trim().split("\n").filter(Boolean).pop() ?? ""}`.slice(0, 300) };
+  }
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(result.stdout) as Record<string, unknown>;
+  } catch {
+    return { state: "error", terminal_at: null, detail: `${argv[0]}: unparseable output` };
+  }
+  if (typeof parsed.state !== "string") return { state: "error", terminal_at: null, detail: `${argv[0]}: no state field` };
+  return forge === "gitlab"
+    ? lifecycleFromFields(parsed.state, parsed.merged_at, parsed.closed_at, parsed.updated_at)
+    : lifecycleFromFields(parsed.state, parsed.mergedAt, parsed.closedAt, parsed.updatedAt);
+}

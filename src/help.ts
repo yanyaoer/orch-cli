@@ -19,6 +19,7 @@ export function topLevelHelp(): string {
     "  orch run create    Start one headless worker run for an MR task",
     "  orch run list      List local runs for an MR",
     "  orch run cancel    Stop a running worker (supervisor finalizes it as failed)",
+    "  orch run gc        Plan (or --execute) retention: delete MR dirs merged/closed >= 30 days, never open MRs",
     "  orch search        Regex-search repo run files and mail event diagnostics",
     "  orch usage         Summarize token usage by run, thread, or day",
     "  orch trajectory    Normalize a run/thread's provider session into role-based records",
@@ -43,6 +44,7 @@ export function topLevelHelp(): string {
     "  orch worktree remove  Remove one clone: loss detection gates it (--force overrides), merged branch tidied",
     "  orch evidence dir  Create/print an MR's control-plane evidence dir (<mr_dir>/evidence/<label>/)",
     "  orch evidence list List an MR's run and control-plane evidence (file counts, bytes, warnings)",
+    "  orch evidence compact Gzip large text and drop rebuildable binaries in stored evidence (plan; --execute)",
     "  orch update        Self-update to the latest GitHub release (--check to only compare)",
     "",
     "[deprecated] commands still run but are slated for removal; see CHANGELOG.md \"Deprecated\".",
@@ -696,6 +698,7 @@ export function evidenceHelp(): string {
     "Usage:",
     "  orch evidence dir --mr <id> --label <label> [--worktree <path>] [--json]",
     "  orch evidence list --mr <id> [--worktree <path>] [--json]",
+    "  orch evidence compact [--mr <id>] [--worktree <path>] [--gzip-min-kb <n>] [--min-file-age-min <n>] [--dry-run | --execute]",
     "",
     "dir creates (mode 0700) and prints <mr_dir>/evidence/<label>/ for evidence the controller produces",
     "itself: merge checks, break-check logs, device evidence, files moved out of an old worktree. The label",
@@ -704,12 +707,24 @@ export function evidenceHelp(): string {
     "list shows every run of the MR that has an evidence/ dir (from its artifacts/evidence-manifest.json, or a",
     "live count while the run is going) and every control-plane label, with file counts, bytes and warnings.",
     "",
+    "compact applies the compaction rules to evidence already on disk (every finished run's evidence dir and",
+    "every control-plane label of one MR, or of every MR in the repo); without --execute it prints the plan.",
+    "Text files (.log .txt .xml .html .htm .json .jsonl .md .csv .out .err .trace .har) of at least",
+    "--gzip-min-kb (default 256) become <file>.gz, deleted only after the .gz decompresses to the original",
+    "sha256; rebuildable build outputs (.apk .aab .aar .jar .dex) are deleted. Each action is recorded in",
+    "<evidence dir>/.orch-compaction.json (path, bytes, sha256); evidence-manifest.json is never rewritten.",
+    "Runs in flight and files written in the last --min-file-age-min minutes (default 10) are skipped;",
+    "symlinks are never followed. The supervisor applies the same rules to a run's evidence when the run",
+    "ends, after writing its manifest (ORCH_EVIDENCE_COMPACT=0 disables that).",
+    "",
     "Run evidence itself needs no command: implementer and verifier runs get <run_dir>/evidence/ and",
     "$ORCH_RUN_EVIDENCE_DIR automatically (orch help concepts).",
     "",
     "Examples:",
     "  orch evidence dir --mr 123 --label merge-check-r2",
     "  orch evidence list --mr 123 --json",
+    "  orch evidence compact | jq .summary   # what compaction would save across the repo",
+    "  orch evidence compact --execute",
   ]);
 }
 
@@ -1242,6 +1257,43 @@ export function fanoutHelp(): string {
   ]);
 }
 
+export function runGcHelp(): string {
+  return lines([
+    "orch run gc: retention for this repo's run state (one MR dir = its runs, their evidence, control-plane evidence, outbox)",
+    "",
+    "Usage:",
+    "  orch run gc [--worktree <path>] [--min-age-days <n>] [--max-age-days <n>] [--concurrency <n>] [--dry-run | --execute]",
+    "",
+    "Flags:",
+    "  --worktree <path>     Repo whose state to collect; defaults to the current directory",
+    "  --min-age-days <n>    A merged/closed MR is deleted once its terminal time and the dir's last write",
+    "                        are both at least this old (default 30)",
+    "  --max-age-days <n>    Age cap for dirs with no forge MR (thread names, 404s, repos without a forge):",
+    "                        deleted once the last write is at least this old (default 180)",
+    "  --concurrency <n>     Parallel forge lookups (default 8)",
+    "  --dry-run             Print the plan only (the default; accepted for explicitness)",
+    "  --execute             Apply the plan",
+    "  --help                Show this help",
+    "",
+    "Behavior:",
+    "  Fail closed. A dir with a run in flight (live supervisor, provider group or pid, or a",
+    "  non-terminal run not yet stale) is kept. An MR the forge reports open is never deleted,",
+    "  however old. A forge lookup that fails (auth, network, unparseable) keeps the dir.",
+    "  The forge ref is the dir's forge_ref file, else a dir name that is a bare number;",
+    "  other names are never guessed into refs. Dirs younger than --min-age-days are kept",
+    "  without a lookup. Lookups use glab / gh from the repo root.",
+    "  --execute re-checks each candidate under its MR lock, keeps it if anything outside",
+    "  locks/ was written after the plan, moves it to <repo_key>/.run-gc-trash/ and deletes it",
+    "  there; trash left by an interrupted --execute is swept by the next --execute.",
+    "  Output is JSON: summary (counts, bytes, by_reason), one row per MR dir, trash.",
+    "",
+    "Examples:",
+    "  orch run gc                                   # plan with the defaults",
+    "  orch run gc --min-age-days 14 | jq .summary  # what a shorter window would reclaim",
+    "  orch run gc --execute",
+  ]);
+}
+
 export function runHelp(): string {
   return lines([
     "orch run commands:",
@@ -1249,11 +1301,13 @@ export function runHelp(): string {
     "  orch run list      List local runs for an MR (dead-pid runs show as 'stale?')",
     "  orch run cancel    Stop a running worker (SIGTERM its process group; supervisor finalizes)",
     "  orch run reap      Persist 'stale' for non-terminal runs whose supervisor pid is gone",
+    "  orch run gc        Retention: print (or --execute) which MR dirs of this repo to delete",
     "",
     "Use:",
     "  orch run create --help",
     "  orch run list --help",
     "  orch run cancel --help",
+    "  orch run gc --help",
     "  orch run reap [--mr <id>] [--worktree <path>]   # omitted --mr reaps across all MRs in this repo",
   ]);
 }
