@@ -466,8 +466,34 @@ function mailTaskRole(event: TaskRequestedMailEvent): RunRole {
   return event.role;
 }
 
-async function runCreateFromMail(argv: string[], worktree: string): Promise<{ stdout: string; stderr: string; exitCode: number }> {
-  const proc = Bun.spawn(argv, { cwd: worktree, stdout: "pipe", stderr: "pipe" });
+// Environment for the run create child of one mail agent: claude agents may pin
+// an account (config dir); everything else inherits the caller's environment.
+export function mailAgentRunEnv(agent: MailAgentDefinition, base: NodeJS.ProcessEnv = process.env): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(base)) if (value !== undefined) env[key] = value;
+  const dir = agent.claude_config_dir;
+  if (dir === undefined || dir === null || dir === "") return env;
+  if (agent.provider !== "claude") {
+    throw new CliError(`mail agent ${agent.id}: claude_config_dir is only valid for provider claude (got ${agent.provider})`);
+  }
+  if (dir === "default") delete env.CLAUDE_CONFIG_DIR;
+  else env.CLAUDE_CONFIG_DIR = dir.startsWith("~/") ? `${base.HOME ?? ""}${dir.slice(1)}` : dir;
+  return env;
+}
+
+function mailAgentModel(agent: MailAgentDefinition): string | null {
+  const model = agent.model;
+  if (model === undefined || model === null) return null;
+  if (typeof model !== "string" || model.trim() === "") throw new CliError(`mail agent ${agent.id}: model must be a non-empty string`);
+  return model;
+}
+
+async function runCreateFromMail(
+  argv: string[],
+  worktree: string,
+  env?: Record<string, string>,
+): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  const proc = Bun.spawn(argv, { cwd: worktree, stdout: "pipe", stderr: "pipe", ...(env ? { env } : {}) });
   const [stdout, stderr, exitCode] = await Promise.all([
     new Response(proc.stdout).text(),
     new Response(proc.stderr).text(),
@@ -538,10 +564,12 @@ async function claimMailTasks(
         "--json",
       ];
       if (args.flags.has("timeout-sec")) argv.push("--timeout-sec", flagString(args, "timeout-sec"));
-      if (args.flags.has("model")) argv.push("--model", flagString(args, "model"));
+      // An explicit --model applies to every target; otherwise each agent's own model.
+      const model = args.flags.has("model") ? flagString(args, "model") : mailAgentModel(agent);
+      if (model) argv.push("--model", model);
       if (dryRun) argv.push("--dry-run");
       if (flagBool(args, "allow-dirty")) argv.push("--allow-dirty");
-      const run = await runCreateFromMail(argv, worktree);
+      const run = await runCreateFromMail(argv, worktree, mailAgentRunEnv(agent));
       if (run.exitCode !== 0) {
         throw new CliError(run.stderr.trim() || run.stdout.trim() || "mail claim failed to start run");
       }
@@ -842,7 +870,12 @@ export async function mailFanout(args: ParsedArgs, context: MailCliContext, opts
         role,
         worktree,
         dry_run: true,
-        agents: agents.map((agent) => ({ agent_id: agent.id, provider: agent.provider })),
+        agents: agents.map((agent) => ({
+          agent_id: agent.id,
+          provider: agent.provider,
+          model: args.flags.has("model") ? flagString(args, "model") : (agent.model ?? null),
+          ...(agent.claude_config_dir ? { claude_config_dir: agent.claude_config_dir } : {}),
+        })),
       },
     };
   }
@@ -968,8 +1001,13 @@ export async function mail(args: ParsedArgs, context: MailCliContext): Promise<n
         auto_invite: flagBool(args, "auto-invite"),
         work_mode: flagString(args, "work-mode", roles[0]!),
         provider_session_mode: sessionMode,
+        ...(args.flags.has("model") ? { model: flagString(args, "model") } : {}),
+        ...(args.flags.has("claude-config-dir") ? { claude_config_dir: flagString(args, "claude-config-dir") } : {}),
         updated_at: new Date().toISOString(),
       });
+      if (cfg.agents[id]!.claude_config_dir && provider !== "claude") {
+        throw new CliError("--claude-config-dir is only valid with --provider claude");
+      }
       writeMailAgentsConfig(cfg);
       printJson({ mail: "agent-bound", config_path: mailAgentsConfigPath(), agent: cfg.agents[id] });
       return 0;

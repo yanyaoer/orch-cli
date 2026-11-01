@@ -782,7 +782,7 @@ export function mailHelp(): string {
     "",
     "Usage:",
     "  orch mail agent defaults",
-    "  orch mail agent bind --id <id> --address <addr> --provider <name> --role <role> [--work-mode <mode>] [--session-mode <mode>] [--auto-invite]",
+    "  orch mail agent bind --id <id> --address <addr> --provider <name> --role <role> [--work-mode <mode>] [--session-mode <mode>] [--model <ref>] [--claude-config-dir <dir|default>] [--auto-invite]",
     "  orch mail agent list",
     "  orch mail submit --thread <id> [--mr <id>] --workspace <id> --task <file>",
     "  orch mail route --thread <id> [--worktree <path>]",

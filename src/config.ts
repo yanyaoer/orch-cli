@@ -90,6 +90,15 @@ export interface MailAgentDefinition {
   auto_invite: boolean;
   work_mode: string;
   provider_session_mode: "ephemeral" | "fresh_persistent" | "resume_exact";
+  // Optional per-agent provider model ref (written in the provider's own
+  // format, e.g. "opus" or "mify-response/ppio/pa/gpt-6-astra"): fan-out and
+  // claim pass it as run create --model unless the command line sets --model.
+  // Lets one roster hold several agents of the same provider on different models.
+  model?: string | null;
+  // claude only: config dir (account/profile) the run uses as CLAUDE_CONFIG_DIR.
+  // "default" runs with CLAUDE_CONFIG_DIR unset (the keychain login of ~/.claude);
+  // absent = inherit the caller's environment.
+  claude_config_dir?: string | null;
   updated_at: string;
 }
 

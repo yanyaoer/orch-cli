@@ -640,6 +640,58 @@ test("fanout forwards --model to spawned runs and honors --to-agent override", a
   expect(spec.role).toBe("verifier");
 });
 
+test("cross-review uses each mail agent's own model and claude config dir; --model still overrides", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orch-fanout-agent-model-"));
+  const stateHome = join(root, "state");
+  const configHome = join(root, "config");
+  const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
+  const remote = "git@github.com:example/repo.git";
+  await initRepo(worktree, remote);
+  const env = { XDG_STATE_HOME: stateHome, XDG_CONFIG_HOME: configHome, ORCH_DRIVER_FAKE_RESULT: "1" };
+  const taskPath = join(root, "review.md");
+  writeFileSync(taskPath, "Review the change.\n", "utf8");
+  const bind = (id: string, provider: string, extra: string[]) =>
+    runOrch(["mail", "agent", "bind", "--id", id, "--address", `orch+${id}@local.orch`, "--provider", provider,
+      "--role", "reviewer", "--session-mode", "ephemeral", ...extra], env);
+  expect(await bind("pi-astra-reviewer", "pi", ["--model", "mify-response/ppio/pa/gpt-6-astra"])).toMatchObject({ exitCode: 0 });
+  expect(await bind("claude-mify-reviewer", "claude", ["--model", "opus", "--claude-config-dir", join(root, "mify")])).toMatchObject({ exitCode: 0 });
+  const bad = await bind("pi-bad", "pi", ["--claude-config-dir", "/x"]);
+  expect(bad.exitCode).toBe(1);
+  expect(bad.stderr).toContain("--claude-config-dir is only valid with --provider claude");
+
+  const dry = await runOrch(["cross-review", "--thread", "xr-plan", "--to-agent", "pi-astra-reviewer", "--to-agent",
+    "claude-mify-reviewer", "--task", taskPath, "--worktree", worktree, "--dry-run"], env);
+  expect(dry).toMatchObject({ exitCode: 0, stderr: "" });
+  expect(JSON.parse(dry.stdout).agents).toEqual([
+    { agent_id: "pi-astra-reviewer", provider: "pi", model: "mify-response/ppio/pa/gpt-6-astra" },
+    { agent_id: "claude-mify-reviewer", provider: "claude", model: "opus", claude_config_dir: join(root, "mify") },
+  ]);
+
+  const specOf = (thread: string, run: { run_id: string }) =>
+    JSON.parse(readFileSync(join(stateHome, "orch", repoKeyFromRemote(remote, worktree), "mrs", thread, "runs", run.run_id, "spec.json"), "utf8")) as { model: string | null; agent: string };
+  const fan = await runOrch(["cross-review", "--thread", "xr-1", "--to-agent", "pi-astra-reviewer", "--task", taskPath, "--worktree", worktree], env);
+  expect(fan).toMatchObject({ exitCode: 0, stderr: "" });
+  const runs = (JSON.parse(fan.stdout) as { runs: Array<{ run: { run_id: string } }> }).runs;
+  expect(specOf("xr-1", runs[0]!.run)).toMatchObject({ agent: "pi", model: "mify-response/ppio/pa/gpt-6-astra" });
+
+  const over = await runOrch(["cross-review", "--thread", "xr-2", "--to-agent", "pi-astra-reviewer", "--model", "other/model",
+    "--task", taskPath, "--worktree", worktree], env);
+  expect(over).toMatchObject({ exitCode: 0, stderr: "" });
+  const overRuns = (JSON.parse(over.stdout) as { runs: Array<{ run: { run_id: string } }> }).runs;
+  expect(specOf("xr-2", overRuns[0]!.run).model).toBe("other/model");
+});
+
+test("mailAgentRunEnv pins, clears or inherits CLAUDE_CONFIG_DIR", async () => {
+  const { mailAgentRunEnv } = await import("./mail-cli.ts");
+  const base = { HOME: "/h", CLAUDE_CONFIG_DIR: "/h/.claude-work", PATH: "/bin" };
+  const agent = { id: "a", address: "a@x", provider: "claude", roles: ["reviewer"], capabilities: [], trust: "internal" as const,
+    auto_invite: false, work_mode: "review", provider_session_mode: "ephemeral" as const, updated_at: "" };
+  expect(mailAgentRunEnv(agent, base).CLAUDE_CONFIG_DIR).toBe("/h/.claude-work");
+  expect(mailAgentRunEnv({ ...agent, claude_config_dir: "~/.claude-mify" }, base).CLAUDE_CONFIG_DIR).toBe("/h/.claude-mify");
+  expect("CLAUDE_CONFIG_DIR" in mailAgentRunEnv({ ...agent, claude_config_dir: "default" }, base)).toBe(false);
+  expect(() => mailAgentRunEnv({ ...agent, provider: "pi", claude_config_dir: "/x" }, base)).toThrow("only valid for provider claude");
+});
+
 test("investigate defaults to omp+claude researchers and rejects unknown flags", async () => {
   const root = mkdtempSync(join(tmpdir(), "orch-investigate-"));
   const stateHome = join(root, "state");
