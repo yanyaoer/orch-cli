@@ -2003,3 +2003,10 @@ test("pi thinking is medium for implementer/verifier and high for reviewer", () 
   const r = buildProviderArgv("pi", spec("reviewer", "pi-reviewer"), "/run", "/worktree");
   expect(r[r.indexOf("--thinking") + 1]).toBe("high");
 });
+
+test("pi deepseek keeps high thinking even for medium roles", () => {
+  const a = buildProviderArgv("pi", { ...spec("verifier", "pi-ds"), model: "mify-response/deepseek/deepseek-flash" }, "/run", "/worktree");
+  expect(a[a.indexOf("--thinking") + 1]).toBe("high");
+  const g = buildProviderArgv("pi", { ...spec("verifier", "pi-g"), model: "magpie/antigravity/gemini-4-argon" }, "/run", "/worktree");
+  expect(g[g.indexOf("--thinking") + 1]).toBe("medium");
+});

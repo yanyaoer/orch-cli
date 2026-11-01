@@ -227,6 +227,12 @@ const PI_ROLE_THINKING: Partial<Record<RunSpec["role"], string>> = {
   implementer: "medium",
   verifier: "medium",
 };
+// deepseek only reasons at high and above, so a medium role default would make
+// it a non-reasoning worker; it keeps high (user 2026-11-02).
+function piThinking(spec: RunSpec, model: string): string {
+  const level = PI_ROLE_THINKING[spec.role] ?? PI_THINKING;
+  return /deepseek/i.test(model) && level !== "xhigh" && level !== "max" ? "high" : level;
+}
 
 export function ompModelChain(model: string | null | undefined): { primary: string; fallbacks: string[] } {
   const primary = model ?? OMP_MODEL_CHAIN[0]!;
@@ -459,7 +465,8 @@ function providerArgv(
     return argv;
   }
 
-  const argv = ["pi", "--model", spec.model ?? PI_DEFAULT_MODEL, "--thinking", PI_ROLE_THINKING[spec.role] ?? PI_THINKING];
+  const piModel = spec.model ?? PI_DEFAULT_MODEL;
+  const argv = ["pi", "--model", piModel, "--thinking", piThinking(spec, piModel)];
   argv.push("-p", "--mode", "json");
   if (readOnly) argv.push("--tools", "read,grep,find,ls");
   if (spec.provider_session_mode === "ephemeral") {
