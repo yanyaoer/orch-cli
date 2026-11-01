@@ -89,7 +89,7 @@ test("apiResumeVerdict: transient API errors resume; limits, auth and other erro
     "API Error: 529 Overloaded",
     "API Error: Request timed out.",
   ]) expect({ text, v: apiResumeVerdict(seg(init, errorResult(text))).resumable }).toEqual({ text, v: true });
-  for (const [text, reason] of [
+  for (const [text, reason] of <[string, string][]>[
     ["You've hit your weekly limit · resets Nov 4 at 10am (Asia/Singapore)", "not_transient"],
     ["You've reached your Fable limit. Switch to another model, or wait.", "not_transient"],
     ["Not logged in · Please run /login", "not_transient"],
