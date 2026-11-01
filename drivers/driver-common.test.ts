@@ -893,7 +893,9 @@ test("engine none: plan argv matches buildProviderArgv, native sandboxes stay on
       spec: base,
       runDir: "/run",
       worktree: "/worktree",
-      env: { PATH: "/usr/bin", HOME: "/home/orch" },
+      // -p: buildProviderArgv is the -p argv; the TUI argv derived from it is
+      // pinned in claude-tui.test.ts.
+      env: { PATH: "/usr/bin", HOME: "/home/orch", ORCH_CLAUDE_MODE: "print" },
     });
     expect(plan.argv).toEqual(buildProviderArgv(provider, base, "/run", "/worktree"));
     expect(plan.sandboxEngine).toBe("none");

@@ -376,7 +376,7 @@ test("mail control notify.to must be a single lower-cased bare address", () => {
 });
 
 test("validateOrchConfig warns on ignored keys/values and rejects wrong types", () => {
-  const known = "version, workspaces, defaults, language, sandbox, sandbox_write_dirs";
+  const known = "version, workspaces, defaults, language, sandbox, sandbox_write_dirs, claude";
   expect(validateOrchConfig({ version: 1, workspaces: {}, sandbox_wirte_dirs: ["/x"] }).warnings).toEqual([
     `unknown key sandbox_wirte_dirs is ignored (known: ${known})`,
   ]);
