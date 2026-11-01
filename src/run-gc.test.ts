@@ -1,10 +1,23 @@
-import { expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { afterAll, expect, test } from "bun:test";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, statSync, utimesSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { deletePlanned, planMrDir, type RunGcOptions } from "./commands/run-gc.ts";
 import type { ForgeMrLifecycle } from "./forge.ts";
 import { repoKeyFromRemote } from "./paths.ts";
+
+// Every temp root this file makes is removed after the file's tests (the race
+// test alone leaves a 32 MiB file per run otherwise).
+const tempRoots: string[] = [];
+function tempRoot(prefix: string): string {
+  const dir = mkdtempSync(prefix);
+  tempRoots.push(dir);
+  return dir;
+}
+afterAll(() => {
+  for (const dir of tempRoots) rmSync(dir, { recursive: true, force: true });
+});
+
 
 const DAY = 24 * 60 * 60 * 1000;
 const NOW = Date.parse("2026-11-01T00:00:00Z");
@@ -56,7 +69,7 @@ function options(states: Record<string, ForgeMrLifecycle>, calls: string[] = [],
 const merged = (daysAgo: number): ForgeMrLifecycle => ({ state: "merged", terminal_at: new Date(NOW - daysAgo * DAY).toISOString(), detail: null });
 
 test("run gc plan: open MRs are never deleted, terminal MRs only after the window, lookups fail closed", async () => {
-  const root = mkdtempSync(join(tmpdir(), "orch-run-gc-plan-"));
+  const root = tempRoot(join(tmpdir(), "orch-run-gc-plan-"));
   mrDir(root, "1", { daysAgo: 400 }); // open, ancient
   mrDir(root, "2", { daysAgo: 100 }); // merged 100d, idle 100d
   mrDir(root, "3", { daysAgo: 10 }); // merged long ago but written 10d ago
@@ -107,7 +120,7 @@ test("run gc plan: open MRs are never deleted, terminal MRs only after the windo
 });
 
 test("run gc plan: a run in flight keeps the whole dir, a dead non-terminal run does not", async () => {
-  const root = mkdtempSync(join(tmpdir(), "orch-run-gc-active-"));
+  const root = tempRoot(join(tmpdir(), "orch-run-gc-active-"));
   mrDir(root, "10", { daysAgo: 400, state: "running", pid: process.pid });
   mrDir(root, "11", { daysAgo: 400, state: "running", pid: 2 ** 22 + 12345 }); // pid gone: stale
   // A finished run whose recorded pid now belongs to another process (pid reuse).
@@ -122,7 +135,7 @@ test("run gc plan: a run in flight keeps the whole dir, a dead non-terminal run 
 });
 
 test("run gc plan: a repo without a forge falls back to the age cap only", async () => {
-  const root = mkdtempSync(join(tmpdir(), "orch-run-gc-noforge-"));
+  const root = tempRoot(join(tmpdir(), "orch-run-gc-noforge-"));
   mrDir(root, "12", { daysAgo: 200 });
   mrDir(root, "13", { daysAgo: 100 });
   const calls: string[] = [];
@@ -133,7 +146,7 @@ test("run gc plan: a repo without a forge falls back to the age cap only", async
 });
 
 test("run gc execute: a dir written after the plan is kept", async () => {
-  const repoRoot = mkdtempSync(join(tmpdir(), "orch-run-gc-race-"));
+  const repoRoot = tempRoot(join(tmpdir(), "orch-run-gc-race-"));
   const mrsRoot = join(repoRoot, "mrs");
   const now = Date.now();
   mrDir(mrsRoot, "20", { daysAgo: 200, now });
@@ -161,7 +174,7 @@ async function sh(argv: string[], cwd: string, env: Record<string, string> = {})
 }
 
 test("orch run gc end to end: plan deletes nothing, --execute deletes exactly the plan via a fake glab", async () => {
-  const root = realpathSync(mkdtempSync(join(tmpdir(), "orch-run-gc-e2e-")));
+  const root = realpathSync(tempRoot(join(tmpdir(), "orch-run-gc-e2e-")));
   const worktree = join(root, "repo");
   mkdirSync(worktree);
   const remote = "git@git.example.com:grp/proj.git";

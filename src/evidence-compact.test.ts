@@ -1,5 +1,5 @@
-import { expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { afterAll, expect, test } from "bun:test";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, statSync, symlinkSync, utimesSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
@@ -7,11 +7,24 @@ import { gunzipSync } from "node:zlib";
 import { COMPACTION_LEDGER, compactEvidenceDir, compactionTestHooks, readCompactionLedger } from "./evidence-compact.ts";
 import { repoKeyFromRemote } from "./paths.ts";
 
+// Every temp root this file makes is removed after the file's tests (the race
+// test alone leaves a 32 MiB file per run otherwise).
+const tempRoots: string[] = [];
+function tempRoot(prefix: string): string {
+  const dir = mkdtempSync(prefix);
+  tempRoots.push(dir);
+  return dir;
+}
+afterAll(() => {
+  for (const dir of tempRoots) rmSync(dir, { recursive: true, force: true });
+});
+
+
 const sha = (data: Buffer | string) => createHash("sha256").update(data).digest("hex");
 const big = (n: number) => "log line with some repetition 0123456789\n".repeat(Math.ceil(n / 42)).slice(0, n);
 
 function evidenceFixture(): { dir: string; outside: string } {
-  const root = realpathSync(mkdtempSync(join(tmpdir(), "orch-compact-")));
+  const root = realpathSync(tempRoot(join(tmpdir(), "orch-compact-")));
   const dir = join(root, "evidence");
   mkdirSync(join(dir, "device", "dumps"), { recursive: true });
   writeFileSync(join(dir, "full.log"), big(400 * 1024));
@@ -85,7 +98,7 @@ async function sh(argv: string[], cwd: string, env: Record<string, string> = {})
 }
 
 test("orch evidence compact: finished runs and control labels only; runs in flight are skipped", async () => {
-  const root = realpathSync(mkdtempSync(join(tmpdir(), "orch-compact-cli-")));
+  const root = realpathSync(tempRoot(join(tmpdir(), "orch-compact-cli-")));
   const worktree = join(root, "repo");
   mkdirSync(worktree);
   const remote = "git@git.example.com:grp/proj.git";
@@ -129,7 +142,7 @@ test("evidence compact keeps an original that a writer keeps changing (no data l
   // A child compacts a 32 MiB log while this process rewrites bytes in place
   // every millisecond (verify-run-gc-r3 scenario ix). Whatever the interleaving,
   // the original must survive unless the .gz holds exactly its final content.
-  const root = realpathSync(mkdtempSync(join(tmpdir(), "orch-compact-race-")));
+  const root = realpathSync(tempRoot(join(tmpdir(), "orch-compact-race-")));
   const dir = join(root, "evidence");
   mkdirSync(dir);
   const path = join(dir, "x.log");
