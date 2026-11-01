@@ -164,6 +164,8 @@ export async function awaitSupervisorHandshake(): Promise<boolean> {
   return received.split("\n")[0] === "go";
 }
 
+export const DEFAULT_CLAUDE_MAX_RETRIES = 30;
+
 export function buildWorkerEnv(baseEnv: NodeJS.ProcessEnv = process.env): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [key, value] of Object.entries(baseEnv)) {
@@ -183,6 +185,12 @@ export function buildWorkerEnv(baseEnv: NodeJS.ProcessEnv = process.env): Record
   // $SHELL breaks providers whose shell tooling follows it (codex hooks do;
   // claude pins zsh, codex exec rejects fish, pi/omp pin /bin/bash).
   if (env.SHELL?.endsWith("fish")) env.SHELL = "/bin/bash";
+  // Long headless runs ride out minutes of proxy/network flaps inside claude's
+  // own request retry (default 10 attempts ends a run after ~1 min of
+  // ECONNRESET; 2026-11-01 three replays died that way). An explicit value wins.
+  if (env.CLAUDE_CODE_MAX_RETRIES === undefined || env.CLAUDE_CODE_MAX_RETRIES === "") {
+    env.CLAUDE_CODE_MAX_RETRIES = String(DEFAULT_CLAUDE_MAX_RETRIES);
+  }
   // bun prepends node_modules/.bin dirs (walking up from cwd, including
   // ~/node_modules/.bin) to spawned PATH; a stale provider CLI there (e.g. an
   // accidental old claude in $HOME) then shadows the real one. Provider
@@ -1640,6 +1648,151 @@ function buildProviderExecutionPlanBase(ctx: ExecutionContext): ProviderExecutio
   };
 }
 
+// ---- In-run resume after a transient API error (claude only) ----
+// A claude run that ends on a network/overload API error after its own request
+// retries is not a failed task: the session is persisted (fresh_persistent /
+// resume_exact) and the worktree still holds the work. The driver resumes the
+// same session inside the same run — same run id, lock, evidence dir and
+// timeout — with one "continue" message, instead of the controller rerunning
+// from zero (2026-11-01: three ~100-call replays lost $22.7 that way).
+// Usage limits are not transient: loopx/the controller resume those after the
+// reset (`orch run create --resume-from`). ORCH_API_RESUME_MAX=0 disables.
+export const API_RESUME_MAX_DEFAULT = 5;
+export const API_RESUME_DELAY_SEC_DEFAULT = 60;
+const API_RESUME_TRANSIENT =
+  /ECONNRESET|Connection dropped|Connection error|Can't reach the API|socket hang up|ETIMEDOUT|timed out|terminated|overloaded|\(429\)|Too many requests|API Error:?\s*\(?5\d\d\b|\(5\d\d\)/i;
+const API_RESUME_NOT_TRANSIENT = /hit your .*limit|usage limit|Fable limit|Not logged in|prompt is too long|credit balance/i;
+const SESSION_LOST = /No conversation found with session ID/;
+
+export const API_RESUME_PROMPT = [
+  "Continue. Your previous turn in this session was cut off by an API/network error; the session and every change in the worktree are intact.",
+  "Pick up exactly where you stopped: check the worktree state if you need to, do not redo steps you already completed,",
+  "and finish the original task, ending with the final answer it requires.",
+].join(" ");
+
+export interface ApiResumeVerdict {
+  resumable: boolean;
+  // the API error text of the segment's terminal result (null: none)
+  error: string | null;
+  // why not resumable: "no_error" | "not_transient" | "session_lost" | "no_result"
+  reason: string | null;
+  num_turns: number | null;
+  cost_usd: number | null;
+}
+
+// Classifies one provider segment's native output (the bytes it appended).
+export function apiResumeVerdict(segment: string): ApiResumeVerdict {
+  let last: Record<string, any> | null = null;
+  for (const line of segment.split(/\r?\n/)) {
+    if (!line.includes('"result"')) continue;
+    try {
+      const obj = JSON.parse(line);
+      if (obj && obj.type === "result") last = obj;
+    } catch {
+      // partial or non-JSON line: not a terminal envelope
+    }
+  }
+  const base = {
+    num_turns: typeof last?.num_turns === "number" ? last.num_turns : null,
+    cost_usd: typeof last?.total_cost_usd === "number" ? last.total_cost_usd : null,
+  };
+  if (SESSION_LOST.test(segment)) return { resumable: false, error: SESSION_LOST.exec(segment)![0], reason: "session_lost", ...base };
+  if (!last) return { resumable: false, error: null, reason: "no_result", ...base };
+  if (last.is_error !== true) return { resumable: false, error: null, reason: "no_error", ...base };
+  const text = typeof last.result === "string" ? last.result : Array.isArray(last.errors) ? last.errors.join("; ") : "";
+  const error = text.slice(0, 300) || null;
+  if (!/^\s*API Error\b/.test(text) || API_RESUME_NOT_TRANSIENT.test(text) || !API_RESUME_TRANSIENT.test(text)) {
+    return { resumable: false, error, reason: "not_transient", ...base };
+  }
+  return { resumable: true, error, reason: null, ...base };
+}
+
+function envInt(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const value = Number(raw);
+  return Number.isFinite(value) && value >= 0 ? Math.floor(value) : fallback;
+}
+
+function readFrom(path: string, offset: number): string {
+  if (!existsSync(path)) return "";
+  const buffer = readFileSync(path);
+  return buffer.subarray(Math.min(offset, buffer.length)).toString("utf8");
+}
+
+function fileSize(path: string): number {
+  return existsSync(path) ? readFileSync(path).length : 0;
+}
+
+// Runs after the first provider exit; returns the exit code of the last segment.
+async function resumeOnApiError(input: {
+  provider: AgentName;
+  spec: RunSpec;
+  runDir: string;
+  worktree: string;
+  firstSegmentStart: number;
+  firstCode: number;
+}): Promise<number> {
+  const { provider, spec, runDir, worktree } = input;
+  let code = input.firstCode;
+  if (provider !== "claude" || spec.provider_session_mode === "ephemeral") return code;
+  const max = envInt("ORCH_API_RESUME_MAX", API_RESUME_MAX_DEFAULT);
+  const delaySec = envInt("ORCH_API_RESUME_DELAY_SEC", API_RESUME_DELAY_SEC_DEFAULT);
+  const nativePath = `${runDir}/native.jsonl`;
+  let segmentStart = input.firstSegmentStart;
+  for (let attempt = 1; ; attempt++) {
+    const verdict = apiResumeVerdict(readFrom(nativePath, segmentStart));
+    if (!verdict.resumable) {
+      // Only a stop that follows a resume (or a lost session) is worth a record;
+      // a run that simply succeeded or failed for another reason stays as-is.
+      if (attempt > 1 || verdict.reason === "session_lost") {
+        appendDriverEvent(runDir, { type: "api_resume_stopped", attempt: attempt - 1, reason: verdict.reason, error: verdict.error, exit_code: code });
+      }
+      return code;
+    }
+    if (attempt > max) {
+      appendDriverEvent(runDir, { type: "api_resume_stopped", attempt: attempt - 1, reason: max === 0 ? "disabled" : "max_attempts", error: verdict.error, exit_code: code });
+      return code;
+    }
+    const sessionId =
+      (spec.provider_session_mode === "resume_exact" ? spec.provider_session_id : null) ??
+      normalizeNativeText(readFileSync(nativePath, "utf8")).find((event) => event.kind === "session")?.session_id ??
+      null;
+    if (!sessionId) {
+      appendDriverEvent(runDir, { type: "api_resume_stopped", attempt: attempt - 1, reason: "no_session_id", error: verdict.error, exit_code: code });
+      return code;
+    }
+    appendDriverEvent(runDir, {
+      type: "api_resume",
+      attempt,
+      max,
+      delay_sec: delaySec,
+      session_id: sessionId,
+      error: verdict.error,
+      prev_exit_code: code,
+      prev_num_turns: verdict.num_turns,
+      prev_cost_usd: verdict.cost_usd,
+    });
+    process.stderr.write(`orch: claude ended on a transient API error (${verdict.error}); resuming session ${sessionId} in ${delaySec}s (attempt ${attempt}/${max})\n`);
+    await sleep(delaySec * 1000);
+    const resumeSpec: RunSpec = { ...spec, provider_session_mode: "resume_exact", provider_session_id: sessionId, provider_session_name: null };
+    let plan: ProviderExecutionPlan;
+    try {
+      plan = buildProviderExecutionPlan({ provider, spec: resumeSpec, runDir, worktree, prompt: API_RESUME_PROMPT });
+    } catch (error) {
+      appendDriverEvent(runDir, { type: "api_resume_stopped", attempt, reason: "plan_failed", error: error instanceof Error ? error.message : String(error), exit_code: code });
+      return code;
+    }
+    segmentStart = fileSize(nativePath);
+    appendFileSync(nativePath, `${JSON.stringify({ type: "orch_api_resume", attempt, session_id: sessionId, error: verdict.error })}\n`, "utf8");
+    appendDriverEvent(runDir, { type: "phase", phase: "provider_start", wait_reason: "provider_process", api_resume_attempt: attempt });
+    // spawnProvider runs the TUI or -p plan (and its own -p fallback) and
+    // appends this segment after the marker; segmentStart is taken before it.
+    code = await spawnProvider({ provider, plan, prompt: API_RESUME_PROMPT, spec: resumeSpec, runDir, worktree, nativePath, nativeMode: "a" });
+    appendDriverEvent(runDir, { type: "phase", phase: "provider_end", exit_code: code, api_resume_attempt: attempt });
+  }
+}
+
 export async function runProviderDriver(provider: AgentName, argv: string[]): Promise<number> {
   const args = parseDriverArgs(argv);
   const spec = readSpec(args.specPath);
@@ -1684,7 +1837,7 @@ export async function runProviderDriver(provider: AgentName, argv: string[]): Pr
     evidence_dir: plan.evidenceDir,
   });
   appendDriverEvent(args.runDir, { type: "phase", phase: "provider_start", wait_reason: "provider_process" });
-  const code = await spawnProvider({
+  const firstCode = await spawnProvider({
     provider,
     plan,
     prompt,
@@ -1694,7 +1847,8 @@ export async function runProviderDriver(provider: AgentName, argv: string[]): Pr
     nativePath: `${args.runDir}/native.jsonl`,
     nativeMode: "w",
   });
-  appendDriverEvent(args.runDir, { type: "phase", phase: "provider_end", exit_code: code });
+  appendDriverEvent(args.runDir, { type: "phase", phase: "provider_end", exit_code: firstCode });
+  const code = await resumeOnApiError({ provider, spec, runDir: args.runDir, worktree: args.worktree, firstSegmentStart: 0, firstCode });
   writeExitCode(args.runDir, code);
 
   appendDriverEvent(args.runDir, { type: "phase", phase: "result_validation" });
