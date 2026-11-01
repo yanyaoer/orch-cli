@@ -284,12 +284,18 @@ export function flatScreen(raw: string): string {
 
 export type ScreenState = "trust_no" | "trust_yes" | "sign_in" | "other";
 
-// Claude Code asks for a tool's permission ("Do you want to proceed?",
-// "Do you want to make this edit to …?") with numbered choices, "1. Yes"
-// first, and "Esc to cancel".
+// Claude Code asks for a tool's permission with a numbered choice list, the
+// selection on "1.", and "Esc to cancel" under it: "Do you want to
+// proceed?", "Do you want to make this edit to …?", "Allow this read outside
+// the working directories?" (2.1.316, a plan-mode Read of a persisted tool
+// output), and wordings to come. The question itself is not matched, only
+// the shape of the choice list.
 export function permissionQuestion(flat: string): boolean {
-  const ask = flat.lastIndexOf("Doyouwantto");
-  return ask >= 0 && /❯1\.Yes/.test(flat.slice(ask)) && flat.indexOf("Esctocancel", ask) >= 0;
+  const esc = flat.lastIndexOf("Esctocancel");
+  if (esc < 0) return false;
+  const before = flat.slice(Math.max(0, esc - 4000), esc);
+  const choice = before.lastIndexOf("❯1.");
+  return choice >= 0 && /\?/.test(before.slice(0, choice));
 }
 
 // What a permission question is answered with: -p has nobody to ask either,

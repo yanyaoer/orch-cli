@@ -228,6 +228,8 @@ test("screen: a tool permission question is told from the prompt", () => {
   const real = "touch created-by-test.txt\x1b[3;1HDo you want to proceed?\x1b[4;1H❯ 1. Yes\x1b[5;1H  2. Yes, and always allow access to /x from this project\x1b[6;1H  4. No\x1b[8;1HEsc to cancel · Tab to amend";
   expect(permissionQuestion(flatScreen(real))).toBe(true);
   expect(permissionQuestion(flatScreen("Do you want to make this edit to a.ts?\n❯ 1. Yes\n  2. No\nEsc to cancel"))).toBe(true);
+  // 2.1.316's read-outside-the-working-directories question (flattened from a real run).
+  expect(permissionQuestion("Toundo,removepermissions.blockReadsOutsideWorkingDirectoriesfromyourusersettings.Allowthisreadoutsidetheworkingdirectories?❯1.Yes,andkeepallowinganyreadsoutsidetheworkingdirectories2.No,andblockreadsoutsidetheworkingdirectoriesfromnowon3.No,andaskagainnexttime4.Yes,butaskagainnexttimeEsctocancel·Tabtoamend")).toBe(true);
   expect(permissionQuestion(flatScreen("❯ Do you want to know more? Esc to cancel"))).toBe(false);
   expect(permissionQuestion(flatScreen("╭─╮ ❯ "))).toBe(false);
 });
