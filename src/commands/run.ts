@@ -403,6 +403,9 @@ function providerPlanPayload(plan: ProviderExecutionPlan, cwd: string) {
     sandbox_profile_sha256: plan.profileSha256,
     provider_native_sandbox: plan.providerNativeSandbox,
     evidence_dir: plan.evidenceDir,
+    claude_mode: plan.claude?.mode ?? null,
+    claude_mode_why: plan.claude?.why ?? null,
+    claude_entrypoint: plan.claude?.entrypoint ?? null,
   };
 }
 
@@ -602,11 +605,16 @@ export async function createRun(args: ParsedArgs): Promise<number> {
         const plan = payload.provider_plan;
         // The multi-line SBPL profile would drown the text view; stand in its
         // hash (the JSON payload carries the full argv).
-        const argv =
+        let argv =
           plan.argv[0] === "/usr/bin/sandbox-exec" && plan.argv[1] === "-p"
             ? [plan.argv[0], plan.argv[1], `<sbpl sha256=${plan.sandbox_profile_sha256}>`, ...plan.argv.slice(3)]
             : plan.argv;
+        // A claude TUI run's prompt is its last argument, after `--`.
+        if (plan.claude_mode === "tui" && argv.at(-2) === "--") {
+          argv = [...argv.slice(0, -1), `<prompt ${Buffer.byteLength(argv.at(-1) ?? "", "utf8")} bytes>`];
+        }
         lines.push(`provider: ${argv.join(" ")}`);
+        if (plan.claude_mode) lines.push(`claude_mode: ${plan.claude_mode}${plan.claude_mode_why ? ` (${plan.claude_mode_why})` : ""}`);
         lines.push(`sandbox: ${plan.sandbox_engine}/${plan.sandbox_posture}`);
         lines.push(`evidence_dir: ${plan.evidence_dir ?? "none"}`);
       }

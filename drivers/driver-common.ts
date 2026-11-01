@@ -7,6 +7,8 @@ import { nativeResult } from "../src/native-result.ts";
 import { codexBaselinePath, readCodexBaseline } from "../src/codex-baseline.ts";
 import { scrubGitLocationEnv } from "../src/git-env.ts";
 import { sha256 } from "../src/hash.ts";
+import { readOrchConfig } from "../src/config.ts";
+import { claudeRunMode, claudeTuiArgv, resumedSessionId, runClaudeTui, type ClaudeMode } from "./claude-tui.ts";
 import {
   acceptableHostTmpDir,
   canonicalizePath,
@@ -925,6 +927,62 @@ function repairTaskText(spec: RunSpec, errors: string[], previous: string): stri
   ].join("\n");
 }
 
+// Spawns a built plan and writes the provider's stream to nativePath. A claude
+// TUI plan runs in a pseudo-terminal (drivers/claude-tui.ts); one that never
+// took its prompt has done nothing, so the same turn runs again as -p, with
+// the reason in events.jsonl.
+async function spawnProvider(input: {
+  provider: AgentName;
+  plan: ProviderExecutionPlan;
+  prompt: string;
+  spec: RunSpec;
+  runDir: string;
+  worktree: string;
+  nativePath: string;
+  nativeMode: "w" | "a";
+}): Promise<number> {
+  const { plan } = input;
+  if (input.provider === "claude" && plan.claude) {
+    appendDriverEvent(input.runDir, {
+      type: "claude_mode",
+      mode: plan.claude.mode,
+      ...(plan.claude.why ? { why: plan.claude.why } : {}),
+      ...(plan.claude.entrypoint ? { entrypoint: plan.claude.entrypoint } : {}),
+    });
+  }
+  if (input.provider === "claude" && plan.claude?.mode === "tui" && plan.claude.sessionId) {
+    const tui = await runClaudeTui({
+      argv: plan.argv,
+      env: plan.env,
+      cwd: input.worktree,
+      sessionId: plan.claude.sessionId,
+      resumed: input.spec.provider_session_mode === "resume_exact" && Boolean(input.spec.provider_session_id),
+      ephemeral: input.spec.provider_session_mode === "ephemeral",
+      nativePath: input.nativePath,
+      nativeMode: input.nativeMode,
+      trustFolder: process.env.ORCH_CLAUDE_TUI_TRUST !== "0",
+      onEvent: (event) => appendDriverEvent(input.runDir, event),
+    });
+    if (tui.started) return tui.code;
+    appendDriverEvent(input.runDir, { type: "claude_mode", mode: "print", fallback_from: "tui", why: tui.why });
+    process.stderr.write(`orch: claude interactive mode did not start (${tui.why}); running claude -p\n`);
+    const printPlan = buildProviderExecutionPlan({
+      provider: input.provider,
+      spec: input.spec,
+      runDir: input.runDir,
+      worktree: input.worktree,
+      prompt: input.prompt,
+      claudeMode: "print",
+    });
+    return spawnProvider({ ...input, plan: printPlan });
+  }
+  const proc = Bun.spawn(plan.argv, { cwd: input.worktree, stdin: "pipe", stdout: "pipe", stderr: "inherit", env: plan.env });
+  if (input.provider !== "omp") proc.stdin.write(input.prompt);
+  proc.stdin.end();
+  await pipeToFile(proc.stdout, input.nativePath, input.nativeMode);
+  return proc.exited;
+}
+
 // One extra provider call that only reformats: the model gets the validator's
 // own errors plus its previous answer and returns the corrected JSON. Fresh
 // ephemeral session, same sandbox plan; its stream is appended to native.jsonl
@@ -956,11 +1014,16 @@ async function runResultRepair(input: {
   const nativePath = `${input.runDir}/native.jsonl`;
   appendFileSync(nativePath, `${JSON.stringify({ type: "orch_result_repair", attempt: 1, errors: input.errors })}\n`, "utf8");
   appendDriverEvent(input.runDir, { type: "phase", phase: "result_repair_start", wait_reason: "provider_process" });
-  const proc = Bun.spawn(plan.argv, { cwd: input.worktree, stdin: "pipe", stdout: "pipe", stderr: "inherit", env: plan.env });
-  if (input.provider !== "omp") proc.stdin.write(prompt);
-  proc.stdin.end();
-  await pipeToFile(proc.stdout, nativePath, "a");
-  const code = await proc.exited;
+  const code = await spawnProvider({
+    provider: input.provider,
+    plan,
+    prompt,
+    spec,
+    runDir: input.runDir,
+    worktree: input.worktree,
+    nativePath,
+    nativeMode: "a",
+  });
   appendDriverEvent(input.runDir, { type: "phase", phase: "result_repair_end", exit_code: code });
   return code;
 }
@@ -1288,6 +1351,19 @@ export interface ExecutionContext {
   dryRun?: boolean;
   platform?: NodeJS.Platform;
   env?: NodeJS.ProcessEnv;
+  // claude only: force the mode (the driver's -p fallback after a TUI that
+  // did not start) and the session id a fresh TUI run is given.
+  claudeMode?: ClaudeMode;
+  claudeSessionId?: string;
+}
+
+// How a claude run is started: Claude Code's interactive mode in a
+// pseudo-terminal (tui, the default) or `claude -p` (print), and why it is -p.
+export interface ClaudeRunPlan {
+  mode: ClaudeMode;
+  why: string | null;
+  sessionId: string | null;
+  entrypoint: string | null;
 }
 
 export interface ProviderExecutionPlan {
@@ -1298,6 +1374,47 @@ export interface ProviderExecutionPlan {
   providerNativeSandbox: boolean;
   evidenceDir: string | null; // ${runDir}/evidence for write roles, exported as ORCH_RUN_EVIDENCE_DIR
   env: Record<string, string>;
+  claude?: ClaudeRunPlan;
+}
+
+function orchClaudeConfig(): { mode?: unknown; entrypoint?: unknown } {
+  try {
+    return readOrchConfig().claude ?? {};
+  } catch {
+    return {};
+  }
+}
+
+// CLAUDE_CODE_ENTRYPOINT for claude workers: unset by default (buildWorkerEnv
+// drops an inherited one), so Claude Code reports its own (`cli` for the TUI,
+// `sdk-cli` for -p). ORCH_CLAUDE_ENTRYPOINT or config.json claude.entrypoint
+// sets it.
+export function claudeEntrypoint(env: NodeJS.ProcessEnv, configured: unknown): string | null {
+  const fromEnv = env.ORCH_CLAUDE_ENTRYPOINT?.trim();
+  if (fromEnv) return fromEnv;
+  return typeof configured === "string" && configured.trim() ? configured.trim() : null;
+}
+
+export function buildProviderExecutionPlan(ctx: ExecutionContext): ProviderExecutionPlan {
+  const plan = buildProviderExecutionPlanBase(ctx);
+  if (ctx.provider !== "claude") return plan;
+  const baseEnv = ctx.env ?? process.env;
+  const config = orchClaudeConfig();
+  const entrypoint = claudeEntrypoint(baseEnv, config.entrypoint);
+  if (entrypoint) plan.env.CLAUDE_CODE_ENTRYPOINT = entrypoint;
+  const prompt = ctx.prompt ?? "";
+  const choice = ctx.claudeMode === "print"
+    ? { mode: "print" as const, why: "the interactive mode did not start; this run is -p" }
+    : claudeRunMode({ env: baseEnv, configMode: config.mode, sandboxed: plan.sandboxEngine !== "none", prompt, platform: ctx.platform });
+  if (choice.mode === "print") {
+    plan.claude = { mode: "print", why: choice.why, sessionId: null, entrypoint };
+    return plan;
+  }
+  const resumed = resumedSessionId(plan.argv);
+  const sessionId = resumed ?? ctx.claudeSessionId ?? crypto.randomUUID();
+  plan.argv = claudeTuiArgv(plan.argv, sessionId, prompt);
+  plan.claude = { mode: "tui", why: null, sessionId, entrypoint };
+  return plan;
 }
 
 // Marker inherited by every descendant of a sandboxed worker. A sandboxed run
@@ -1317,7 +1434,7 @@ export const ORCH_SANDBOX_RUN_DIR_ENV = "ORCH_SANDBOX_RUN_DIR";
 // settings), env redirections, and the Seatbelt wrapper are produced together,
 // so a sandbox-disabling argv can never escape without its outer jail. Drivers
 // spawn plan.argv with plan.env, nothing else; dry-run displays the same plan.
-export function buildProviderExecutionPlan(ctx: ExecutionContext): ProviderExecutionPlan {
+function buildProviderExecutionPlanBase(ctx: ExecutionContext): ProviderExecutionPlan {
   const { provider, spec, runDir, worktree } = ctx;
   const posture = sandboxPosture(spec.role);
   const env = buildWorkerEnv(ctx.env ?? process.env);
@@ -1567,18 +1684,16 @@ export async function runProviderDriver(provider: AgentName, argv: string[]): Pr
     evidence_dir: plan.evidenceDir,
   });
   appendDriverEvent(args.runDir, { type: "phase", phase: "provider_start", wait_reason: "provider_process" });
-  const proc = Bun.spawn(plan.argv, {
-    cwd: args.worktree,
-    stdin: "pipe",
-    stdout: "pipe",
-    stderr: "inherit",
-    env: plan.env,
+  const code = await spawnProvider({
+    provider,
+    plan,
+    prompt,
+    spec,
+    runDir: args.runDir,
+    worktree: args.worktree,
+    nativePath: `${args.runDir}/native.jsonl`,
+    nativeMode: "w",
   });
-  if (provider !== "omp") proc.stdin.write(prompt);
-  proc.stdin.end();
-
-  await pipeToFile(proc.stdout, `${args.runDir}/native.jsonl`);
-  const code = await proc.exited;
   appendDriverEvent(args.runDir, { type: "phase", phase: "provider_end", exit_code: code });
   writeExitCode(args.runDir, code);
 

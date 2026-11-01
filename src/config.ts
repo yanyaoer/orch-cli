@@ -78,6 +78,13 @@ export interface OrchConfig {
   // never be able to edit this list or forge run state). This shifts the
   // blast-radius responsibility for the listed dirs to the user.
   sandbox_write_dirs?: string[];
+  // How claude workers start. mode "tui" (default) runs Claude Code's
+  // interactive mode in a pseudo-terminal, which reports the `cli`
+  // entrypoint; "print" runs `claude -p` (`sdk-cli`). ORCH_CLAUDE_MODE
+  // overrides it. entrypoint, when set, is exported to the worker as
+  // CLAUDE_CODE_ENTRYPOINT (ORCH_CLAUDE_ENTRYPOINT overrides it); unset, an
+  // inherited CLAUDE_CODE_ENTRYPOINT is dropped.
+  claude?: { mode?: "tui" | "print"; entrypoint?: string };
 }
 
 export interface MailAgentDefinition {
@@ -326,7 +333,8 @@ export async function resolveMailPassword(cfg: MailControlConfig): Promise<strin
   throw new Error("mail control account.password or account.password_cmd is required");
 }
 
-const ORCH_CONFIG_KEYS = ["version", "workspaces", "defaults", "language", "sandbox", "sandbox_write_dirs"] as const;
+const ORCH_CONFIG_KEYS = ["version", "workspaces", "defaults", "language", "sandbox", "sandbox_write_dirs", "claude"] as const;
+const CLAUDE_CONFIG_KEYS = ["mode", "entrypoint"] as const;
 const ORCH_DEFAULTS_KEYS = ["agents", "models", "fanout"] as const;
 const ROLE_DEFAULT_KEYS = ["agent", "model", "timeout_sec"] as const;
 const FANOUT_KEYS = ["cross-review", "investigate"] as const;
@@ -362,6 +370,16 @@ export function validateOrchConfig(raw: unknown): { warnings: string[] } {
   }
   if (raw.sandbox_write_dirs !== undefined && (!Array.isArray(raw.sandbox_write_dirs) || raw.sandbox_write_dirs.some((d) => typeof d !== "string"))) {
     fail("sandbox_write_dirs must be an array of strings");
+  }
+  if (raw.claude !== undefined) {
+    if (!isObject(raw.claude)) fail("claude must be an object");
+    unknownKeys(raw.claude, CLAUDE_CONFIG_KEYS, "claude.");
+    if (raw.claude.mode !== undefined && raw.claude.mode !== "tui" && raw.claude.mode !== "print") {
+      warnings.push(`claude.mode ${JSON.stringify(raw.claude.mode)} is not "tui" or "print"; tui applies`);
+    }
+    if (raw.claude.entrypoint !== undefined && (typeof raw.claude.entrypoint !== "string" || raw.claude.entrypoint === "")) {
+      fail("claude.entrypoint must be a non-empty string");
+    }
   }
   const defaults = raw.defaults;
   if (defaults === undefined) return { warnings };
