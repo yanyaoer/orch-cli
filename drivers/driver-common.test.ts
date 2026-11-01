@@ -279,7 +279,7 @@ test("buildProviderArgv keeps defaults fresh and only resumes exact sessions", (
     "--model",
     "openai-codex/gpt-6-astra",
     "--thinking",
-    "high",
+    "medium",
     "-p",
     "--mode",
     "json",
@@ -334,7 +334,7 @@ test("buildProviderArgv keeps defaults fresh and only resumes exact sessions", (
       "/run",
       "/worktree",
     ),
-  ).toEqual(["pi", "--model", "openai-codex/gpt-6-astra", "--thinking", "high", "-p", "--mode", "json", "--session-id", "pi-session"]);
+  ).toEqual(["pi", "--model", "openai-codex/gpt-6-astra", "--thinking", "medium", "-p", "--mode", "json", "--session-id", "pi-session"]);
 });
 
 test("buildProviderArgv passes explicit model overrides to supporting providers", () => {
@@ -811,7 +811,7 @@ test("buildProviderArgv picks claude model/effort by role", () => {
     "/run/evidence",
   ]);
 
-  // verifier stays on the CLI default model (sonnet), low effort (mechanical checks).
+  // verifier stays on the CLI default model (sonnet), medium effort like the implementer.
   expect(argv("verifier", "role-verifier")).toEqual([
     "claude",
     "-p",
@@ -821,7 +821,7 @@ test("buildProviderArgv picks claude model/effort by role", () => {
     "--input-format",
     "text",
     "--effort",
-    "low",
+    "medium",
     "--allowedTools",
     CLAUDE_WRITE_ALLOWED_TOOLS,
     "--permission-mode",
@@ -1993,4 +1993,13 @@ test("evidence dir: write roles get the prompt line, env and --add-dir on every 
     expect(plan.env[ORCH_RUN_EVIDENCE_DIR_ENV]).toBeUndefined();
     expect(plan.argv).not.toContain("--add-dir");
   }
+});
+
+test("pi thinking is medium for implementer/verifier and high for reviewer", () => {
+  for (const role of ["implementer", "verifier"] as const) {
+    const a = buildProviderArgv("pi", spec(role, `pi-${role}`), "/run", "/worktree");
+    expect(a[a.indexOf("--thinking") + 1]).toBe("medium");
+  }
+  const r = buildProviderArgv("pi", spec("reviewer", "pi-reviewer"), "/run", "/worktree");
+  expect(r[r.indexOf("--thinking") + 1]).toBe("high");
 });

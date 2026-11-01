@@ -228,7 +228,7 @@ console.log(JSON.stringify({ type: "result", result: JSON.stringify(result(runId
   const pi = `#!/usr/bin/env bun
 ${common}
 const args = Bun.argv.slice(2);
-const expected = ["--model", "openai-codex/gpt-6-astra", "--thinking", "high", "-p", "--mode", "json", "--no-session"];
+const expected = ["--model", "openai-codex/gpt-6-astra", "--thinking", "medium", "-p", "--mode", "json", "--no-session"];
 if (JSON.stringify(args) !== JSON.stringify(expected)) {
   console.error("unexpected pi argv: " + JSON.stringify(args));
   process.exit(13);
