@@ -7,7 +7,7 @@
 //      keeps the whole dir;
 //   2. an MR the forge reports open is never deleted, however old;
 //   3. a merged / closed MR is deleted once both its terminal time and the
-//      dir's last write are at least --min-age-days old (default 90);
+//      dir's last write are at least --min-age-days old (default 30);
 //   4. a dir with no forge MR (non-numeric thread name without forge_ref, a
 //      404, a repo without a forge) is deleted once its last write is at
 //      least --max-age-days old (default 180) — the age cap;
@@ -331,7 +331,7 @@ export async function runGc(args: ParsedArgs): Promise<number> {
   assertKnownFlags(args, "run gc", RUN_GC_FLAGS);
   const execute = flagBool(args, "execute");
   if (execute && flagBool(args, "dry-run")) throw new CliError("--execute and --dry-run are mutually exclusive");
-  const minAgeDays = nonNegative(args, "min-age-days", 90);
+  const minAgeDays = nonNegative(args, "min-age-days", 30);
   const maxAgeDays = nonNegative(args, "max-age-days", 180);
   const concurrency = Math.max(1, Math.floor(nonNegative(args, "concurrency", 8)));
   const worktree = resolve(flagString(args, "worktree", process.cwd()));

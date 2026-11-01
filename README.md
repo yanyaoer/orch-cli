@@ -219,7 +219,7 @@ $ orch events tail -f --all --native
                            # no --run: multiplex every active run (tail-style ==> mr/run <== headers),
                            # pick up runs created while following, until Ctrl-C; --all spans every repo
 $ orch run reap            # persist stale for runs whose supervisor died
-$ orch run gc              # retention plan; --execute deletes merged/closed MR dirs past 90 days
+$ orch run gc              # retention plan; --execute deletes merged/closed MR dirs past 30 days
 ```
 
 Record a controller decision (the run id locates its MR):
@@ -502,7 +502,7 @@ orch run create    Start one headless worker run for an MR task
 orch run list      List local runs for an MR (dead-pid runs show as stale?)
 orch run cancel    Stop a running worker (supervisor finalizes it as failed)
 orch run reap      Persist stale for non-terminal runs whose supervisor died
-orch run gc        Retention: delete this repo's MR dirs merged/closed >= 90 days (plan by default, --execute)
+orch run gc        Retention: delete this repo's MR dirs merged/closed >= 30 days (plan by default, --execute)
 orch search        Regex-search run files and mail event diagnostics
 orch usage         Summarize token usage by run, thread, or day
 orch cross-review  Review one diff in parallel with several agents (via mail thread)

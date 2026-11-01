@@ -176,6 +176,8 @@ test("orch run gc end to end: plan deletes nothing, --execute deletes exactly th
   mrDir(mrsRoot, "2", { daysAgo: 120, now }); // merged 120d
   mrDir(mrsRoot, "3", { daysAgo: 120, now }); // 404, inside the cap
   mrDir(mrsRoot, "4", { daysAgo: 120, now }); // glab fails
+  mrDir(mrsRoot, "5", { daysAgo: 40, now }); // merged 40d: inside the old 90d window, past the 30d default
+  mrDir(mrsRoot, "6", { daysAgo: 20, now }); // too recent for the default: no lookup
   mrDir(mrsRoot, "issue-9", { daysAgo: 365, now }); // thread name past the cap
   const bin = join(root, "bin");
   mkdirSync(bin);
@@ -188,6 +190,7 @@ test("orch run gc end to end: plan deletes nothing, --execute deletes exactly th
       'case "$3" in',
       `  1) echo '{"iid":1,"state":"opened","merged_at":null,"closed_at":null,"updated_at":"${ago(400)}"}' ;;`,
       `  2) echo '{"iid":2,"state":"merged","merged_at":"${ago(120)}","closed_at":null,"updated_at":"${ago(120)}"}' ;;`,
+      `  5) echo '{"iid":5,"state":"merged","merged_at":"${ago(40)}","closed_at":null,"updated_at":"${ago(40)}"}' ;;`,
       `  3) echo '{"error":{"message":"failed to get merge request 3: 404 Not Found"}}'; echo 'failed to get merge request 3: 404 Not Found.' >&2; exit 1 ;;`,
       `  *) echo 'connection refused' >&2; exit 1 ;;`,
       "esac",
@@ -207,21 +210,24 @@ test("orch run gc end to end: plan deletes nothing, --execute deletes exactly th
     "2": "delete:mr_terminal",
     "3": "keep:age_cap_recent",
     "4": "keep:lookup_failed",
+    "5": "delete:mr_terminal",
+    "6": "keep:recent",
     "issue-9": "delete:age_cap",
   });
   expect(plan.executed).toBe(false);
-  expect(plan.summary.delete).toBe(2);
+  expect(plan.min_age_days).toBe(30);
+  expect(plan.summary.delete).toBe(3);
   expect(plan.execute_with).toContain("--execute");
-  for (const mr of ["1", "2", "3", "4", "issue-9"]) expect(existsSync(join(mrsRoot, mr))).toBe(true);
+  for (const mr of ["1", "2", "3", "4", "5", "6", "issue-9"]) expect(existsSync(join(mrsRoot, mr))).toBe(true);
   // glab ran from the repo root, once per numeric MR.
   const calls = (await Bun.file(log).text()).trim().split("\n");
-  expect(calls.length).toBe(4);
+  expect(calls.length).toBe(5);
   expect(calls.every((line) => line.startsWith(`${realpathSync(worktree)} mr view `))).toBe(true);
 
   const applied = JSON.parse((await orch("--execute")).stdout);
   expect(applied.executed).toBe(true);
-  expect(applied.summary.removed).toBe(2);
-  expect(readdirSync(mrsRoot).sort()).toEqual(["1", "3", "4"]);
+  expect(applied.summary.removed).toBe(3);
+  expect(readdirSync(mrsRoot).sort()).toEqual(["1", "3", "4", "6"]);
   expect(statSync(join(stateHome, "orch", repoKey, ".run-gc-trash")).isDirectory()).toBe(true);
   expect(readdirSync(join(stateHome, "orch", repoKey, ".run-gc-trash"))).toEqual([]);
 
