@@ -19,7 +19,7 @@ import { existsSync, lstatSync, mkdirSync, readdirSync, renameSync, rmSync } fro
 import { resolve } from "node:path";
 import { getRepoIdentity, orchStateRoot } from "../paths.ts";
 import { CliError, assertKnownFlags, flagBool, flagNumber, flagString, printJson, type ParsedArgs } from "../cli.ts";
-import { forgeRefFor, looksStale, mrIdsForRepo, nonTerminalStates, runProcessesAlive, scanRunsRoot, utcCompact } from "../run-store.ts";
+import { forgeRefFor, mrIdsForRepo, runInFlight, scanRunsRoot, utcCompact } from "../run-store.ts";
 import { detectForge, forgeMrLifecycle, type ForgeKind, type ForgeMrLifecycle } from "../forge.ts";
 import { acquirePidfileLockWait } from "../locks.ts";
 import { randomHex } from "../hash.ts";
@@ -105,20 +105,10 @@ export function dirUsage(root: string): DirUsage {
   return usage;
 }
 
-// Runs that still have work in flight: a non-terminal run the stale rule has
-// not given up on (mid-creation, before any pid is recorded), or a
-// non-terminal / stale run whose processes (supervisor, provider group,
-// provider pid) are alive — a stale run's provider can outlive its
-// supervisor. A finished run's recorded pids are never probed: pids are
-// reused, and a live stranger would pin the dir forever.
+// Runs that still have work in flight (see runInFlight).
 export function activeRunIds(mrDir: string): string[] {
   return scanRunsRoot(`${mrDir}/runs`, "")
-    .filter(({ status }) => {
-      if (status === null) return false;
-      const unfinished = nonTerminalStates.has(status.state);
-      if (unfinished && !looksStale(status)) return true;
-      return (unfinished || status.state === "stale") && runProcessesAlive(status);
-    })
+    .filter(({ status }) => status !== null && runInFlight(status))
     .map(({ run_dir }) => run_dir.slice(run_dir.lastIndexOf("/") + 1));
 }
 

@@ -11,7 +11,7 @@ import { runOmpDriver } from "../drivers/omp-headless.ts";
 import { mail } from "./mail-cli.ts";
 import { workspace } from "./workspace-cli.ts";
 import { worktreeClone, worktreeGc, worktreeRemove } from "./worktree.ts";
-import { evidenceDirCommand, evidenceListCommand } from "./commands/evidence.ts";
+import { evidenceCompactCommand, evidenceDirCommand, evidenceListCommand } from "./commands/evidence.ts";
 import { CliError, assertKnownFlags, flagBool, flagString, hasHelp, parseArgs, printJson, readStdinText, type ParsedArgs } from "./cli.ts";
 import { insideSandbox, proxyToHost, reconcileDispatchOnce, reconcileDispatchWatch, shouldProxyToHost } from "./dispatch.ts";
 import { prewalkCommand } from "./prewalk.ts";
@@ -271,6 +271,7 @@ async function main(): Promise<number> {
   if (first === "worktree" && second === "remove") return worktreeRemove(args);
   if (first === "evidence" && second === "dir") return evidenceDirCommand(args);
   if (first === "evidence" && second === "list") return evidenceListCommand(args);
+  if (first === "evidence" && second === "compact") return evidenceCompactCommand(args);
   if (first === "chatgpt-bridge") return chatgptBridge(args);
   if (first === "handoff-pro") return handoffPro(args);
   if (first === "update") return updateCommand(args);

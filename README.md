@@ -502,6 +502,7 @@ orch run create    Start one headless worker run for an MR task
 orch run list      List local runs for an MR (dead-pid runs show as stale?)
 orch run cancel    Stop a running worker (supervisor finalizes it as failed)
 orch run reap      Persist stale for non-terminal runs whose supervisor died
+orch evidence compact  Gzip large text, drop rebuildable binaries in stored evidence (plan; --execute)
 orch run gc        Retention: delete this repo's MR dirs merged/closed >= 30 days (plan by default, --execute)
 orch search        Regex-search run files and mail event diagnostics
 orch usage         Summarize token usage by run, thread, or day

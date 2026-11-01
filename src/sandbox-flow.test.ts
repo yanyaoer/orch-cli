@@ -559,3 +559,36 @@ test("fake reviewer run gets no evidence dir and no manifest", async () => {
   expect(existsSync(join(out.run_dir, "evidence"))).toBe(false);
   expect(existsSync(join(out.run_dir, "artifacts", "evidence-manifest.json"))).toBe(false);
 });
+
+test("supervisor compacts a run's evidence after the manifest; ORCH_EVIDENCE_COMPACT=0 leaves it", async () => {
+  const { gunzipSync } = await import("node:zlib");
+  const { createHash } = await import("node:crypto");
+  for (const disabled of [false, true]) {
+    const fx = await fixture(false, {
+      ORCH_DRIVER_FAKE_RESULT: "1",
+      ORCH_DRIVER_FAKE_EVIDENCE: "check.log",
+      ORCH_DRIVER_FAKE_EVIDENCE_BYTES: String(300 * 1024),
+      ...(disabled ? { ORCH_EVIDENCE_COMPACT: "0" } : {}),
+    });
+    const created = await runOrch(roleArgs(fx.worktree, "verifier", "pi"), fx.env, "verify with a big log\n");
+    expect(created.exitCode).toBe(0);
+    const out = JSON.parse(created.stdout) as { run_dir: string; evidence_dir: string };
+    expect((await waitForTerminal(join(out.run_dir, "status.json"))).state).toBe("done");
+    const manifest = JSON.parse(readFileSync(join(out.run_dir, "artifacts", "evidence-manifest.json"), "utf8")) as {
+      files: Array<{ path: string; bytes: number; sha256: string }>;
+    };
+    // The manifest records what the run left, before compaction.
+    expect(manifest.files.map((f) => f.path)).toEqual(["check.log"]);
+    expect(manifest.files[0]!.bytes).toBeGreaterThanOrEqual(300 * 1024);
+    if (disabled) {
+      expect(existsSync(join(out.evidence_dir, "check.log"))).toBe(true);
+      expect(existsSync(join(out.evidence_dir, ".orch-compaction.json"))).toBe(false);
+      continue;
+    }
+    expect(existsSync(join(out.evidence_dir, "check.log"))).toBe(false);
+    const restored = gunzipSync(readFileSync(join(out.evidence_dir, "check.log.gz")));
+    expect(createHash("sha256").update(restored).digest("hex")).toBe(manifest.files[0]!.sha256);
+    const ledger = JSON.parse(readFileSync(join(out.evidence_dir, ".orch-compaction.json"), "utf8")) as { entries: Array<{ path: string; action: string; sha256: string }> };
+    expect(ledger.entries).toEqual([expect.objectContaining({ path: "check.log", action: "gzip", sha256: manifest.files[0]!.sha256 })]);
+  }
+});

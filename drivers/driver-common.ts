@@ -1161,7 +1161,11 @@ export async function maybeWriteFakeResult(runDir: string, spec: RunSpec, provid
       throw new Error(`ORCH_DRIVER_FAKE_EVIDENCE must be a plain file name: ${JSON.stringify(fakeEvidence)}`);
     }
     mkdirSync(runEvidenceDir(runDir), { recursive: true, mode: 0o700 });
-    writeFileSync(`${runEvidenceDir(runDir)}/${fakeEvidence}`, `fake ${provider} evidence for ${spec.run_id}\n`, "utf8");
+    const line = `fake ${provider} evidence for ${spec.run_id}\n`;
+    // ORCH_DRIVER_FAKE_EVIDENCE_BYTES pads the file (compaction tests).
+    const padTo = Number(process.env.ORCH_DRIVER_FAKE_EVIDENCE_BYTES ?? "0");
+    const body = Number.isFinite(padTo) && padTo > line.length ? line.repeat(Math.ceil(padTo / line.length)) : line;
+    writeFileSync(`${runEvidenceDir(runDir)}/${fakeEvidence}`, body, "utf8");
   }
   const sleepMs = Number(process.env.ORCH_DRIVER_FAKE_SLEEP_MS ?? "0");
   if (Number.isFinite(sleepMs) && sleepMs > 0) await sleep(sleepMs);
