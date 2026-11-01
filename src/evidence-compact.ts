@@ -87,18 +87,54 @@ function classify(name: string, bytes: number, gzipMinBytes: number): { action: 
   return { action: "gzip", reason: `text >= ${gzipMinBytes} bytes` };
 }
 
-function gzipInPlace(abs: string, entry: CompactionAction): void {
+// Test seam: runs right before the unchanged-check that guards each unlink.
+export const compactionTestHooks: { beforeUnlinkCheck?: (abs: string) => void } = {};
+
+interface FileIdentity {
+  size: number;
+  mtimeMs: number;
+  ino: number;
+}
+
+function identity(path: string): FileIdentity {
+  const stat = lstatSync(path);
+  return { size: stat.size, mtimeMs: stat.mtimeMs, ino: stat.ino };
+}
+
+function sameIdentity(a: FileIdentity, b: FileIdentity): boolean {
+  return a.size === b.size && a.mtimeMs === b.mtimeMs && a.ino === b.ino;
+}
+
+// Refuse to delete an original that changed since it was hashed: same size,
+// mtime and inode, and the same sha256 again right before the unlink. A writer
+// that lands between this check and the unlink is not detectable without a
+// lock; the minimum file age (orch evidence compact) and running only after a
+// run has ended (supervisor) keep writers away.
+function assertUnchanged(abs: string, entry: CompactionAction, before: FileIdentity): void {
+  if (!sameIdentity(before, identity(abs)) || sha256File(abs) !== entry.sha256) {
+    throw new Error("file changed during compaction (size, mtime, inode or sha256 differ); original kept");
+  }
+}
+
+function gzipInPlace(abs: string, entry: CompactionAction, before: FileIdentity): void {
   const gzAbs = `${abs}.gz`;
   if (existsSync(gzAbs)) throw new Error(`${entry.path}.gz already exists`);
   const original = readFileSync(abs);
   const compressed = gzipSync(original, { level: 6 });
   const check = createHash("sha256").update(gunzipSync(compressed)).digest("hex");
-  if (check !== entry.sha256) throw new Error("gzip round trip does not match the original sha256");
+  if (check !== entry.sha256) throw new Error("gzip round trip does not match the original sha256 (file changed while reading); original kept");
   const stat = lstatSync(abs);
   const tmp = `${gzAbs}.${randomHex(3)}.tmp`;
   writeFileSync(tmp, compressed, { mode: stat.mode & 0o777 });
   utimesSync(tmp, stat.atime, stat.mtime);
   renameSync(tmp, gzAbs);
+  try {
+    compactionTestHooks.beforeUnlinkCheck?.(abs);
+    assertUnchanged(abs, entry, before);
+  } catch (error) {
+    rmSync(gzAbs, { force: true });
+    throw error;
+  }
   rmSync(abs);
   entry.gz_path = `${entry.path}.gz`;
   entry.gz_bytes = compressed.length;
@@ -154,12 +190,15 @@ export function compactEvidenceDir(dir: string, options: CompactionOptions): Com
     }
     const abs = `${dir}/${entry.path}`;
     try {
+      const before = identity(abs);
       entry.sha256 = sha256File(abs);
       if (entry.action === "drop") {
+        compactionTestHooks.beforeUnlinkCheck?.(abs);
+        assertUnchanged(abs, entry, before);
         rmSync(abs);
         report.bytes_saved += entry.bytes;
       } else {
-        gzipInPlace(abs, entry);
+        gzipInPlace(abs, entry, before);
         report.bytes_saved += entry.bytes - (entry.gz_bytes ?? entry.bytes);
       }
       entry.applied = true;

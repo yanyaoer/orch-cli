@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { gunzipSync } from "node:zlib";
-import { COMPACTION_LEDGER, compactEvidenceDir, readCompactionLedger } from "./evidence-compact.ts";
+import { COMPACTION_LEDGER, compactEvidenceDir, compactionTestHooks, readCompactionLedger } from "./evidence-compact.ts";
 import { repoKeyFromRemote } from "./paths.ts";
 
 const sha = (data: Buffer | string) => createHash("sha256").update(data).digest("hex");
@@ -123,4 +123,64 @@ test("orch evidence compact: finished runs and control labels only; runs in flig
   expect(existsSync(join(live, "evidence", "full.log"))).toBe(true);
   expect(existsSync(join(control, "android-app-build", "app.apk"))).toBe(false);
   expect(readCompactionLedger(control)!.entries[0]).toMatchObject({ path: "android-app-build/app.apk", action: "drop" });
+});
+
+test("evidence compact keeps an original that a writer keeps changing (no data loss)", async () => {
+  // A child compacts a 32 MiB log while this process rewrites bytes in place
+  // every millisecond (verify-run-gc-r3 scenario ix). Whatever the interleaving,
+  // the original must survive unless the .gz holds exactly its final content.
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "orch-compact-race-")));
+  const dir = join(root, "evidence");
+  mkdirSync(dir);
+  const path = join(dir, "x.log");
+  writeFileSync(path, Buffer.alloc(32 * 1024 * 1024, 65));
+  const old = new Date(Date.now() - 3600_000);
+  utimesSync(path, old, old);
+  const code = `import { compactEvidenceDir } from ${JSON.stringify(join(import.meta.dir, "evidence-compact.ts"))}; console.log(JSON.stringify(compactEvidenceDir(${JSON.stringify(dir)}, { execute: true, now: Date.now() + 3600_000 })))`;
+  const child = Bun.spawn([process.execPath, "-e", code], { stdout: "pipe", stderr: "pipe" });
+  const { openSync, writeSync, closeSync, readSync, fstatSync } = await import("node:fs");
+  const fd = openSync(path, "r+");
+  let n = 0;
+  const timer = setInterval(() => {
+    try {
+      writeSync(fd, Buffer.from([66 + (n++ % 20)]), 0, 1, (n * 4096) % (32 * 1024 * 1024));
+    } catch {
+      // the file may be gone if compaction won the race
+    }
+  }, 1);
+  const exitCode = await child.exited;
+  clearInterval(timer);
+  // The inode's final bytes, read through the writer's fd: valid even if the
+  // path was unlinked under it.
+  const final = Buffer.alloc(fstatSync(fd).size);
+  readSync(fd, final, 0, final.length, 0);
+  closeSync(fd);
+  expect(exitCode).toBe(0);
+  const action = JSON.parse(await new Response(child.stdout).text()).actions[0];
+  if (existsSync(path)) {
+    expect(action.applied).not.toBe(true);
+    expect(existsSync(`${path}.gz`)).toBe(false);
+  } else {
+    // The original is gone only if the .gz holds every byte the writer wrote.
+    expect(action.applied).toBe(true);
+    expect(gunzipSync(readFileSync(`${path}.gz`)).equals(final)).toBe(true);
+  }
+}, 30000);
+
+test("evidence compact keeps an original written after it was read (gzip and drop)", () => {
+  const { dir } = evidenceFixture();
+  const { appendFileSync } = require("node:fs") as typeof import("node:fs");
+  compactionTestHooks.beforeUnlinkCheck = (abs) => appendFileSync(abs, "late write\n");
+  try {
+    const report = compactEvidenceDir(dir, { execute: true });
+    for (const path of ["full.log", "device/dumps/ui.xml", "device/app-debug.apk"]) {
+      const action = report.actions.find((a) => a.path === path)!;
+      expect([action.applied, action.error]).toEqual([false, expect.stringContaining("changed during compaction")]);
+      expect(readFileSync(join(dir, path), "utf8").endsWith("late write\n")).toBe(true);
+      expect(existsSync(join(dir, `${path}.gz`))).toBe(false);
+    }
+    expect(existsSync(join(dir, COMPACTION_LEDGER))).toBe(false);
+  } finally {
+    delete compactionTestHooks.beforeUnlinkCheck;
+  }
 });
