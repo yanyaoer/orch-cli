@@ -217,10 +217,22 @@ export const OMP_MODEL_CHAIN: readonly string[] = [
 
 export const OMP_THINKING = "--thinking=high";
 
-// pi default mirrors omp's primary: gpt-6-astra at high thinking. pi has no
-// quota-fallback chain; an explicit --model overrides the default.
+// pi default mirrors omp's primary: gpt-6-astra. pi has no quota-fallback
+// chain; an explicit --model overrides the default. Thinking by role:
+// implementer/verifier medium (same as claude's and the loopx policy's
+// default), reviewer/researcher keep high for the deep passes.
 export const PI_DEFAULT_MODEL = "openai-codex/gpt-6-astra";
 export const PI_THINKING = "high";
+const PI_ROLE_THINKING: Partial<Record<RunSpec["role"], string>> = {
+  implementer: "medium",
+  verifier: "medium",
+};
+// deepseek only reasons at high and above, so a medium role default would make
+// it a non-reasoning worker; it keeps high (user 2026-11-02).
+function piThinking(spec: RunSpec, model: string): string {
+  const level = PI_ROLE_THINKING[spec.role] ?? PI_THINKING;
+  return /deepseek/i.test(model) && level !== "xhigh" && level !== "max" ? "high" : level;
+}
 
 export function ompModelChain(model: string | null | undefined): { primary: string; fallbacks: string[] } {
   const primary = model ?? OMP_MODEL_CHAIN[0]!;
@@ -302,12 +314,11 @@ const CLAUDE_ROLE_MODEL: Partial<Record<RunSpec["role"], string>> = {
 };
 
 // claude reasoning effort by role: researcher and reviewer need the deepest
-// passes, verifier is mechanical (tests/acceptance checks) so it stays cheap,
-// implementer sits in between and can be bumped manually per-task via
-// provider_session_name/task text.
+// passes; implementer and verifier both run medium (a low-effort verifier
+// missed real defects and returned unparseable results more often).
 const CLAUDE_ROLE_EFFORT: Partial<Record<RunSpec["role"], string>> = {
   implementer: "medium",
-  verifier: "low",
+  verifier: "medium",
   reviewer: "high",
   researcher: "xhigh",
   controller: "medium",
@@ -454,7 +465,8 @@ function providerArgv(
     return argv;
   }
 
-  const argv = ["pi", "--model", spec.model ?? PI_DEFAULT_MODEL, "--thinking", PI_THINKING];
+  const piModel = spec.model ?? PI_DEFAULT_MODEL;
+  const argv = ["pi", "--model", piModel, "--thinking", piThinking(spec, piModel)];
   argv.push("-p", "--mode", "json");
   if (readOnly) argv.push("--tools", "read,grep,find,ls");
   if (spec.provider_session_mode === "ephemeral") {
