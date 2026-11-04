@@ -46,6 +46,7 @@ const init = { type: "system", subtype: "init", session_id: SID };
 const errorResult = (text: string, n = 1) => ({ type: "result", subtype: "success", is_error: true, result: text, session_id: SID, num_turns: 7, total_cost_usd: 0.5, usage: usage(n) });
 const okResult = { type: "result", subtype: "success", is_error: false, result: valid, session_id: SID, num_turns: 3, total_cost_usd: 0.2, usage: usage(5) };
 const ECONNRESET = "API Error: Connection dropped (ECONNRESET). Check the proxy or network.";
+const MID_RESPONSE = "API Error: Connection lost mid-response. The response above may be incomplete.";
 
 // Fake claude: call N prints calls[N-1] (the last entry repeats), records argv and stdin per call.
 async function drive(calls: unknown[][], runSpec = spec()): Promise<{ code: number; runDir: string; argv: string[]; stdin: string[] }> {
@@ -88,6 +89,9 @@ test("apiResumeVerdict: transient API errors resume; limits, auth and other erro
     'API Error: 524 {"type":"https://developers.cloudflare.com/support/troubleshooting/http-status-codes/cloudflare-5xx-errors/error-524/"}',
     "API Error: 529 Overloaded",
     "API Error: Request timed out.",
+    // 2026-11-01..02 (TUI runs): the stream broke after part of the answer arrived.
+    MID_RESPONSE,
+    "API Error: Your computer went to sleep mid-response. The response above may be incomplete.",
   ]) expect({ text, v: apiResumeVerdict(seg(init, errorResult(text))).resumable }).toEqual({ text, v: true });
   for (const [text, reason] of <[string, string][]>[
     ["You've hit your weekly limit · resets Nov 4 at 10am (Asia/Singapore)", "not_transient"],
@@ -123,6 +127,15 @@ test("driver: an ECONNRESET end resumes the same session in the same run and del
   // usage: both claude processes are counted.
   expect(usageEvidence(native, spec(), { state: "done" } as never).normalized_tokens?.output_tokens).toBe(6);
   expect(usageEvidence(native, spec(), { state: "done" } as never).response_observations.repair_attempts).toBe(0);
+});
+
+test("driver: a connection lost mid-response resumes the same session in the same run", async () => {
+  const { code, runDir, argv } = await drive([[init, errorResult(MID_RESPONSE)], [init, okResult]]);
+  expect(code).toBe(0);
+  expect(argv).toHaveLength(2);
+  expect(argv[1]).toContain(`--resume ${SID}`);
+  expect(resultOf(runDir)).toMatchObject({ verdict: "approve" });
+  expect(events(runDir).filter((e) => e.type === "api_resume")).toEqual([expect.objectContaining({ attempt: 1, error: MID_RESPONSE })]);
 });
 
 test("driver: a resume_exact run resumes its own session id", async () => {
