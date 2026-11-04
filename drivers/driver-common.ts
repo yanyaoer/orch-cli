@@ -1671,8 +1671,10 @@ function buildProviderExecutionPlanBase(ctx: ExecutionContext): ProviderExecutio
 // reset (`orch run create --resume-from`). ORCH_API_RESUME_MAX=0 disables.
 export const API_RESUME_MAX_DEFAULT = 5;
 export const API_RESUME_DELAY_SEC_DEFAULT = 60;
+// "Connection lost mid-response" / "went to sleep mid-response": the stream broke after part of the
+// answer arrived (7 TUI implementer runs on 2026-11-01..02 ended this way and were not resumed).
 const API_RESUME_TRANSIENT =
-  /ECONNRESET|Connection dropped|Connection error|Can't reach the API|socket hang up|ETIMEDOUT|timed out|terminated|overloaded|\(429\)|Too many requests|API Error:?\s*\(?5\d\d\b|\(5\d\d\)/i;
+  /ECONNRESET|Connection dropped|Connection error|Connection lost|mid-response|Can't reach the API|socket hang up|ETIMEDOUT|timed out|terminated|overloaded|\(429\)|Too many requests|API Error:?\s*\(?5\d\d\b|\(5\d\d\)/i;
 const API_RESUME_NOT_TRANSIENT = /hit your .*limit|usage limit|Fable limit|Not logged in|prompt is too long|credit balance/i;
 const SESSION_LOST = /No conversation found with session ID/;
 
