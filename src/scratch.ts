@@ -15,7 +15,7 @@
 // applies) and keyed by run so cleanup is a single, identity-checked subtree.
 // <run_id>/.orch-scratch.json names the owning run dir: `orch worktree gc`
 // removes copies a dead supervisor left once that run is no longer in flight.
-import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, rmdirSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmdirSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { CliError } from "./cli.ts";
 import { gitEnv } from "./git-env.ts";
@@ -24,6 +24,7 @@ import { runInFlight } from "./run-store.ts";
 import type { RunStatus } from "./types.ts";
 import {
   cloneWorktreeCow,
+  ensurePrivateDirectory,
   fanoutRootPath,
   forceRemoveTree,
   privateWorktreeRoot,
@@ -36,6 +37,7 @@ export const ORCH_RUN_SCRATCH_DIR_ENV = "ORCH_RUN_SCRATCH_DIR";
 const SCRATCH_DIR = "scratch";
 const MARKER = ".orch-scratch.json";
 const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$/;
+const RUN_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const MAX_COPIES = 8;
 
 export interface ScratchRequest {
@@ -117,14 +119,16 @@ export function createScratchCopies(
   requests: Array<ScratchRequest & { head: string | null }>,
   backendFactory?: CowBackendFactory,
 ): { root: string; copies: ScratchCopy[] } {
+  if (!RUN_ID_RE.test(runId) || runId.includes("..")) throw new CliError(`--scratch: unusable run id ${JSON.stringify(runId)}`);
   const main = mainCheckoutOf(worktree);
+  // Each level is a real 0700 directory (ensurePrivateDirectory refuses a
+  // symlink or a file), so a planted link cannot redirect the copies.
   const base = privateWorktreeRoot(main);
-  const scratchBase = join(base, SCRATCH_DIR);
-  if (!existsSync(scratchBase)) Bun.spawnSync(["mkdir", "-m", "700", scratchBase]);
+  const scratchBase = ensurePrivateDirectory(join(base, SCRATCH_DIR));
   const root = join(scratchBase, runId);
-  if (existsSync(root)) throw new CliError(`scratch root already exists: ${root}`);
-  Bun.spawnSync(["mkdir", "-m", "700", root]);
-  if (!existsSync(root)) throw new CliError(`cannot create scratch root ${root}`);
+  if (existsSync(root) || isSymlink(root)) throw new CliError(`scratch root already exists: ${root}`);
+  mkdirSync(root, { mode: 0o700 });
+  if (realpathSync(root) !== root || expectedRoot(main, runId) !== root) throw new CliError(`scratch root ${root} does not resolve to itself`);
   writeFileSync(join(root, MARKER), `${JSON.stringify({ run_id: runId, run_dir: runDir, created_at: new Date().toISOString() })}\n`, {
     mode: 0o600,
   });
@@ -148,9 +152,8 @@ export function createScratchCopies(
       }
     }
   } catch (error) {
-    removeScratchCopies({ worktree, scratch_root: root, scratch: copies });
+    removeScratchCopies({ worktree, run_id: runId, scratch_root: root, scratch: copies });
     // A copy that failed mid-clone was rolled back by cloneWorktreeCow itself.
-    removeEmptyRoot(root);
     throw error;
   }
   return { root, copies };
@@ -161,6 +164,45 @@ export function createScratchCopies(
 function mainCheckoutFromRoot(root: string): string {
   const base = dirname(dirname(root));
   return join(dirname(dirname(base)), basename(base));
+}
+
+function isSymlink(path: string): boolean {
+  try {
+    return lstatSync(path).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+// The only place a run's copies may live: realpath'd orch root (privateWorktreeRoot
+// returns a realpath) + scratch/<run_id>.
+function expectedRoot(main: string, runId: string): string {
+  return join(fanoutRootPath(realpathSync(main)), SCRATCH_DIR, runId);
+}
+
+// Why a recorded root is not this run's scratch root, or null when it is: the
+// exact <orch root>/scratch/<run_id> path, no symlink at either level, and the
+// marker naming the same run. Without this, a crafted spec could point
+// scratch_root at the orch root itself and name a sibling clone as a "copy".
+function rootProblem(main: string, root: string, runId: string | undefined): string | null {
+  if (!runId || !RUN_ID_RE.test(runId) || runId.includes("..")) return "spec has no usable run_id";
+  let expected: string;
+  try {
+    expected = expectedRoot(main, runId);
+  } catch (error) {
+    return `cannot resolve the orch root: ${error instanceof Error ? error.message : String(error)}`;
+  }
+  if (root !== expected) return `scratch_root is not ${expected}`;
+  if (!existsSync(root)) return null;
+  if (isSymlink(dirname(root)) || isSymlink(root)) return "scratch root or its parent is a symlink";
+  try {
+    if (realpathSync(root) !== root) return "scratch root does not resolve to itself";
+    const marker = JSON.parse(readFileSync(join(root, MARKER), "utf8")) as { run_id?: unknown };
+    if (marker.run_id !== runId) return "scratch marker names another run";
+  } catch {
+    return "scratch marker missing or unreadable";
+  }
+  return null;
 }
 
 function removeEmptyRoot(root: string): void {
@@ -181,13 +223,16 @@ function rmMarker(root: string): void {
 // Removes exactly the copies a spec recorded, each only if it is still the
 // registered orch clone at <root>/<name>. Copies are disposable by contract
 // (mutations, base trees), so there is no loss gate — identity is the gate.
-export function removeScratchCopies(spec: { worktree: string; scratch_root?: string; scratch?: ScratchCopy[] }): ScratchCleanup {
+export function removeScratchCopies(spec: {
+  worktree: string;
+  run_id?: string;
+  scratch_root?: string;
+  scratch?: ScratchCopy[];
+}): ScratchCleanup {
   const cleanup: ScratchCleanup = { removed: [], kept: [] };
   const root = spec.scratch_root;
-  if (!root || !spec.scratch || spec.scratch.length === 0) {
-    if (root) removeEmptyRoot(root);
-    return cleanup;
-  }
+  if (!root) return cleanup;
+  const copies = spec.scratch ?? [];
   let main: string | null = null;
   for (const candidate of [spec.worktree, mainCheckoutFromRoot(root)]) {
     if (main || !candidate || !existsSync(candidate)) continue;
@@ -195,8 +240,13 @@ export function removeScratchCopies(spec: { worktree: string; scratch_root?: str
       main = mainCheckoutOf(candidate);
     } catch {}
   }
-  for (const copy of spec.scratch) {
-    const reason = removeOneCopy(main, root, copy);
+  const problem = main ? rootProblem(main, root, spec.run_id) : "cannot locate the main checkout to unregister the copies";
+  if (problem) {
+    for (const copy of copies) cleanup.kept.push({ path: copy.path, reason: problem });
+    return cleanup;
+  }
+  for (const copy of copies) {
+    const reason = removeOneCopy(main!, root, copy, [spec.worktree, main!]);
     if (reason === null) cleanup.removed.push(copy.path);
     else cleanup.kept.push({ path: copy.path, reason });
   }
@@ -204,9 +254,9 @@ export function removeScratchCopies(spec: { worktree: string; scratch_root?: str
   return cleanup;
 }
 
-function removeOneCopy(main: string | null, root: string, copy: ScratchCopy): string | null {
+function removeOneCopy(main: string, root: string, copy: ScratchCopy, protectedPaths: string[]): string | null {
   if (copy.path !== join(root, copy.name) || !NAME_RE.test(copy.name)) return "recorded path is not <scratch root>/<name>";
-  if (!main) return "cannot locate the main checkout to unregister the copy";
+  if (protectedPaths.some((path) => path === copy.path)) return "recorded path is the run's worktree or the main checkout";
   if (!existsSync(copy.path)) {
     git(["-C", main, "worktree", "prune"]);
     return null;
@@ -279,7 +329,7 @@ export function scratchGc(source: string, execute: boolean): ScratchGcEntry[] {
       reason: status ? `run ${status.state}` : "run dir gone",
     };
     if (execute) {
-      const result = removeScratchCopies({ worktree: main, scratch_root: root, scratch: copies });
+      const result = removeScratchCopies({ worktree: main, run_id: runId, scratch_root: root, scratch: copies });
       entry.removed = result.removed;
       entry.kept = result.kept;
     }

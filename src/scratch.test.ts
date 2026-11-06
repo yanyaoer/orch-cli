@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CliError } from "./cli.ts";
@@ -17,7 +17,7 @@ import { runSupervisor, writeInitialRunFiles } from "./supervisor.ts";
 import { seatbeltProfile } from "../drivers/sandbox.ts";
 import { buildPrompt, buildProviderExecutionPlan } from "../drivers/driver-common.ts";
 import type { RunSpec, RunStatus } from "./types.ts";
-import type { CowBackendFactory } from "./worktree.ts";
+import { cloneWorktreeCow, type CowBackendFactory } from "./worktree.ts";
 
 const cleanups: Array<() => void> = [];
 afterEach(() => {
@@ -123,7 +123,7 @@ test("copies of a linked worktree live under the main checkout's orch root and c
   // Disposable by contract: a mutated copy is still removed.
   writeFileSync(join(combo!.path, "app.txt"), "mutated\n");
   writeFileSync(join(combo!.path, "untracked.txt"), "x\n");
-  const cleanup = removeScratchCopies({ worktree: verify, scratch_root: root, scratch: copies });
+  const cleanup = removeScratchCopies({ worktree: verify, run_id: "run-1", scratch_root: root, scratch: copies });
   expect(cleanup.removed.sort()).toEqual([base!.path, combo!.path].sort());
   expect(cleanup.kept).toEqual([]);
   expect(existsSync(root)).toBe(false);
@@ -139,7 +139,7 @@ test("removal works after the run's own worktree is gone (derived from the scrat
   mkdirSync(runDir, { recursive: true });
   const { root, copies } = createScratchCopies(verify, "run-2", runDir, resolveScratchRevs(verify, parseScratchRequests(["combo"])), portableBackend);
   sh(main, "git", "worktree", "remove", "--force", verify);
-  const cleanup = removeScratchCopies({ worktree: verify, scratch_root: root, scratch: copies });
+  const cleanup = removeScratchCopies({ worktree: verify, run_id: "run-2", scratch_root: root, scratch: copies });
   expect(cleanup.removed).toEqual([copies[0]!.path]);
   expect(existsSync(root)).toBe(false);
 });
@@ -152,7 +152,7 @@ test("removal is identity-gated: a recorded path outside <root>/<name>, or a non
   const victim = join(parent, "victim");
   mkdirSync(victim);
   writeFileSync(join(victim, "keep.txt"), "precious\n");
-  const outside = removeScratchCopies({ worktree: verify, scratch_root: root, scratch: [{ name: "combo", path: victim, rev: null, head: "x" }] });
+  const outside = removeScratchCopies({ worktree: verify, run_id: "run-3", scratch_root: root, scratch: [{ name: "combo", path: victim, rev: null, head: "x" }] });
   expect(outside.removed).toEqual([]);
   expect(outside.kept[0]!.reason).toContain("not <scratch root>/<name>");
   expect(existsSync(join(victim, "keep.txt"))).toBe(true);
@@ -161,11 +161,63 @@ test("removal is identity-gated: a recorded path outside <root>/<name>, or a non
   const planted = join(root, "planted");
   mkdirSync(planted);
   writeFileSync(join(planted, "keep.txt"), "precious\n");
-  const notClone = removeScratchCopies({ worktree: verify, scratch_root: root, scratch: [{ name: "planted", path: planted, rev: null, head: "x" }] });
+  const notClone = removeScratchCopies({ worktree: verify, run_id: "run-3", scratch_root: root, scratch: [{ name: "planted", path: planted, rev: null, head: "x" }] });
   expect(notClone.kept[0]!.reason).toContain("provenance");
   expect(existsSync(join(planted, "keep.txt"))).toBe(true);
-  removeScratchCopies({ worktree: verify, scratch_root: root, scratch: copies });
+  removeScratchCopies({ worktree: verify, run_id: "run-3", scratch_root: root, scratch: copies });
   expect(existsSync(copies[0]!.path)).toBe(false);
+});
+
+// verify-cow-scratch r1 (codex): a crafted spec pointing scratch_root at the
+// orch root itself made a sibling registered clone pass as "<root>/<name>".
+test("removal refuses any scratch_root other than <orch root>/scratch/<run_id> with its marker", () => {
+  const { parent, main, verify } = fixture();
+  const fanout = join(parent, ".orch-worktrees", "repo");
+  const sibling = join(fanout, "sibling-clone");
+  cloneWorktreeCow(main, sibling, null, { mode: "snapshot" }, portableBackend);
+  const crafted = [
+    { run_id: "run-7", scratch_root: fanout },
+    { run_id: undefined, scratch_root: fanout },
+    { run_id: "scratch", scratch_root: fanout },
+    { run_id: "../repo", scratch_root: fanout },
+    { run_id: "run-7", scratch_root: join(fanout, "scratch", "run-8") },
+  ];
+  for (const spec of crafted) {
+    const result = removeScratchCopies({ worktree: verify, ...spec, scratch: [{ name: "sibling-clone", path: sibling, rev: null, head: "x" }] });
+    expect(result.removed).toEqual([]);
+    expect(result.kept).toHaveLength(1);
+  }
+  // Nor may a copy be the run's own worktree, even under a well-formed root.
+  const runDir = join(parent, "state", "run-7");
+  mkdirSync(runDir, { recursive: true });
+  const { root } = createScratchCopies(verify, "run-7", runDir, resolveScratchRevs(verify, parseScratchRequests(["combo"])), portableBackend);
+  const ownWorktree = removeScratchCopies({ worktree: verify, run_id: "run-7", scratch_root: root, scratch: [{ name: "verify-1", path: verify, rev: null, head: "x" }] });
+  expect(ownWorktree.removed).toEqual([]);
+  expect(existsSync(sibling)).toBe(true);
+  expect(existsSync(verify)).toBe(true);
+  expect(registered(main)).toContain(sibling);
+});
+
+// verify-cow-scratch r1 (codex): a symlink planted at <orch root>/scratch sent
+// the copies outside the required root.
+test("a symlinked scratch dir (or run root) is refused before anything is cloned", () => {
+  const { parent, main, verify } = fixture();
+  const elsewhere = join(parent, "elsewhere");
+  mkdirSync(elsewhere);
+  const scratchBase = join(parent, ".orch-worktrees", "repo", "scratch");
+  symlinkSync(elsewhere, scratchBase);
+  const runDir = join(parent, "state", "run-9");
+  mkdirSync(runDir, { recursive: true });
+  expect(() => createScratchCopies(verify, "run-9", runDir, resolveScratchRevs(verify, parseScratchRequests(["combo"])), portableBackend)).toThrow();
+  expect(readdirSync(elsewhere)).toEqual([]);
+  expect(registered(main)).not.toContain("combo");
+
+  rmSync(scratchBase);
+  mkdirSync(scratchBase, { mode: 0o700 });
+  symlinkSync(elsewhere, join(scratchBase, "run-10"));
+  expect(() => createScratchCopies(verify, "run-10", runDir, resolveScratchRevs(verify, parseScratchRequests(["combo"])), portableBackend)).toThrow(CliError);
+  expect(readdirSync(elsewhere)).toEqual([]);
+  expect(() => createScratchCopies(verify, "../x", runDir, [], portableBackend)).toThrow(CliError);
 });
 
 test("a failing @rev checkout rolls back the copies already made", () => {

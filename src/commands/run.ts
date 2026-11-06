@@ -784,7 +784,7 @@ async function startRun(input: StartRunInput): Promise<Record<string, unknown>> 
     // failure removes them; after that the supervisor owns their removal.
     const scratch = input.scratchRequests.length > 0 ? createScratchCopies(worktree, id, runDir, input.scratchRequests) : null;
     const dropScratch = (): void => {
-      if (scratch) removeScratchCopies({ worktree, scratch_root: scratch.root, scratch: scratch.copies });
+      if (scratch) removeScratchCopies({ worktree, run_id: id, scratch_root: scratch.root, scratch: scratch.copies });
     };
     let supervisorSpawned = false;
     try {

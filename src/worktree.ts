@@ -143,7 +143,7 @@ function canonicalizeAllowMissing(path: string): string {
   }
 }
 
-function ensurePrivateDirectory(path: string): string {
+export function ensurePrivateDirectory(path: string): string {
   if (pathExists(path)) {
     const stat = lstatSync(path);
     if (stat.isSymbolicLink() || !stat.isDirectory()) {
