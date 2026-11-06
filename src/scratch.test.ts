@@ -190,7 +190,19 @@ test("removal refuses any scratch_root other than <orch root>/scratch/<run_id> w
   // Nor may a copy be the run's own worktree, even under a well-formed root.
   const runDir = join(parent, "state", "run-7");
   mkdirSync(runDir, { recursive: true });
-  const { root } = createScratchCopies(verify, "run-7", runDir, resolveScratchRevs(verify, parseScratchRequests(["combo"])), portableBackend);
+  const { root, copies } = createScratchCopies(verify, "run-7", runDir, resolveScratchRevs(verify, parseScratchRequests(["combo"])), portableBackend);
+
+  // verify-cow-scratch r2 (codex): a marker forged to name another run inside
+  // run-7's otherwise valid root. Marker, symlink and provenance gates all
+  // pass; only the exact <orch root>/scratch/<run_id> comparison refuses it.
+  const marker = join(root, ".orch-scratch.json");
+  const original = readFileSync(marker, "utf8");
+  writeFileSync(marker, JSON.stringify({ run_id: "run-8", run_dir: join(parent, "state", "run-8") }));
+  const forged = removeScratchCopies({ worktree: verify, run_id: "run-8", scratch_root: root, scratch: copies });
+  expect(forged.removed).toEqual([]);
+  expect(forged.kept[0]!.reason).toContain("scratch_root is not");
+  expect(existsSync(copies[0]!.path)).toBe(true);
+  writeFileSync(marker, original);
   const ownWorktree = removeScratchCopies({ worktree: verify, run_id: "run-7", scratch_root: root, scratch: [{ name: "verify-1", path: verify, rev: null, head: "x" }] });
   expect(ownWorktree.removed).toEqual([]);
   expect(existsSync(sibling)).toBe(true);
