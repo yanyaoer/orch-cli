@@ -13,7 +13,7 @@ import {
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { getSystemErrorName } from "node:util";
-import { dlopen, FFIType, ptr, read } from "bun:ffi";
+import { dlopen, FFIType, read } from "bun:ffi";
 import { gitEnv } from "./git-env.ts";
 import { randomHex, sha256 } from "./hash.ts";
 import { assertKnownFlags, CliError, collectFlags, flagBool, flagNumber, flagString, printJson, type ParsedArgs } from "./cli.ts";
@@ -183,7 +183,14 @@ function darwinClonefile(): CopyFn | null {
       __error: { args: [], returns: FFIType.ptr },
     });
     darwinClonefileFn = (source, dest) => {
-      const rc = lib.symbols.clonefile(ptr(Buffer.from(`${source}\0`)), ptr(Buffer.from(`${dest}\0`)), CLONE_NOFOLLOW);
+      // Pass the Buffers themselves, held in locals: `ptr(Buffer.from(...))` leaves the
+      // temporary unreferenced, so a GC between ptr() and the call can free it and the
+      // kernel reads a reused path (seen as random ENOENT once --exclude made the copy
+      // per-file: tens of thousands of calls). A typed-array argument stays alive for
+      // the whole FFI call.
+      const sourcePath = Buffer.from(`${source}\0`);
+      const destPath = Buffer.from(`${dest}\0`);
+      const rc = lib.symbols.clonefile(sourcePath, destPath, CLONE_NOFOLLOW);
       if (rc === 0) return;
       const errno = read.i32(lib.symbols.__error()!, 0);
       throw new CliError(`clonefile ${source} -> ${dest} failed: ${getSystemErrorName(-errno)}`);
