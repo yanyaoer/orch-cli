@@ -11,7 +11,8 @@ import { describeSnapshot, vcsDirty, vcsHead, vcsResolveCommit, vcsSnapshot } fr
 import { isTerminal } from "../overview.ts";
 import { orchLanguage, readOrchConfig, type RoleDefaults } from "../config.ts";
 
-import { CliError, assertKnownFlags, flagBool, flagString, printJson, readStdinText, type ParsedArgs } from "../cli.ts";
+import { CliError, assertKnownFlags, collectFlags, flagBool, flagString, printJson, readStdinText, type ParsedArgs } from "../cli.ts";
+import { createScratchCopies, parseScratchRequests, removeScratchCopies, resolveScratchRevs, scratchFingerprint, scratchRootPath, type ScratchRequest } from "../scratch.ts";
 import { buildPrompt, buildProviderExecutionPlan, roleHasEvidenceDir, runEvidenceDir, type ProviderExecutionPlan } from "../../drivers/driver-common.ts";
 import { SEATBELT_ENGINE, sandboxPosture, sandboxRunIdentity, seatbeltUnsupportedReason } from "../../drivers/sandbox.ts";
 import { DEPRECATED_SANDBOX_REASON, warnDeprecated } from "../deprecation.ts";
@@ -271,6 +272,7 @@ const RUN_CREATE_FLAGS = [
   "allow-session-chain",
   "head",
   "supersedes",
+  "scratch",
   "dry-run",
   "json",
 ] as const;
@@ -462,12 +464,22 @@ export async function createRun(args: ParsedArgs): Promise<number> {
   const snapshot = await captureCreateSnapshot(worktree);
   const pinnedHead = args.flags.has("head") ? await resolvePinnedHead(worktree, flagString(args, "head"), snapshot, role) : null;
   const supersedes = resolveSupersedes(args, mrDir, mr, role, resume);
+  // --scratch: revs resolve now so the key and the copies agree; the copies
+  // themselves are made in startRun, once the run id exists.
+  const scratchRequests = args.flags.has("scratch") ? resolveScratchRevs(worktree, parseScratchRequests(collectFlags(args, "scratch"))) : [];
+  if (args.flags.has("scratch") && scratchRequests.length === 0) throw new CliError("--scratch needs at least one name");
+  if (scratchRequests.length > 0 && !roleHasEvidenceDir(role)) {
+    throw new CliError(`--scratch is for implementer and verifier runs (a ${role} run gets no writable copies)`);
+  }
   // The engine version is part of the default fingerprint so sandboxed and
   // unsandboxed requests can never reuse each other's runs; the actual HEAD
   // (plus content for reviewer/verifier on a dirty checkout) is too, so the
   // same request against a new candidate is a new run.
   const contentKey = evidenceRoles.has(role) && snapshot.dirty ? `:content-${sha256(snapshot.content_sha).slice(0, 12)}` : "";
-  const defaultIdempotencyKey = `mr${mr}:${tag}:${taskSha}:session-${providerSessionFingerprint(providerSession)}:head-${snapshot.head}${contentKey}${sandboxIdentity.keySuffix}`;
+  // Absent --scratch leaves the key exactly as before; with it, the same
+  // request asking for different copies (or a rev that moved) is a new run.
+  const scratchKey = scratchRequests.length > 0 ? `:scratch-${sha256(scratchFingerprint(scratchRequests)).slice(0, 12)}` : "";
+  const defaultIdempotencyKey = `mr${mr}:${tag}:${taskSha}:session-${providerSessionFingerprint(providerSession)}:head-${snapshot.head}${contentKey}${sandboxIdentity.keySuffix}${scratchKey}`;
   const idempotencyKey = flagString(args, "idempotency-key", defaultIdempotencyKey);
   const idempotencyPath = `${mrDir}/idempotency.json`;
   const dryRun = flagBool(args, "dry-run");
@@ -488,6 +500,22 @@ export async function createRun(args: ParsedArgs): Promise<number> {
     const runDir = idempotent ? existing!.run_dir : `${mrDir}/runs/${id}`;
     const plannedSupersedes = retry ? withRetrySupersede(supersedes, existing, role) : supersedes;
     const specPath = `${runDir}/spec.json`;
+    // Planned only: dry-run never clones. Paths are where startRun would put them.
+    const plannedScratch =
+      scratchRequests.length > 0 && !idempotent
+        ? (() => {
+            const root = scratchRootPath(worktree, id);
+            return {
+              root,
+              copies: scratchRequests.map((request) => ({
+                name: request.name,
+                path: `${root}/${request.name}`,
+                rev: request.rev,
+                head: request.head ?? snapshot.head,
+              })),
+            };
+          })()
+        : null;
     const specPreview: RunSpec = {
       version: 1,
       run_id: id,
@@ -510,6 +538,7 @@ export async function createRun(args: ParsedArgs): Promise<number> {
       snapshot,
       ...(pinnedHead ? { pinned_head: pinnedHead } : {}),
       ...(plannedSupersedes.length > 0 ? { supersedes: plannedSupersedes } : {}),
+      ...(plannedScratch ? { scratch_root: plannedScratch.root, scratch: plannedScratch.copies } : {}),
     };
     const payload = {
       dry_run: true,
@@ -543,6 +572,7 @@ export async function createRun(args: ParsedArgs): Promise<number> {
       snapshot,
       pinned_head: pinnedHead,
       supersedes: plannedSupersedes,
+      scratch: plannedScratch,
       timeout_sec: timeoutSec,
       supervisor_plan: idempotent
         ? null
@@ -646,6 +676,7 @@ export async function createRun(args: ParsedArgs): Promise<number> {
       snapshot,
       pinnedHead,
       supersedes,
+      scratchRequests,
     })),
   });
   return 0;
@@ -675,6 +706,7 @@ interface StartRunInput {
   snapshot: VcsSnapshot;
   pinnedHead: string | null;
   supersedes: string[];
+  scratchRequests: Array<ScratchRequest & { head: string | null }>;
 }
 
 // Spawns a single supervised run and returns its create payload. Shared by
@@ -747,90 +779,106 @@ async function startRun(input: StartRunInput): Promise<Record<string, unknown>> 
     // the fake driver); ORCH_RUN_EVIDENCE_DIR and the prompt point here.
     const evidenceDir = roleHasEvidenceDir(role) ? runEvidenceDir(runDir) : null;
     if (evidenceDir) mkdirSync(evidenceDir, { recursive: true, mode: 0o700 });
-    const createdAt = new Date().toISOString();
-    const spec: RunSpec = {
-      version: 1,
-      run_id: id,
-      mr,
-      role,
-      agent,
-      tag,
-      ...(orchLanguage() === "中文" ? { language: "中文" as const } : {}),
-      ...sandboxIdentity.specField,
-      ...providerSession,
-      idempotency_key: idempotencyKey,
-      repo_key: repo.repo_key,
-      worktree,
-      task_path: taskPath,
-      task_text: taskText,
-      task_sha: taskSha,
-      base_sha: baseSha,
-      timeout_sec: timeoutSec,
-      created_at: createdAt,
-      snapshot,
-      ...(pinnedHead ? { pinned_head: pinnedHead } : {}),
-      ...(supersedes.length > 0 ? { supersedes } : {}),
+    // Made host-side before the worker exists (a sandboxed worker could not
+    // register a worktree). From here until the supervisor is spawned, a
+    // failure removes them; after that the supervisor owns their removal.
+    const scratch = input.scratchRequests.length > 0 ? createScratchCopies(worktree, id, runDir, input.scratchRequests) : null;
+    const dropScratch = (): void => {
+      if (scratch) removeScratchCopies({ worktree, scratch_root: scratch.root, scratch: scratch.copies });
     };
-    const specBytes = jsonBytes(spec);
-    writeTextAtomic(`${runDir}/spec.json`, specBytes);
-    writeJsonAtomic(`${runDir}/spec.sha256`, { sha256: sha256(specBytes) });
-    writeInitialRunFiles(runDir, spec);
-
-    const proc = Bun.spawn(
-      [...orchCommand(), "__supervisor", "--run-dir", runDir],
-      {
-        cwd: worktree,
-        detached: true,
-        stdin: "ignore",
-        stdout: "ignore",
-        stderr: "ignore",
-        // The supervisor is an orch process; AI/tool subprocess env is sanitized
-        // at the supervisor→driver and driver→provider boundaries.
-        env: process.env,
-      },
-    );
-
-    idempotency[idempotencyKey] = {
-      run_id: id,
-      run_dir: runDir,
-      status_path: `${runDir}/status.json`,
-      result_path: `${runDir}/result.json`,
-      created_at: createdAt,
-      previous: existing ? [...(existing.previous ?? []), archivedIdempotency(existing)] : undefined,
-    };
+    let supervisorSpawned = false;
     try {
-      writeJsonAtomic(idempotencyPath, idempotency);
-    } catch (error) {
-      // Without the idempotency record a same-key retry would double-dispatch;
-      // reap the just-spawned supervisor's process group before surfacing.
-      // Residual risk (accepted): the driver is spawned detached in its own
-      // group, so if the supervisor already reached its driver-spawn in this
-      // sub-millisecond window, the driver survives as an orphan.
+      const createdAt = new Date().toISOString();
+      const spec: RunSpec = {
+        version: 1,
+        run_id: id,
+        mr,
+        role,
+        agent,
+        tag,
+        ...(orchLanguage() === "中文" ? { language: "中文" as const } : {}),
+        ...sandboxIdentity.specField,
+        ...providerSession,
+        idempotency_key: idempotencyKey,
+        repo_key: repo.repo_key,
+        worktree,
+        task_path: taskPath,
+        task_text: taskText,
+        task_sha: taskSha,
+        base_sha: baseSha,
+        timeout_sec: timeoutSec,
+        created_at: createdAt,
+        snapshot,
+        ...(pinnedHead ? { pinned_head: pinnedHead } : {}),
+        ...(supersedes.length > 0 ? { supersedes } : {}),
+        ...(scratch ? { scratch_root: scratch.root, scratch: scratch.copies } : {}),
+      };
+      const specBytes = jsonBytes(spec);
+      writeTextAtomic(`${runDir}/spec.json`, specBytes);
+      writeJsonAtomic(`${runDir}/spec.sha256`, { sha256: sha256(specBytes) });
+      writeInitialRunFiles(runDir, spec);
+
+      const proc = Bun.spawn(
+        [...orchCommand(), "__supervisor", "--run-dir", runDir],
+        {
+          cwd: worktree,
+          detached: true,
+          stdin: "ignore",
+          stdout: "ignore",
+          stderr: "ignore",
+          // The supervisor is an orch process; AI/tool subprocess env is sanitized
+          // at the supervisor→driver and driver→provider boundaries.
+          env: process.env,
+        },
+      );
+      supervisorSpawned = true;
+
+      idempotency[idempotencyKey] = {
+        run_id: id,
+        run_dir: runDir,
+        status_path: `${runDir}/status.json`,
+        result_path: `${runDir}/result.json`,
+        created_at: createdAt,
+        previous: existing ? [...(existing.previous ?? []), archivedIdempotency(existing)] : undefined,
+      };
       try {
-        process.kill(-proc.pid, "SIGTERM");
-      } catch {
-        // already exited
+        writeJsonAtomic(idempotencyPath, idempotency);
+      } catch (error) {
+        // Without the idempotency record a same-key retry would double-dispatch;
+        // reap the just-spawned supervisor's process group before surfacing.
+        // Residual risk (accepted): the driver is spawned detached in its own
+        // group, so if the supervisor already reached its driver-spawn in this
+        // sub-millisecond window, the driver survives as an orphan.
+        try {
+          process.kill(-proc.pid, "SIGTERM");
+        } catch {
+          // already exited
+        }
+        throw error;
       }
+
+      return {
+        run_id: id,
+        state: "starting",
+        model: providerSession.model,
+        provider_session_name: providerSession.provider_session_name,
+        provider_session_id: providerSession.provider_session_id,
+        provider_session_mode: providerSession.provider_session_mode,
+        supervisor_pid: proc.pid,
+        repo_key: repo.repo_key,
+        mr_dir: mrDir,
+        run_dir: runDir,
+        evidence_dir: evidenceDir,
+        ...(scratch ? { scratch_root: scratch.root, scratch: scratch.copies } : {}),
+        status_path: `${runDir}/status.json`,
+        events_path: `${runDir}/events.jsonl`,
+        worktree_lock: lockPathForWorktree(worktree),
+        dirty: dirty.length > 0,
+      };
+    } catch (error) {
+      if (!supervisorSpawned) dropScratch();
       throw error;
     }
-
-    return {
-      run_id: id,
-      state: "starting",
-      model: providerSession.model,
-      provider_session_name: providerSession.provider_session_name,
-      provider_session_id: providerSession.provider_session_id,
-      provider_session_mode: providerSession.provider_session_mode,
-      supervisor_pid: proc.pid,
-      repo_key: repo.repo_key,
-      mr_dir: mrDir,
-      run_dir: runDir,
-      evidence_dir: evidenceDir,
-      status_path: `${runDir}/status.json`,
-      events_path: `${runDir}/events.jsonl`,
-      worktree_lock: lockPathForWorktree(worktree),
-      dirty: dirty.length > 0,
-    };
   } finally {
     mrLock.release();
   }

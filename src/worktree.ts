@@ -17,6 +17,7 @@ import { dlopen, FFIType, read } from "bun:ffi";
 import { gitEnv } from "./git-env.ts";
 import { randomHex, sha256 } from "./hash.ts";
 import { assertKnownFlags, CliError, collectFlags, flagBool, flagNumber, flagString, printJson, type ParsedArgs } from "./cli.ts";
+import { scratchGc } from "./scratch.ts";
 
 export type WorktreeMaterializationMode = "snapshot" | "warm-head";
 export type ExternalSymlinkPolicy = "preserve" | "warn" | "reject";
@@ -59,7 +60,7 @@ interface WorkspaceState {
   untracked_unverifiable: string[];
 }
 
-interface CloneProvenance {
+export interface CloneProvenance {
   schema: "orch.worktree-clone/v1";
   source: string;
   dest: string;
@@ -156,11 +157,11 @@ function ensurePrivateDirectory(path: string): string {
 }
 
 // Read-only path of the fanout storage root; never creates directories.
-function fanoutRootPath(source: string): string {
+export function fanoutRootPath(source: string): string {
   return join(dirname(source), ".orch-worktrees", basename(source));
 }
 
-function privateWorktreeRoot(source: string): string {
+export function privateWorktreeRoot(source: string): string {
   const storage = ensurePrivateDirectory(join(dirname(source), ".orch-worktrees"));
   return ensurePrivateDirectory(join(storage, basename(source)));
 }
@@ -638,7 +639,7 @@ function readProvenanceFile(path: string): CloneProvenance | null {
   }
 }
 
-function readProvenance(dest: string): CloneProvenance | null {
+export function readProvenance(dest: string): CloneProvenance | null {
   try {
     return readProvenanceFile(provenancePath(dest));
   } catch {
@@ -657,7 +658,7 @@ function attempt(step: () => unknown): void {
 
 // A copied read-only directory blocks unlink of its children; repair the
 // doomed tree's modes (never the source's) and retry.
-function forceRemoveTree(path: string): void {
+export function forceRemoveTree(path: string): void {
   attempt(() => rmSync(path, { recursive: true, force: true }));
   if (!pathExists(path)) return;
   attempt(() => Bun.spawnSync(["chmod", "-R", "u+w", path], { stdout: "pipe", stderr: "pipe" }));
@@ -858,7 +859,7 @@ function restoreParked(moves: Array<{ from: string; to: string }>, parkRoot: str
   if (leftover.length === 0) rmSync(parkRoot, { recursive: true, force: true });
 }
 
-function worktreeRegistered(source: string, dest: string): boolean {
+export function worktreeRegistered(source: string, dest: string): boolean {
   // NUL-delimited so a path containing a newline cannot split into unmatched
   // lines and misread a still-registered worktree as unregistered.
   const list = spawnGit(["-C", source, "worktree", "list", "--porcelain", "-z"]);
@@ -1060,7 +1061,9 @@ export function scanWorktreeClones(sourceArg: string): WorktreeCloneScan {
   const root = fanoutRootPath(source);
   if (pathExists(root)) {
     for (const entry of readdirSync(root)) {
-      if (entry === ".trash") continue;
+      // scratch/ holds per-run `run create --scratch` copies; gc reports them
+      // separately, keyed by the owning run.
+      if (entry === ".trash" || entry === "scratch") continue;
       let path = join(root, entry);
       try {
         path = realpathSync(path);
@@ -1138,6 +1141,10 @@ export async function worktreeGc(args: ParsedArgs): Promise<number> {
     return { ...entry, action: "sweep", reason: "clone was removed as proven-safe; leftover from an interrupted sweep" };
   });
 
+  // Per-run scratch copies are disposable by contract: removed (identity
+  // checked, no loss gate) once their run is no longer in flight.
+  const scratch = scratchGc(scan.source, execute);
+
   if (execute) {
     for (const clone of clones) {
       if (clone.action === "remove" || clone.action === "prune") {
@@ -1153,20 +1160,29 @@ export async function worktreeGc(args: ParsedArgs): Promise<number> {
     }
   }
 
-  const removable = clones.filter((clone) => clone.action !== "keep").length + trash.filter((entry) => entry.action === "sweep").length;
+  const removable =
+    clones.filter((clone) => clone.action !== "keep").length +
+    trash.filter((entry) => entry.action === "sweep").length +
+    scratch.filter((entry) => entry.action === "remove").length;
   printJson({
     worktree: "gc",
     source: scan.source,
     executed: execute,
     clones,
     trash,
+    scratch,
     orphans: scan.orphans,
     summary: {
       clones: clones.length,
       trash: trash.length,
+      scratch: scratch.length,
       orphans: scan.orphans.length,
       removable,
-      removed: execute ? clones.filter((clone) => clone.removed).length + trash.filter((entry) => entry.swept).length : 0,
+      removed: execute
+        ? clones.filter((clone) => clone.removed).length +
+          trash.filter((entry) => entry.swept).length +
+          scratch.filter((entry) => entry.action === "remove" && (entry.kept ?? []).length === 0).length
+        : 0,
     },
     ...(execute || removable === 0 ? {} : { execute_with: "orch worktree gc --execute" }),
   });

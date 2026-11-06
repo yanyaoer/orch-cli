@@ -12,6 +12,7 @@ import { sandboxPosture } from "../drivers/sandbox.ts";
 import { describeSnapshot, jjWorkspaceRoot, sameSnapshot, vcsHead, vcsKind, vcsSnapshot } from "./vcs.ts";
 import { writeEvidenceManifest } from "./evidence.ts";
 import { compactEvidenceDir, evidenceCompactEnabled } from "./evidence-compact.ts";
+import { removeScratchCopies } from "./scratch.ts";
 
 function now(): string {
   return new Date().toISOString();
@@ -435,6 +436,17 @@ export async function runSupervisor(runDir: string, orchCommand: string[]): Prom
   } finally {
     if (timeout) clearTimeout(timeout);
     if (heartbeat) clearInterval(heartbeat);
+    // After the terminal status and the evidence manifest: the copies were the
+    // worker's to mutate and carry nothing the run must keep. Best effort — a
+    // copy that cannot go is recorded, and `orch worktree gc` retries it.
+    if (loadedSpec?.scratch && loadedSpec.scratch.length > 0) {
+      try {
+        const cleanup = removeScratchCopies(loadedSpec);
+        updateStatus(runDir, loadedSpec, { scratch_cleanup: cleanup });
+      } catch {
+        // diagnostic only; gc sweeps what is left
+      }
+    }
     worktreeLock?.release();
   }
 }
