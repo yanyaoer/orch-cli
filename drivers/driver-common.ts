@@ -6,6 +6,7 @@ import { normalizeNativeText } from "../src/native-events.ts";
 import { nativeResult } from "../src/native-result.ts";
 import { codexBaselinePath, readCodexBaseline } from "../src/codex-baseline.ts";
 import { scrubGitLocationEnv } from "../src/git-env.ts";
+import { ORCH_RUN_SCRATCH_DIR_ENV } from "../src/scratch.ts";
 import { sha256 } from "../src/hash.ts";
 import { readOrchConfig } from "../src/config.ts";
 import { claudeRunMode, claudeTuiArgv, resumedSessionId, runClaudeTui, type ClaudeMode } from "./claude-tui.ts";
@@ -64,6 +65,21 @@ export function roleHasEvidenceDir(role: RunSpec["role"]): boolean {
   return writeRoles.has(role);
 }
 
+function scratchCopies(spec: RunSpec): NonNullable<RunSpec["scratch"]> {
+  return spec.scratch_root && Array.isArray(spec.scratch) ? spec.scratch : [];
+}
+
+// `run create --scratch`: orch made these CoW copies before the run started
+// and deletes them when it ends — the worker never copies the tree itself.
+function scratchPromptLines(spec: RunSpec): string[] {
+  const copies = scratchCopies(spec);
+  if (copies.length === 0) return [];
+  return [
+    `Scratch copies (also $${ORCH_RUN_SCRATCH_DIR_ENV}=${spec.scratch_root}): copy-on-write snapshots of the worktree, dependencies and build output included, made for this run. Modify them freely (mutations, break checks, a base tree) instead of making your own whole-tree copy; orch deletes them when the run ends, so anything worth keeping goes to the evidence dir. Do not commit, fetch or change branches in them; their Git metadata is read-only.`,
+    ...copies.map((copy) => `- ${copy.name}: ${copy.path} (at ${copy.head}${copy.rev ? `, from ${copy.rev}` : ", the worktree's own HEAD and content"})`),
+  ];
+}
+
 export function buildPrompt(spec: RunSpec, provider: string, runDir?: string): string {
   const role = isRunRole(spec.role) ? spec.role : "implementer";
   const evidenceDir = runDir && roleHasEvidenceDir(role) ? runEvidenceDir(runDir) : null;
@@ -84,6 +100,7 @@ export function buildPrompt(spec: RunSpec, provider: string, runDir?: string): s
           "Write every log, reproduction script, red/break check output, mutation diff and fetched test report you want kept into the evidence dir (a subdirectory per check is fine); it outlives the worktree and the controller cites it. Keep fixture repositories and whole-tree copies in $TMPDIR, not there. The worktree must end clean (`git status --porcelain` empty); one-off scratch goes to $TMPDIR.",
         ]
       : []),
+    ...scratchPromptLines(spec),
     "",
     "Execute the task below. Your final answer must be a single JSON object matching this orch schema.",
     `The top-level JSON object must include: "schema": "${schemaName}".`,
@@ -408,6 +425,7 @@ function providerArgv(
     // tee) are checked against the working directories, so without it a
     // dontAsk worker cannot write its evidence. Re-passed on every resume.
     if (roleHasEvidenceDir(spec.role)) argv.push("--add-dir", runEvidenceDir(runDir));
+    if (scratchCopies(spec).length > 0) argv.push("--add-dir", spec.scratch_root!);
     if (spec.provider_session_name) argv.push("--name", spec.provider_session_name);
     if (nativeSchemaEnabled() && isRunRole(spec.role)) argv.push("--json-schema", JSON.stringify(roleJsonSchema(spec.role)));
     if (spec.provider_session_mode === "ephemeral") {
@@ -442,7 +460,10 @@ function providerArgv(
     // The run's evidence dir is the only writable root added to workspace-write
     // (worktree, $TMPDIR and /tmp are codex defaults); the rest of the run dir
     // stays unwritable. Like --sandbox it rides the parent `exec` level on resume.
-    const evidenceFlags = roleHasEvidenceDir(spec.role) ? ["--add-dir", runEvidenceDir(runDir)] : [];
+    const evidenceFlags = [
+      ...(roleHasEvidenceDir(spec.role) ? ["--add-dir", runEvidenceDir(runDir)] : []),
+      ...(scratchCopies(spec).length > 0 ? ["--add-dir", spec.scratch_root!] : []),
+    ];
     if (spec.provider_session_mode === "resume_exact" && spec.provider_session_id) {
       // `codex exec resume` has no --sandbox flag (exit 2 if passed); the
       // sandbox rides the parent `exec` level, accepted before the subcommand.
@@ -1464,6 +1485,7 @@ function buildProviderExecutionPlanBase(ctx: ExecutionContext): ProviderExecutio
   // The plan never touches the host (its fail-closed checks come first): run
   // create makes the dir, and runProviderDriver re-ensures it before spawning.
   if (evidenceDir) env[ORCH_RUN_EVIDENCE_DIR_ENV] = evidenceDir;
+  if (scratchCopies(spec).length > 0) env[ORCH_RUN_SCRATCH_DIR_ENV] = spec.scratch_root!;
   if (spec.sandbox_engine === undefined) {
     return {
       argv: providerArgv(provider, spec, runDir, worktree, ctx.prompt ?? "", false),
@@ -1635,6 +1657,10 @@ function buildProviderExecutionPlanBase(ctx: ExecutionContext): ProviderExecutio
     workerCacheDir: canonicalCache,
     extraWriteDirs,
     evidenceDir: evidenceDir ? canonicalizePath(evidenceDir) : null,
+    // run create made the copies before the driver runs; a dry-run plans
+    // paths that do not exist yet (canonicalizePath rebuilds those on the parent).
+    scratchCopiesRoot: scratchCopies(spec).length > 0 ? canonicalizePath(spec.scratch_root!) : null,
+    scratchCopyPaths: scratchCopies(spec).map((copy) => canonicalizePath(copy.path)),
   });
 
   return {

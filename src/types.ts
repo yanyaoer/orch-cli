@@ -78,6 +78,11 @@ export interface RunSpec {
   // (--supersedes, --resume-from, --retry). Aggregation drops a superseded
   // run's evidence once this run is done.
   supersedes?: string[];
+  // `run create --scratch`: CoW snapshot copies of the worktree made before the
+  // run started, provider-writable, removed by the supervisor when it ends
+  // (`orch worktree gc` sweeps what a dead supervisor left). Absent = none.
+  scratch_root?: string;
+  scratch?: Array<{ name: string; path: string; rev: string | null; head: string }>;
 }
 
 // Host-captured worktree identity. content_sha equals head when the checkout
@@ -124,6 +129,9 @@ export interface RunStatus {
   worktree: string;
   base_sha: string;
   head_sha: string | null;
+  // `run create --scratch` copies the supervisor removed (or kept, with why)
+  // after the run ended; absent when the run had none.
+  scratch_cleanup?: { removed: string[]; kept: Array<{ path: string; reason: string }> };
   // Effective sandbox contract for audit: engine/posture snapshot from the
   // spec at create; profile hash and native-sandbox flag flow in from the
   // driver's recorded execution plan (sandbox.json) once the driver runs.
