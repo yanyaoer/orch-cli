@@ -412,7 +412,7 @@ controller / human
   -> MaildirBus signed event log
   -> orch mail route / claim
   -> per-run supervisor
-  -> codex, claude, pi, or omp headless driver
+  -> codex, claude, pi, omp, or agy headless driver
   -> result.submitted mail
   -> reviewer / verifier follow-up tasks
   -> optional PR/MR mirror through outbox

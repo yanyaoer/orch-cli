@@ -76,9 +76,9 @@ resolves relative to your shell's current directory, not `--worktree`.
 
 | Role | Writes the worktree | Agents allowed | Typical use |
 |---|---|---|---|
-| `implementer` | yes (takes the worktree lock) | codex, claude, pi, omp | land a change; rework via `--resume-from` |
+| `implementer` | yes (takes the worktree lock) | codex, claude, pi, omp, agy | land a change; rework via `--resume-from` |
 | `reviewer` | no | codex, claude, pi, omp | approve / request_changes with findings |
-| `verifier` | yes (must run tests) | codex, claude, pi, omp | pass / fail against acceptance checks |
+| `verifier` | yes (must run tests) | codex, claude, pi, omp, agy | pass / fail against acceptance checks |
 | `researcher` | no, web allowed | codex, claude, omp (not pi) | recommendation, never code |
 | `controller` | no, may call `orch` | claude only | `orch new` and `orch mailctl` drive this |
 
