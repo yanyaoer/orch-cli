@@ -269,6 +269,8 @@ test("buildProviderArgv keeps defaults fresh and only resumes exact sessions", (
     "/worktree",
     "--output-last-message",
     "/run/last_message.txt",
+    "-c",
+    'service_tier="default"',
     "--sandbox",
     "workspace-write",
     "--add-dir",
@@ -327,7 +329,7 @@ test("buildProviderArgv keeps defaults fresh and only resumes exact sessions", (
       "/run",
       "/worktree",
     ),
-  ).toEqual(["codex", "exec", "--sandbox", "workspace-write", "--add-dir", "/run/evidence", "resume", "--json", "--output-last-message", "/run/last_message.txt", "thread-123", "-"]);
+  ).toEqual(["codex", "exec", "--sandbox", "workspace-write", "--add-dir", "/run/evidence", "resume", "--json", "--output-last-message", "/run/last_message.txt", "-c", 'service_tier="default"', "thread-123", "-"]);
   expect(
     buildProviderArgv(
       "pi",
@@ -383,6 +385,8 @@ test("buildProviderArgv passes explicit model overrides to supporting providers"
     "/run/last_message.txt",
     "--model",
     model,
+    "-c",
+    'service_tier="default"',
     "--sandbox",
     "read-only",
     "-",
@@ -406,6 +410,8 @@ test("buildProviderArgv passes explicit model overrides to supporting providers"
     "/run/last_message.txt",
     "--model",
     model,
+    "-c",
+    'service_tier="default"',
     "thread-123",
     "-",
   ]);
@@ -528,6 +534,8 @@ test("buildProviderArgv matches read-only posture to the reviewer role per provi
     "/worktree",
     "--output-last-message",
     "/run/last_message.txt",
+    "-c",
+    'service_tier="default"',
     "--sandbox",
     "read-only",
     "-",
@@ -589,6 +597,8 @@ test("buildProviderArgv gives researcher a read-only web-research posture on cla
     "model_reasoning_effort=high",
     "-c",
     "tools.web_search=true",
+    "-c",
+    'service_tier="default"',
     "--sandbox",
     "read-only",
     "-",
@@ -622,6 +632,8 @@ test("buildProviderArgv gives researcher a read-only web-research posture on cla
     "model_reasoning_effort=high",
     "-c",
     "tools.web_search=true",
+    "-c",
+    'service_tier="default"',
     "sess-1",
     "-",
   ]);
