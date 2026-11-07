@@ -1183,7 +1183,7 @@ export function prewalkHelp(): string {
     "  --task <file|->           Task text; - reads stdin",
     "  --executor-model <ref>    Cheaper model for the executor phase (required)",
     "  --guide-model <ref>       Guide model; defaults to the agent's implementer default",
-    "  --agent <name>            codex|claude|pi|omp (default codex; both phases, sessions are not portable)",
+    "  --agent <name>            codex|claude|pi|omp|agy (default codex; both phases, sessions are not portable)",
     "  --mr <id>                 Thread/MR id; defaults to prewalk-<utc>-<hex>",
     "  --worktree <path>         Git worktree; defaults to the current directory",
     "  --tag <tag>               Run tag (default prewalk; the executor run gets <tag>-exec)",

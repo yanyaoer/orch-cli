@@ -19,7 +19,7 @@ permissions, model/effort tiers, result schemas — live in the CLI:
   [--workspace <id>]`: Fable drafts a validated plan, you confirm/amend it, then
   the resumed controller drives workers; persisted worker decisions determine success.
 - **Implement / review / verify / research one task** → `orch run create`
-  (agent = codex|claude|pi|omp, role = implementer|reviewer|verifier|researcher).
+  (agent = codex|claude|pi|omp|agy (agy: implementer/verifier only), role = implementer|reviewer|verifier|researcher).
   Follow with `orch status` / `orch result`; record `orch decision`, then
   `orch mirror` it to the PR/MR. Dispatching a rework? `orch run create
   --resume-from <run_id> --task rework.md` keeps the worker's provider session
