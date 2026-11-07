@@ -2,7 +2,7 @@
 // runs (dispatch with --resume-from and a tag), not separate roles.
 export type RunRole = "implementer" | "reviewer" | "verifier" | "controller" | "researcher";
 
-export type AgentName = "codex" | "claude" | "pi" | "omp";
+export type AgentName = "codex" | "claude" | "pi" | "omp" | "agy";
 
 export type ProviderSessionMode = "ephemeral" | "fresh_persistent" | "resume_exact";
 

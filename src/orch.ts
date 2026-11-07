@@ -8,6 +8,7 @@ import { runClaudeDriver } from "../drivers/claude-headless.ts";
 import { awaitSupervisorHandshake } from "../drivers/driver-common.ts";
 import { runPiDriver } from "../drivers/pi-headless.ts";
 import { runOmpDriver } from "../drivers/omp-headless.ts";
+import { runAgyDriver } from "../drivers/agy-headless.ts";
 import { mail } from "./mail-cli.ts";
 import { workspace } from "./workspace-cli.ts";
 import { worktreeClone, worktreeGc, worktreeRemove } from "./worktree.ts";
@@ -83,6 +84,7 @@ async function main(): Promise<number> {
   if (first === "__driver-claude") return runClaudeDriver(process.argv.slice(3));
   if (first === "__driver-pi") return runPiDriver(process.argv.slice(3));
   if (first === "__driver-omp") return runOmpDriver(process.argv.slice(3));
+  if (first === "__driver-agy") return runAgyDriver(process.argv.slice(3));
 
   // Host-side dispatch boundary: a state-mutating orch command issued from
   // inside a sandbox (a controller's run/decision/mailctl mutation) can't

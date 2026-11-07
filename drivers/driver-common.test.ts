@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   buildPrompt,
+  agyStdinMessage,
   buildProviderArgv,
   buildProviderExecutionPlan,
   buildWorkerEnv,
@@ -2009,4 +2010,24 @@ test("pi deepseek keeps high thinking even for medium roles", () => {
   expect(a[a.indexOf("--thinking") + 1]).toBe("high");
   const g = buildProviderArgv("pi", { ...spec("verifier", "pi-g"), model: "magpie/antigravity/gemini-4-argon" }, "/run", "/worktree");
   expect(g[g.indexOf("--thinking") + 1]).toBe("medium");
+});
+
+test("agy argv: stream-json in and out, effort by role, evidence dir, exact resume, write roles only", () => {
+  withoutNativeSchema();
+  const verifier = { ...spec("verifier", "agy-v"), provider_session_mode: "ephemeral" as const };
+  expect(buildProviderArgv("agy", verifier, "/run", "/worktree")).toEqual([
+    "agy", "--model", "gemini-4-argon", "--effort", "medium",
+    "--input-format", "stream-json", "--output-format", "stream-json",
+    "--dangerously-skip-permissions", "--disable-slash-commands",
+    "--add-dir", "/run/evidence",
+  ]);
+  const resumed = { ...verifier, model: "gemini-3.8-flash", provider_session_mode: "resume_exact" as const, provider_session_id: "conv-1" };
+  const argv = buildProviderArgv("agy", resumed, "/run", "/worktree");
+  expect(argv.slice(0, 3)).toEqual(["agy", "--model", "gemini-3.8-flash"]);
+  expect(argv.slice(-2)).toEqual(["--conversation", "conv-1"]);
+  expect(() => buildProviderArgv("agy", spec("reviewer", "agy-r"), "/run", "/worktree")).toThrow("agy only supports write-capable roles");
+  const line = agyStdinMessage("line one\n\"quoted\"");
+  expect(line.endsWith("\n")).toBe(true);
+  expect(line.trimEnd().includes("\n")).toBe(false);
+  expect(JSON.parse(line)).toEqual({ event: "user", message: { role: "user", content: "line one\n\"quoted\"" } });
 });

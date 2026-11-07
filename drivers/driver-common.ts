@@ -251,6 +251,24 @@ function piThinking(spec: RunSpec, model: string): string {
   return /deepseek/i.test(model) && level !== "xhigh" && level !== "max" ? "high" : level;
 }
 
+// agy = Antigravity CLI (Google). Same Antigravity account quota as pi's
+// magpie/antigravity/* models, different harness. Print mode reads the prompt
+// only from argv or, with --input-format stream-json, from stdin as NDJSON
+// {"event":"user","message":{"content":…}}; orch uses stdin (keeps the prompt
+// out of `ps` and clear of ARG_MAX) and stream-json output, whose terminal
+// {"event":"result","result":{status,response}} line carries the answer.
+// Reasoning rides --effort (same levels as claude); the model id has no
+// -low/-medium/-high suffix then.
+export const AGY_DEFAULT_MODEL = "gemini-4-argon";
+const AGY_ROLE_EFFORT: Partial<Record<RunSpec["role"], string>> = {
+  implementer: "medium",
+  verifier: "medium",
+};
+
+export function agyStdinMessage(prompt: string): string {
+  return `${JSON.stringify({ event: "user", message: { role: "user", content: prompt } })}\n`;
+}
+
 export function ompModelChain(model: string | null | undefined): { primary: string; fallbacks: string[] } {
   const primary = model ?? OMP_MODEL_CHAIN[0]!;
   // A primary outside the built-in chain names a provider orch knows nothing
@@ -372,6 +390,22 @@ function providerArgv(
   // runs the default chain with read-only tools (repo-internal research, no web).
   if (spec.role === "researcher" && provider === "pi") {
     throw new Error("researcher role only supports claude, codex, and omp providers");
+  }
+
+  if (provider === "agy") {
+    // Second line of defense behind run create's validateRunAgent.
+    if (readOnly || spec.role === "researcher") throw new Error(`agy only supports write-capable roles; refusing role ${spec.role}`);
+    const argv = ["agy", "--model", spec.model ?? AGY_DEFAULT_MODEL, "--effort", AGY_ROLE_EFFORT[spec.role] ?? "medium"];
+    argv.push("--input-format", "stream-json", "--output-format", "stream-json");
+    // Headless: without it every edit and shell command waits for an approval
+    // that never comes. Write confinement is the same as pi's (none by agy).
+    argv.push("--dangerously-skip-permissions", "--disable-slash-commands");
+    if (roleHasEvidenceDir(spec.role)) argv.push("--add-dir", runEvidenceDir(runDir));
+    if (scratchCopies(spec).length > 0) argv.push("--add-dir", spec.scratch_root!);
+    if (spec.provider_session_mode === "resume_exact" && spec.provider_session_id) {
+      argv.push("--conversation", spec.provider_session_id);
+    }
+    return argv;
   }
 
   if (provider === "omp") {
@@ -1018,7 +1052,8 @@ async function spawnProvider(input: {
     return spawnProvider({ ...input, plan: printPlan });
   }
   const proc = Bun.spawn(plan.argv, { cwd: input.worktree, stdin: "pipe", stdout: "pipe", stderr: "inherit", env: plan.env });
-  if (input.provider !== "omp") proc.stdin.write(input.prompt);
+  if (input.provider === "agy") proc.stdin.write(agyStdinMessage(input.prompt));
+  else if (input.provider !== "omp") proc.stdin.write(input.prompt);
   proc.stdin.end();
   await pipeToFile(proc.stdout, input.nativePath, input.nativeMode);
   return proc.exited;
@@ -1508,6 +1543,10 @@ function buildProviderExecutionPlanBase(ctx: ExecutionContext): ProviderExecutio
 
   const unsupported = seatbeltUnsupportedReason(ctx.platform ?? process.platform);
   if (unsupported) fail("platform", unsupported);
+  // agy keeps its login and conversation store with a local language-server
+  // daemon outside any provider state dir orch knows; unverified under the
+  // profile, so it fails closed instead of guessing the writable roots.
+  if (provider === "agy") fail("provider", "agy is not supported under the Seatbelt engine; run it with sandbox_engine none");
   const outerEngine = env[SEATBELT_ENV_MARKER];
   if (outerEngine) {
     fail(

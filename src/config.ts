@@ -339,7 +339,7 @@ const ORCH_DEFAULTS_KEYS = ["agents", "models", "fanout"] as const;
 const ROLE_DEFAULT_KEYS = ["agent", "model", "timeout_sec"] as const;
 const FANOUT_KEYS = ["cross-review", "investigate"] as const;
 const RUN_ROLES: readonly string[] = ["implementer", "reviewer", "verifier", "controller", "researcher"];
-const AGENT_NAMES: readonly string[] = ["codex", "claude", "pi", "omp"];
+const AGENT_NAMES: readonly string[] = ["codex", "claude", "pi", "omp", "agy"];
 
 // Shape check for config.json. Unknown keys and unrecognized enum-like values
 // are warnings (the field is ignored, which is exactly what must not stay
