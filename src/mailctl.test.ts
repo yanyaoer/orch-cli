@@ -704,7 +704,16 @@ describe("buildControllerTask", () => {
     expect(task).toContain("Do NOT enter plan mode");
     expect(task).toContain("Do NOT call ExitPlanMode");
     expect(task).toContain("If a step would need a tool you do not have, SKIP it");
-    expect(task).toContain("You have no Edit/Write; dispatch a worker to change code");
+    // Principles lead the rules; the duplicated "no Edit/Write" rule is now principle 2.
+    expect(task).toContain("## Principles");
+    expect(task.indexOf("## Principles")).toBeLessThan(task.indexOf("## Rules"));
+    expect(task).toContain("You dispatch; workers change code: you have no Edit/Write");
+    expect(task).toContain("One bounded batch, then exit");
+    expect(task).toContain("Confirm before you fix");
+    expect(task).toContain("at most one bounded <=120s wait");
+    expect(task).toContain("pass it as --base-version on every orch mailctl reply");
+    expect(task).toContain("Reply bodies must not contain local paths or secrets");
+    expect(task).toContain("Final output must be orch.result/controller/v1 JSON");
     expect(task).toContain("Your only tools are Bash for `orch ...` commands plus read-only Read/Grep/Glob/LS");
     expect(task).toContain("orch fanout/cross-review --thread em-abc123 --task <file>");
     expect(task).toContain("check the workspace repo for docs/adr/ and docs/specs/");
