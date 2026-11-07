@@ -338,6 +338,8 @@ export const CLAUDE_WRITE_ALLOWED_TOOLS =
 // chain (gpt-6-astra primary at high thinking).
 export const CODEX_RESEARCHER_MODEL = "gpt-6-astra";
 export const CODEX_RESEARCHER_EFFORT = "high";
+// codex service tier for every launch: "default" is the standard tier (never priority / ultrafast).
+export const CODEX_SERVICE_TIER = "default";
 
 // claude model tier by role: reviewer escalates to opus (deep critique, paired
 // with omp's gpt-6-astra as a distinct model family in cross-review);
@@ -490,6 +492,10 @@ function providerArgv(
     // commands, so web research must ride the Responses web_search tool.
     const researcherFlags =
       spec.role === "researcher" ? ["-c", `model_reasoning_effort=${CODEX_RESEARCHER_EFFORT}`, "-c", "tools.web_search=true"] : [];
+    // Pin the standard service tier on every codex launch (2026-11-07): gpt-6.1-sol / gpt-6-astra also offer
+    // priority ("Fast") and ultrafast, and some bundled models default to priority, so ~/.codex/config.toml (which the
+    // app's Fast toggle may rewrite) must not decide. codex records its standard tier as "default".
+    const tierFlags = ["-c", `service_tier="${CODEX_SERVICE_TIER}"`];
     const model = spec.model ?? (spec.role === "researcher" ? CODEX_RESEARCHER_MODEL : null);
     // The run's evidence dir is the only writable root added to workspace-write
     // (worktree, $TMPDIR and /tmp are codex defaults); the rest of the run dir
@@ -505,14 +511,14 @@ function providerArgv(
       resume.push("resume", "--json", "--output-last-message", lastMessagePath);
       if (nativeSchemaEnabled()) resume.push("--output-schema", resultSchemaPath(runDir));
       if (model) resume.push("--model", model);
-      resume.push(...researcherFlags);
+      resume.push(...researcherFlags, ...tierFlags);
       resume.push(spec.provider_session_id, "-");
       return resume;
     }
     const argv = ["codex", "exec", "--json", "--cd", worktree, "--output-last-message", lastMessagePath];
     if (nativeSchemaEnabled()) argv.push("--output-schema", resultSchemaPath(runDir));
     if (model) argv.push("--model", model);
-    argv.push(...researcherFlags);
+    argv.push(...researcherFlags, ...tierFlags);
     argv.push(...sandboxFlags);
     argv.push(...evidenceFlags);
     if (spec.provider_session_mode === "ephemeral") argv.push("--ephemeral");

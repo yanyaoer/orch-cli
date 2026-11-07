@@ -461,6 +461,7 @@ test("dry-run argv snapshots: write roles get --add-dir <run>/evidence, read-onl
     "codex", "exec", "--json", "--cd", fx.worktree,
     "--output-last-message", `${run}/last_message.txt`,
     "--output-schema", `${run}/result.schema.json`,
+    "-c", 'service_tier="default"',
     "--sandbox", "workspace-write",
     "--add-dir", `${run}/evidence`,
     "-",
