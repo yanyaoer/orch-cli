@@ -80,6 +80,9 @@ function scratchPromptLines(spec: RunSpec): string[] {
   ];
 }
 
+// Worker prompt text: principle first, validator contracts verbatim. Adding a
+// situation-specific rule needs a badcase, the failing provider/model and an
+// owner-approved PR — see README "Prompt maintenance".
 export function buildPrompt(spec: RunSpec, provider: string, runDir?: string): string {
   const role = isRunRole(spec.role) ? spec.role : "implementer";
   const evidenceDir = runDir && roleHasEvidenceDir(role) ? runEvidenceDir(runDir) : null;
@@ -97,7 +100,7 @@ export function buildPrompt(spec: RunSpec, provider: string, runDir?: string): s
     ...(evidenceDir
       ? [
           `Evidence dir: ${evidenceDir} (also $${ORCH_RUN_EVIDENCE_DIR_ENV})`,
-          "Write every log, reproduction script, red/break check output, mutation diff and fetched test report you want kept into the evidence dir (a subdirectory per check is fine); it outlives the worktree and the controller cites it. Keep fixture repositories and whole-tree copies in $TMPDIR, not there. The worktree must end clean (`git status --porcelain` empty); one-off scratch goes to $TMPDIR.",
+          "The worktree must end clean (`git status --porcelain` empty) and the controller can cite only what is in the evidence dir, which outlives the worktree: so anything you want kept goes there, a subdirectory per check is fine (for example logs and red/break check output). Keep fixture repositories and whole-tree copies in $TMPDIR, not there; one-off scratch goes to $TMPDIR too.",
         ]
       : []),
     ...scratchPromptLines(spec),
@@ -119,9 +122,26 @@ export function buildPrompt(spec: RunSpec, provider: string, runDir?: string): s
           "Verification discipline: finish ALL edits first, then run the checks this change needs: targeted tests for the code you changed, plus any broader suite or build the task explicitly requires. Do not loop full builds inside edit cycles. A necessary check you could not run is reported as skipped, never as passed.",
         ]
       : []),
+    // Principle first, then the validator contract as a checklist: the
+    // contract items are parsed, so they stay explicit (docs: README
+    // "Prompt maintenance").
     ...(role === "implementer" || role === "verifier"
       ? [
-          `Command evidence: every ${role === "verifier" ? "commands" : "tests"} entry carries "status": "passed" | "failed" | "skipped". A check that did not run is "skipped" with "exit_code": null — never exit_code 0. ${role === "verifier" ? 'For a negative test whose expected outcome is a non-zero exit, set "expected_exit_code" to that code; "passed" then means exit_code equals it. ' : 'Write a negative check so that success exits 0 (e.g. `! cmd`); implementer tests never set a non-zero "expected_exit_code". Every test carries "phase": a red check run on the unfixed tree is "before_change" (its failure is expected evidence, and the same cmd must also appear passing as "after_change" — the identical command string; put notes such as the tree, commit or mutation it ran against in "summary", not in "cmd"); everything else is "after_change". '}A success verdict must not contain a failed check or an unmet acceptance item (acceptance status: met | unmet | skipped): a required check that failed means the verdict is "${failure ?? "failed"}".${role === "verifier" ? ' A verifier "pass" also needs at least one command that actually ran and passed, and may skip a command or acceptance item only when it is marked "optional": true. Nit and pre-existing observations go to the optional "non_blocking_findings" (severity "nit" | "pre-existing"); they never change the verdict.' : ""} orch checks this JSON for consistency but does not re-run your commands: list only commands you actually ran.`,
+          "Command evidence: orch checks this JSON for consistency but does not re-run your commands, and the controller decides on it, so report every check exactly as it happened: list only commands you actually ran. The validator enforces:",
+          `- every ${role === "verifier" ? "commands" : "tests"} entry carries "status": "passed" | "failed" | "skipped"; a check that did not run is "skipped" with "exit_code": null — never exit_code 0.`,
+          ...(role === "verifier"
+            ? ['- for a negative test whose expected outcome is a non-zero exit, set "expected_exit_code" to that code; "passed" then means exit_code equals it.']
+            : [
+                '- write a negative check so that success exits 0 (e.g. `! cmd`); implementer tests never set a non-zero "expected_exit_code".',
+                '- every test carries "phase": a red check run on the unfixed tree is "before_change" (its failure is expected evidence, and the same cmd must also appear passing as "after_change" — the identical command string; put notes such as the tree, commit or mutation it ran against in "summary", not in "cmd"); everything else is "after_change".',
+              ]),
+          `- a success verdict must not contain a failed check or an unmet acceptance item (acceptance status: met | unmet | skipped): a required check that failed means the verdict is "${failure ?? "failed"}".`,
+          ...(role === "verifier"
+            ? [
+                '- a verifier "pass" also needs at least one command that actually ran and passed, and may skip a command or acceptance item only when it is marked "optional": true.',
+                '- nit and pre-existing observations go to the optional "non_blocking_findings" (severity "nit" | "pre-existing"); they never change the verdict.',
+              ]
+            : []),
         ]
       : []),
     ...(spec.language === "中文"
@@ -999,7 +1019,7 @@ function repairTaskText(spec: RunSpec, errors: string[], previous: string): stri
     ...errors.map((error) => `- ${error}`),
     ...(hints.length ? ["", "Rules behind these errors:", ...hints.map((hint) => `- ${hint}`)] : []),
     "",
-    "Return the corrected JSON object as your final answer and nothing else. Keep every fact and the verdict from the previous answer. Do not upgrade failures, remove findings, or invent evidence. Do not run tools or edit files. Fix the shape the rules above describe (cmd strings, status, exit_code, phase) before considering the verdict.",
+    "Return the corrected JSON object as your final answer and nothing else. This is a formatting pass, not a second attempt at the task: the previous answer is the only record of what happened, so keep every fact and the verdict (for example, do not upgrade failures, remove findings or invent evidence), and do not run tools or edit files. Fix the shape the rules above describe (cmd strings, status, exit_code, phase) before considering the verdict.",
     `Exception: if the previous answer claimed success but its own evidence shows a failed required check or an unmet acceptance item, a required check that failed means the verdict is ${JSON.stringify(ROLE_VERDICTS[role][1])}: return that verdict with the facts unchanged. A failed before_change red check is not a failed required check.`,
     `Required shape: ${ROLE_RESULT_EXAMPLE[role]}`,
     "",
