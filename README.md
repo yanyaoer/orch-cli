@@ -589,6 +589,23 @@ $ XDG_STATE_HOME=/tmp/orch-demo-state orch status --mr demo --json
 
 `fixtures/` holds data-only contract cases (worker text → `result.json`, result → comment body) run by `src/golden.test.ts`. Add a case by adding a directory; after an intentional behaviour change regenerate with `UPDATE_FIXTURES=1 bun test src/golden.test.ts` and review the diff. See `fixtures/README.md`.
 
+### Prompt maintenance
+
+Worker prompt text (`buildPrompt` and the repair prompt in `drivers/driver-common.ts`, the rework appendix in `src/mail-cli.ts`, the mail controller task in `src/mailctl.ts`) follows these principles:
+
+- **Principles first, each with its reason.** The reason lets a model apply the rule to cases nobody wrote down; a bare list of cases gets matched literally and read as closed.
+- **Examples are labelled as examples, one or two of them.** Cases a principle already covers are not listed one by one.
+- **Contracts and red lines stay verbatim and checkable.** Anything the validator parses (schema name, required fields, verdict enum, `status` / `exit_code` / `phase` / `expected_exit_code` rules, result shape), worktree hygiene (`git status --porcelain` empty, no commits in scratch copies) and safety rules are written as explicit items, not paraphrased into principles. Tests assert several of these strings.
+- **Fix behaviour by changing a principle or the model first.** A new *situation-specific* rule (a sentence that only covers one observed case) is the last resort, because each one patches the case in front of you and the next unlisted variant fails the same way.
+
+A PR that adds a situation-specific rule must:
+
+1. include the badcase (a run transcript or evidence path), the provider + model that fails it, and why changing a principle or switching model does not fix it;
+2. be approved on the PR by the repository owner in person (a delegated or AI review does not count);
+3. carry replay evidence with pass counts: replay the badcase 10 times on the default model and on the weakest supported model; it counts as reproduced only with at least 3 failures, and must pass 10/10 after the change; replay 3 main-path cases twice each with no new failure; a verifier from a different model family re-runs the badcase set. Without a replay fixture, replay at least 3 historical transcripts cut at the decision point, then ship it as a dated trial and record the next 10 real runs; if neither is possible, write `not run` and do not merge.
+
+Changing or deleting a principle skips item 1 but not the verification: run `bun test`, the affected main-path replays and one real run per model family. Example of what this replaces: the old "Command evidence" line packed about ten rules into one sentence; it is now one principle followed by the validator checklist.
+
 ## Roadmap
 
 The current MVP intentionally avoids a daemon. Natural next steps are:
