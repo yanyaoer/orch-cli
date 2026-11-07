@@ -209,3 +209,16 @@ test("printJson delivers large output through a pipe before process.exit", async
   const [out] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
   expect(JSON.parse(out).blob.length).toBe(600_000);
 });
+
+test("agy stream-json: the result line's response is the answer; a non-SUCCESS status fails", () => {
+  const agy = (status: string, response: string) =>
+    [
+      { event: "init", conversation_id: "c1", init: { model: "gemini-4-argon", conversation_id: "c1" } },
+      { event: "step_update", step_update: { conversation_id: "c1", step_type: "agent_response", state: "ACTIVE", text_delta: "{\"verdict\"" } },
+      { event: "result", result: { conversation_id: "c1", status, response, usage: { input_tokens: 3 } } },
+    ].map((l) => JSON.stringify(l)).join("\n") + "\n";
+  expect(nativeResult(agy("SUCCESS", "  {\"a\":1}\n"))).toMatchObject({ text: "{\"a\":1}", structured: true, failed: false });
+  expect(nativeResult(agy("ERROR", "partial"))).toMatchObject({ text: null, structured: true, failed: true });
+  // Only text deltas, no result line (killed mid-turn): nothing to deliver.
+  expect(nativeResult(JSON.stringify({ event: "step_update", step_update: { text_delta: "x" } }) + "\n")).toMatchObject({ text: null, structured: true });
+});

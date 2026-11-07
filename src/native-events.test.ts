@@ -152,3 +152,21 @@ test("createNativeNormalizer dedups sessions across incremental calls", () => {
   );
   expect(repeat).toEqual([{ kind: "assistant", format: "claude", text: "hi" }]);
 });
+
+test("normalizes an agy stream-json run and finds its conversation id", () => {
+  const text = jsonl([
+    { event: "init", conversation_id: "conv-9", init: { model: "gemini-4-argon", cwd: "/w", tools: ["run_command"], conversation_id: "conv-9" } },
+    { event: "step_update", step_update: { conversation_id: "conv-9", step_index: 1, state: "ACTIVE", step_type: "agent_response", text_delta: "hi" } },
+    { event: "step_update", step_update: { conversation_id: "conv-9", step_index: 2, state: "ACTIVE", step_type: "tool", tool_name: "run_command", tool_info: { name: "run_command", parameters: { CommandLine: "git status" } } } },
+    { event: "step_update", step_update: { conversation_id: "conv-9", step_index: 2, state: "DONE", step_type: "tool", tool_name: "run_command", tool_info: { name: "run_command", output: "clean" } } },
+    { event: "result", result: { conversation_id: "conv-9", status: "SUCCESS", response: "done", usage: { input_tokens: 10, output_tokens: 2 } } },
+  ]);
+  expect(normalizeNativeText(text)).toEqual([
+    { kind: "session", format: "unknown", session_id: "conv-9" },
+    { kind: "tool_use", format: "agy", tool: "run_command", text: '{"CommandLine":"git status"}' },
+    { kind: "tool_result", format: "agy", tool: "run_command", text: "clean" },
+    { kind: "final", format: "agy", text: "done" },
+    { kind: "usage", format: "agy", usage: { input_tokens: 10, output_tokens: 2 } },
+  ]);
+  expect(providerResumeIdFromNativeText(text)).toBe("conv-9");
+});

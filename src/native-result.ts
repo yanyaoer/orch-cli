@@ -58,6 +58,16 @@ export function nativeResult(text: string): {
       }
       continue;
     }
+    if (obj.event === "result" && obj.result && typeof obj.result === "object" && !Array.isArray(obj.result)) {
+      // agy's terminal line: status SUCCESS carries the whole answer in
+      // `response`; anything else (ERROR, quota, timeout) is a failed attempt.
+      structured = true;
+      failed = obj.result.status !== "SUCCESS";
+      answer = failed ? null : typeof obj.result.response === "string" ? obj.result.response.trim() || null : null;
+      endsOnEnvelope = false;
+      continue;
+    }
+    if (obj.event === "init" || obj.event === "step_update") { structured = true; continue; }
     if (obj.type === "turn.completed" || (obj.type === "result" && obj.is_error === false)) failed = false;
     if (obj.type === "turn.failed" || obj.type === "error" ||
         (obj.type === "result" && (obj.is_error === true || String(obj.subtype ?? "").startsWith("error")))) {

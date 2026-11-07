@@ -23,7 +23,7 @@ function isProviderSessionMode(value: string): value is ProviderSessionMode {
 }
 
 function defaultProviderSessionMode(agent: AgentName): ProviderSessionMode {
-  return agent === "pi" || agent === "omp" ? "ephemeral" : "fresh_persistent";
+  return agent === "pi" || agent === "omp" || agent === "agy" ? "ephemeral" : "fresh_persistent";
 }
 
 function isUuid(value: string): boolean {
@@ -55,6 +55,9 @@ function providerSessionConfig(args: ParsedArgs, agent: AgentName, defaultModel:
   if (agent === "omp" && name) {
     throw new CliError("omp does not support --session-name; use --session-id with --session-mode resume_exact");
   }
+  if (agent === "agy" && name) {
+    throw new CliError("agy does not support --session-name; use --session-id with --session-mode resume_exact");
+  }
   if (agent === "codex" && name) {
     throw new CliError("codex does not support --session-name in headless exec; use --session-id with --session-mode resume_exact");
   }
@@ -74,7 +77,7 @@ function providerSessionFingerprint(session: ProviderSessionConfig): string {
 function providerSessionFromValue(value: unknown, fallbackAgent: AgentName): ProviderSessionConfig {
   const obj = value && typeof value === "object" && !Array.isArray(value) ? (value as Partial<RunSpec>) : {};
   const agent =
-    obj.agent === "codex" || obj.agent === "claude" || obj.agent === "pi" || obj.agent === "omp"
+    obj.agent === "codex" || obj.agent === "claude" || obj.agent === "pi" || obj.agent === "omp" || obj.agent === "agy"
       ? obj.agent
       : fallbackAgent;
   const mode =
@@ -241,7 +244,7 @@ function withRetrySupersede(supersedes: string[], existing: IdempotencyRecord | 
   return storedRole === role ? [...supersedes, existing.run_id] : supersedes;
 }
 
-const VALID_AGENTS: readonly AgentName[] = ["codex", "claude", "pi", "omp"];
+const VALID_AGENTS: readonly AgentName[] = ["codex", "claude", "pi", "omp", "agy"];
 
 function validateRunAgent(agent: AgentName, _role: RunRole): void {
   if (!VALID_AGENTS.includes(agent)) throw new CliError(`unsupported agent: ${agent}`);
@@ -250,6 +253,11 @@ function validateRunAgent(agent: AgentName, _role: RunRole): void {
   }
   if (_role === "researcher" && agent === "pi") {
     throw new CliError("researcher role only supports the claude, codex, and omp agents");
+  }
+  // agy (Antigravity CLI) has no read-only tool switch in print mode, so it only
+  // takes roles that may write: implementer and verifier.
+  if (agent === "agy" && _role !== "implementer" && _role !== "verifier") {
+    throw new CliError("agy only supports the implementer and verifier roles");
   }
 }
 

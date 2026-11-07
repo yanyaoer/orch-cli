@@ -11,7 +11,7 @@ export type NativeEventKind = "session" | "assistant" | "tool_use" | "tool_resul
 // Which provider's native format a line matched. Matching is structural, not
 // declared: the same normalizer runs over any native.jsonl without knowing the
 // agent, so result extraction keeps working even if spec.json is missing.
-export type NativeEventFormat = "claude" | "codex" | "pi" | "unknown";
+export type NativeEventFormat = "claude" | "codex" | "pi" | "agy" | "unknown";
 
 export interface NativeEvent {
   kind: NativeEventKind;
@@ -182,6 +182,42 @@ function piEvents(event: NativeLine): NativeEvent[] {
   return events;
 }
 
+// agy (Antigravity CLI) --output-format stream-json: every line is
+// {"event": <name>, <name>: {...}}; init carries the conversation id, tool
+// steps arrive as step_update ACTIVE/DONE, and the terminal result line holds
+// the whole answer (agent_response steps only stream text deltas, which are
+// not complete messages and are not surfaced).
+function agyEvents(event: Record<string, unknown>): NativeEvent[] {
+  const name = event.event;
+  if (typeof name !== "string") return [];
+  const body = event[name];
+  if (!body || typeof body !== "object" || Array.isArray(body)) return [];
+  const data = body as Record<string, unknown>;
+  const events: NativeEvent[] = [];
+  if (name === "init" && typeof data.conversation_id === "string" && data.conversation_id) {
+    events.push({ kind: "session", format: "agy", session_id: data.conversation_id });
+  }
+  if (name === "step_update" && data.step_type === "tool" && (data.state === "ACTIVE" || data.state === "DONE")) {
+    const info = (data.tool_info && typeof data.tool_info === "object" ? data.tool_info : {}) as Record<string, unknown>;
+    const tool = typeof data.tool_name === "string" ? data.tool_name : typeof info.name === "string" ? info.name : undefined;
+    events.push({
+      kind: data.state === "ACTIVE" ? "tool_use" : "tool_result",
+      format: "agy",
+      tool,
+      text: data.state === "ACTIVE" ? summarizedInput(info.parameters) : typeof info.output === "string" ? truncated(info.output) : undefined,
+    });
+  }
+  if (name === "result") {
+    if (typeof data.conversation_id === "string" && data.conversation_id) {
+      events.push({ kind: "session", format: "agy", session_id: data.conversation_id });
+    }
+    if (typeof data.response === "string") events.push({ kind: "final", format: "agy", text: data.response });
+    const usage = numericUsage(data.usage);
+    if (usage) events.push({ kind: "usage", format: "agy", usage });
+  }
+  return events;
+}
+
 function usageEvent(event: NativeLine): NativeEvent | null {
   const usage = numericUsage(event.usage);
   if (!usage) return null;
@@ -217,7 +253,7 @@ export function normalizeNativeLine(line: string): NativeEvent[] {
   const events: NativeEvent[] = [];
   const session = sessionEvent(event);
   if (session) events.push(session);
-  events.push(...claudeEvents(event), ...codexEvents(event), ...piEvents(event));
+  events.push(...claudeEvents(event), ...codexEvents(event), ...piEvents(event), ...agyEvents(event));
   const usage = usageEvent(event);
   if (usage) events.push(usage);
   return events;

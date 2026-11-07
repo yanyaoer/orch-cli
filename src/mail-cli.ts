@@ -454,7 +454,8 @@ function mailAgentProvider(agent: MailAgentDefinition): AgentName {
     agent.provider === "codex" ||
     agent.provider === "claude" ||
     agent.provider === "pi" ||
-    agent.provider === "omp"
+    agent.provider === "omp" ||
+    agent.provider === "agy"
   ) {
     return agent.provider;
   }

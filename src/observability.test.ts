@@ -746,7 +746,7 @@ test("run create guards provider session chains: same-task tags only, max 3 runs
   expect(dry.stderr).toContain("already belongs to task tag");
 });
 
-test("run create rejects the removed agy agent and accepts omp for any result role", async () => {
+test("run create takes agy only for write roles and accepts omp for any result role", async () => {
   const root = mkdtempSync(join(tmpdir(), "orch-omp-role-test-"));
   const stateHome = join(root, "state");
   const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
@@ -757,10 +757,18 @@ test("run create rejects the removed agy agent and accepts omp for any result ro
     { XDG_STATE_HOME: stateHome },
   );
   expect(rejected.exitCode).toBe(1);
-  expect(rejected.stderr).toContain("unsupported agent: agy");
+  expect(rejected.stderr).toContain("agy only supports the implementer and verifier roles");
   // CliError prints the message only, not a stack trace.
   expect(rejected.stderr).not.toContain("    at ");
   expect(existsSync(stateHome)).toBe(false);
+
+  for (const role of ["implementer", "verifier"]) {
+    const agy = await runOrch(
+      ["run", "create", "--mr", "omp-role", "--role", role, "--agent", "agy", "--tag", `agy-${role}`, "--worktree", worktree, "--dry-run"],
+      { XDG_STATE_HOME: stateHome },
+    );
+    expect(agy).toMatchObject({ exitCode: 0, stderr: "" });
+  }
 
   for (const role of ["implementer", "reviewer", "verifier"]) {
     const allowed = await runOrch(
