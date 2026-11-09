@@ -251,9 +251,6 @@ function validateRunAgent(agent: AgentName, _role: RunRole): void {
   if (_role === "controller" && agent !== "claude") {
     throw new CliError("controller role only supports the claude agent");
   }
-  if (_role === "researcher" && agent === "pi") {
-    throw new CliError("researcher role only supports the claude, codex, and omp agents");
-  }
   // agy (Antigravity CLI) has no read-only tool switch in print mode, so it only
   // takes roles that may write: implementer and verifier.
   if (agent === "agy" && _role !== "implementer" && _role !== "verifier") {

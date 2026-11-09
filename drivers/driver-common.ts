@@ -408,11 +408,10 @@ function providerArgv(
   if (spec.role === "controller" && provider !== "claude") {
     throw new Error("controller role only supports claude provider");
   }
-  // pi is excluded: no strong-reasoning model and no web path. omp researcher
-  // runs the default chain with read-only tools (repo-internal research, no web).
-  if (spec.role === "researcher" && provider === "pi") {
-    throw new Error("researcher role only supports claude, codex, and omp providers");
-  }
+  // omp and pi researchers run with read-only tools and no web path
+  // (repo-internal research): any outside material has to ride the task text.
+  // pi takes whatever strong model --model names (e.g. a gemini argon route);
+  // its default is gpt-6-astra at high thinking, like omp's primary.
 
   if (provider === "agy") {
     // Second line of defense behind run create's validateRunAgent.

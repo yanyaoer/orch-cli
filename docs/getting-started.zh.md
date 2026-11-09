@@ -74,7 +74,7 @@ $ orch result --run <run_id> --wait
 | `implementer` | 是（持有 worktree 锁） | codex、claude、pi、omp | 落地一个改动；返工用 `--resume-from` |
 | `reviewer` | 否 | codex、claude、pi、omp | 给出 approve / request_changes 和 findings |
 | `verifier` | 是（要跑测试） | codex、claude、pi、omp | 按验收条件给 pass / fail |
-| `researcher` | 否，可联网 | codex、claude、omp（不含 pi） | 给建议，从不写代码 |
+| `researcher` | 否，可联网 | codex、claude、omp、pi（omp/pi 不联网） | 给建议，从不写代码 |
 | `controller` | 否，可调用 `orch` | 仅 claude | `orch new` 和 `orch mailctl` 驱动它 |
 
 ### 配置文件
