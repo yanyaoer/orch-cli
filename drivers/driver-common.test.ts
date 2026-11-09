@@ -655,9 +655,23 @@ test("buildProviderArgv gives researcher a read-only web-research posture on cla
     "@/run/prompt.md",
   ]);
 
-  expect(() => buildProviderArgv("pi", base, "/run", "/worktree")).toThrow(
-    "researcher role only supports claude, codex, and omp providers",
-  );
+  // pi researcher: read-only tools, high thinking, an explicit --model wins.
+  expect(buildProviderArgv("pi", { ...base, provider_session_mode: "ephemeral" }, "/run", "/worktree")).toEqual([
+    "pi",
+    "--model",
+    "openai-codex/gpt-6-astra",
+    "--thinking",
+    "high",
+    "-p",
+    "--mode",
+    "json",
+    "--tools",
+    "read,grep,find,ls",
+    "--no-session",
+  ]);
+  expect(
+    buildProviderArgv("pi", { ...base, model: "magpie/antigravity/gemini-4-argon", provider_session_mode: "ephemeral" }, "/run", "/worktree").slice(0, 5),
+  ).toEqual(["pi", "--model", "magpie/antigravity/gemini-4-argon", "--thinking", "high"]);
 });
 
 test("extractResultFromText does not restart the object scan from braces inside string literals", () => {

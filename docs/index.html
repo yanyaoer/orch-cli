@@ -187,13 +187,13 @@
           <h2 data-lang="zh">权限与模型随角色匹配。</h2>
           <p class="sec-lead" data-lang="en">
             The reviewer and researcher roles launch every provider read-only — researcher runs
-            claude, codex, and omp without the worktree lock, with web research on claude and codex
+            claude, codex, omp, and pi without the worktree lock, with web research on claude and codex
             only; write roles and the verifier keep write-capable access. The claude driver also
             picks model and effort per role.
           </p>
           <p class="sec-lead" data-lang="zh">
-            reviewer 与 researcher 角色下所有 provider 都以只读方式启动——researcher 支持 claude、codex
-            与 omp，不占 worktree 锁，联网检索仅限 claude 与 codex；写角色与 verifier 保留写权限。
+            reviewer 与 researcher 角色下所有 provider 都以只读方式启动——researcher 支持 claude、codex、
+            omp 与 pi，不占 worktree 锁，联网检索仅限 claude 与 codex；写角色与 verifier 保留写权限。
             claude driver 还会按角色选择模型与推理力度。
           </p>
         </div>
