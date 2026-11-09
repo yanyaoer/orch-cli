@@ -145,6 +145,20 @@ export interface RunStatus {
   start_snapshot?: VcsSnapshot | null;
   end_snapshot?: VcsSnapshot | null;
   snapshot_error?: string | null;
+  // Why a run ended in state "timeout": "total" = timeout_sec ran out,
+  // "idle" = the idle watchdog stopped it (src/idle-watchdog.ts). Absent on
+  // other states and on runs from older versions (read as "total").
+  timeout_reason?: "total" | "idle";
+  // Set when the idle watchdog stopped the run, whatever the final state:
+  // "done"/"failed" when the agent had already delivered result.json
+  // (finalized_from_result), "timeout" otherwise.
+  idle_stop?: {
+    at: string;
+    last_activity_at: string;
+    last_activity_source: string;
+    idle_timeout_min: number;
+    finalized_from_result: boolean;
+  };
 }
 
 export interface ResultCoercion {
@@ -155,10 +169,12 @@ export interface ResultCoercion {
 }
 
 export interface OrchEvent {
-  type: "created" | "starting" | "running" | "heartbeat" | "done" | "failed" | "timeout" | "stale" | "result_coercion";
+  type: "created" | "starting" | "running" | "heartbeat" | "done" | "failed" | "timeout" | "stale" | "result_coercion" | "idle_watchdog";
   seq: number;
   ts: string;
   message?: string;
+  // idle_watchdog: the criteria snapshot that judged the run idle.
+  idle?: import("./idle-watchdog.ts").IdleSnapshot;
   coercions?: ResultCoercion[];
 }
 
