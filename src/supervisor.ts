@@ -13,6 +13,7 @@ import { describeSnapshot, jjWorkspaceRoot, sameSnapshot, vcsHead, vcsKind, vcsS
 import { writeEvidenceManifest } from "./evidence.ts";
 import { compactEvidenceDir, evidenceCompactEnabled } from "./evidence-compact.ts";
 import { removeScratchCopies } from "./scratch.ts";
+import { IdleWatchdog, idleCheckIntervalMs, idleTimeoutMinutes, type IdleSnapshot, type PsRunner } from "./idle-watchdog.ts";
 
 function now(): string {
   return new Date().toISOString();
@@ -266,12 +267,18 @@ function fallbackSpec(runDir: string): RunSpec {
   };
 }
 
-export async function runSupervisor(runDir: string, orchCommand: string[]): Promise<number> {
+export interface SupervisorOptions {
+  // Process table reader for the idle watchdog (tests inject one).
+  ps?: PsRunner;
+}
+
+export async function runSupervisor(runDir: string, orchCommand: string[], options: SupervisorOptions = {}): Promise<number> {
   const specPath = runDirFile(runDir, "spec.json");
   let loadedSpec: RunSpec | null = null;
   let worktreeLock: PidfileLock | null = null;
   let timeout: ReturnType<typeof setTimeout> | null = null;
   let heartbeat: ReturnType<typeof setInterval> | null = null;
+  let idleTimer: ReturnType<typeof setInterval> | null = null;
   let pgid: number | null = null;
   let startSnapshot: VcsSnapshot | null = null;
 
@@ -362,6 +369,43 @@ export async function runSupervisor(runDir: string, orchCommand: string[]): Prom
     }, spec.timeout_sec * 1000);
     timeout.unref();
 
+    // Idle watchdog: ends a run with no activity on every signal for
+    // ORCH_IDLE_TIMEOUT_MIN minutes (src/idle-watchdog.ts). It kills the same
+    // way the total timeout does; the outcome is decided below.
+    let idleStop: IdleSnapshot | null = null;
+    const idleMinutes = idleTimeoutMinutes();
+    if (idleMinutes > 0) {
+      const idleMs = idleMinutes * 60_000;
+      const watchdog = new IdleWatchdog({ runDir, driverPid: proc.pid, idleMs, startedAtMs: Date.now(), ps: options.ps });
+      let checking = false;
+      idleTimer = setInterval(() => {
+        if (checking || timedOut || idleStop || existsSync(runDirFile(runDir, "canceled.json"))) return;
+        checking = true;
+        void watchdog
+          .check()
+          .then((verdict) => {
+            if (!verdict.idle || timedOut || idleStop || existsSync(runDirFile(runDir, "canceled.json"))) return;
+            idleStop = verdict.snapshot;
+            appendEvent(runDir, {
+              type: "idle_watchdog",
+              seq: nextSeq(runDir),
+              ts: now(),
+              message: `no activity since ${verdict.snapshot.last_activity_at} (${verdict.snapshot.last_activity_source}) for ${idleMinutes} min; stopping the run`,
+              idle: verdict.snapshot,
+            });
+            killProcessGroup(proc.pid, "SIGTERM");
+            setTimeout(() => killProcessGroup(proc.pid, "SIGKILL"), 5_000).unref();
+          })
+          .catch(() => {
+            // a failed probe is not idleness; try again next tick
+          })
+          .finally(() => {
+            checking = false;
+          });
+      }, idleCheckIntervalMs(idleMs));
+      idleTimer.unref();
+    }
+
     heartbeat = setInterval(() => {
       appendEvent(runDir, { type: "heartbeat", seq: nextSeq(runDir), ts: now() });
       updateStatus(runDir, spec, { state: "running", last_event_seq: nextSeq(runDir) - 1 });
@@ -371,15 +415,30 @@ export async function runSupervisor(runDir: string, orchCommand: string[]): Prom
     let exitCode = await proc.exited;
     clearTimeout(timeout);
     timeout = null;
+    if (idleTimer) clearInterval(idleTimer);
+    idleTimer = null;
+    const idleSnapshot = idleStop as IdleSnapshot | null;
     clearInterval(heartbeat);
     heartbeat = null;
     await drain;
 
-    if (timedOut) exitCode = 124;
+    // An idle stop with a result.json the agent had already delivered ends on
+    // that result (validated below like any other); without one it is a
+    // timeout like the total one.
+    const idleWithResult = idleSnapshot !== null && idleSnapshot.result_json_present;
+    if (timedOut || (idleSnapshot && !idleWithResult)) exitCode = 124;
     const exitPath = runDirFile(runDir, "exit_code");
     if (!existsSync(exitPath)) writeFileSync(exitPath, `${exitCode}\n`, "utf8");
 
-    ensureResult(runDir, spec, exitCode === 0 ? "driver did not produce result.json" : `driver exited ${exitCode}`);
+    ensureResult(
+      runDir,
+      spec,
+      idleSnapshot && !timedOut
+        ? `idle watchdog: no activity since ${idleSnapshot.last_activity_at} for ${idleSnapshot.idle_timeout_min} min`
+        : exitCode === 0
+          ? "driver did not produce result.json"
+          : `driver exited ${exitCode}`,
+    );
     const resultErrors = validateResultFile(runDir, spec);
     // Still under the worktree lock: an evidence run whose checkout moved
     // while it ran (an outside edit, a commit) proved nothing about either
@@ -392,7 +451,18 @@ export async function runSupervisor(runDir: string, orchCommand: string[]): Prom
         : !sameSnapshot(startSnapshot, end.snapshot)
           ? `worktree drifted during run: start ${describeSnapshot(startSnapshot)}, end ${describeSnapshot(end.snapshot)}`
           : null;
-    const finalState: RunState = timedOut ? "timeout" : exitCode === 0 && resultErrors.length === 0 && !snapshotError ? "done" : "failed";
+    const finalState: RunState = timedOut
+      ? "timeout"
+      : idleSnapshot
+        ? idleWithResult && resultErrors.length === 0
+          ? snapshotError
+            ? "failed"
+            : "done"
+          : "timeout"
+        : exitCode === 0 && resultErrors.length === 0 && !snapshotError
+          ? "done"
+          : "failed";
+    const timeoutReason = finalState !== "timeout" ? undefined : timedOut ? ("total" as const) : ("idle" as const);
     if (resultErrors.length > 0) {
       writeFileSync(runDirFile(runDir, "schema.errors.log"), `${resultErrors.join("\n")}\n`, "utf8");
     }
@@ -401,7 +471,14 @@ export async function runSupervisor(runDir: string, orchCommand: string[]): Prom
       type: finalState === "done" ? "done" : finalState === "timeout" ? "timeout" : "failed",
       seq: nextSeq(runDir),
       ts: now(),
-      message: [...resultErrors, ...(snapshotError ? [snapshotError] : [])].join("; ") || undefined,
+      message:
+        [
+          ...(idleSnapshot && !timedOut
+            ? [`idle watchdog: no activity since ${idleSnapshot.last_activity_at}${finalState !== "timeout" ? "; finalized on the result.json delivered before the stop" : ""}`]
+            : []),
+          ...resultErrors,
+          ...(snapshotError ? [snapshotError] : []),
+        ].join("; ") || undefined,
     });
 
     updateStatus(runDir, spec, {
@@ -409,6 +486,18 @@ export async function runSupervisor(runDir: string, orchCommand: string[]): Prom
       exit_code: exitCode,
       end_snapshot: end.snapshot,
       snapshot_error: snapshotError,
+      ...(timeoutReason ? { timeout_reason: timeoutReason } : {}),
+      ...(idleSnapshot && !timedOut
+        ? {
+            idle_stop: {
+              at: idleSnapshot.checked_at,
+              last_activity_at: idleSnapshot.last_activity_at,
+              last_activity_source: idleSnapshot.last_activity_source,
+              idle_timeout_min: idleSnapshot.idle_timeout_min,
+              finalized_from_result: finalState !== "timeout",
+            },
+          }
+        : {}),
       last_event_seq: nextSeq(runDir) - 1,
       provider_resume_id: readProviderResumeId(runDir),
       head_sha: await worktreeHead(spec.worktree),
@@ -436,6 +525,7 @@ export async function runSupervisor(runDir: string, orchCommand: string[]): Prom
   } finally {
     if (timeout) clearTimeout(timeout);
     if (heartbeat) clearInterval(heartbeat);
+    if (idleTimer) clearInterval(idleTimer);
     // After the terminal status and the evidence manifest: the copies were the
     // worker's to mutate and carry nothing the run must keep. Best effort — a
     // copy that cannot go is recorded, and `orch worktree gc` retries it.
