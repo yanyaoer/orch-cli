@@ -267,7 +267,7 @@ const PI_ROLE_THINKING: Partial<Record<RunSpec["role"], string>> = {
 // deepseek only reasons at high and above, so a medium role default would make
 // it a non-reasoning worker; it keeps high (user 2026-11-02).
 function piThinking(spec: RunSpec, model: string): string {
-  const level = PI_ROLE_THINKING[spec.role] ?? PI_THINKING;
+  const level = spec.effort ?? PI_ROLE_THINKING[spec.role] ?? PI_THINKING;
   return /deepseek/i.test(model) && level !== "xhigh" && level !== "max" ? "high" : level;
 }
 
@@ -354,7 +354,7 @@ export const CLAUDE_WRITE_ALLOWED_TOOLS =
   "Task,Bash,BashOutput,KillShell,Glob,Grep,LS,Read,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch,TodoWrite";
 
 // Researcher model per provider: codex pins gpt-6-astra at high reasoning and
-// claude pins fable at xhigh effort; omp rides its default quota-fallback
+// claude pins fable at high effort; omp rides its default quota-fallback
 // chain (gpt-6-astra primary at high thinking).
 export const CODEX_RESEARCHER_MODEL = "gpt-6-astra";
 export const CODEX_RESEARCHER_EFFORT = "high";
@@ -370,16 +370,47 @@ const CLAUDE_ROLE_MODEL: Partial<Record<RunSpec["role"], string>> = {
   researcher: "fable",
 };
 
-// claude reasoning effort by role: researcher and reviewer need the deepest
+// claude reasoning effort by role: researcher and reviewer get the deep
 // passes; implementer and verifier both run medium (a low-effort verifier
-// missed real defects and returned unparseable results more often).
+// missed real defects and returned unparseable results more often). The
+// researcher (fable) runs high, Fable's own default: most of its gain is at
+// high, while xhigh spends far more tokens and pays off only on the hardest
+// tasks, so xhigh is a per-run `--effort xhigh`, not the default.
 const CLAUDE_ROLE_EFFORT: Partial<Record<RunSpec["role"], string>> = {
   implementer: "medium",
   verifier: "medium",
   reviewer: "high",
-  researcher: "xhigh",
+  researcher: "high",
   controller: "medium",
 };
+
+// Providers whose argv carries a run's effort: claude and agy as --effort, pi
+// as --thinking. codex and omp keep their own fixed reasoning settings and
+// ignore a configured effort.
+export function providerTakesEffort(provider: AgentName): boolean {
+  return provider === "claude" || provider === "pi" || provider === "agy";
+}
+
+// The model a run actually launches when spec.model is null: the per-role
+// tier or provider default. Config effort_by_model matches against it, so a
+// researcher with no --model still matches "fable". null = the provider CLI's
+// own default (claude implementer/verifier/controller).
+export function builtinRunModel(provider: AgentName, role: RunSpec["role"]): string | null {
+  if (provider === "claude") return CLAUDE_ROLE_MODEL[role] ?? null;
+  if (provider === "pi") return PI_DEFAULT_MODEL;
+  if (provider === "agy") return AGY_DEFAULT_MODEL;
+  if (provider === "codex") return role === "researcher" ? CODEX_RESEARCHER_MODEL : null;
+  return OMP_MODEL_CHAIN[0] ?? null;
+}
+
+// Built-in effort a provider gets for a role when neither --effort nor config
+// names one (what the argv builders below fall back to).
+export function builtinRunEffort(provider: AgentName, role: RunSpec["role"]): string | null {
+  if (provider === "claude") return CLAUDE_ROLE_EFFORT[role] ?? null;
+  if (provider === "pi") return PI_ROLE_THINKING[role] ?? PI_THINKING;
+  if (provider === "agy") return AGY_ROLE_EFFORT[role] ?? "medium";
+  return null;
+}
 
 // Non-sandboxed argv (engine "none"). The external-sandbox variant — the only
 // one that flips codex/claude native sandboxes off — is deliberately not
@@ -416,7 +447,7 @@ function providerArgv(
   if (provider === "agy") {
     // Second line of defense behind run create's validateRunAgent.
     if (readOnly || spec.role === "researcher") throw new Error(`agy only supports write-capable roles; refusing role ${spec.role}`);
-    const argv = ["agy", "--model", spec.model ?? AGY_DEFAULT_MODEL, "--effort", AGY_ROLE_EFFORT[spec.role] ?? "medium"];
+    const argv = ["agy", "--model", spec.model ?? AGY_DEFAULT_MODEL, "--effort", spec.effort ?? AGY_ROLE_EFFORT[spec.role] ?? "medium"];
     argv.push("--input-format", "stream-json", "--output-format", "stream-json");
     // Headless: without it every edit and shell command waits for an approval
     // that never comes. Write confinement is the same as pi's (none by agy).
@@ -459,7 +490,7 @@ function providerArgv(
     if (externalSandbox) argv.push("--settings", '{"sandbox":{"enabled":false}}');
     const model = spec.model ?? CLAUDE_ROLE_MODEL[spec.role];
     if (model) argv.push("--model", model);
-    const effort = CLAUDE_ROLE_EFFORT[spec.role];
+    const effort = spec.effort ?? CLAUDE_ROLE_EFFORT[spec.role];
     if (effort) argv.push("--effort", effort);
     // Controller intentionally stays out of reviewer plan mode so dispatched
     // workers hold the worktree lock. Keep this whitelist narrow: no Edit/Write,
