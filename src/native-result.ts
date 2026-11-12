@@ -29,10 +29,11 @@ export function nativeResult(text: string): {
       envelopes = []; endsOnEnvelope = false;
       continue;
     }
-    if (obj?.type === "orch_api_resume") {
-      // The driver resumed the same session after a transient API error: the
-      // segment that follows decides the outcome. Earlier envelopes of the
-      // session stay (they are the same attempt, see `earlier`).
+    if (obj?.type === "orch_api_resume" || obj?.type === "orch_auto_continue") {
+      // The driver resumed the same session after a transient API error, or
+      // continued it after a turn that ended without a result: the segment
+      // that follows decides the outcome. Earlier envelopes of the session
+      // stay (they are the same attempt, see `earlier`).
       answer = null; failed = false; endsOnEnvelope = false;
       continue;
     }
