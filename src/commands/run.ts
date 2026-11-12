@@ -13,7 +13,7 @@ import { configuredRoleEffort, EFFORT_LEVELS, orchLanguage, readOrchConfig, type
 
 import { CliError, assertKnownFlags, collectFlags, flagBool, flagString, printJson, readStdinText, type ParsedArgs } from "../cli.ts";
 import { createScratchCopies, parseScratchRequests, removeScratchCopies, resolveScratchRevs, scratchFingerprint, scratchRootPath, type ScratchRequest } from "../scratch.ts";
-import { buildPrompt, buildProviderExecutionPlan, builtinRunEffort, builtinRunModel, providerTakesEffort, roleHasEvidenceDir, runEvidenceDir, type ProviderExecutionPlan } from "../../drivers/driver-common.ts";
+import { autoContinueLimit, buildPrompt, buildProviderExecutionPlan, builtinRunEffort, builtinRunModel, providerTakesEffort, roleHasEvidenceDir, runEvidenceDir, type ProviderExecutionPlan } from "../../drivers/driver-common.ts";
 import { SEATBELT_ENGINE, sandboxPosture, sandboxRunIdentity, seatbeltUnsupportedReason } from "../../drivers/sandbox.ts";
 import { DEPRECATED_SANDBOX_REASON, warnDeprecated } from "../deprecation.ts";
 import { archivedIdempotency, formatTable, locateRun, looksStale, mrIdsForRepo, nonTerminalStates, orchCommand, readIdempotency, resolveMr, runId, runListRows, scanMrRuns, scanRunsRoot, stateDirectoryHint, statusState, type IdempotencyRecord } from "../run-store.ts";
@@ -605,6 +605,8 @@ export async function createRun(args: ParsedArgs): Promise<number> {
       supersedes: plannedSupersedes,
       scratch: plannedScratch,
       timeout_sec: timeoutSec,
+      // In-run continuations of a claude turn that ends without a result JSON (null: never for this run).
+      auto_continue_max: autoContinueLimit(agent, specPreview),
       supervisor_plan: idempotent
         ? null
         : {
@@ -660,6 +662,7 @@ export async function createRun(args: ParsedArgs): Promise<number> {
         `pinned_head: ${pinnedHead ?? "none"}`,
         `supersedes: ${plannedSupersedes.length > 0 ? plannedSupersedes.join(",") : "none"}`,
         `timeout_sec: ${timeoutSec}`,
+        `auto_continue_max: ${payload.auto_continue_max ?? "none"}`,
       ];
       if (payload.supervisor_plan) lines.push(`supervisor: ${payload.supervisor_plan.argv.join(" ")}`);
       if (payload.driver_plan) lines.push(`driver: ${payload.driver_plan.argv.join(" ")}`);

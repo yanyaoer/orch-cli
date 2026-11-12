@@ -144,6 +144,17 @@ export function buildPrompt(spec: RunSpec, provider: string, runDir?: string): s
             : []),
         ]
       : []),
+    // Researcher only: its result is read by a person who decides on it
+    // (Fable 5.2 prompting guide, "Communicating clearly").
+    ...(role === "researcher"
+      ? [
+          "写给低上下文读者：结果 JSON 里给人读的字段（summary、recommendation、alternatives、open_questions、risks）的读者是没看过你调研过程的用户。用户要读懂才会确认方案，读不懂的方案只会被搁置或者被误批，所以按这个读者来写：",
+          "- 结论放最前面：先说推荐什么、为什么，再给依据和细节，因为读者可能只读开头几句。",
+          "- 不用调研中自己起的术语、代号和缩写，读者不知道它们指什么；非用不可的，第一次出现时用一句话说明。",
+          "- 用短句和主动语态，写明谁做什么，因为长句和被动句会把主语和因果藏起来。",
+          "- 有关联的想法写成段落，让因果和取舍留在句子之间；只有真正并列的项（例如几个备选方案、几个步骤）才用列表。",
+        ]
+      : []),
     ...(spec.language === "中文"
       ? [
           "结果 JSON 中人类可读的 prose 字段(summary、blocking/non_blocking findings 的 body、suggested_tests、recommendation、risks、acceptance evidence、rollback)必须用中文书写;代码、命令、文件路径、标识符保持原样。",
@@ -1928,6 +1939,107 @@ async function resumeOnApiError(input: {
   }
 }
 
+// A claude turn that ends in text only, with no result attempt, is a progress
+// report, not the end of the task (Opus 5.5 prompting guide: the harness, not
+// the model, decides completion). In the runs of 2026-10-28..11-12 every such
+// end was a report of this kind — "the reviewer sub-agent is still running,
+// I'll wait for its notification", "next message writes section 4" — and the
+// formatting-only repair round then turned it into a "failed" result although
+// the work was partly or fully done. So the driver resumes the same session
+// inside the same run with one message that names what is missing, at most
+// ORCH_AUTO_CONTINUE_MAX times (default 2, 0 disables) so a session that is
+// truly stuck still ends. Only the new user message is added: the resumed argv
+// is the same plan as the API resume (same model, effort, tools, system
+// prompt), so the cached prefix holds. A final answer that is a result attempt
+// (malformed JSON, missing fields) is not continued: the repair round fixes
+// its shape. Roles: the ones that deliver a result JSON and keep a session
+// (implementer, verifier, researcher).
+export const AUTO_CONTINUE_MAX_DEFAULT = 2;
+const AUTO_CONTINUE_ROLES: ReadonlySet<RunSpec["role"]> = new Set(["implementer", "verifier", "researcher"]);
+
+// How many continuations a run may get; null when the run never gets one
+// (provider, role or an ephemeral session).
+export function autoContinueLimit(provider: AgentName, spec: Pick<RunSpec, "role" | "provider_session_mode">): number | null {
+  if (provider !== "claude" || !AUTO_CONTINUE_ROLES.has(spec.role) || spec.provider_session_mode === "ephemeral") return null;
+  return envInt("ORCH_AUTO_CONTINUE_MAX", AUTO_CONTINUE_MAX_DEFAULT);
+}
+
+export function autoContinuePrompt(spec: RunSpec): string {
+  const role = isRunRole(spec.role) ? spec.role : "implementer";
+  const failure = ROLE_VERDICTS[role][1];
+  return [
+    `Your last turn ended without the final answer this run needs: one JSON object with "schema": "${resultSchemaName(role)}".`,
+    "orch reads a turn that ends in text only as a progress report, not as the end of the task, so the run is not finished yet.",
+    "If the task is not done, continue it now; the session and the worktree are as you left them.",
+    "Background tasks or sub-agents you were waiting on do not report back into this turn: read their output yourself if it exists, otherwise do that part directly.",
+    `If you are blocked, say so in the result JSON: verdict "${failure}", what blocks you, and what is already done.`,
+    "End this turn with the result JSON as your final answer.",
+  ].join(" ");
+}
+
+// Runs after the provider (and its API resumes) ended; returns the exit code
+// of the last segment.
+async function continueOnMissingResult(input: {
+  provider: AgentName;
+  spec: RunSpec;
+  runDir: string;
+  worktree: string;
+  code: number;
+}): Promise<number> {
+  const { provider, spec, runDir, worktree } = input;
+  let code = input.code;
+  const max = autoContinueLimit(provider, spec);
+  if (max === null) return code;
+  const nativePath = `${runDir}/native.jsonl`;
+  const prompt = autoContinuePrompt(spec);
+  for (let attempt = 1; ; attempt++) {
+    // Why this segment does not get a continuation; null: it does.
+    let reason: string | null = null;
+    let finalTurn = "";
+    if (code !== 0 || providerFailed(runDir)) reason = "provider_failed";
+    else if (extractResultWithCoercionsFromRunDir(runDir, spec)) reason = "result_delivered";
+    else {
+      const answer = effectiveFinalAnswer(runDir, spec);
+      if (answer && looksLikeResultAttempt(answer.text, spec)) reason = "result_attempt";
+      finalTurn = compactCoercionValue(answer?.text ?? "");
+    }
+    if (reason) {
+      // Only the end of a continuation is worth a record.
+      if (attempt > 1) appendDriverEvent(runDir, { type: "auto_continue_stopped", attempt: attempt - 1, reason, exit_code: code });
+      return code;
+    }
+    if (attempt > max) {
+      appendDriverEvent(runDir, { type: "auto_continue_stopped", attempt: attempt - 1, reason: max === 0 ? "disabled" : "max_attempts", final_turn_excerpt: finalTurn, exit_code: code });
+      return code;
+    }
+    const sessionId =
+      (spec.provider_session_mode === "resume_exact" ? spec.provider_session_id : null) ??
+      normalizeNativeText(readFileSync(nativePath, "utf8")).find((event) => event.kind === "session")?.session_id ??
+      null;
+    if (!sessionId) {
+      appendDriverEvent(runDir, { type: "auto_continue_stopped", attempt: attempt - 1, reason: "no_session_id", exit_code: code });
+      return code;
+    }
+    appendDriverEvent(runDir, { type: "auto_continue", attempt, max, session_id: sessionId, missing: "result_json", final_turn_excerpt: finalTurn });
+    process.stderr.write(`orch: claude ended its turn without a result JSON; continuing session ${sessionId} (attempt ${attempt}/${max})\n`);
+    const resumeSpec: RunSpec = { ...spec, provider_session_mode: "resume_exact", provider_session_id: sessionId, provider_session_name: null };
+    let plan: ProviderExecutionPlan;
+    try {
+      plan = buildProviderExecutionPlan({ provider, spec: resumeSpec, runDir, worktree, prompt });
+    } catch (error) {
+      appendDriverEvent(runDir, { type: "auto_continue_stopped", attempt, reason: "plan_failed", error: error instanceof Error ? error.message : String(error), exit_code: code });
+      return code;
+    }
+    const segmentStart = fileSize(nativePath);
+    appendFileSync(nativePath, `${JSON.stringify({ type: "orch_auto_continue", attempt, session_id: sessionId })}\n`, "utf8");
+    appendDriverEvent(runDir, { type: "phase", phase: "provider_start", wait_reason: "provider_process", auto_continue_attempt: attempt });
+    code = await spawnProvider({ provider, plan, prompt, spec: resumeSpec, runDir, worktree, nativePath, nativeMode: "a" });
+    appendDriverEvent(runDir, { type: "phase", phase: "provider_end", exit_code: code, auto_continue_attempt: attempt });
+    // A continuation cut off by a transient API error is resumed like the first segment.
+    code = await resumeOnApiError({ provider, spec: resumeSpec, runDir, worktree, firstSegmentStart: segmentStart, firstCode: code });
+  }
+}
+
 export async function runProviderDriver(provider: AgentName, argv: string[]): Promise<number> {
   const args = parseDriverArgs(argv);
   const spec = readSpec(args.specPath);
@@ -1983,7 +2095,8 @@ export async function runProviderDriver(provider: AgentName, argv: string[]): Pr
     nativeMode: "w",
   });
   appendDriverEvent(args.runDir, { type: "phase", phase: "provider_end", exit_code: firstCode });
-  const code = await resumeOnApiError({ provider, spec, runDir: args.runDir, worktree: args.worktree, firstSegmentStart: 0, firstCode });
+  const resumedCode = await resumeOnApiError({ provider, spec, runDir: args.runDir, worktree: args.worktree, firstSegmentStart: 0, firstCode });
+  const code = await continueOnMissingResult({ provider, spec, runDir: args.runDir, worktree: args.worktree, code: resumedCode });
   writeExitCode(args.runDir, code);
 
   appendDriverEvent(args.runDir, { type: "phase", phase: "result_validation" });

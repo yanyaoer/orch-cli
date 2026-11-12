@@ -41,8 +41,8 @@ export function usageEvidence(native: string | null, spec: Partial<RunSpec> | nu
     if (!line.trim()) continue;
     let e: any; try { e = JSON.parse(line); } catch { reasons.add("malformed_native_record"); continue; }
     if (e?.type === "orch_result_repair") { attempts.push([]); repairs++; }
-    // An in-run API resume is a new claude process: its result carries only its own usage.
-    else if (e?.type === "orch_api_resume") attempts.push([]);
+    // An in-run API resume or auto-continue is a new claude process: its result carries only its own usage.
+    else if (e?.type === "orch_api_resume" || e?.type === "orch_auto_continue") attempts.push([]);
     else if (e && typeof e === "object") attempts.at(-1)!.push(e);
   }
   let sum = zero(), records = 0;
