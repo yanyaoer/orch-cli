@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import {
   addWorkspace,
   buildBridgeUrls,
+  configuredRoleEffort,
   mailAgentsConfigPath,
   mailControlConfigPath,
   orchConfigPath,
@@ -443,4 +444,27 @@ test("readOrchConfig prints each config warning once per process and rejects inv
     if (prev === undefined) delete process.env.XDG_CONFIG_HOME;
     else process.env.XDG_CONFIG_HOME = prev;
   }
+});
+
+test("configuredRoleEffort prefers an effort_by_model match over the role effort", () => {
+  const defaults = { effort: "medium", effort_by_model: { fable: "high", "claude-fable-5-2": "xhigh", opus: "low" } };
+  expect(configuredRoleEffort(defaults, "claude-fable-5-2")).toBe("xhigh");
+  expect(configuredRoleEffort(defaults, "fable")).toBe("high");
+  expect(configuredRoleEffort(defaults, "Claude-Fable-5-3")).toBe("high");
+  expect(configuredRoleEffort(defaults, "claude-opus-5-5")).toBe("low");
+  expect(configuredRoleEffort(defaults, "sonnet")).toBe("medium");
+  expect(configuredRoleEffort(defaults, null)).toBe("medium");
+  expect(configuredRoleEffort({}, "fable")).toBeNull();
+  expect(configuredRoleEffort({ effort_by_model: { fable: "high" } }, "opus")).toBeNull();
+});
+
+test("validateOrchConfig accepts role effort settings and rejects unknown levels", () => {
+  expect(
+    validateOrchConfig({ defaults: { agents: { verifier: { effort: "medium", effort_by_model: { fable: "high" } } } } }).warnings,
+  ).toEqual([]);
+  expect(() => validateOrchConfig({ defaults: { agents: { verifier: { effort: "huge" } } } })).toThrow("defaults.agents.verifier.effort must be one of");
+  expect(() => validateOrchConfig({ defaults: { agents: { verifier: { effort_by_model: { fable: 3 } } } } })).toThrow(
+    "defaults.agents.verifier.effort_by_model.fable must be one of",
+  );
+  expect(() => validateOrchConfig({ defaults: { agents: { verifier: { effort_by_model: ["high"] } } } })).toThrow("must be an object");
 });

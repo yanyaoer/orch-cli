@@ -9,11 +9,11 @@ import { appendJsonLine, countLines, jsonBytes, readJsonFile, writeJsonAtomic, w
 import { writeInitialRunFiles } from "../supervisor.ts";
 import { describeSnapshot, vcsDirty, vcsHead, vcsResolveCommit, vcsSnapshot } from "../vcs.ts";
 import { isTerminal } from "../overview.ts";
-import { orchLanguage, readOrchConfig, type RoleDefaults } from "../config.ts";
+import { configuredRoleEffort, EFFORT_LEVELS, orchLanguage, readOrchConfig, type RoleDefaults } from "../config.ts";
 
 import { CliError, assertKnownFlags, collectFlags, flagBool, flagString, printJson, readStdinText, type ParsedArgs } from "../cli.ts";
 import { createScratchCopies, parseScratchRequests, removeScratchCopies, resolveScratchRevs, scratchFingerprint, scratchRootPath, type ScratchRequest } from "../scratch.ts";
-import { buildPrompt, buildProviderExecutionPlan, roleHasEvidenceDir, runEvidenceDir, type ProviderExecutionPlan } from "../../drivers/driver-common.ts";
+import { buildPrompt, buildProviderExecutionPlan, builtinRunEffort, builtinRunModel, providerTakesEffort, roleHasEvidenceDir, runEvidenceDir, type ProviderExecutionPlan } from "../../drivers/driver-common.ts";
 import { SEATBELT_ENGINE, sandboxPosture, sandboxRunIdentity, seatbeltUnsupportedReason } from "../../drivers/sandbox.ts";
 import { DEPRECATED_SANDBOX_REASON, warnDeprecated } from "../deprecation.ts";
 import { archivedIdempotency, formatTable, locateRun, looksStale, mrIdsForRepo, nonTerminalStates, orchCommand, readIdempotency, resolveMr, runId, runListRows, scanMrRuns, scanRunsRoot, stateDirectoryHint, statusState, type IdempotencyRecord } from "../run-store.ts";
@@ -271,6 +271,7 @@ const RUN_CREATE_FLAGS = [
   "retry",
   "allow-dirty",
   "timeout-sec",
+  "effort",
   "session-mode",
   "session-name",
   "session-id",
@@ -398,6 +399,23 @@ function configuredRoleDefaults(role: RunRole): RoleDefaults {
   return typeof raw === "string" ? { agent: raw } : raw;
 }
 
+// Reasoning effort snapshotted into the spec. Precedence: --effort, then
+// config.json defaults.agents.<role>.effort_by_model (matched against the
+// run's model, or the provider's built-in model for the role when no model is
+// set), then defaults.agents.<role>.effort; null leaves the driver's built-in
+// role table in charge. codex/omp take no effort: --effort is an error there
+// and a configured value is ignored.
+function resolveRunEffort(args: ParsedArgs, agent: AgentName, role: RunRole, roleDefaults: RoleDefaults, model: string | null): string | null {
+  if (args.flags.has("effort")) {
+    const effort = flagString(args, "effort").trim();
+    if (!EFFORT_LEVELS.includes(effort)) throw new CliError(`--effort must be one of ${EFFORT_LEVELS.join(", ")}`);
+    if (!providerTakesEffort(agent)) throw new CliError(`--effort is not supported for agent ${agent} (claude, pi, agy only)`);
+    return effort;
+  }
+  if (!providerTakesEffort(agent)) return null;
+  return configuredRoleEffort(roleDefaults, model ?? builtinRunModel(agent, role));
+}
+
 // Dry-run view of an execution plan: argv + the effective sandbox contract.
 // plan.env is deliberately omitted — it is the worker's full environment.
 function providerPlanPayload(plan: ProviderExecutionPlan, cwd: string) {
@@ -454,6 +472,8 @@ export async function createRun(args: ParsedArgs): Promise<number> {
   const roleModel = agent === roleDefaults.agent ? roleDefaults.model : undefined;
   const configModel = roleModel ?? readOrchConfig().defaults?.models?.[agent] ?? null;
   const providerSession = resume ? resume.session : providerSessionConfig(args, agent, configModel);
+  const effort = resolveRunEffort(args, agent, role, roleDefaults, providerSession.model);
+  const effortField = effort ? { effort } : {};
 
   // Resolved exactly once here and threaded through to the spec, key,
   // compatibility check, dry-run, and startRun (F6): a config change between
@@ -484,7 +504,10 @@ export async function createRun(args: ParsedArgs): Promise<number> {
   // Absent --scratch leaves the key exactly as before; with it, the same
   // request asking for different copies (or a rev that moved) is a new run.
   const scratchKey = scratchRequests.length > 0 ? `:scratch-${sha256(scratchFingerprint(scratchRequests)).slice(0, 12)}` : "";
-  const defaultIdempotencyKey = `mr${mr}:${tag}:${taskSha}:session-${providerSessionFingerprint(providerSession)}:head-${snapshot.head}${contentKey}${sandboxIdentity.keySuffix}${scratchKey}`;
+  // An explicit --effort is a different request; config/built-in effort keeps
+  // the key unchanged so existing keys stay stable.
+  const effortKey = args.flags.has("effort") && effort ? `:effort-${effort}` : "";
+  const defaultIdempotencyKey = `mr${mr}:${tag}:${taskSha}:session-${providerSessionFingerprint(providerSession)}:head-${snapshot.head}${contentKey}${sandboxIdentity.keySuffix}${scratchKey}${effortKey}`;
   const idempotencyKey = flagString(args, "idempotency-key", defaultIdempotencyKey);
   const idempotencyPath = `${mrDir}/idempotency.json`;
   const dryRun = flagBool(args, "dry-run");
@@ -531,6 +554,7 @@ export async function createRun(args: ParsedArgs): Promise<number> {
       ...(orchLanguage() === "中文" ? { language: "中文" as const } : {}),
       ...sandboxIdentity.specField,
       ...effectiveSession,
+      ...effortField,
       idempotency_key: idempotencyKey,
       repo_key: repo.repo_key,
       worktree,
@@ -552,6 +576,8 @@ export async function createRun(args: ParsedArgs): Promise<number> {
       role,
       agent,
       model: effectiveSession.model,
+      effort: effort ?? (providerTakesEffort(agent) ? builtinRunEffort(agent, role) : null),
+      effort_source: args.flags.has("effort") ? "flag" : effort ? "config" : providerTakesEffort(agent) ? "builtin" : "none",
       tag,
       provider_session_name: effectiveSession.provider_session_name,
       provider_session_id: effectiveSession.provider_session_id,
@@ -623,6 +649,7 @@ export async function createRun(args: ParsedArgs): Promise<number> {
         `idempotent: ${payload.idempotent}`,
         `state: ${payload.state}`,
         `model: ${payload.model ?? "default"}`,
+        `effort: ${payload.effort ?? "default"} (${payload.effort_source})`,
         `provider_session_mode: ${payload.provider_session_mode}`,
         `provider_session_name: ${payload.provider_session_name ?? "none"}`,
         `provider_session_id: ${payload.provider_session_id ?? "none"}`,
@@ -672,6 +699,7 @@ export async function createRun(args: ParsedArgs): Promise<number> {
       taskSha,
       timeoutSec,
       providerSession,
+      effortField,
       repo,
       mrDir,
       idempotencyKey,
@@ -699,6 +727,7 @@ interface StartRunInput {
   taskSha: string;
   timeoutSec: number;
   providerSession: ProviderSessionConfig;
+  effortField: { effort?: string };
   repo: RepoIdentity;
   mrDir: string;
   idempotencyKey: string;
@@ -718,7 +747,7 @@ interface StartRunInput {
 // `run create` and the fan-out commands (cross-review / fanout / investigate).
 async function startRun(input: StartRunInput): Promise<Record<string, unknown>> {
   const { args, mr, role, agent, tag, worktree, taskPath, taskText, taskSha, timeoutSec } = input;
-  const { providerSession, repo, mrDir, idempotencyKey, idempotencyPath, sandboxEngine, sandboxWriteDirs, snapshot, pinnedHead } = input;
+  const { providerSession, effortField, repo, mrDir, idempotencyKey, idempotencyPath, sandboxEngine, sandboxWriteDirs, snapshot, pinnedHead } = input;
   const sandboxIdentity = sandboxRunIdentity(sandboxEngine, sandboxWriteDirs);
 
   try {
@@ -804,6 +833,7 @@ async function startRun(input: StartRunInput): Promise<Record<string, unknown>> 
         ...(orchLanguage() === "中文" ? { language: "中文" as const } : {}),
         ...sandboxIdentity.specField,
         ...providerSession,
+        ...effortField,
         idempotency_key: idempotencyKey,
         repo_key: repo.repo_key,
         worktree,

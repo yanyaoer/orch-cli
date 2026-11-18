@@ -8,6 +8,9 @@ import {
   buildProviderArgv,
   buildProviderExecutionPlan,
   buildWorkerEnv,
+  builtinRunEffort,
+  builtinRunModel,
+  providerTakesEffort,
   CLAUDE_CONTROLLER_ALLOWED_TOOLS,
   CLAUDE_RESEARCHER_ALLOWED_TOOLS,
   CLAUDE_WRITE_ALLOWED_TOOLS,
@@ -561,8 +564,9 @@ test("buildProviderArgv gives researcher a read-only web-research posture on cla
   withoutNativeSchema();
   const base = spec("researcher", "research-posture");
 
-  // claude researcher runs fable at xhigh effort; web tools ride an explicit
-  // whitelist under dontAsk (plan mode would deny them headless), no Edit/Write.
+  // claude researcher runs fable at high effort (Fable's own default; xhigh
+  // is a per-run --effort); web tools ride an explicit whitelist under
+  // dontAsk (plan mode would deny them headless), no Edit/Write.
   expect(buildProviderArgv("claude", base, "/run", "/worktree")).toEqual([
     "claude",
     "-p",
@@ -574,7 +578,7 @@ test("buildProviderArgv gives researcher a read-only web-research posture on cla
     "--model",
     "fable",
     "--effort",
-    "xhigh",
+    "high",
     "--allowedTools",
     CLAUDE_RESEARCHER_ALLOWED_TOOLS,
     "--permission-mode",
@@ -2056,4 +2060,43 @@ test("agy argv: stream-json in and out, effort by role, evidence dir, exact resu
   expect(line.endsWith("\n")).toBe(true);
   expect(line.trimEnd().includes("\n")).toBe(false);
   expect(JSON.parse(line)).toEqual({ event: "user", message: { role: "user", content: "line one\n\"quoted\"" } });
+});
+
+test("spec.effort overrides the built-in role effort for claude, pi and agy only", () => {
+  withoutNativeSchema();
+  const flagAfter = (argv: string[], flag: string) => argv[argv.indexOf(flag) + 1];
+
+  // No spec.effort: the built-in role tables decide.
+  expect(flagAfter(buildProviderArgv("claude", spec("researcher", "e1"), "/run", "/wt"), "--effort")).toBe("high");
+  expect(flagAfter(buildProviderArgv("claude", spec("verifier", "e2"), "/run", "/wt"), "--effort")).toBe("medium");
+  expect(flagAfter(buildProviderArgv("claude", spec("reviewer", "e3"), "/run", "/wt"), "--effort")).toBe("high");
+
+  const withEffort = (role: RunSpec["role"], agent: AgentName, effort: string): RunSpec => ({ ...spec(role, `${agent}-${role}`), agent, effort });
+  expect(flagAfter(buildProviderArgv("claude", withEffort("researcher", "claude", "xhigh"), "/run", "/wt"), "--effort")).toBe("xhigh");
+  expect(flagAfter(buildProviderArgv("claude", withEffort("verifier", "claude", "high"), "/run", "/wt"), "--effort")).toBe("high");
+  expect(flagAfter(buildProviderArgv("pi", withEffort("verifier", "pi", "high"), "/run", "/wt"), "--thinking")).toBe("high");
+  expect(flagAfter(buildProviderArgv("pi", withEffort("reviewer", "pi", "low"), "/run", "/wt"), "--thinking")).toBe("low");
+  // deepseek still reasons only at high and above.
+  expect(flagAfter(buildProviderArgv("pi", { ...withEffort("verifier", "pi", "low"), model: "x/deepseek-v4" }, "/run", "/wt"), "--thinking")).toBe("high");
+  expect(flagAfter(buildProviderArgv("agy", withEffort("implementer", "agy", "high"), "/run", "/wt"), "--effort")).toBe("high");
+  // codex keeps its own reasoning setting: no effort flag appears.
+  const codex = buildProviderArgv("codex", withEffort("verifier", "codex", "xhigh"), "/run", "/wt");
+  expect(codex.join(" ")).not.toContain("xhigh");
+  expect(codex).not.toContain("--effort");
+});
+
+test("built-in effort and model helpers mirror the argv builders", () => {
+  expect(builtinRunEffort("claude", "researcher")).toBe("high");
+  expect(builtinRunEffort("claude", "reviewer")).toBe("high");
+  expect(builtinRunEffort("claude", "verifier")).toBe("medium");
+  expect(builtinRunEffort("pi", "reviewer")).toBe("high");
+  expect(builtinRunEffort("pi", "implementer")).toBe("medium");
+  expect(builtinRunEffort("agy", "verifier")).toBe("medium");
+  expect(builtinRunEffort("codex", "verifier")).toBeNull();
+  expect(builtinRunModel("claude", "researcher")).toBe("fable");
+  expect(builtinRunModel("claude", "reviewer")).toBe("opus");
+  expect(builtinRunModel("claude", "implementer")).toBeNull();
+  expect(providerTakesEffort("claude")).toBe(true);
+  expect(providerTakesEffort("codex")).toBe(false);
+  expect(providerTakesEffort("omp")).toBe(false);
 });

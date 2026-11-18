@@ -40,6 +40,10 @@ export interface RunSpec {
   role: RunRole;
   agent: AgentName;
   model: string | null;
+  // Reasoning effort resolved at create (run create --effort, then config.json
+  // defaults.agents.<role>.effort_by_model / .effort). Absent = the driver's
+  // built-in role default. Only claude/pi/agy read it.
+  effort?: string;
   tag: string;
   provider_session_name: string | null;
   provider_session_id: string | null;

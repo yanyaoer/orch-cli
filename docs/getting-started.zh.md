@@ -82,7 +82,9 @@ $ orch result --run <run_id> --wait
 默认值放在 `~/.config/orch/config.json` 的 `defaults` 下，分三节：
 
 - `agents.<role>`：哪个 agent 负责哪个角色。裸字符串是 `{ "agent": ... }` 的简写；
-  对象形式可以再带 `model` 和 `timeout_sec`。
+  对象形式可以再带 `model`、`timeout_sec`、`effort` 和 `effort_by_model`（按模型 ref 设推理强度，
+  如 `{"fable": "high"}`；精确匹配优先，否则取被模型名包含的最长键）。优先级：`--effort` > `effort_by_model`
+  > `effort` > 内置表；effort 对 claude/agy/pi 生效，codex、omp 忽略。
 - `models.<agent>`：某个 agent 的默认模型，用该 CLI 自己的 ref 格式。正是这一行让
   自定义 provider 成为该 agent 所有角色（包括 fan-out 派发的 run）的默认。
 - `fanout`：`cross-review` 和 `investigate` 派发给 roster 里的哪些 agent（见第 5 节）。
@@ -142,7 +144,7 @@ $ orch result --run <run_id> --wait
 | `pi` | `openai-codex/gpt-6-astra` | 始终 `--thinking high` | 无回退链 |
 | `omp` | `openai-codex/gpt-6-astra` | 始终 `--thinking=high` | 配额回退 `google-antigravity/gemini-3.1-pro` 通过每次 run 的 overlay 下发；模型不在这条链里就不写 overlay，由 omp 自己 `~/.omp/agent/config.yml` 的 `retry.fallbackChains` 决定 |
 | `codex` | `~/.codex/config.toml` 里设的那个 | 取 config.toml，researcher 强制 `high` + 联网搜索 | researcher 固定 `gpt-6-astra`，除非 `--model` |
-| `claude` | CLI 自己的默认模型 | 按角色：implementer `medium`、verifier `low`、reviewer `high`、researcher `xhigh`、controller `medium` | reviewer 固定 `--model opus`，researcher 固定 `--model fable`；`--model` 覆盖两者 |
+| `claude` | CLI 自己的默认模型 | 按角色：implementer `medium`、verifier `medium`、reviewer `high`、researcher `high`、controller `medium`；config 或 `--effort` 可覆盖 | reviewer 固定 `--model opus`，researcher 固定 `--model fable`；`--model` 覆盖两者 |
 
 `--model` 的值原样透传，所以必须是所选 CLI 认的格式：
 

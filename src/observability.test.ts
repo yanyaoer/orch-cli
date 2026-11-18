@@ -2346,3 +2346,74 @@ test("run create --resume-from refuses ephemeral prior runs", async () => {
   expect(resumed.exitCode).not.toBe(0);
   expect(resumed.stderr).toContain("ephemeral");
 });
+
+test("run create resolves effort: --effort > config effort_by_model > config effort > built-in", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orch-effort-dry-run-test-"));
+  const stateHome = join(root, "state");
+  const configHome = join(root, "config");
+  mkdirSync(join(configHome, "orch"), { recursive: true });
+  const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
+  await initGitWorktree(worktree);
+  const taskPath = join(root, "task.md");
+  writeFileSync(taskPath, "effort resolution\n", "utf8");
+  const env = { XDG_STATE_HOME: stateHome, XDG_CONFIG_HOME: configHome };
+  const dry = async (role: string, agent: string, extra: string[] = []) => {
+    const result = await runOrch(
+      ["run", "create", "--mr", "effort", "--role", role, "--agent", agent, "--worktree", worktree, "--task", taskPath, ...extra, "--dry-run", "--json"],
+      env,
+    );
+    return result;
+  };
+  const effortOf = async (role: string, agent: string, extra: string[] = []) => {
+    const result = await dry(role, agent, extra);
+    expect(result).toMatchObject({ exitCode: 0, stderr: "" });
+    const payload = JSON.parse(result.stdout) as { effort: string | null; effort_source: string; idempotency_key: string; provider_plan: { argv: string[] } };
+    const argv = payload.provider_plan.argv;
+    const flag = agent === "pi" ? "--thinking" : "--effort";
+    return { effort: payload.effort, source: payload.effort_source, argv: argv.includes(flag) ? argv[argv.indexOf(flag) + 1] : null, key: payload.idempotency_key };
+  };
+
+  // No config: built-in table (researcher fable now high).
+  expect(await effortOf("researcher", "claude")).toMatchObject({ effort: "high", source: "builtin", argv: "high" });
+  expect(await effortOf("reviewer", "claude")).toMatchObject({ effort: "high", source: "builtin", argv: "high" });
+  const builtinKey = (await effortOf("researcher", "claude")).key;
+
+  writeFileSync(
+    join(configHome, "orch", "config.json"),
+    JSON.stringify({
+      version: 1,
+      workspaces: {},
+      defaults: {
+        agents: {
+          verifier: { effort: "medium", effort_by_model: { fable: "high" } },
+          researcher: { effort: "high" },
+          implementer: { effort: "low" },
+        },
+      },
+    }),
+  );
+  expect(await effortOf("verifier", "claude", ["--model", "opus"])).toMatchObject({ effort: "medium", source: "config", argv: "medium" });
+  expect(await effortOf("verifier", "claude", ["--model", "claude-fable-5-2"])).toMatchObject({ effort: "high", source: "config", argv: "high" });
+  expect(await effortOf("verifier", "pi")).toMatchObject({ effort: "medium", source: "config", argv: "medium" });
+  expect(await effortOf("implementer", "agy")).toMatchObject({ effort: "low", source: "config", argv: "low" });
+  // Config effort leaves the idempotency key alone; an explicit --effort does not.
+  const configured = await effortOf("researcher", "claude");
+  expect(configured).toMatchObject({ effort: "high", source: "config", argv: "high" });
+  expect(configured.key).toBe(builtinKey);
+  const flagged = await effortOf("researcher", "claude", ["--effort", "xhigh"]);
+  expect(flagged).toMatchObject({ effort: "xhigh", source: "flag", argv: "xhigh" });
+  expect(flagged.key).toBe(`${builtinKey}:effort-xhigh`);
+  expect(await effortOf("verifier", "claude", ["--model", "fable", "--effort", "medium"])).toMatchObject({ effort: "medium", source: "flag", argv: "medium" });
+
+  // codex takes no effort: a configured one is ignored, an explicit one is refused.
+  const codex = await dry("verifier", "codex");
+  expect(codex.exitCode).toBe(0);
+  expect(JSON.parse(codex.stdout)).toMatchObject({ effort: null, effort_source: "none" });
+  const refused = await dry("verifier", "codex", ["--effort", "high"]);
+  expect(refused.exitCode).not.toBe(0);
+  expect(refused.stderr).toContain("--effort is not supported for agent codex");
+  const bad = await dry("verifier", "claude", ["--effort", "huge"]);
+  expect(bad.exitCode).not.toBe(0);
+  expect(bad.stderr).toContain("--effort must be one of");
+  expect(existsSync(stateHome)).toBe(false);
+});

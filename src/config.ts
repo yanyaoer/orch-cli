@@ -33,10 +33,36 @@ export interface OrchWorkspace {
 // format, so it applies only when the run's agent is this entry's agent — a
 // `--agent` override never inherits it. It becomes spec.model (careful: for
 // claude that also overrides the role's model tier, e.g. reviewer/opus).
+// `effort` / `effort_by_model` set the role's reasoning effort for whichever
+// agent runs it (levels are shared by claude/pi/agy; codex and omp ignore
+// them). effort_by_model keys match the run's model — --model, the config
+// model, or the built-in tier (researcher -> fable) — exactly, else the
+// longest key contained in it (case-insensitive: "fable" matches
+// "claude-fable-5-2"). Precedence: --effort > effort_by_model > effort >
+// built-in table.
 export interface RoleDefaults {
   agent?: AgentName;
   model?: string;
   timeout_sec?: number;
+  effort?: string;
+  effort_by_model?: Record<string, string>;
+}
+
+export const EFFORT_LEVELS: readonly string[] = ["low", "medium", "high", "xhigh", "max"];
+
+// Config-level effort for a run (null = none configured): the effort_by_model
+// entry matching `model`, else the role's `effort`.
+export function configuredRoleEffort(defaults: RoleDefaults, model: string | null): string | null {
+  const byModel = defaults.effort_by_model;
+  if (byModel && model) {
+    const ref = model.toLowerCase();
+    const keys = Object.keys(byModel);
+    const exact = keys.find((key) => key.toLowerCase() === ref);
+    if (exact) return byModel[exact]!;
+    const contained = keys.filter((key) => key !== "" && ref.includes(key.toLowerCase())).sort((a, b) => b.length - a.length || a.localeCompare(b));
+    if (contained.length > 0) return byModel[contained[0]!]!;
+  }
+  return defaults.effort ?? null;
 }
 
 export interface OrchDefaults {
@@ -336,7 +362,7 @@ export async function resolveMailPassword(cfg: MailControlConfig): Promise<strin
 const ORCH_CONFIG_KEYS = ["version", "workspaces", "defaults", "language", "sandbox", "sandbox_write_dirs", "claude"] as const;
 const CLAUDE_CONFIG_KEYS = ["mode", "entrypoint"] as const;
 const ORCH_DEFAULTS_KEYS = ["agents", "models", "fanout"] as const;
-const ROLE_DEFAULT_KEYS = ["agent", "model", "timeout_sec"] as const;
+const ROLE_DEFAULT_KEYS = ["agent", "model", "timeout_sec", "effort", "effort_by_model"] as const;
 const FANOUT_KEYS = ["cross-review", "investigate"] as const;
 const RUN_ROLES: readonly string[] = ["implementer", "reviewer", "verifier", "controller", "researcher"];
 const AGENT_NAMES: readonly string[] = ["codex", "claude", "pi", "omp", "agy"];
@@ -403,6 +429,18 @@ export function validateOrchConfig(raw: unknown): { warnings: string[] } {
       if (entry.model !== undefined && (typeof entry.model !== "string" || entry.model === "")) fail(`${where}.model must be a non-empty string`);
       if (entry.timeout_sec !== undefined && (typeof entry.timeout_sec !== "number" || !Number.isFinite(entry.timeout_sec) || entry.timeout_sec <= 0)) {
         fail(`${where}.timeout_sec must be a positive number`);
+      }
+      if (entry.effort !== undefined && (typeof entry.effort !== "string" || !EFFORT_LEVELS.includes(entry.effort))) {
+        fail(`${where}.effort must be one of ${EFFORT_LEVELS.join(", ")}`);
+      }
+      if (entry.effort_by_model !== undefined) {
+        if (!isObject(entry.effort_by_model)) fail(`${where}.effort_by_model must be an object keyed by model ref`);
+        for (const [model, effort] of Object.entries(entry.effort_by_model)) {
+          if (model === "") fail(`${where}.effort_by_model keys must be non-empty model refs`);
+          if (typeof effort !== "string" || !EFFORT_LEVELS.includes(effort)) {
+            fail(`${where}.effort_by_model.${model} must be one of ${EFFORT_LEVELS.join(", ")}`);
+          }
+        }
       }
     }
   }
