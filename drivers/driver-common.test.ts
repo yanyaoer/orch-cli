@@ -2061,10 +2061,11 @@ test("agy argv: stream-json in and out, effort by role, evidence dir, exact resu
 });
 
 test("codexToolCacheDirs: GRADLE_USER_HOME wins, else ~/.gradle; relative or unknown homes add nothing", () => {
-  expect(codexToolCacheDirs({ HOME: "/home/a" })).toEqual(["/home/a/.gradle"]);
-  expect(codexToolCacheDirs({ HOME: "/home/a", GRADLE_USER_HOME: "/cache/gradle" })).toEqual(["/cache/gradle"]);
-  expect(codexToolCacheDirs({ HOME: "/home/a", GRADLE_USER_HOME: "  " })).toEqual(["/home/a/.gradle"]);
+  expect(codexToolCacheDirs({ HOME: "/home/a" })).toEqual(["/home/a/.gradle", "/home/a/.android", "/home/a/.m2"]);
+  expect(codexToolCacheDirs({ HOME: "/home/a", GRADLE_USER_HOME: "/cache/gradle" })).toEqual(["/cache/gradle", "/home/a/.android", "/home/a/.m2"]);
+  expect(codexToolCacheDirs({ HOME: "/home/a", GRADLE_USER_HOME: "  " })).toEqual(["/home/a/.gradle", "/home/a/.android", "/home/a/.m2"]);
   expect(codexToolCacheDirs({ GRADLE_USER_HOME: "relative/gradle" })).toEqual([]);
+  expect(codexToolCacheDirs({ HOME: "relative", GRADLE_USER_HOME: "/cache/gradle" })).toEqual(["/cache/gradle"]);
   expect(codexToolCacheDirs({})).toEqual([]);
 });
 

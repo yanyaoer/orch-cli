@@ -466,6 +466,8 @@ test("dry-run argv snapshots: write roles get --add-dir <run>/evidence, read-onl
     "--add-dir", `${run}/evidence`,
     // write roles: Gradle's home is writable under codex's own sandbox (r4 lock failures)
     "--add-dir", `${fx.env.HOME}/.gradle`,
+    "--add-dir", `${fx.env.HOME}/.android`,
+    "--add-dir", `${fx.env.HOME}/.m2`,
     "-",
   ]);
   expect(existsSync(`${fx.env.HOME}/.gradle`)).toBe(false);

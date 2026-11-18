@@ -559,16 +559,20 @@ function providerArgv(
   return argv;
 }
 
-// Tool caches a write-role codex run must write under its native
+// Tool homes a write-role codex run must write under its native
 // workspace-write sandbox, which otherwise leaves $HOME read-only: Gradle takes
 // its wrapper/daemon locks in GRADLE_USER_HOME (default ~/.gradle), so every
 // Android target failed "lock creation denied" (2026-11-18 !1105 verifier r4).
 // Pure (dry-run creates nothing); runProviderDriver creates them before a codex
 // launch so a first Gradle run on a fresh host works too.
+// Also ~/.android (the Android Gradle plugin creates the debug keystore there)
+// and ~/.m2 (Robolectric resolves its android-all jars into ~/.m2/repository):
+// both failed read-only in !1146 verifier r1 after the ~/.gradle fix.
 export function codexToolCacheDirs(env: NodeJS.ProcessEnv = process.env): string[] {
-  const home = env.HOME;
+  const home = env.HOME?.trim() ?? "";
   const gradle = env.GRADLE_USER_HOME?.trim() || (home ? `${home}/.gradle` : "");
-  return gradle.startsWith("/") ? [gradle] : [];
+  const dirs = [gradle, ...(home ? [`${home}/.android`, `${home}/.m2`] : [])];
+  return dirs.filter((dir) => dir.startsWith("/"));
 }
 
 function ensureCodexToolCacheDirs(spec: RunSpec): void {
