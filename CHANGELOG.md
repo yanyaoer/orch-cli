@@ -4,6 +4,11 @@ All notable user-facing changes are recorded here.
 
 ## [Unreleased]
 
+### Changes
+
+- pi runs resume in-run after a transient model error. A pi implementer/verifier whose last assistant message ends `stopReason: "error"` with a transient `errorMessage` (`Upstream error`, `Connection error`, `Request timed out`, 429, 5xx) after pi's own retries is resumed in the same run with `pi --session-id <same session>` and the "continue" message, like claude (`ORCH_API_RESUME_MAX` / `ORCH_API_RESUME_DELAY_SEC`, `api_resume` events). Auth, quota, context-length and missing-model errors are not resumed. Before, pi exited 0, orch found no result and the run was redone from zero (a verifier lost 40 minutes of suites to one `Upstream error`). pi implementer/verifier runs now default to `--session-mode fresh_persistent` so there is a session to resume (and `--resume-from` works for them); reviewer and researcher stay `ephemeral`.
+- Write-role codex runs can use Gradle. Under codex's own `workspace-write` sandbox, implementer/verifier runs get `--add-dir` for `GRADLE_USER_HOME` (default `~/.gradle`, created if missing); before, every Gradle target failed "lock creation denied" because `$HOME` was read-only.
+
 ## [0.0.15] - 2026-11-18
 
 ### Changes

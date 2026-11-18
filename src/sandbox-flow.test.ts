@@ -464,8 +464,11 @@ test("dry-run argv snapshots: write roles get --add-dir <run>/evidence, read-onl
     "-c", 'service_tier="default"',
     "--sandbox", "workspace-write",
     "--add-dir", `${run}/evidence`,
+    // write roles: Gradle's home is writable under codex's own sandbox (r4 lock failures)
+    "--add-dir", `${fx.env.HOME}/.gradle`,
     "-",
   ]);
+  expect(existsSync(`${fx.env.HOME}/.gradle`)).toBe(false);
 
   const claude = await plan("implementer", "claude");
   expect(claude.provider_plan.evidence_dir).toBe(`${claude.run_dir}/evidence`);
