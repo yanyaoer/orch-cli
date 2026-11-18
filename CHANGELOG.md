@@ -4,6 +4,8 @@ All notable user-facing changes are recorded here.
 
 ## [Unreleased]
 
+## [0.0.15] - 2026-11-18
+
 ### Changes
 
 - Run idle watchdog. A run with no activity for `ORCH_IDLE_TIMEOUT_MIN` minutes (default 90 — the p99 of the time completed runs spent after their last test command, 2026-11-04..09; `0` disables) is stopped instead of waiting out its whole `timeout_sec` (11 timeout runs in 5.4 days spent 82% of their time after their last test). Idle needs every signal to agree: no `events.jsonl` entry besides heartbeats, no growth of `native.jsonl` / `stdout.log` / `stderr.log`, no write under `evidence/`, and no process below the agent (process tree from the driver pid, so a background `full-test.py`, `make`, `gradle` or `ssh` in its own session keeps the run alive; provider helpers `node_repl`, `codex-code-mode-host`, `caffeinate`, `*mcp*` and `ORCH_IDLE_IGNORE_PROCS` basenames are skipped; an unreadable process table counts as busy). The stop takes the total timeout's kill and finalize path and appends an `idle_watchdog` event with the criteria snapshot. The run ends `timeout` with the new `status.timeout_reason: "idle"` (`"total"` for the `timeout_sec` limit) — or, when the agent had already delivered `result.json`, is finalized on it (`done`, or `failed` on schema errors/drift); `status.idle_stop` records the stop. The total timeout, API resume and cancel are unchanged. Not yet: asking the session to write its result before stopping it.
