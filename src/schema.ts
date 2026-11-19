@@ -37,11 +37,12 @@ function requireFields(obj: Record<string, unknown>, fields: string[]): string[]
 }
 
 function validateStringArray(obj: Record<string, unknown>, field: string, errors: string[]): void {
-  if (!array(obj[field])) {
+  const items = obj[field];
+  if (!array(items)) {
     errors.push(`${field} must be an array`);
     return;
   }
-  obj[field].forEach((item, index) => {
+  items.forEach((item, index) => {
     if (typeof item !== "string") errors.push(`${field}[${index}] must be a string`);
   });
 }
@@ -139,11 +140,12 @@ export function commandOutcome(item: { exit_code?: unknown; status?: unknown; ex
 // "completed". A genuine negative check there is written to exit 0 (`! cmd`),
 // and a red check is reported as failed with phase "before_change".
 function validateCommands(obj: Record<string, unknown>, field: string, errors: string[], negativeChecks = true): void {
-  if (!array(obj[field])) {
+  const items = obj[field];
+  if (!array(items)) {
     errors.push(`${field} must be an array`);
     return;
   }
-  obj[field].forEach((item, index) => {
+  items.forEach((item, index) => {
     if (!record(item)) {
       errors.push(`${field}[${index}] must be an object`);
       return;
@@ -237,11 +239,12 @@ function validateSuccessConsistency(obj: Record<string, unknown>, verdict: strin
 }
 
 function validateAcceptance(obj: Record<string, unknown>, field: string, errors: string[], evidenceAllowed: boolean): void {
-  if (!array(obj[field])) {
+  const items = obj[field];
+  if (!array(items)) {
     errors.push(`${field} must be an array`);
     return;
   }
-  obj[field].forEach((item, index) => {
+  items.forEach((item, index) => {
     if (!record(item)) {
       errors.push(`${field}[${index}] must be an object`);
       return;
@@ -255,11 +258,12 @@ function validateAcceptance(obj: Record<string, unknown>, field: string, errors:
 }
 
 function validateFindings(obj: Record<string, unknown>, field: string, errors: string[], blocking: boolean): void {
-  if (!array(obj[field])) {
+  const items = obj[field];
+  if (!array(items)) {
     errors.push(`${field} must be an array`);
     return;
   }
-  obj[field].forEach((item, index) => {
+  items.forEach((item, index) => {
     if (!record(item)) {
       errors.push(`${field}[${index}] must be an object`);
       return;

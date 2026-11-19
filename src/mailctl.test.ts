@@ -68,7 +68,7 @@ import { parseArgs } from "./cli.ts";
 import { getRepoIdentity, mrStateDir, orchStateRoot } from "./paths.ts";
 import type { RunSpec, RunStatus } from "./types.ts";
 
-type ConfigOverrides = Partial<MailControlConfig> & {
+type ConfigOverrides = Partial<Omit<MailControlConfig, "account" | "imap" | "smtp" | "controller" | "reports" | "notify">> & {
   account?: Partial<MailControlConfig["account"]>;
   imap?: Partial<MailControlConfig["imap"]>;
   smtp?: Partial<MailControlConfig["smtp"]>;

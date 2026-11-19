@@ -1205,7 +1205,8 @@ export function repairPreservesVerdict(previous: string, result: RoleResult, spe
       if (success && obj && typeof obj.verdict === "string") {
         if (Array.isArray(obj.blocking_findings) && obj.blocking_findings.length) return false;
         for (const field of ["tests", "commands"]) {
-          if (Array.isArray(obj[field]) && obj[field].some((entry: any, _index: number, all: unknown[]) => entry && !isRepairableRedCheck(entry, all) && (
+          const entries = obj[field];
+          if (Array.isArray(entries) && entries.some((entry: any, _index: number, all: unknown[]) => entry && !isRepairableRedCheck(entry, all) && (
             commandOutcome(entry) === "failed" ||
             (typeof entry.exit_code === "number" && entry.exit_code !== (entry.expected_exit_code ?? 0)) ||
             (spec.role === "verifier" && entry.status === "skipped" && entry.optional !== true)

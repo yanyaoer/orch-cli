@@ -119,8 +119,9 @@ function claudeEvents(event: NativeLine): NativeEvent[] {
     }
   }
 
-  if (event.type === "user" && Array.isArray(event.message?.content)) {
-    for (const block of event.message.content) {
+  const userContent = event.message?.content;
+  if (event.type === "user" && Array.isArray(userContent)) {
+    for (const block of userContent) {
       if (!block || typeof block !== "object") continue;
       const toolResult = block as { type?: unknown; content?: unknown };
       if (toolResult.type !== "tool_result") continue;
