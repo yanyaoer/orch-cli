@@ -4,10 +4,13 @@ All notable user-facing changes are recorded here.
 
 ## [Unreleased]
 
+## [0.0.16] - 2026-11-19
+
 ### Changes
 
 - pi runs resume in-run after a transient model error. A pi implementer/verifier whose last assistant message ends `stopReason: "error"` with a transient `errorMessage` (`Upstream error`, `Connection error`, `Request timed out`, 429, 5xx) after pi's own retries is resumed in the same run with `pi --session-id <same session>` and the "continue" message, like claude (`ORCH_API_RESUME_MAX` / `ORCH_API_RESUME_DELAY_SEC`, `api_resume` events). Auth, quota, context-length and missing-model errors are not resumed. Before, pi exited 0, orch found no result and the run was redone from zero (a verifier lost 40 minutes of suites to one `Upstream error`). pi implementer/verifier runs now default to `--session-mode fresh_persistent` so there is a session to resume (and `--resume-from` works for them); reviewer and researcher stay `ephemeral`.
 - Write-role codex runs can build and test Android. Under codex's own `workspace-write` sandbox, implementer/verifier runs get `--add-dir` for `GRADLE_USER_HOME` (default `~/.gradle`), `~/.android` and `~/.m2`, each created if missing; before, Gradle failed "lock creation denied", the debug keystore could not be created and Robolectric could not resolve its jars, because `$HOME` was read-only.
+- `tsc --noEmit` is clean again (26 strict-mode errors in sources and tests; no behaviour change).
 
 ## [0.0.15] - 2026-11-18
 
