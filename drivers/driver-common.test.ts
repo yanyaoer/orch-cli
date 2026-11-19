@@ -1852,7 +1852,7 @@ test("latest Pi answer wins; invalid final cannot resurrect earlier valid JSON o
   const lines = [piAnswer("I will inspect first"), piAnswer(JSON.stringify(deliveryResult)),
     { type: "tool_execution_end", result: { content: [{ type: "text", text: JSON.stringify(deliveryResult) }] } },
     piAnswer(final)];
-  writeFileSync(join(dir, "native.jsonl"), lines.map(JSON.stringify).join("\n"));
+  writeFileSync(join(dir, "native.jsonl"), lines.map((line) => JSON.stringify(line)).join("\n"));
   writeFileSync(join(dir, "last_message.txt"), JSON.stringify(deliveryResult));
   expect(rawResultText(dir)).toBe(final);
   expect(extractResultFromRunDir(dir, spec("reviewer", "delivery"))).toBeNull();
@@ -1871,11 +1871,11 @@ test("provider failed terminal invalidates valid-looking answer; repair attempts
   for (const ending of [piAnswer("", "error"), piAnswer("", "aborted"), { type: "turn.failed" },
     { type: "result", is_error: true, result: JSON.stringify(deliveryResult) }]) {
     const dir = tempDir();
-    writeFileSync(join(dir, "native.jsonl"), [piAnswer(JSON.stringify(deliveryResult)), ending].map(JSON.stringify).join("\n"));
+    writeFileSync(join(dir, "native.jsonl"), [piAnswer(JSON.stringify(deliveryResult)), ending].map((line) => JSON.stringify(line)).join("\n"));
     expect(extractResultFromRunDir(dir, spec("reviewer", "delivery"))).toBeNull();
   }
   const dir = tempDir();
-  writeFileSync(join(dir, "native.jsonl"), [piAnswer(JSON.stringify(deliveryResult)), { type: "orch_result_repair", attempt: 1 }].map(JSON.stringify).join("\n"));
+  writeFileSync(join(dir, "native.jsonl"), [piAnswer(JSON.stringify(deliveryResult)), { type: "orch_result_repair", attempt: 1 }].map((line) => JSON.stringify(line)).join("\n"));
   writeFileSync(join(dir, "last_message.txt"), JSON.stringify(deliveryResult));
   expect(rawResultText(dir)).toBeNull();
   expect(extractResultFromRunDir(dir, spec("reviewer", "delivery"))).toBeNull();
@@ -1922,7 +1922,7 @@ test("format repair cannot delete failed checks while retaining a success verdic
 test("empty Pi message or terminal snapshot cannot retain an earlier result", () => {
   for (const final of [piAnswer(""), { type: "turn_end", message: piAnswer("").message }, { type: "agent_end", messages: [piAnswer("").message] }, { type: "agent_end", messages: [] }]) {
     const dir = tempDir();
-    writeFileSync(join(dir, "native.jsonl"), [piAnswer(JSON.stringify(deliveryResult)), final].map(JSON.stringify).join("\n"));
+    writeFileSync(join(dir, "native.jsonl"), [piAnswer(JSON.stringify(deliveryResult)), final].map((line) => JSON.stringify(line)).join("\n"));
     expect(extractResultFromRunDir(dir, spec("reviewer", "delivery"))).toBeNull();
   }
 });
@@ -1946,7 +1946,7 @@ test("an incomplete latest assistant cannot revive a completed earlier answer", 
   for (const tail of [{ type: "message_start", message: { role: "assistant" } },
     { type: "item.started", item: { type: "agent_message", text: JSON.stringify(deliveryResult) } }]) {
     const dir = tempDir();
-    writeFileSync(join(dir, "native.jsonl"), [piAnswer(JSON.stringify(deliveryResult)), tail].map(JSON.stringify).join("\n"));
+    writeFileSync(join(dir, "native.jsonl"), [piAnswer(JSON.stringify(deliveryResult)), tail].map((line) => JSON.stringify(line)).join("\n"));
     expect(extractResultFromRunDir(dir, spec("reviewer", "delivery"))).toBeNull();
   }
 });
@@ -1959,7 +1959,7 @@ test("native envelopes without an answer ignore stale files and repair tool-shap
     const dir = tempDir();
     mkdirSync(join(dir, "scratch"));
     writeFileSync(join(dir, "scratch/last_message.txt"), JSON.stringify(deliveryResult));
-    writeFileSync(join(dir, "native.jsonl"), lines.map(JSON.stringify).join("\n"));
+    writeFileSync(join(dir, "native.jsonl"), lines.map((line) => JSON.stringify(line)).join("\n"));
     expect(extractResultFromRunDir(dir, spec("reviewer", "delivery"))).toBeNull();
   }
 });
@@ -1970,7 +1970,7 @@ test("Claude missing or malformed terminal text invalidates earlier success", ()
     writeFileSync(join(dir, "native.jsonl"), [
       { type: "assistant", message: { content: [{ type: "text", text: JSON.stringify(deliveryResult) }] } },
       { type: "result", subtype: "success", is_error: false, ...ending },
-    ].map(JSON.stringify).join("\n"));
+    ].map((line) => JSON.stringify(line)).join("\n"));
     writeFileSync(join(dir, "last_message.txt"), JSON.stringify(deliveryResult));
     expect(extractResultFromRunDir(dir, spec("reviewer", "delivery"))).toBeNull();
     expect(rawResultText(dir)).toBeNull();
