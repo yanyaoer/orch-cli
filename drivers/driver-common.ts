@@ -522,6 +522,7 @@ function providerArgv(
     const evidenceFlags = [
       ...(roleHasEvidenceDir(spec.role) ? ["--add-dir", runEvidenceDir(runDir)] : []),
       ...(scratchCopies(spec).length > 0 ? ["--add-dir", spec.scratch_root!] : []),
+      ...(!readOnly && !externalSandbox ? codexToolCacheDirs().flatMap((dir) => ["--add-dir", dir]) : []),
     ];
     if (spec.provider_session_mode === "resume_exact" && spec.provider_session_id) {
       // `codex exec resume` has no --sandbox flag (exit 2 if passed); the
@@ -556,6 +557,33 @@ function providerArgv(
   }
   if (spec.provider_session_name) argv.push("--name", spec.provider_session_name);
   return argv;
+}
+
+// Tool homes a write-role codex run must write under its native
+// workspace-write sandbox, which otherwise leaves $HOME read-only: Gradle takes
+// its wrapper/daemon locks in GRADLE_USER_HOME (default ~/.gradle), so every
+// Android target failed "lock creation denied" (2026-11-18 !1105 verifier r4).
+// Pure (dry-run creates nothing); runProviderDriver creates them before a codex
+// launch so a first Gradle run on a fresh host works too.
+// Also ~/.android (the Android Gradle plugin creates the debug keystore there)
+// and ~/.m2 (Robolectric resolves its android-all jars into ~/.m2/repository):
+// both failed read-only in !1146 verifier r1 after the ~/.gradle fix.
+export function codexToolCacheDirs(env: NodeJS.ProcessEnv = process.env): string[] {
+  const home = env.HOME?.trim() ?? "";
+  const gradle = env.GRADLE_USER_HOME?.trim() || (home ? `${home}/.gradle` : "");
+  const dirs = [gradle, ...(home ? [`${home}/.android`, `${home}/.m2`] : [])];
+  return dirs.filter((dir) => dir.startsWith("/"));
+}
+
+function ensureCodexToolCacheDirs(spec: RunSpec): void {
+  if (isReadOnlyRole(spec.role)) return;
+  for (const dir of codexToolCacheDirs()) {
+    try {
+      mkdirSync(dir, { recursive: true });
+    } catch (error) {
+      process.stderr.write(`orch: could not create codex tool cache dir ${dir}: ${error instanceof Error ? error.message : String(error)}\n`);
+    }
+  }
 }
 
 function tryParseJson(text: string): unknown | null {
@@ -1750,7 +1778,7 @@ function buildProviderExecutionPlanBase(ctx: ExecutionContext): ProviderExecutio
   };
 }
 
-// ---- In-run resume after a transient API error (claude only) ----
+// ---- In-run resume after a transient API error (claude, pi) ----
 // A claude run that ends on a network/overload API error after its own request
 // retries is not a failed task: the session is persisted (fresh_persistent /
 // resume_exact) and the worktree still holds the work. The driver resumes the
@@ -1828,6 +1856,47 @@ function fileSize(path: string): number {
   return existsSync(path) ? readFileSync(path).length : 0;
 }
 
+// pi (and omp, same stream) report a failed model request on the assistant
+// message: `stopReason: "error"` + `errorMessage`, after pi's own retries
+// (`auto_retry_*`, settings.json retry) gave up. The process still exits 0, so
+// without this the run is "failed: no valid result" and reruns from zero
+// (2026-11-18 !1105 verifier r3: 40 min of suites lost to "Upstream error").
+const PI_RESUME_TRANSIENT = new RegExp(
+  `${API_RESUME_TRANSIENT.source}|Upstream error|Request timed out|fetch failed|network|\\bstream (?:closed|ended|error)|rate limit|\\b(?:500|502|503|504|529)\\b|Service Unavailable|Bad Gateway|Gateway Timeout|Internal Server Error`,
+  "i",
+);
+const PI_RESUME_NOT_TRANSIENT = new RegExp(
+  `${API_RESUME_NOT_TRANSIENT.source}|quota|insufficient|invalid api key|unauthori[sz]ed|\\b(?:401|403)\\b|forbidden|context (?:length|window)|too long|No models match|model .*not (?:found|exist)`,
+  "i",
+);
+
+// Classifies one pi segment's native output: the last assistant message decides.
+export function piResumeVerdict(segment: string): ApiResumeVerdict {
+  let last: Record<string, any> | null = null;
+  let turns = 0;
+  for (const line of segment.split(/\r?\n/)) {
+    if (!line.includes('"assistant"')) continue;
+    try {
+      const obj = JSON.parse(line);
+      if (obj?.type === "turn_end") turns++;
+      if ((obj?.type === "message_end" || obj?.type === "turn_end") && obj.message?.role === "assistant") last = obj.message;
+    } catch {
+      // partial or non-JSON line
+    }
+  }
+  const base = { num_turns: turns || null, cost_usd: null };
+  if (!last) return { resumable: false, error: null, reason: "no_result", ...base };
+  if (last.stopReason !== "error") return { resumable: false, error: null, reason: "no_error", ...base };
+  const error = (typeof last.errorMessage === "string" ? last.errorMessage : "").slice(0, 300) || null;
+  if (!error || PI_RESUME_NOT_TRANSIENT.test(error) || !PI_RESUME_TRANSIENT.test(error)) {
+    return { resumable: false, error, reason: "not_transient", ...base };
+  }
+  return { resumable: true, error, reason: null, ...base };
+}
+
+// Providers whose sessions the driver resumes in-run after a transient API error.
+const API_RESUME_PROVIDERS: ReadonlySet<AgentName> = new Set(["claude", "pi"]);
+
 // Runs after the first provider exit; returns the exit code of the last segment.
 async function resumeOnApiError(input: {
   provider: AgentName;
@@ -1839,13 +1908,14 @@ async function resumeOnApiError(input: {
 }): Promise<number> {
   const { provider, spec, runDir, worktree } = input;
   let code = input.firstCode;
-  if (provider !== "claude" || spec.provider_session_mode === "ephemeral") return code;
+  if (!API_RESUME_PROVIDERS.has(provider) || spec.provider_session_mode === "ephemeral") return code;
+  const classify = provider === "pi" ? piResumeVerdict : apiResumeVerdict;
   const max = envInt("ORCH_API_RESUME_MAX", API_RESUME_MAX_DEFAULT);
   const delaySec = envInt("ORCH_API_RESUME_DELAY_SEC", API_RESUME_DELAY_SEC_DEFAULT);
   const nativePath = `${runDir}/native.jsonl`;
   let segmentStart = input.firstSegmentStart;
   for (let attempt = 1; ; attempt++) {
-    const verdict = apiResumeVerdict(readFrom(nativePath, segmentStart));
+    const verdict = classify(readFrom(nativePath, segmentStart));
     if (!verdict.resumable) {
       // Only a stop that follows a resume (or a lost session) is worth a record;
       // a run that simply succeeded or failed for another reason stays as-is.
@@ -1877,7 +1947,7 @@ async function resumeOnApiError(input: {
       prev_num_turns: verdict.num_turns,
       prev_cost_usd: verdict.cost_usd,
     });
-    process.stderr.write(`orch: claude ended on a transient API error (${verdict.error}); resuming session ${sessionId} in ${delaySec}s (attempt ${attempt}/${max})\n`);
+    process.stderr.write(`orch: ${provider} ended on a transient API error (${verdict.error}); resuming session ${sessionId} in ${delaySec}s (attempt ${attempt}/${max})\n`);
     await sleep(delaySec * 1000);
     const resumeSpec: RunSpec = { ...spec, provider_session_mode: "resume_exact", provider_session_id: sessionId, provider_session_name: null };
     let plan: ProviderExecutionPlan;
@@ -1904,6 +1974,7 @@ export async function runProviderDriver(provider: AgentName, argv: string[]): Pr
 
   const prompt = buildPrompt(spec, provider, args.runDir);
   if (provider === "codex" && nativeSchemaEnabled()) writeResultSchemaFile(args.runDir, spec);
+  if (provider === "codex") ensureCodexToolCacheDirs(spec);
   if (provider === "codex" && spec.provider_session_mode === "resume_exact" && spec.provider_session_id) {
     const baseline = readCodexBaseline(spec.provider_session_id);
     if (baseline) writeFileSync(codexBaselinePath(args.runDir), `${JSON.stringify(baseline)}\n`, "utf8");

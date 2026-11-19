@@ -228,7 +228,8 @@ console.log(JSON.stringify({ type: "result", result: JSON.stringify(result(runId
   const pi = `#!/usr/bin/env bun
 ${common}
 const args = Bun.argv.slice(2);
-const expected = ["--model", "openai-codex/gpt-6-astra", "--thinking", "medium", "-p", "--mode", "json", "--no-session"];
+// implementer: pi sessions persist by default so the driver can resume them in-run.
+const expected = ["--model", "openai-codex/gpt-6-astra", "--thinking", "medium", "-p", "--mode", "json"];
 if (JSON.stringify(args) !== JSON.stringify(expected)) {
   console.error("unexpected pi argv: " + JSON.stringify(args));
   process.exit(13);
@@ -611,6 +612,31 @@ test("run create dry-run passes explicit model to the pi provider plan", async (
     "--no-session",
   ]);
   expect(existsSync(stateHome)).toBe(false);
+});
+
+test("pi write roles default to a persistent session; read-only pi roles stay ephemeral; --session-mode wins", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orch-pi-session-default-"));
+  const worktree = realpathSync(mkdtempSync(join(root, "worktree-")));
+  await initGitWorktree(worktree);
+  const taskPath = join(root, "task.md");
+  writeFileSync(taskPath, "session default probe\n");
+  const env = { XDG_STATE_HOME: join(root, "state"), XDG_CONFIG_HOME: join(root, "config") };
+  const plan = async (role: string, ...extra: string[]) => {
+    const result = await runOrch(["run", "create", "--mr", "7", "--role", role, "--agent", "pi", "--tag", `${role}-probe`, "--worktree", worktree, "--task", taskPath, "--dry-run", "--json", ...extra], env);
+    expect(result.exitCode).toBe(0);
+    return JSON.parse(result.stdout) as { provider_session_mode: string; provider_plan: { argv: string[] } };
+  };
+  for (const role of ["implementer", "verifier"]) {
+    const payload = await plan(role);
+    expect(payload.provider_session_mode).toBe("fresh_persistent");
+    expect(payload.provider_plan.argv).not.toContain("--no-session");
+  }
+  const reviewer = await plan("reviewer");
+  expect(reviewer.provider_session_mode).toBe("ephemeral");
+  expect(reviewer.provider_plan.argv).toContain("--no-session");
+  const forced = await plan("verifier", "--session-mode", "ephemeral");
+  expect(forced.provider_session_mode).toBe("ephemeral");
+  expect(forced.provider_plan.argv).toContain("--no-session");
 });
 
 test("run create resolves an omitted --mr from the task text, then the branch", async () => {

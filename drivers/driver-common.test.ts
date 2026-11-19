@@ -24,6 +24,7 @@ import {
   runProviderDriver,
   ORCH_RUN_EVIDENCE_DIR_ENV,
   SEATBELT_ENV_MARKER,
+  codexToolCacheDirs,
 } from "./driver-common.ts";
 import type { AgentName, RunSpec } from "../src/types.ts";
 
@@ -275,6 +276,7 @@ test("buildProviderArgv keeps defaults fresh and only resumes exact sessions", (
     "workspace-write",
     "--add-dir",
     "/run/evidence",
+    ...codexToolCacheDirs().flatMap((dir) => ["--add-dir", dir]),
     "-",
   ]);
   expect(buildProviderArgv("pi", { ...base, provider_session_mode: "ephemeral" }, "/run", "/worktree")).toEqual([
@@ -329,7 +331,7 @@ test("buildProviderArgv keeps defaults fresh and only resumes exact sessions", (
       "/run",
       "/worktree",
     ),
-  ).toEqual(["codex", "exec", "--sandbox", "workspace-write", "--add-dir", "/run/evidence", "resume", "--json", "--output-last-message", "/run/last_message.txt", "-c", 'service_tier="default"', "thread-123", "-"]);
+  ).toEqual(["codex", "exec", "--sandbox", "workspace-write", "--add-dir", "/run/evidence", ...codexToolCacheDirs().flatMap((dir) => ["--add-dir", dir]), "resume", "--json", "--output-last-message", "/run/last_message.txt", "-c", 'service_tier="default"', "thread-123", "-"]);
   expect(
     buildProviderArgv(
       "pi",
@@ -2056,4 +2058,24 @@ test("agy argv: stream-json in and out, effort by role, evidence dir, exact resu
   expect(line.endsWith("\n")).toBe(true);
   expect(line.trimEnd().includes("\n")).toBe(false);
   expect(JSON.parse(line)).toEqual({ event: "user", message: { role: "user", content: "line one\n\"quoted\"" } });
+});
+
+test("codexToolCacheDirs: GRADLE_USER_HOME wins, else ~/.gradle; relative or unknown homes add nothing", () => {
+  expect(codexToolCacheDirs({ HOME: "/home/a" })).toEqual(["/home/a/.gradle", "/home/a/.android", "/home/a/.m2"]);
+  expect(codexToolCacheDirs({ HOME: "/home/a", GRADLE_USER_HOME: "/cache/gradle" })).toEqual(["/cache/gradle", "/home/a/.android", "/home/a/.m2"]);
+  expect(codexToolCacheDirs({ HOME: "/home/a", GRADLE_USER_HOME: "  " })).toEqual(["/home/a/.gradle", "/home/a/.android", "/home/a/.m2"]);
+  expect(codexToolCacheDirs({ GRADLE_USER_HOME: "relative/gradle" })).toEqual([]);
+  expect(codexToolCacheDirs({ HOME: "relative", GRADLE_USER_HOME: "/cache/gradle" })).toEqual(["/cache/gradle"]);
+  expect(codexToolCacheDirs({})).toEqual([]);
+});
+
+test("codex: only write roles get the tool cache dirs", () => {
+  const dirs = codexToolCacheDirs();
+  expect(dirs.length).toBeGreaterThan(0);
+  const verifier = buildProviderArgv("codex", spec("verifier", "cache-v"), "/run", "/worktree");
+  const reviewer = buildProviderArgv("codex", spec("reviewer", "cache-r"), "/run", "/worktree");
+  for (const dir of dirs) {
+    expect(verifier).toContain(dir);
+    expect(reviewer).not.toContain(dir);
+  }
 });

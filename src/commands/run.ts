@@ -22,8 +22,14 @@ function isProviderSessionMode(value: string): value is ProviderSessionMode {
   return value === "ephemeral" || value === "fresh_persistent" || value === "resume_exact";
 }
 
-function defaultProviderSessionMode(agent: AgentName): ProviderSessionMode {
-  return agent === "pi" || agent === "omp" || agent === "agy" ? "ephemeral" : "fresh_persistent";
+// pi implementer/verifier sessions persist so the driver can resume them in-run
+// after a transient model error, and `--resume-from` can continue them later
+// (a verifier that dies 40 min into the suites otherwise reruns from zero).
+// Other pi roles, omp and agy stay ephemeral. Legacy records without a mode
+// (providerSessionFromValue) keep the agent-only default.
+function defaultProviderSessionMode(agent: AgentName, role: string | null = null): ProviderSessionMode {
+  if (agent === "pi") return role === "implementer" || role === "verifier" ? "fresh_persistent" : "ephemeral";
+  return agent === "omp" || agent === "agy" ? "ephemeral" : "fresh_persistent";
 }
 
 function isUuid(value: string): boolean {
@@ -35,8 +41,8 @@ type ProviderSessionConfig = Pick<
   "provider_session_name" | "provider_session_id" | "provider_session_mode" | "model"
 >;
 
-function providerSessionConfig(args: ParsedArgs, agent: AgentName, defaultModel: string | null = null): ProviderSessionConfig {
-  const modeValue = flagString(args, "session-mode", defaultProviderSessionMode(agent));
+function providerSessionConfig(args: ParsedArgs, agent: AgentName, defaultModel: string | null = null, role: string | null = null): ProviderSessionConfig {
+  const modeValue = flagString(args, "session-mode", defaultProviderSessionMode(agent, role));
   if (!isProviderSessionMode(modeValue)) {
     throw new CliError("--session-mode must be ephemeral|fresh_persistent|resume_exact");
   }
@@ -453,7 +459,7 @@ export async function createRun(args: ParsedArgs): Promise<number> {
   // the per-agent default (defaults.models.<agent>), then the driver's built-in.
   const roleModel = agent === roleDefaults.agent ? roleDefaults.model : undefined;
   const configModel = roleModel ?? readOrchConfig().defaults?.models?.[agent] ?? null;
-  const providerSession = resume ? resume.session : providerSessionConfig(args, agent, configModel);
+  const providerSession = resume ? resume.session : providerSessionConfig(args, agent, configModel, role);
 
   // Resolved exactly once here and threaded through to the spec, key,
   // compatibility check, dry-run, and startRun (F6): a config change between
